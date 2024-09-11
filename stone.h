@@ -227,10 +227,10 @@ public:
     constexpr static double value_ma = 0.3;
     constexpr static double value_pao = 0.3;
     constexpr static double value_bing = 0.1;
-    constexpr static double value_jiang = 1;
+    constexpr static double value_jiang = 1000;
     constexpr static double value_shi = 0.2;
     constexpr static double value_xiang = 0.2;
-    constexpr static double value_infi = 10000.0;
+    constexpr static double value_infi = 100000.0;
     using Offset = Pos;
     static StoneMap<Stone> map;
 

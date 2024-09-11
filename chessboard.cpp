@@ -5,8 +5,7 @@ ChessBoard::ChessBoard(QWidget *parent) :
     selectID(Stone::ID_NONE),
     state(STATE_IDEL)
 {
-    setMinimumSize(offsetX*2 + Stone::map.row*gridSize,
-                   offsetY*2 + Stone::map.col*gridSize);
+    setFixedSize(600, 620);
 
     connect(this, &ChessBoard::sendResult,
             this, &ChessBoard::checkGameOver, Qt::QueuedConnection);
@@ -214,6 +213,7 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
             state = STATE_READY;
             condit.wakeAll();
         });
+
     }
     update();
     return;
