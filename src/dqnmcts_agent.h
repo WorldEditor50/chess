@@ -172,6 +172,8 @@ public:
         return totalEpisodes > 0 ? (float)totalWins[idx] / totalEpisodes : 0.0f;
     }
     float getExploreRate() const { return dqn.exploringRate; }
+    /* 最近一次 learn 的平均平方 TD 误差 (界面"训练损失曲线"用, 见 rl/dqn.h) */
+    float getLastTrainLoss() const override { return (float)dqn.lastLoss; }
 };
 
 #endif // DQNMCTS_AGENT_H

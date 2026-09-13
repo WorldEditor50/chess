@@ -5,6 +5,9 @@
 #include <sstream>
 #include <string>
 #include <iostream>
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
 #include <assert.h>
 #include "simd_ops.hpp"
 
@@ -1439,34 +1442,187 @@ public:
         return;
     }
 
+    /*
+       ============================================================
+        Tensor 的序列化: 权重文件用 (见 Net::save / Net::load)
+       ============================================================
+
+       格式 v2 (现在是默认的):
+           <shape 用逗号分隔>|b64:<base64 的原始数据>
+       上一版是 `<shape>|<十进制浮点, 用逗号分隔>`, 有两个真问题:
+         1. **有损**: `std::ostream << float` 默认 6 位有效数字。存一次再读回来,
+            权重就会漂移 ~1e-6 相对 —— 而本工程的后台训练每轮都在
+            save -> load (见 ChessBoard::backgroundTrainLoop 的 TMP_WEIGHTS),
+            也就是说每轮都在往网络里注入一次不该有的扰动。
+         2. **又大又慢**: 一个 float 要 9~13 个字节的文本 (还要 strtof/double 解析),
+            实测 16 MB 的 DQN+MCTS 权重文件读写一次要几百毫秒。
+
+        base64 之后是 5.33 字节/float、无损、编解码只做位运算。仍然保留"一行一个
+       张量 + 用 `|` 分隔形状"的外层结构, 因为分层的 write/read **顺序**是现成的
+       结构描述 (97 处调用点都依赖它), 而 base64 里不可能出现换行, 行式读取
+       (`std::getline`) 因此仍然安全。
+
+       `fromString` **同时接受两种格式** (老文件不带 `b64:` 前缀), 所以以前存下来的
+       权重照样能读。解码失败 (长度不对 / 非法字符 / 数据被截断) 会置
+       `lastDecodeFailed()`, 由 Net::load 汇总成一个"载入失败"返回给调用方 ——
+       否则一个被截断的文件会静默地载入半个模型。
+    */
     std::string toString() const
     {
-        /*
-           shape|val
-           1, 2, 3|4, 5, 2, 1, 8, 5
-        */
+        std::string out;
+        for (std::size_t i = 0; i < shape.size(); i++) {
+            out += std::to_string(shape[i]);
+            out += (i + 1 == shape.size()) ? '|' : ',';
+        }
+        out += "b64:";
+        const unsigned char *rawBytes =
+            reinterpret_cast<const unsigned char *>(val.data());
+        char crcHex[16];
+        std::snprintf(crcHex, sizeof(crcHex), "%08x",
+                      (unsigned int)crc32(rawBytes, val.size() * sizeof(T)));
+        out += crcHex;
+        out += ':';
+        out += base64Encode(val);
+        return out;
+    }
+
+    /* 人能读的版本 (调试用; 权重文件不用它, 因为它有损且更大) */
+    std::string toDebugString() const
+    {
         std::stringstream stream;
         for (std::size_t i = 0; i < shape.size(); i++) {
-            stream<<shape[i];
+            stream << shape[i];
             if (i != shape.size() - 1) {
-                stream<<",";
+                stream << ",";
             } else {
-                stream<<"|";
+                stream << "|";
             }
         }
         for (std::size_t i = 0; i < val.size(); i++) {
-            stream<<val[i];
+            stream << val[i];
             if (i < val.size() - 1) {
-                stream<<",";
+                stream << ",";
             }
         }
         return stream.str();
     }
+
+    /*
+       上一次 fromString 是否解码失败。做成静态的 "错误旗标" 是因为 97 处调用点
+       都写成 `x = Tensor::fromString(s)`, 没有地方能接收错误码; 由 Net::load 在
+       读完整层之前清零、之后检查, 就能把"文件坏了"变成一次明确的失败。
+       (线程安全: 权重读写只在单一训练/AI 线程里发生, 且有锁保护, 见 ChessBoard。)
+    */
+    static bool &lastDecodeFailedRef()
+    {
+        static bool failed = false;
+        return failed;
+    }
+    static bool lastDecodeFailed() { return lastDecodeFailedRef(); }
+    static void clearDecodeFailed() { lastDecodeFailedRef() = false; }
+
+    /*
+       ============================================================
+        快速结构校验 (给 Net::load 的"先校验一遍再真正载入"用)
+       ============================================================
+       它必须**不构造张量、不解析浮点数**: 一个 16 MB 的老格式权重文件里, 真正的
+       fromString 要 `split()` 出几百万个 std::string (实测让 GUI 启动从秒级变成
+       30 秒以上), 而这里只扫一遍字节、数一遍逗号。要求依然是严的:
+         * 形状能解析且每个维度为正;
+         * 值的个数必须恰好等于形状的乘积 (少一个就是被截断了);
+         * v2 还要过 base64 合法性 + 长度 + CRC32。
+    */
+    static bool validateEncoded(const std::string &s)
+    {
+        const std::string::size_type bar = s.find('|');
+        if (bar == std::string::npos) {
+            return false;
+        }
+        long long shapeProduct = 1;
+        if (!parseShape(s.substr(0, bar), shapeProduct)) {
+            return false;
+        }
+        const char *p = s.data() + bar + 1;
+        std::size_t n = s.size() - bar - 1;
+        while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) {
+            n--;
+        }
+        if (n >= 4 && std::strncmp(p, "b64:", 4) == 0) {
+            if (n < 4 + 8 + 1 || p[12] != ':') {
+                return false;
+            }
+            std::uint32_t want = 0;
+            for (std::size_t k = 4; k < 12; k++) {
+                const char c = p[k];
+                int d;
+                if (c >= '0' && c <= '9') {
+                    d = c - '0';
+                } else if (c >= 'a' && c <= 'f') {
+                    d = c - 'a' + 10;
+                } else if (c >= 'A' && c <= 'F') {
+                    d = c - 'A' + 10;
+                } else {
+                    return false;
+                }
+                want = (want << 4) | (std::uint32_t)d;
+            }
+            std::vector<unsigned char> raw;
+            if (!base64Decode(std::string(p + 13, n - 13), raw)) {
+                return false;
+            }
+            if ((long long)raw.size() != shapeProduct * (long long)sizeof(T)) {
+                return false;
+            }
+            return crc32(raw.data(), raw.size()) == want;
+        }
+        /* v1 (十进制文本): 值的个数 = 逗号数 + 1 */
+        long long values = (n == 0) ? 0 : 1;
+        for (std::size_t k = 0; k < n; k++) {
+            if (p[k] == ',') {
+                values++;
+            }
+        }
+        return values == shapeProduct;
+    }
+
+    /* 解析 "1,2,3" 形式的形状, 同时给出元素总数 */
+    static bool parseShape(const std::string &shapeString, long long &product)
+    {
+        product = 1;
+        if (shapeString.empty()) {
+            return false;
+        }
+        long long cur = 0;
+        bool any = false;
+        for (std::size_t i = 0; i < shapeString.size(); i++) {
+            const char c = shapeString[i];
+            if (c >= '0' && c <= '9') {
+                cur = cur * 10 + (c - '0');
+                any = true;
+            } else if (c == ',') {
+                if (!any || cur <= 0) {
+                    return false;
+                }
+                product *= cur;
+                cur = 0;
+                any = false;
+            } else {
+                return false;
+            }
+        }
+        if (!any || cur <= 0) {
+            return false;
+        }
+        product *= cur;
+        return true;
+    }
+
     static Tensor_ fromString(const std::string &s)
     {
         Tensor_ x;
         std::string::size_type pos = s.find('|');
         if (pos == std::string::npos) {
+            lastDecodeFailedRef() = true;
             return x;
         }
         auto split = [](const std::string &str)->std::vector<std::string> {
@@ -1474,8 +1630,8 @@ public:
             std::size_t pos = 0;
             std::size_t len = str.length();
             while (pos < len) {
-                int findPos = str.find(',', pos);
-                if (findPos < 0) {
+                std::size_t findPos = str.find(',', pos);
+                if (findPos == std::string::npos) {
                     elems.push_back(str.substr(pos, len - pos));
                     break;
                 }
@@ -1484,24 +1640,197 @@ public:
             }
             return elems;
         };
-        /* parse shape */
-        std::string shapeString = s.substr(0, pos);
-        std::vector<std::string> shapeElements = split(shapeString);
+        /* parse shape (与 validateEncoded 共用同一份解析, 保证两边判定一致) */
+        long long shapeProduct = 1;
+        if (!parseShape(s.substr(0, pos), shapeProduct)) {
+            lastDecodeFailedRef() = true;
+            return Tensor_();
+        }
         std::vector<int> shape;
-        for (std::size_t i = 0; i < shapeElements.size(); i++) {
-            int val = std::atoi(shapeElements[i].c_str());
-            shape.push_back(val);
+        {
+            long long cur = 0;
+            for (std::size_t i = 0; i <= pos; i++) {
+                const char c = (i == pos) ? ',' : s[i];
+                if (c == ',') {
+                    shape.push_back((int)cur);
+                    cur = 0;
+                } else {
+                    cur = cur * 10 + (c - '0');
+                }
+            }
         }
         /* create */
         x = Tensor_(shape);
-        /* parse value */
-        std::string valString = s.substr(pos + 1);
-        std::vector<std::string> valElements = split(valString);
+
+        std::string payload = s.substr(pos + 1);
+        /* 去掉行尾可能残留的 '\r' (Windows 上文本模式写入的文件) */
+        while (!payload.empty()
+               && (payload.back() == '\r' || payload.back() == '\n'
+                   || payload.back() == ' ')) {
+            payload.pop_back();
+        }
+
+        if (payload.compare(0, 4, "b64:") == 0) {
+            /* ---- v2: b64:<crc32 hex>:<base64 原始数据> ---- */
+            const std::string::size_type colon = payload.find(':', 4);
+            if (colon == std::string::npos || colon != 12) {
+                lastDecodeFailedRef() = true;
+                return Tensor_();
+            }
+            std::uint32_t want = 0;
+            for (std::size_t k = 4; k < colon; k++) {
+                const char c = payload[k];
+                int d;
+                if (c >= '0' && c <= '9') {
+                    d = c - '0';
+                } else if (c >= 'a' && c <= 'f') {
+                    d = c - 'a' + 10;
+                } else if (c >= 'A' && c <= 'F') {
+                    d = c - 'A' + 10;
+                } else {
+                    lastDecodeFailedRef() = true;
+                    return Tensor_();
+                }
+                want = (want << 4) | (std::uint32_t)d;
+            }
+            std::vector<unsigned char> raw;
+            if (!base64Decode(payload.substr(colon + 1), raw)) {
+                lastDecodeFailedRef() = true;
+                return Tensor_();
+            }
+            if ((long long)raw.size() != shapeProduct * (long long)sizeof(T)) {
+                /* 长度对不上 = 文件被截断或形状写错了。**不能**照着 raw 的长度硬填。 */
+                lastDecodeFailedRef() = true;
+                return Tensor_();
+            }
+            if (crc32(raw.data(), raw.size()) != want) {
+                /* 校验和不对 = 数据被改过/坏过。宁可报错, 也不要载入一个"略微不同"的模型。 */
+                lastDecodeFailedRef() = true;
+                return Tensor_();
+            }
+            std::memcpy(x.val.data(), raw.data(), raw.size());
+            return x;
+        }
+
+        /* ---- v1 (老格式): 十进制文本, 仍然要能读 ---- */
+        std::vector<std::string> valElements = split(payload);
+        if ((long long)valElements.size() != shapeProduct) {
+            lastDecodeFailedRef() = true;
+            return Tensor_();
+        }
         for (std::size_t i = 0; i < valElements.size(); i++) {
-            float val = std::atof(valElements[i].c_str());
-            x[i] = val;
+            x[i] = (T)std::atof(valElements[i].c_str());
         }
         return x;
+    }
+
+    /* ---- base64 (只用位运算, 便于以后换真正的二进制流) ---- */
+    /* CRC-32 (IEEE 802.3 多项式, 反射写法): 用来发现权重文件里的比特损坏 */
+    static std::uint32_t crc32(const unsigned char *data, std::size_t n)
+    {
+        static std::uint32_t table[256];
+        static bool init = false;
+        if (!init) {
+            for (std::uint32_t i = 0; i < 256; i++) {
+                std::uint32_t c = i;
+                for (int k = 0; k < 8; k++) {
+                    c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                }
+                table[i] = c;
+            }
+            init = true;
+        }
+        std::uint32_t c = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < n; i++) {
+            c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+        }
+        return c ^ 0xFFFFFFFFu;
+    }
+
+    static std::string base64Encode(const std::vector<T, Alloc<T> > &data)
+    {
+        static const char *kTab =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const unsigned char *bytes =
+            reinterpret_cast<const unsigned char *>(data.data());
+        const std::size_t n = data.size() * sizeof(T);
+        std::string out;
+        out.reserve((n + 2) / 3 * 4);
+        std::size_t i = 0;
+        for (; i + 3 <= n; i += 3) {
+            const unsigned int v = ((unsigned int)bytes[i] << 16)
+                                   | ((unsigned int)bytes[i + 1] << 8)
+                                   | (unsigned int)bytes[i + 2];
+            out += kTab[(v >> 18) & 63];
+            out += kTab[(v >> 12) & 63];
+            out += kTab[(v >> 6) & 63];
+            out += kTab[v & 63];
+        }
+        const std::size_t rest = n - i;
+        if (rest == 1) {
+            const unsigned int v = (unsigned int)bytes[i] << 16;
+            out += kTab[(v >> 18) & 63];
+            out += kTab[(v >> 12) & 63];
+            out += '=';
+            out += '=';
+        } else if (rest == 2) {
+            const unsigned int v = ((unsigned int)bytes[i] << 16)
+                                   | ((unsigned int)bytes[i + 1] << 8);
+            out += kTab[(v >> 18) & 63];
+            out += kTab[(v >> 12) & 63];
+            out += kTab[(v >> 6) & 63];
+            out += '=';
+        }
+        return out;
+    }
+
+    static bool base64Decode(const std::string &in, std::vector<unsigned char> &out)
+    {
+        auto val = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        out.clear();
+        if (in.size() % 4 != 0) {
+            return false;
+        }
+        out.reserve(in.size() / 4 * 3);
+        for (std::size_t i = 0; i < in.size(); i += 4) {
+            int q[4];
+            int pad = 0;
+            for (int k = 0; k < 4; k++) {
+                const char c = in[i + k];
+                if (c == '=') {
+                    /* 填充只允许出现在最后 4 字节组的末尾 */
+                    if (i + 4 != in.size() || k < 2) {
+                        return false;
+                    }
+                    q[k] = 0;
+                    pad++;
+                } else {
+                    q[k] = val(c);
+                    if (q[k] < 0) {
+                        return false;
+                    }
+                }
+            }
+            const unsigned int v = ((unsigned int)q[0] << 18)
+                                   | ((unsigned int)q[1] << 12)
+                                   | ((unsigned int)q[2] << 6)
+                                   | (unsigned int)q[3];
+            out.push_back((unsigned char)((v >> 16) & 0xFF));
+            if (pad < 2) {
+                out.push_back((unsigned char)((v >> 8) & 0xFF));
+            }
+            if (pad < 1) {
+                out.push_back((unsigned char)(v & 0xFF));
+            }
+        }
+        return true;
     }
 };
 

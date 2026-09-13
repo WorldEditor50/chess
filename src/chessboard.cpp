@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace {
 
@@ -22,6 +23,8 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_PPOMCTS:   return QStringLiteral("PPO+MCTS");
     case ChessBoard::AGENT_DQNMCTS:   return QStringLiteral("DQN+MCTS");
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
+    case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
+    case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
     }
     return QStringLiteral("agent");
 }
@@ -35,6 +38,8 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_PPOMCTS:
     case ChessBoard::AGENT_DQNMCTS:
     case ChessBoard::AGENT_EVAB:
+    case ChessBoard::AGENT_SACAZ:
+    case ChessBoard::AGENT_SACAZ_MOE:
         return true;
     default:
         return false;
@@ -77,6 +82,46 @@ static constexpr int AB_DEPTH = 4;            /* Alpha-Beta 搜索深度 */
 static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
 static constexpr int PPO_SIMS = 80;           /* PPO+MCTS 每次决策的模拟次数 */
 static constexpr int DQNMCTS_ITERATIONS = 200;/* DQN+MCTS 每次决策的迭代次数 */
+/*
+ * SAC+AZ 每次决策的 MCTS 模拟次数。实测 (test_sacaz, 本机 AVX2): 64 次模拟约 3 ms,
+ * 也就是 ~0.05 ms/模拟 —— 它的网络是 1260->64->64->128 的小 MLP, 比 EVAB 的
+ * alpha-beta 搜索便宜得多, 所以这里给到 256 次 (约 12 ms), 换更准的访问分布。
+ * 需要更强就继续加大: 成本是线性的。
+ */
+/*
+ * EVAB 的搜索预算。**不能用 AB_DEPTH**: EVAB 有置换表 + 迭代加深 + 走法排序 +
+ * 静态搜索, 同一深度比 ABAgent 快一个数量级 (本机实测初始局面:
+ *   EVAB depth 4 = 90 ms,  depth 5 = 188 ms,  depth 6 = 890 ms
+ *   AB   depth 4 = 89 ms,  depth 5 = 1873 ms
+ * 也就是 EVAB 用 AB 深度 4 的时间可以搜到深度 5。原来这里写的是 AB_DEPTH(4),
+ * 等于把"学到的评估 + 更强的搜索"这两个卖点都关掉了 —— 实测那样下的 EVAB 与
+ * ABAgent 走法 22/30 相同, 只会和棋。
+ *
+ * 深度给到 6 而把**时间上限**当真正的约束 (800 ms): 叶子评估的代价取决于 blend (见 evagent.h 里 blendMax
+ * 的注释: blend>0 时每步要跑网络前向, 会贵 10 倍以上), 用迭代加深 + 时间上限就
+ * 自动"贵了就搜浅一点", 不需要为两个模式各调一个深度。
+ */
+static constexpr int EVAB_DEPTH = 6;
+static constexpr long long EVAB_BUDGET_MS = 800;
+static constexpr int SACAZ_SIMS = 256;
+static constexpr int SACAZ_HIDDEN = 64;       /* SAC+AZ 的网络隐层宽度 */
+/*
+ * 稀疏 MoE (TB 专家) 骨干的那个变体: 一次模拟 ~10.9 ms (实测, test_sacaz [10]),
+ * 所以模拟次数只能给到 16 (约 175 ms/步)。这是"容量换算力"的直接后果 ——
+ * 同样的参数量下, 稀疏路由让它比全算 4 个专家快 3.8 倍 (42.0 -> 10.9 ms/模拟),
+ * 但要和 0.07 ms/模拟的 MLP 骨干比算力, 无论如何都差两个数量级。
+ */
+static constexpr int SACAZ_MOE_SIMS = 16;
+/*
+ * 负载均衡辅助损失的系数。0.1 是实测选出来的 (bench_moe --cases=B --pretrain=3):
+ *   aux=0     -> 8 个专家里有 3 个一次都没被选中 (路由塌了)
+ *   aux=0.01  -> 都被用到, 但最大/均值仍是 4.00
+ *   aux=0.1   -> 都被用到, 最大/均值 2.91   <- 选这个
+ *   aux=0.5/2 -> 更均匀 (2.63/2.32), 但辅助项开始盖过真正的策略梯度
+ * 这里的"批"只有 32 个样本, 而主干给门控的梯度比辅助项大两个数量级, 所以系数比
+ * Switch Transformer 论文里的 0.01 要大得多才起作用。
+ */
+static constexpr float SACAZ_MOE_AUX = 0.1f;
 /* 单局手数上限已集中到 ChessBoard::DEFAULT_MAX_PLIES (界面上可用 setMaxPliesPerGame 调) */
 
 /*
@@ -94,6 +139,8 @@ DQNAgent *ChessBoard::m_sfDQN = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTS = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
+SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
+SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
 /*
@@ -116,6 +163,14 @@ void ChessBoard::startupLoad()
     */
     qInfo().noquote() << "[SIMD]" << QString::fromStdString(RL::cpuinfo::describe());
 
+    /*
+       启动阶段的"请稍候": 读 7 组权重可能要好几秒 (老格式是十进制文本, DQN+MCTS
+       一个文件就 16 MB), 界面上必须有个沙漏在转。这些信号是队列投递到 GUI 线程的,
+       所以在这里(工作线程)emit 是安全的。
+    */
+    emit busyStarted(QStringLiteral("正在载入"),
+                     QStringLiteral("读取棋局数据库与模型权重…"));
+
     /* ---- 1. 打开数据库 ---- */
     GameDatabase::instance().open("chess_games.db");
 
@@ -130,7 +185,15 @@ void ChessBoard::startupLoad()
         {AGENT_DQN,       "weights/dqn_agent.dat"},
         {AGENT_PPOMCTS,   "weights/ppomcts_agent.dat"},
         {AGENT_DQNMCTS,   "weights/dqnmcts_agent.dat"},
-        {AGENT_EVAB,      "weights/evab_agent.dat"}
+        {AGENT_EVAB,      "weights/evab_agent.dat"},
+        /*
+           SAC+AZ 的一个模型是三个文件 (actor / q1 / q2), 所以这里的路径是**前缀**:
+           weights/sacaz_agent -> sacaz_agent_actor / _q1 / _q2。
+           判定"有没有已训练的权重"用 actor 那一个即可。
+        */
+        {AGENT_SACAZ,     "weights/sacaz_agent_actor"},
+        /* 稀疏 MoE 骨干的变体: 权重不能共用 —— 层结构完全不同 */
+        {AGENT_SACAZ_MOE, "weights/sacaz_moe_agent_actor"}
     };
 
     for (const auto &we : weightFiles) {
@@ -143,32 +206,61 @@ void ChessBoard::startupLoad()
 
     /* ---- 3. 预创建 self-play agent 并加载权重 ---- */
     if (s_weightPaths.count(AGENT_PG)) {
+        emit busyMessage(QStringLiteral("正在载入 Policy Gradient 权重…"));
         if (m_sfPG == nullptr)
             m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
         m_sfPG->loadPolicy(s_weightPaths[AGENT_PG]);
     }
     if (s_weightPaths.count(AGENT_DQN)) {
+        emit busyMessage(QStringLiteral("正在载入 DQN 权重…"));
         if (m_sfDQN == nullptr)
             m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
         m_sfDQN->loadModel(s_weightPaths[AGENT_DQN]);
     }
     if (s_weightPaths.count(AGENT_PPOMCTS)) {
+        emit busyMessage(QStringLiteral("正在载入 PPO+MCTS 权重…"));
         if (m_sfPPOMCTS == nullptr)
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
         m_sfPPOMCTS->loadModel(s_weightPaths[AGENT_PPOMCTS]);
     }
     if (s_weightPaths.count(AGENT_EVAB)) {
+        emit busyMessage(QStringLiteral("正在载入 EVAB 权重…"));
         if (m_sfEVAB == nullptr)
-            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+            m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
         m_sfEVAB->loadModel(s_weightPaths[AGENT_EVAB]);
     }
     if (s_weightPaths.count(AGENT_DQNMCTS)) {
+        emit busyMessage(QStringLiteral("正在载入 DQN+MCTS 权重… (文件较大，可能要几秒)"));
         if (m_sfDQNMCTS == nullptr)
             m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
         m_sfDQNMCTS->loadModel(s_weightPaths[AGENT_DQNMCTS]);
     }
+    if (s_weightPaths.count(AGENT_SACAZ)) {
+        emit busyMessage(QStringLiteral("正在载入 SAC+AZ 权重…"));
+        if (m_sfSACAZ == nullptr)
+            m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+        /* 路径是前缀: 去掉结尾的 "_actor" */
+        std::string prefix = s_weightPaths[AGENT_SACAZ];
+        const std::string suffix = "_actor";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfSACAZ->loadModel(prefix);
+    }
+    /*
+       SAC+AZ (稀疏 MoE + TB 专家) 的权重**故意不在这里预加载**。
+       它一个模型是三个文件、每个 146 MB (28.7 M 参数), 实测把启动时间从 ~2 秒
+       拉到 **19 秒** —— 而绝大多数会话根本不会用到这个变体。
+       路径已经在上面的扫描里登记进 s_weightPaths, 所以第一次真正选中它时
+       (aiThink / aiThinkForAgent 的懒创建分支) 会照常载入, 并同样弹出"请稍候"
+       沙漏 (见那两处的 busyStarted/busyFinished)。
+       实测: 预加载 19 s -> 改成懒加载后启动 ~2 s。
+    */
 
     /* ---- 4. 启动后台训练 & 通知主线程加载完成 ---- */
+    emit busyMessage(QStringLiteral("初始化完成"));
+    emit busyFinished();
     m_startupComplete = true;
 
     /* 启动后台训练线程 (神经网络agent持续自我对弈提升棋力) */
@@ -821,8 +913,7 @@ void ChessBoard::setAgentType(AgentType type)
  *  它们无害; 而且探索全程用 moveForward/moveBack 试走并原样回退, 不会改动真棋局。
  * ================================================================ */
 std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
-{
-    if (agent == nullptr) {
+{    if (agent == nullptr) {
         emitStage(QStringLiteral("① 搜索 / 决策"));
         return std::string();
     }
@@ -841,6 +932,18 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
     std::string info = agent->getExploreInfo();
     if (info.empty()) {
         info = trained ? "已预训练" : "无需预训练 (该 agent 没有在线可训练参数)";
+    }
+    /*
+       上报这次在线训练的损失 (界面的"训练损失曲线")。不上报损失的 agent 返回 NaN
+       (见 AgentBase::getLastTrainLoss), 曲线控件会直接丢弃这个点 —— 所以这里不需要
+       区分"是 0"和"没上报", 用 isfinite 判断即可。
+    */
+    {
+        const float loss = agent->getLastTrainLoss();
+        if (std::isfinite(loss)) {
+            emit trainLossSample((double)loss, QString::fromStdString(agent->getName()),
+                                 m_trainSampleNo.fetch_add(1) + 1);
+        }
     }
     {
         QMutexLocker locker(&m_infoMutex);
@@ -969,7 +1072,7 @@ Step ChessBoard::aiThink(int color)
         /* EVAB: 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md) */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfEVAB == nullptr) {
-            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+            m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
             auto it = s_weightPaths.find(AGENT_EVAB);
             if (it != s_weightPaths.end())
                 m_sfEVAB->loadModel(it->second);
@@ -977,6 +1080,58 @@ Step ChessBoard::aiThink(int color)
         /* EVAB 的"探索"就是它的搜索; 这里额外把探索结果蒸馏回评估网络 */
         preTrainThenDecide(m_sfEVAB, color);
         return m_sfEVAB->getBestMove(color);
+    }
+    case AGENT_SACAZ: {
+        /* SAC + MCTS + AlphaZero: 最大熵 critic 给 PUCT 搜索提供叶子估值 */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZ == nullptr) {
+            m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+            auto it = s_weightPaths.find(AGENT_SACAZ);
+            if (it != s_weightPaths.end()) {
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZ->loadModel(prefix);
+            }
+        }
+        preTrainThenDecide(m_sfSACAZ, color);
+        /* temp = 0: 取访问数最多的走法 (确定性) */
+        return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+    }
+    case AGENT_SACAZ_MOE: {
+        /*
+           SAC + MCTS + AlphaZero, 骨干 = 稀疏路由 MoE + TransformerBlock 专家
+           (E=4, top-1)。刻意用很少的模拟次数: 一次模拟 ~10.9 ms, 16 次约 175 ms。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZMoe == nullptr) {
+            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                          SACAZAgent::Backbone::SparseMoeTb,
+                                          64, SACAZ_MOE_AUX);
+            auto it = s_weightPaths.find(AGENT_SACAZ_MOE);
+            if (it != s_weightPaths.end()) {
+                /*
+                   这个变体的权重是 3 x 146 MB, 读起来要十几秒 (所以启动时不预加载,
+                   见 startupLoad 里的说明)。第一次用到它时同样弹"请稍候"沙漏 ——
+                   这些信号是队列投递到 GUI 线程的, 在工作线程 emit 是安全的。
+                */
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ (稀疏MoE): 读取 3 个 146 MB 权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZMoe->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(m_sfSACAZMoe, color);
+        return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
     }
     default: {
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
@@ -1048,10 +1203,46 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
     case AGENT_EVAB: {
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfEVAB == nullptr) {
-            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+            m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
         }
         preTrainThenDecide(m_sfEVAB, color);
         return m_sfEVAB->getBestMove(color);
+    }
+    case AGENT_SACAZ: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZ == nullptr) {
+            m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+        }
+        preTrainThenDecide(m_sfSACAZ, color);
+        return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+    }
+    case AGENT_SACAZ_MOE: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZMoe == nullptr) {
+            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                          SACAZAgent::Backbone::SparseMoeTb,
+                                          64, SACAZ_MOE_AUX);
+            /*
+               以前这里**只建对象、不载权重** —— 于是对弈里用到这个 agent 时跑的是
+               随机初始化的网络 (界面上"选了它却像没训练过"), 而它自己在 aiThink
+               路径里又会载权重, 两条路径行为不一致。现在两条都懒加载, 且都弹沙漏。
+            */
+            auto it = s_weightPaths.find(AGENT_SACAZ_MOE);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ (稀疏MoE): 读取 3 个 146 MB 权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZMoe->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(m_sfSACAZMoe, color);
+        return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
     }
     default:
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
@@ -1114,8 +1305,14 @@ ChessBoard::AgentType ChessBoard::typeForTurn(int turn, AgentType redType,
 }
 
 /* 打一局: 红方 redType, 黑方 blackType。返回 Chess::RESULT_*, 被中止则返回 ONGOING */
-int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats &st)
+int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats &st,
+                              double &rewardRed, double &rewardBlack, double &rewardA,
+                              double &rewardB)
 {
+    rewardRed = 0.0;
+    rewardBlack = 0.0;
+    rewardA = 0.0;
+    rewardB = 0.0;
     {
         QMutexLocker locker(&mutex);
         chess.reset();
@@ -1196,12 +1393,43 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats
         {
             QMutexLocker locker(&mutex);
             double totalReward = 0;
+            /* 走这一步的是 turn 方, moveForward 之前先记下来 */
+            const int mover = turn;
             chess.moveForward(&step, totalReward);
+            /*
+               环境奖励记账。`Chess::moveForward` 的 totalReward 是**黑方视角**的记账
+               (吃红子 +value, 吃黑子 −value), 而 RL agent 学的是"走子方视角"的奖励
+               (与 SACAZAgent::computeReward、终局 ±1 同一套约定), 所以这里换算过去。
+               换算公式: 黑方视角 == −(红方视角), 于是
+                 红方走: 走子方收益 = −totalReward
+                 黑方走: 走子方收益 = +totalReward
+               (实测探针: 红炮吃黑马 totalReward = −0.30, 即红方收益 +0.30。)
+            */
+            const double moverReward =
+                (mover == Stone::COLOR_RED) ? -totalReward : totalReward;
+            if (mover == Stone::COLOR_RED) {
+                rewardRed += moverReward;
+            } else {
+                rewardBlack += moverReward;
+            }
+            /* A/B 的归属由 matchAgents 按"这一局谁执红"换算, 这里只管红黑 */
             /* sideToMove 必须跟着 turn 走, 否则下一手 getResult 会看错方 */
             turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
             chess.sideToMove = turn;
         }
         moves++;
+    }
+
+    /*
+       终局奖励 ±1 也算进"本局环境奖励"里 —— 否则这条曲线只反映吃子, 看不出输赢。
+       和棋不加不减 (0)。
+    */
+    if (ret == Chess::RESULT_RED_WIN) {
+        rewardRed += 1.0;
+        rewardBlack -= 1.0;
+    } else if (ret == Chess::RESULT_BLACK_WIN) {
+        rewardBlack += 1.0;
+        rewardRed -= 1.0;
     }
 
     /*
@@ -1260,11 +1488,20 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         const AgentType redType = aIsRed ? typeA : typeB;
         const AgentType blackType = aIsRed ? typeB : typeA;
 
-        const int res = playMatchGame(redType, blackType, st);
+        double rewardRed = 0.0;
+        double rewardBlack = 0.0;
+        double rewardA = 0.0;
+        double rewardB = 0.0;
+        const int res = playMatchGame(redType, blackType, st, rewardRed, rewardBlack,
+                                      rewardA, rewardB);
         if (res == Chess::RESULT_ONGOING) {
             st.aborted = true;      /* playMatchGame 用 ONGOING 表示"被中止" */
             break;
         }
+
+        /* A/B 视角的本局环境奖励 (谁执红就把红方那份记给谁) */
+        const double rA = aIsRed ? rewardRed : rewardBlack;
+        const double rB = aIsRed ? rewardBlack : rewardRed;
 
         QString line = QStringLiteral("  第 %1 局: 红=%2 黑=%3 -> ")
                            .arg(g + 1)
@@ -1285,9 +1522,25 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
             }
         }
         st.games++;
-        st.log += line + QStringLiteral("  (%1 手)\n").arg(m_selfPlayMoveNo.load());
+        /*
+           每局明细里带上"本局环境奖励": 这条曲线的意义是"模型下完一局拿到了多少
+           奖励", 所以它同时也是逐局明细的一部分 (界面上的列表直接用它)。
+        */
+        const QString rewardText =
+            QStringLiteral("  奖励 A=%1 B=%2").arg(rA, 0, 'f', 2).arg(rB, 0, 'f', 2);
+        st.log += line + QStringLiteral("  (%1 手)").arg(m_selfPlayMoveNo.load())
+                  + rewardText + QStringLiteral("\n");
 
-        emit matchGameFinished(st.games, games, line);
+        emit matchGameFinished(st.games, games, line + rewardText);
+        /* ---- 实时比分 (界面用, 见 matchScoreChanged 的注释) ---- */
+        {
+            QString score = QStringLiteral("%1 %2 : %3 %4")
+                                .arg(st.agentA).arg(st.winA).arg(st.winB).arg(st.agentB);
+            score += QStringLiteral("   和 %1").arg(st.draws);
+            score += QStringLiteral("   (%1/%2 局)").arg(st.games).arg(games);
+            emit matchScoreChanged(score);
+        }
+        emit gameRewardSample(st.games, st.agentA, st.agentB, rA, rB);
     }
 
     m_matchRunning = false;
@@ -1303,8 +1556,60 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
 /* ================================================================
  *  保存AI模型权重
  * ================================================================ */
+
+/*
+ * defaultWeightPath - 每个 agent 的正式权重路径 (单一来源)
+ *
+ * 这些字符串以前散在 shutdownSave() 里, 而"对弈结束后保存"在 GUI 里另有一套
+ * (走文件对话框, 默认文件名还不一样) —— 两套名字不一致就会静默失效: 用户以为
+ * 存上了, 下次启动读的却是另一个文件。现在统一到这里。
+ */
+std::string ChessBoard::defaultWeightPath(AgentType agentType)
+{
+    switch (agentType) {
+    case AGENT_PG:        return "weights/pg_agent.dat";
+    case AGENT_DQN:       return "weights/dqn_agent.dat";
+    case AGENT_PPOMCTS:   return "weights/ppomcts_agent.dat";
+    case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
+    case AGENT_EVAB:      return "weights/evab_agent.dat";
+    /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 */
+    case AGENT_SACAZ:     return "weights/sacaz_agent";
+    case AGENT_SACAZ_MOE: return "weights/sacaz_moe_agent";
+    default:              return std::string();
+    }
+}
+
+bool ChessBoard::hasAgentInstance(AgentType agentType) const
+{
+    switch (agentType) {
+    case AGENT_PG:        return m_sfPG != nullptr;
+    case AGENT_DQN:       return m_sfDQN != nullptr;
+    case AGENT_PPOMCTS:   return m_sfPPOMCTS != nullptr;
+    case AGENT_DQNMCTS:   return m_sfDQNMCTS != nullptr;
+    case AGENT_EVAB:      return m_sfEVAB != nullptr;
+    case AGENT_SACAZ:     return m_sfSACAZ != nullptr;
+    case AGENT_SACAZ_MOE: return m_sfSACAZMoe != nullptr;
+    default:              return false;
+    }
+}
+
 bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &filepath)
 {
+    /*
+       保存也可能很慢 (稀疏 MoE 骨干 28.7 M 参数, 权重按文本编码时是几百 MB), 所以
+       同样报一次"请稍候"。用 RAII 保证**任何返回路径**都会发 busyFinished ——
+       以前手工在每个 return 前收尾的话, 漏一个分支就是"弹窗永远挂着"。
+    */
+    struct BusyGuard {
+        ChessBoard *self;
+        explicit BusyGuard(ChessBoard *s, const QString &what) : self(s)
+        {
+            emit self->busyStarted(QStringLiteral("正在保存"), what);
+        }
+        ~BusyGuard() { emit self->busyFinished(); }
+    } guard(this, QStringLiteral("写出 %1 的权重…")
+                       .arg(agentDisplayName(agentType)));
+
     switch (agentType) {
     case AGENT_PG: {
         if (m_sfPG == nullptr) return false;
@@ -1325,6 +1630,15 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     case AGENT_EVAB: {
         if (m_sfEVAB == nullptr) return false;
         return m_sfEVAB->saveModel(filepath);
+    }
+    case AGENT_SACAZ: {
+        if (m_sfSACAZ == nullptr) return false;
+        /* 一个模型三个文件: filepath 是前缀 -> filepath_actor / _q1 / _q2 */
+        return m_sfSACAZ->saveModel(filepath);
+    }
+    case AGENT_SACAZ_MOE: {
+        if (m_sfSACAZMoe == nullptr) return false;
+        return m_sfSACAZMoe->saveModel(filepath);
     }
     default:
         return false;
@@ -1420,12 +1734,18 @@ void ChessBoard::backgroundTrainLoop()
         /* ---- 在独立棋盘上创建克隆agent并训练4轮 ---- */
         {
             Chess trainChess;  /* 独立训练棋盘: 从初始局面开始 */
+            /*
+               这一轮训练结束后的损失 (界面的"训练损失曲线")。不上报损失的 agent
+               (PG/PPO/DQN+MCTS 的训练循环里没有 scalar loss) 保持 NaN -> 不上图。
+            */
+            float roundLoss = std::numeric_limits<float>::quiet_NaN();
 
             switch (type) {
             case AGENT_PG: {
                 PGEagent clone(trainChess, 64, 0.9f, 0.01f, 1.0f);
                 clone.loadPolicy(TMP_WEIGHTS);
                 clone.train(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, true, false);
+                roundLoss = clone.getLastTrainLoss();
                 clone.savePolicy(TMP_WEIGHTS);
                 break;
             }
@@ -1433,6 +1753,7 @@ void ChessBoard::backgroundTrainLoop()
                 DQNAgent clone(trainChess, 64, 0.99f, 0.001f, 1.0f);
                 clone.loadModel(TMP_WEIGHTS);
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, false);
+                roundLoss = clone.getLastTrainLoss();
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
@@ -1441,6 +1762,7 @@ void ChessBoard::backgroundTrainLoop()
                 clone.loadModel(TMP_WEIGHTS);
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
                                     BG_TRAIN_MAX_MOVES, false);
+                roundLoss = clone.getLastTrainLoss();
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
@@ -1449,10 +1771,16 @@ void ChessBoard::backgroundTrainLoop()
                 clone.loadModel(TMP_WEIGHTS);
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
                                     BG_TRAIN_MAX_MOVES, false);
+                roundLoss = clone.getLastTrainLoss();
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
             default: break;
+            }
+
+            if (std::isfinite(roundLoss)) {
+                emit trainLossSample((double)roundLoss, agentDisplayName(type),
+                                     m_trainSampleNo.fetch_add(1) + 1);
             }
         }
 
@@ -1489,21 +1817,20 @@ void ChessBoard::shutdownSave()
     /* 确保 weights 目录存在 */
     QDir().mkpath("weights");
 
-    /* 保存 aiThink / aiThinkForAgent 共享的 neural agent 权重 */
-    if (m_sfPG != nullptr)
-        m_sfPG->savePolicy("weights/pg_agent.dat");
-    if (m_sfDQN != nullptr)
-        m_sfDQN->saveModel("weights/dqn_agent.dat");
-    if (m_sfPPOMCTS != nullptr)
-        m_sfPPOMCTS->saveModel("weights/ppomcts_agent.dat");
-    if (m_sfDQNMCTS != nullptr)
-        m_sfDQNMCTS->saveModel("weights/dqnmcts_agent.dat");
     /*
-       EVAB 原来漏在这里了: 它是界面上可选、能被在线训练的 agent, 但退出时从来不
-       落盘, 于是每次启动都从"随机价值网络"重新开始 —— 上一局学到的东西全丢。
+       保存 aiThink / aiThinkForAgent 共享的 neural agent 权重。
+       路径全部走 defaultWeightPath() —— 与"对弈结束后静默保存"用的是同一份,
+       不会再出现"存这边、读那边"的静默失效。
+       (EVAB 曾经漏在这里: 它是界面上可选、能被在线训练的 agent, 但退出时从来不落盘,
+        于是每次启动都从随机价值网络重新开始, 上一局学到的东西全丢。)
     */
-    if (m_sfEVAB != nullptr)
-        m_sfEVAB->saveModel("weights/evab_agent.dat");
+    const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
+                              AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE };
+    for (AgentType t : all) {
+        if (hasAgentInstance(t)) {
+            saveCurrentAgentModel(t, defaultWeightPath(t));
+        }
+    }
 }
 
 /* ================================================================

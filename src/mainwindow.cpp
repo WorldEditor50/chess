@@ -2,6 +2,8 @@
 #include "ui_mainwindow.h"
 #include "chessboard.h"
 #include "thinkingindicator.h"
+#include "metricsview.h"
+#include "busydialog.h"
 #include "qssloader.hpp"
 #include "rl/cpuinfo.hpp"
 #include <QSqlQuery>
@@ -13,6 +15,10 @@
 #include <QSpinBox>
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QListWidgetItem>
+#include <QFile>
+#include <QTextStream>
+#include <QDateTime>
 
 namespace {
 
@@ -30,6 +36,14 @@ const AgentChoice kAgents[] = {
     { "PPO+MCTS (AlphaZero)",        ChessBoard::AGENT_PPOMCTS },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
     { "EVAB (学会评估的 Alpha-Beta)", ChessBoard::AGENT_EVAB },
+    { "SAC+MCTS+AlphaZero (最大熵搜索)", ChessBoard::AGENT_SACAZ },
+    /*
+       同一个算法, 骨干换成"稀疏路由 MoE + TransformerBlock 专家" (E=4, top-1)。
+       与上一项相比: 参数量大 ~4 倍 (4 个 TB 专家), 算力只算 1 个专家 —— 实测
+       10.9 ms/模拟 (MLP 骨干 0.07), 所以每次走子只给 16 次模拟 (约 175 ms)。
+       界面上把它单独列出来, 就是为了能直接和 MLP 骨干的版本对弈比较。
+    */
+    { "SAC+MCTS+AlphaZero (稀疏MoE+TB专家)", ChessBoard::AGENT_SACAZ_MOE },
 };
 
 void fillAgentCombo(QComboBox *combo, int defaultIndex)
@@ -52,6 +66,8 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_PPOMCTS:
     case ChessBoard::AGENT_DQNMCTS:
     case ChessBoard::AGENT_EVAB:
+    case ChessBoard::AGENT_SACAZ:
+    case ChessBoard::AGENT_SACAZ_MOE:
         return true;
     default:
         return false;
@@ -68,17 +84,25 @@ QString agentLongName(ChessBoard::AgentType type)
     return QStringLiteral("agent");
 }
 
-QString agentWeightFilename(ChessBoard::AgentType type)
-{
-    switch (type) {
-    case ChessBoard::AGENT_PG:      return QStringLiteral("pg_agent_weights.dat");
-    case ChessBoard::AGENT_DQN:     return QStringLiteral("dqn_agent_weights.dat");
-    case ChessBoard::AGENT_PPOMCTS: return QStringLiteral("ppomcts_actor_weights.dat");
-    case ChessBoard::AGENT_DQNMCTS: return QStringLiteral("dqnmcts_agent_weights.dat");
-    case ChessBoard::AGENT_EVAB:    return QStringLiteral("evab_agent_weights.dat");
-    default:                        return QStringLiteral("agent_weights.dat");
-    }
-}
+/*
+    这里原来还有一个 agentWeightFilename(): 它是"另存为"文件对话框的默认文件名,
+    与 ChessBoard::defaultWeightPath() 是**两套**名字 —— 正是那种"存到 A、读 B"的
+    隐患。改成静默保存(存到标准路径)之后它没有用处了, 删掉, 只留一个来源。
+*/
+
+/*
+ * 曲线配色: 按"第几条曲线"取, 与 agent 名无关 (同一对 agent 每次对弈颜色一致,
+ * 便于跨场比较)。取值都在米色底 (#fef9e3) 上够清楚。
+ */
+const QColor kSeriesColors[] = {
+    QColor(47, 127, 214),    /* 蓝 */
+    QColor(198, 90, 40),     /* 砖红 */
+    QColor(46, 125, 50),     /* 绿 */
+    QColor(140, 82, 172),    /* 紫 */
+    QColor(186, 140, 30),    /* 金 */
+    QColor(0, 131, 143)      /* 青 */
+};
+const int kSeriesColorCount = 6;
 
 } // namespace
 
@@ -87,7 +111,7 @@ MainWindow::MainWindow(QWidget *parent)
     , ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
-    setFixedSize(900, 650);
+    setFixedSize(1360, 760);
 
     /*
       把本构建实际启用的 SIMD 指令集写进窗口标题。
@@ -114,6 +138,9 @@ MainWindow::MainWindow(QWidget *parent)
     ui->preTrainStepsSpin->setSingleStep(16);
     ui->preTrainStepsSpin->setValue(ui->gameWidget->getPreTrainSteps());
     ui->preTrainStepsSpin->setSuffix(QStringLiteral(" 步"));
+
+    /* ---- 指标曲线与逐局明细 (右侧面板, 见 metricsview.h) ---- */
+    setupMetricsPanel();
 
     /* Agent选择 (与你对战的AI; 你执红, 它执黑) */
     connect(ui->agentComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -220,12 +247,50 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QString &a, const QString &b, int games) {
             ui->matchResultLabel->setText(
                 QString("对弈 %1 vs %2 · 共 %3 局 · 进行中").arg(a, b).arg(games));
+            /*
+               新的一场: 重建奖励曲线 (两条, 分别是 A 与 B), 并在明细列表里插一个
+               分组标题。**损失曲线不清空** —— 训练是跨场持续的, 清掉就看不出趋势了。
+            */
+            resetMetricsForMatch(a, b);
+            ui->gameListWidget->addItem(
+                QString("—— 第 %1 场: %2 vs %3, %4 局 ——")
+                    .arg(++m_metricsMatchNo).arg(a, b).arg(games));
+            ui->gameListWidget->scrollToBottom();
         });
     connect(ui->gameWidget, &ChessBoard::matchGameFinished, this,
         [this](int no, int games, const QString &line) {
             m_matchLog += line + "\n";
             ui->matchResultLabel->setText(QString("对弈 %1/%2 局完成").arg(no).arg(games));
             ui->matchResultLabel->setToolTip(m_matchLog);
+            /* 逐局明细: 一局一行, 结束时列表里就是完整战绩 (不再只放在 tooltip 里) */
+            ui->gameListWidget->addItem(line.trimmed());
+            ui->gameListWidget->scrollToBottom();
+        });
+    /* 实时比分: 每局结束后刷新 (以前只有整场结束才弹一个结果框) */
+    connect(ui->gameWidget, &ChessBoard::matchScoreChanged, this,
+        [this](const QString &scoreLine) {
+            ui->scoreLabel->setText(QString("当前比分: %1").arg(scoreLine));
+        });
+    /* ---- 指标曲线采样 ---- */
+    connect(ui->gameWidget, &ChessBoard::trainLossSample, this,
+        [this](double loss, const QString &agent, int step) {
+            (void)step;
+            ui->lossChart->addPoint(lossSeriesFor(agent), loss);
+            updateMetricsLabels();
+        });
+    connect(ui->gameWidget, &ChessBoard::gameRewardSample, this,
+        [this](int gameNo, const QString &agentA, const QString &agentB,
+               double rewardA, double rewardB) {
+            (void)gameNo;
+            (void)agentA;
+            (void)agentB;
+            if (m_rewardSeriesA >= 0) {
+                ui->rewardChart->addPoint(m_rewardSeriesA, rewardA);
+            }
+            if (m_rewardSeriesB >= 0) {
+                ui->rewardChart->addPoint(m_rewardSeriesB, rewardB);
+            }
+            updateMetricsLabels();
         });
     /* 本次"探索环境 + 预训练"到底做了什么 */
     connect(ui->gameWidget, &ChessBoard::aiExploreInfo, this,
@@ -259,8 +324,7 @@ MainWindow::MainWindow(QWidget *parent)
         });
 
     /* ---- 启动加载阶段: 禁用所有交互控件 ---- */
-    ui->resetBtn->setEnabled(false);
-    ui->selfPlayBtn->setEnabled(false);
+    ui->resetBtn->setEnabled(false);    ui->selfPlayBtn->setEnabled(false);
     ui->agentComboBox->setEnabled(false);
     ui->matchAComboBox->setEnabled(false);
     ui->matchBComboBox->setEnabled(false);
@@ -274,8 +338,56 @@ MainWindow::MainWindow(QWidget *parent)
     ui->exploreLabel->setText("探索+预训练: -");
     ui->matchResultLabel->setText("对弈结果: -");
 
+    /* ---- 载入/保存模型权重时的"请稍候"弹窗 (里面是那个沙漏控件) ---- */
+    /*
+       ChessBoard 只负责报告状态 (busyStarted/busyMessage/busyFinished), 弹窗长什么样
+       由界面决定 —— 见 src/busydialog.h。启动加载会读 7 组权重 (老格式是十进制文本,
+       DQN+MCTS 一个文件 16 MB), 以前这段时间界面只有一行"正在加载...", 看起来像卡死。
+    */
+    m_busy = new BusyDialog(this);
+    /*
+       延迟显示 (300 ms): 小权重的读写只要几十毫秒, 每次都弹一下窗反而是干扰
+       (用户要求"对弈结束后静默保存权重")。所以只有**确实慢**的操作才把沙漏亮出来:
+         busyStarted -> 起 300 ms 单发定时器 -> 到点还在忙才 show
+         busyFinished -> 停定时器 + 收起 (没亮过就什么都不做)
+       启动加载是个例外: 构造函数里已经直接把它亮起来了(它是秒级以上的等待, 用户需要
+       立刻看到"在启动"), 这里的定时器只是让它别被重复 show 打断。
+    */
+    m_busyDelay = new QTimer(this);
+    m_busyDelay->setSingleShot(true);
+    m_busyDelay->setInterval(300);
+    connect(m_busyDelay, &QTimer::timeout, this, [this]() {
+        if (m_busyPending) {
+            m_busy->startBusy(m_busyTitle, m_busyMessage);
+        }
+    });
+    connect(ui->gameWidget, &ChessBoard::busyStarted, this,
+            [this](const QString &title, const QString &message) {
+                m_busyPending = true;
+                m_busyTitle = title;
+                m_busyMessage = message;
+                if (m_busy->isBusy()) {
+                    /* 已经在等 (例如启动加载): 只更新文字, 不重新弹 */
+                    m_busy->setMessage(message);
+                } else {
+                    m_busyDelay->start();
+                }
+            });
+    connect(ui->gameWidget, &ChessBoard::busyMessage, this,
+            [this](const QString &message) {
+                m_busyMessage = message;
+                m_busy->setMessage(message);
+            });
+    connect(ui->gameWidget, &ChessBoard::busyFinished, this, [this]() {
+        m_busyPending = false;
+        m_busyDelay->stop();
+        m_busy->stopBusy();
+    });
+
     /* 在后台线程启动异步加载 (数据库 + AI模型权重) */
     ui->gameWidget->setEnabled(false);
+    m_busy->startBusy(QStringLiteral("正在载入"),
+                      QStringLiteral("读取棋局数据库与模型权重…"));
     m_loadThread = std::thread([this]() {
         ui->gameWidget->startupLoad();
     });
@@ -295,6 +407,13 @@ MainWindow::~MainWindow()
         /* 对弈可能还在跑: 先请求中止, 否则关窗会一直等到整场对弈打完 */
         ui->gameWidget->abortMatch();
         m_selfPlayThread.join();
+    }
+    /*
+       存权重也可能在后台跑 (见 offerSaveWeights: 保存放到线程里, 好让沙漏能转)。
+       它同样访问 ui->gameWidget, 所以必须先 join 再 delete ui。
+    */
+    if (m_saveThread.joinable()) {
+        m_saveThread.join();
     }
     /* 程序退出前保存所有已训练的agent权重 */
     ui->gameWidget->shutdownSave();
@@ -474,18 +593,31 @@ void MainWindow::onStartMatch()
             ui->selfPlayBtn->setText("开始对弈");
             ui->matchResultLabel->setText(summary);
             ui->matchResultLabel->setToolTip(detail);
+            ui->scoreLabel->setText(QStringLiteral("最终比分: %1").arg(summary));
 
-            /* 结果 + 可展开的逐局明细 */
-            QMessageBox box(QMessageBox::Information, "Agent 对弈结果",
-                            summary, QMessageBox::Ok, this);
-            box.setDetailedText(detail.isEmpty() ? m_matchLog : detail);
-            box.exec();
-
-            /* 打过的 RL agent 可以存盘 (Alpha-Beta / MCTS 没有权重) */
-            offerSaveWeights(typeA);
-            if (typeB != typeA) {
-                offerSaveWeights(typeB);
+            /*
+               逐局明细已经在 matchGameFinished 里一局一行地写进列表了, 这里只补
+               两条收尾信息。原来是一个**模态**结果框 (要手动关掉, 而且关掉之后
+               明细就只剩 tooltip 里那一大段文字) —— 现在明细常驻在右侧列表里,
+               可以逐行对照, 也可以事后回看。
+            */
+            ui->gameListWidget->addItem(QStringLiteral("—— 本场结束: %1 ——").arg(summary));
+            const QStringList detailLines =
+                detail.split(QChar('\n'), Qt::SkipEmptyParts);
+            for (int i = detailLines.size() - 1; i >= 0; --i) {
+                if (detailLines[i].startsWith(QStringLiteral("思考耗时"))) {
+                    ui->gameListWidget->addItem(detailLines[i].trimmed());
+                    break;
+                }
             }
+            ui->gameListWidget->scrollToBottom();
+
+            /*
+               打过的可训练 agent **静默存盘** (用户要求: 不再弹任何窗口)。
+               存到标准路径, 下次启动自然加载; 期间由"请稍候"沙漏提示, 结果写进
+               右侧逐局明细列表。见 saveWeightsAfterMatch() 的注释。
+            */
+            saveWeightsAfterMatch(QVector<ChessBoard::AgentType>{typeA, typeB});
 
             refreshGameList();
         }, Qt::QueuedConnection);
@@ -493,28 +625,245 @@ void MainWindow::onStartMatch()
 }
 
 /* ================================================================
- *  offerSaveWeights - 对弈结束后询问是否把某个 agent 的权重存盘
+ *  setupMetricsPanel - 右侧"曲线 + 逐局明细"面板的初始化
+ *
+ *  三条曲线:
+ *    lossChart   : 训练损失。**每个 agent 一条**(名字进图例) —— 不同 agent 的
+ *                  损失尺度完全不同 (SAC+AZ 是 critic 的 MSE, EVAB 是价值网蒸馏
+ *                  的 MAE, DQN 是平方 TD 误差), 混在一条线上没有可比性。
+ *    rewardChart : 每局环境奖励。每场对弈两条 (A / B), 每局结束各加一个点。
+ *                  纵轴含 0 线, 所以"正贡献/负贡献"一眼能看出来。
+ *
+ *  曲线只保留最近 2000 个点 (setWindow): 后台训练会一直往里塞样本, 不设上限就是
+ *  内存泄漏。横轴是"第几个样本", 不是时间 —— 训练是事件驱动的, 时间轴没有意义。
  * ================================================================ */
-void MainWindow::offerSaveWeights(ChessBoard::AgentType type)
+void MainWindow::setupMetricsPanel()
 {
-    if (!agentIsTrainable(type)) {
-        return;      /* Alpha-Beta / MCTS 是纯搜索, 没有需要保存的参数 */
-    }
+    ui->lossChart->setTitle(QStringLiteral("训练损失 (每完成一次在线训练一个点)"));
+    ui->lossChart->setValueSuffix(QString());
+    ui->lossChart->setWindow(2000);
 
-    const QString filePath = QFileDialog::getSaveFileName(
-        this,
-        QString("保存 %1 权重文件").arg(agentLongName(type)),
-        agentWeightFilename(type),
-        "权重文件 (*.dat);;所有文件 (*.*)");
-    if (filePath.isEmpty()) {
+    ui->rewardChart->setTitle(QStringLiteral("每局环境奖励 (吃子 + 终局 ±1, 走子方视角)"));
+    ui->rewardChart->setValueSuffix(QString());
+    ui->rewardChart->setWindow(2000);
+
+    connect(ui->clearMetricsBtn, &QPushButton::clicked, this, [this]() {
+        ui->lossChart->clearData();
+        ui->rewardChart->clearData();
+        m_lossSeries.clear();
+        m_rewardSeriesA = -1;
+        m_rewardSeriesB = -1;
+        ui->gameListWidget->clear();
+        ui->scoreLabel->setText(QStringLiteral("当前比分: -"));
+        updateMetricsLabels();
+    });
+    connect(ui->exportMetricsBtn, &QPushButton::clicked,
+            this, &MainWindow::exportMetricsCsv);
+
+    ui->scoreLabel->setText(QStringLiteral("当前比分: -"));
+    ui->gameListWidget->addItem(QStringLiteral("(还没有对局)"));
+    updateMetricsLabels();
+
+    /* ---- 双击曲线 -> 放大到独立窗口 (用户要求的手动放大) ---- */
+    connect(ui->lossChart, &CurveChart::doubleClicked, this, [this]() {
+        openLargeChart(ui->lossChart, QStringLiteral("训练损失 (放大)"));
+    });
+    connect(ui->rewardChart, &CurveChart::doubleClicked, this, [this]() {
+        openLargeChart(ui->rewardChart, QStringLiteral("每局环境奖励 (放大)"));
+    });
+}
+
+/*
+   双击曲线 -> 弹一个 900x560 的独立窗口 (可缩放、可拖到别的屏幕), 内容与源控件
+   实时同步 (CurveChartDialog::follow 接的是源控件的 dataChanged 信号)。
+   同一个源只留一个窗口: 已经开着就抬到前面 (再双击不会开出一堆重复窗口)。
+*/
+void MainWindow::openLargeChart(CurveChart *source, const QString &title)
+{
+    const auto it = m_largeCharts.find(source);
+    if (it != m_largeCharts.end() && it.value() != nullptr) {
+        it.value()->show();
+        it.value()->raise();
+        it.value()->activateWindow();
+        return;
+    }
+    auto *dlg = new CurveChartDialog(title, this);
+    dlg->chart()->setValueSuffix(source == ui->lossChart ? QString() : QString());
+    dlg->follow(source);
+    /* 关掉时把表里的指针清掉 (窗口是 WA_DeleteOnClose, 会自己析构) */
+    connect(dlg, &QObject::destroyed, this, [this, source]() {
+        m_largeCharts.remove(source);
+    });
+    m_largeCharts.insert(source, dlg);
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
+}
+
+/*
+   把两条曲线的"最新值 / 均值 / 样本数"写进图下面的标签。
+   曲线本身是画出来的 (UIA 读不到数字), 而图下的数字读数既有用 (一眼看到当前值),
+   又让自动化脚本能读到确凿信息 (tools/verify_match_ui.ps1 就靠它判断"有没有数据")。
+*/
+void MainWindow::updateMetricsLabels()
+{
+    /* 读数格式化统一在 CurveChart::readoutText 里, 免得三处各写一份 (以前就不一致) */
+    ui->lossValueLabel->setText(
+        ui->lossChart->readoutText(QStringLiteral("损失")));
+    ui->rewardValueLabel->setText(
+        ui->rewardChart->readoutText(QStringLiteral("奖励")));
+}
+
+/* 每场对弈开始: 重建奖励曲线的两条序列 (名字换成这一场的两位参赛者) */
+void MainWindow::resetMetricsForMatch(const QString &agentA, const QString &agentB)
+{
+    ui->rewardChart->clearData();
+    m_rewardSeriesA = ui->rewardChart->addSeries(agentA, kSeriesColors[0]);
+    m_rewardSeriesB = ui->rewardChart->addSeries(agentB, kSeriesColors[1]);
+}
+
+/* agent 名 -> 损失曲线下标; 第一次见到这个 agent 时新建一条 */
+int MainWindow::lossSeriesFor(const QString &agentName)
+{
+    const auto it = m_lossSeries.constFind(agentName);
+    if (it != m_lossSeries.constEnd()) {
+        return it.value();
+    }
+    /*
+       分线键是 **agent 名字**, 所以这个名字必须**稳定**: 以前 EVAB 的名字里带着
+       当前的 blend ("..., blend=0.30"), 于是它每变一次 blend 就多出一条曲线 ——
+       一局下来同一张图上出现 6 条 "EVAB ..." (实测)。现在 getName() 只留结构信息。
+       这里再加一道防线: 条数超过 6 条就警告一次 —— 那说明又有 agent 的名字不稳定。
+    */
+    if (m_lossSeries.size() >= 6) {
+        qWarning() << "[metrics] 损失曲线已经有" << m_lossSeries.size()
+                   << "条, 又出现新名字:" << agentName
+                   << "(agent 的 getName() 是不是把会变的状态写进名字了?)";
+    }
+    const int idx = ui->lossChart->addSeries(
+        agentName, kSeriesColors[m_lossSeries.size() % kSeriesColorCount]);
+    m_lossSeries.insert(agentName, idx);
+    return idx;
+}
+
+/* 把当前曲线导出成 CSV (两列不同长度, 所以分两段写, 带表头) */
+void MainWindow::exportMetricsCsv()
+{
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("导出指标曲线"),
+        QStringLiteral("metrics_%1.csv")
+            .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")),
+        QStringLiteral("CSV (*.csv);;所有文件 (*.*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"),
+                             QStringLiteral("打不开文件: %1").arg(f.errorString()));
+        return;
+    }
+    QTextStream out(&f);
+    out << "# 训练损失\n";
+    out << "sample";
+    for (int s = 0; s < ui->lossChart->seriesCount(); ++s) {
+        out << "," << ui->lossChart->series(s).name;
+    }
+    out << "\n";
+    int maxN = ui->lossChart->sampleCount();
+    for (int i = 0; i < maxN; ++i) {
+        out << (i + 1);
+        for (int s = 0; s < ui->lossChart->seriesCount(); ++s) {
+            const CurveChart::Series &sr = ui->lossChart->series(s);
+            out << ",";
+            if (i < sr.pts.size()) {
+                out << QString::number(sr.pts[i], 'g', 8);
+            }
+        }
+        out << "\n";
+    }
+    out << "\n# 每局环境奖励\n";
+    out << "game";
+    for (int s = 0; s < ui->rewardChart->seriesCount(); ++s) {
+        out << "," << ui->rewardChart->series(s).name;
+    }
+    out << "\n";
+    maxN = ui->rewardChart->sampleCount();
+    for (int i = 0; i < maxN; ++i) {
+        out << (i + 1);
+        for (int s = 0; s < ui->rewardChart->seriesCount(); ++s) {
+            const CurveChart::Series &sr = ui->rewardChart->series(s);
+            out << ",";
+            if (i < sr.pts.size()) {
+                out << QString::number(sr.pts[i], 'g', 8);
+            }
+        }
+        out << "\n";
+    }
+    f.close();
+    QMessageBox::information(this, QStringLiteral("导出完成"),
+                             QStringLiteral("已写出: %1").arg(path));
+}
+
+/*
+ *  saveWeightsAfterMatch - 对弈结束后**静默**把权重存到标准路径
+ *
+ *  用户要求: 不再弹窗 (既不要"存到哪里"的文件对话框, 也不要"保存成功"的消息框)。
+ *  所以这里:
+ *    * 目标路径 = ChessBoard::defaultWeightPath() —— 与启动加载/退出保存同一条路径,
+ *      下次启动自然读到这次训练的结果;
+ *    * 只在**确实实例化过**的 agent 上存 (没跑过的 agent 没有权重可存);
+ *    * 放到后台线程 (m_saveThread) 做: GUI 线程同步写盘会把事件循环堵住, 而权重
+ *      可能有几百 MB; 读写期间 ChessBoard 会发 busyStarted/busyFinished, "请稍候"
+ *      沙漏弹窗由那两个信号驱动, 这里不用管;
+ *    * 结果用**界面上的文字**汇报 (逐局明细列表里加一行 + 结果标签的 tooltip),
+ *      不用模态框打断用户 —— 失败也看得到, 但不会挡住操作。
+ * ================================================================ */
+void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &types)
+{
+    QVector<ChessBoard::AgentType> todo;
+    for (ChessBoard::AgentType t : types) {
+        if (!agentIsTrainable(t)) {
+            continue;               /* Alpha-Beta / MCTS 是纯搜索, 没有参数 */
+        }
+        if (!ui->gameWidget->hasAgentInstance(t)) {
+            continue;               /* 这次没用过它 -> 没有权重 */
+        }
+        if (!todo.contains(t)) {
+            todo.append(t);
+        }
+    }
+    if (todo.isEmpty()) {
         return;
     }
 
-    if (ui->gameWidget->saveCurrentAgentModel(type, filePath.toStdString())) {
-        QMessageBox::information(this, "保存成功",
-            QString("%1 的权重已保存到:\n%2").arg(agentLongName(type), filePath));
-    } else {
-        QMessageBox::warning(this, "保存失败",
-            QString("%1 保存权重文件时发生错误!").arg(agentLongName(type)));
+    /* 上一次保存若还没结束, 先收回来 (同一时刻只允许一个保存任务) */
+    if (m_saveThread.joinable()) {
+        m_saveThread.join();
     }
+
+    m_saveThread = std::thread([this, todo]() {
+        QStringList lines;
+        bool allOk = true;
+        for (ChessBoard::AgentType t : todo) {
+            const std::string path = ChessBoard::defaultWeightPath(t);
+            const bool ok = ui->gameWidget->saveCurrentAgentModel(t, path);
+            allOk = allOk && ok;
+            lines << QStringLiteral("%1 -> %2%3")
+                         .arg(agentLongName(t), QString::fromStdString(path),
+                              ok ? QString() : QStringLiteral("  [失败]"));
+        }
+        /* 回到 GUI 线程写界面 (在工作线程里碰控件是错的) */
+        QMetaObject::invokeMethod(this, [this, lines, allOk]() {
+            for (const QString &l : lines) {
+                ui->gameListWidget->addItem(
+                    QStringLiteral("—— 已静默保存权重: %1 ——").arg(l));
+            }
+            if (!allOk) {
+                ui->gameListWidget->addItem(
+                    QStringLiteral("—— 有权重保存失败, 详见上面带 [失败] 的行 ——"));
+            }
+            ui->gameListWidget->scrollToBottom();
+        }, Qt::QueuedConnection);
+    });
 }

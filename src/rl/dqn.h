@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <cmath>
+#include <limits>
 #include "net.hpp"
 #include "rl_basic.h"
 
@@ -45,6 +46,15 @@ public:
     float gamma;
     float exploringRate;
     int learningSteps = 0;
+    /*
+     * 最近一次 learn() 的平均平方 TD 误差 ("训练损失", 只给界面画曲线用)。
+     * NaN = 还没学过。**不参与任何训练计算** —— 加它是因为象棋 RL 的训练在 GUI 里
+     * 是后台不可见的, 没有一条损失曲线就完全看不出"到底有没有在学"。
+     */
+    double lastLoss = std::numeric_limits<double>::quiet_NaN();
+    /* learn() 内部用: 本次批量的 TD 误差累加 */
+    double lossSum = 0.0;
+    int lossCount = 0;
     Net QMainNet;
     Net QTargetNet;
     std::deque<Transition> memories;

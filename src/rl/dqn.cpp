@@ -121,6 +121,13 @@ void RL::DQN::experienceReplay(const Transition& x)
         Tensor out = QMainNet.forward(x.state);
         Tensor qTarget = out;
         qTarget[i] = x.reward;
+        /*
+           顺便把这次 TD 误差记下来 (只给界面画"训练损失曲线"用, 不参与任何计算)。
+           批量里逐样本累加, learn() 结束时除以 batchSize 得到平均 TD 误差。
+        */
+        const double td = (double)out[i] - (double)qTarget[i];
+        lossSum += td * td;
+        lossCount++;
         QMainNet.backward(x.state, Loss::MSE::df(out, qTarget));
     } else {
         /*
@@ -141,6 +148,10 @@ void RL::DQN::experienceReplay(const Transition& x)
         Tensor &v = QTargetNet.forward(x.nextState);
         qTarget[i] = x.reward + gamma * v[k];
 
+        const double td = (double)out[i] - (double)qTarget[i];
+        lossSum += td * td;
+        lossCount++;
+
         /* Backward on QMainNet with x.state (cached values intact) */
         QMainNet.backward(x.state, Loss::MSE::df(out, qTarget));
     }
@@ -155,6 +166,9 @@ void RL::DQN::learn(std::size_t maxMemorySize,
     if (memories.size() < batchSize) {
         return;
     }
+
+    lossSum = 0.0;
+    lossCount = 0;
 
     /* update target network periodically (Polyak soft update) */
     if (learningSteps % replaceTargetIter == 0) {
@@ -171,6 +185,11 @@ void RL::DQN::learn(std::size_t maxMemorySize,
 
     /* apply optimizer */
     QMainNet.RMSProp(learningRate, 0.9, 0);
+
+    /* 本批的平均 TD 误差 (界面曲线用, 见 dqn.h 的 lastLoss) */
+    if (lossCount > 0) {
+        lastLoss = lossSum / (double)lossCount;
+    }
 
     /* manage replay buffer: drop oldest entries when full */
     if (memories.size() > maxMemorySize + batchSize) {

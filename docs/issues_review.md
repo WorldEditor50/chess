@@ -459,6 +459,81 @@ Stone *stone = m_children[s->id];    /* std::array, 不检查 */
 
 ---
 
+## 零之二点十、做奖励曲线时挖出来的符号 bug（即时奖励一直是黑方视角）
+
+用户要求"增加控件动态显示……模型每次对局所获的环境奖励曲线"。要画这条曲线，先得回答
+"这一步到底给了多少奖励"，于是写了个 30 行探针（`build/reward_probe.cpp`，临时文件）
+直接问棋盘和 agent：
+
+```
+红方: 炮(7,1) 吃 马(0,1), victim color=1 value=0.30
+moveForward totalReward = -0.300
+computeReward(红)      = -0.300
+结论: 红方白吃一个黑子, 拿到的即时奖励是 负
+```
+
+**根因**：五个 agent（`dqnagent` / `dqnmcts_agent` / `pgagent` / `ppomcts_agent` /
+`sacazagent`）各有一份 `computeReward` 拷贝，全都写成
+
+```cpp
+return (color == Stone::COLOR_BLACK) ? reward : -reward;   // 黑方视角
+```
+
+而 `Chess::moveForward` 的记账（`吃红子 += value`）也是黑方视角 —— 两处同源，所以看起来
+"自洽"，很难被注意到。但**同一个 agent 的终局奖励是走子方视角的 ±1**
+（`SACAZAgent::resultValue`），于是对红方来说塑形信号（吃子 −）与终局信号（赢棋 +）
+方向相反：**红方被教成"吃子是坏事"**。
+（`EVABAgent::evaluateLeaf` 的 `(color == BLACK) ? MATE : -MATE` 是正确的走子方视角，
+说明原意就是走子方视角，`computeReward` 是写错了。`dqnmcts_agent.cpp` 里另有一处调用把
+颜色硬编码成 `COLOR_BLACK`，是同一个错误的产物。）
+
+**修复**：五份 `computeReward` 统一成走子方视角（吃子永远 `+value`），并在 `test_match`
+第 [2.6] 节把**两套约定都钉住**（agent 侧走子方视角、棋盘侧黑方视角记账）：
+
+```
+红方吃 马 (value=0.30): moveForward 记账 = -0.300
+computeReward(红) = +3.000
+computeReward(黑) = +3.000
+```
+
+
+## 零之二点十一、EVAB 的三个 bug（"与 AB 对弈无法取胜"的根因）
+
+用户报"evagent 与 abagent 多次对弈无法取胜，检查 evagent 在对弈过程是否累计梯度训练"。
+查下来：**梯度确实在累计**（64 步探索 / 每 16 个样本一次 RMSProp），但训练出来的网络
+**从来没有参与过决策**，而且它本身是坏的。三个独立的 bug：
+
+| # | 问题 | 现象（探针实测） | 修复 |
+|---|------|------------------|------|
+| 1 | **价值网络没有按 fan_in 缩放初始化** | 输入是 1260 维 one-hot，第一层 pre-activation 标准差 ≈ √(32/3) ≈ 3.3 → tanh 一上来就饱和：任意局面输出都是 0.998，20 次更新只动了 **1.4e-4**，`|net-hand|` ≈ 0.95（几乎最大分歧） | 构造函数里加 `scaleLayerInit(valueNet)`（1/√fan_in）；修完 `|net-hand|` 0.95 → **0.02**，每轮真的在动 |
+| 2 | **`blend`（学习评估与手工评估的混合比例）恒为 0** | 全工程只有测试改过它，agent 本体从没改过 → 界面上那个 "learned eval" 一次都没生效；EVAB(depth=4) 与 ABAgent 走法 **22/30 相同** | 在线更新成功后 `blend += 0.05`（上限 0.3），回滚时退两步（门控沿用原有的 `|net-hand|` 检查） |
+| 3 | **搜索预算照抄了 AB 的深度** | `EVABAgent(env, 48, AB_DEPTH=4, 0)` —— 同深度下 EVAB 比 AB 快一个数量级（depth 5: EVAB 188 ms vs AB 1873 ms），等于把"更强的搜索"这个卖点也关掉了 | `EVAB_DEPTH = 6` + `EVAB_BUDGET_MS = 800`（迭代加深 + 时间上限自动适应评估成本） |
+
+修完之后（`build/evab_arena.cpp` 探针，每配置 6 局、每局交换先后手、与界面同一条调用序列）：
+
+| 配置 | 胜 | 和 | 负 | ms/步 |
+|------|--:|--:|--:|------:|
+| 同深度(4) + 学习评估 | 2 | 2 | 2 | 174 |
+| 深一层(5) + 学习评估 | 1 | **5** | **0** | 796 |
+| 深一层(5) + 纯手工评估（blend 钉 0） | **0** | 6 | 0 | 70 |
+
+**能赢了**（修复前探针里 0 胜），而且"赢棋来自学习评估"这件事有对照：把 blend 钉回 0、
+同样深度就是 6 局全和（两边同一个评估）。
+
+**代价**：只要 blend > 0，每个叶子都要跑一次网络前向，实测贵 11~14 倍（depth 5: 70 → 796
+ms/步）→ 评估变贵 = 搜索变浅。所以 blend 上限刻意压到 0.3、搜索用时间上限。
+细节见 `docs/agents_design.md` §14。
+
+**样本量说明**：每配置 6 局，单局偶然性足以翻转结论，所以结论只能到"机制通了、能赢棋了"，
+不能到"EVAB 比 AB 强多少"。
+**界面上也验过**（`tools/verify_match_ui.ps1 -AIndex 6 -BIndex 0 -Games 2 -Full`）：
+`最终比分: EVAB 1 : 1 Alpha-Beta  共 2 局 / 190 手`，损失曲线 95 个样本、只有一条
+（修了"名字里带 blend 导致同一 agent 分出一堆曲线"的问题），双击放大窗口与源控件逐字一致。
+
+**还没定位的偶发现象**：arena 里偶尔出现 `[1 次无效走法已兜底]`（约每 200 次决策 1 次）。
+兜底逻辑保证不影响胜负，但根因未知，见 `docs/agents_design.md` §14.9 —— 不假装已解决。
+
+---
 ## 零之三、修复前的实测结果（作为对照）
 
 `ctest --test-dir build/Desktop_Qt_6_9_2_MSVC2022_64bit-Release`：
@@ -504,7 +579,7 @@ Stone *stone = m_children[s->id];    /* std::array, 不检查 */
 | 头文件依赖显式化 | `chess_add_header_deps()` 应用到**每一个**目标 | 本机 MSVC 输出本地化 `/showIncludes`（`注意: 包含文件:`），ninja 解析不出依赖 → **改了 `chess.h` 目标文件不重编**，跑的是新旧混编的二进制（实测 `test_ab` 5 s vs 23 s，搜索基准 1910 vs 3133 ms）。一度让本文早期所有数字失真 |
 | `RL_CORE` 独立静态库 | 显式源文件列表、`AUTOMOC/UIC/RCC OFF`、不依赖 Qt | RL 内核与界面解耦；测试目标可以只链 `RL_CORE`（`test_grad` 完全不依赖 Qt） |
 | `/bigobj` | RL 的模板实例化量很大 | 否则编译直接失败 |
-| 测试铺开 | `ctest` 从 1 个崩的 `test_ab` 变成 **6 个全过**：`test_ab`/`test_mcts`/`test_rules`/`test_pretrain`/`test_match`/`test_grad` | 见 4.4 |
+| 测试铺开 | `ctest` 从 1 个崩的 `test_ab` 变成 **9 个全过**：`test_ab`/`test_mcts`/`test_rules`/`test_pretrain`/`test_match`/`test_grad`/`test_weights`/`test_sacaz`/`test_sparse_moe`（另外 `bench_moe` 是手动跑的基准，故意不进 ctest） | 见 4.4 |
 | ASan 配方 | 单独构建目录 + `CMAKE_CXX_FLAGS=/fsanitize=address`（**整个**构建都要带，否则 LNK2038）；运行前把 `clang_rt.asan_dynamic-x86_64.dll` 目录加进 PATH，`ASAN_OPTIONS=detect_leaks=0` | 只给单个目标加 ASan 会链接失败。C1 那个堆损坏就是它定位的 |
 
 ### 4.3 算法与交互
@@ -518,6 +593,16 @@ Stone *stone = m_children[s->id];    /* std::array, 不检查 */
 | 对弈方法学 | 每局**交换先后手**、胜负按参赛者 A/B 记（中国象棋先手优势大，固定红黑只是在测"谁执红"） | `test_match` + `tools/verify_match_ui.ps1` |
 | 长思考的可观测性 | `ThinkingIndicator`（沙漏+旋转粒子+呼吸灯+实时耗时）+ 棋盘顶部 24 px 空白带内的状态条；**只重绘这一小条**；思考期间点击给"请稍候"反馈 | `tools/verify_thinking_ui.ps1` 量出"思考中有状态条、空闲/结束都干净" |
 | 对弈不阻塞界面 | 对弈在后台线程，进度用队列信号回 GUI；同一个按钮兼作"停止"（`abortMatch` 逐手检查） | 关窗先 `abortMatch()` 再 join |
+| **新增 SAC+AZ agent** | 最大熵 critic（双 Q + 软备份 + 自动调节 α）给 AlphaZero 式 PUCT 搜索提供叶子估值；策略目标来自搜索访问分布，数据进回放反复利用 | 单步决策 64 模拟 **3 ms**（1260 维输入的小 MLP），GUI 里给到 256 模拟（约 12 ms）。设计见 `docs/agents_design.md` §11 |
+| **稀疏路由 MoE** | 自己实现 `rl/sparse_moe.hpp`：门控选 top-k 个专家**只算这几个**（上游 `MOE::forward` 是 16 个全算的稠密混合）。`TopK==E` 退化成稠密，正好当等参数对照 | 同样 28.7 M 参数下 **42.0 → 10.9 ms/模拟（3.85×）**；专家从 16 个减到 4 个、head 取满真因数。实测与陷阱见 §零之四 4.5 |
+| **对弈结果实时可见** | `matchScoreChanged` 每局更新实时比分；逐局明细进 `QListWidget`（一局一行，含本局环境奖励）；去掉模态结果框 | 长对弈中途也能看到"几比几"；脚本断言 `score shows a ratio = True` / `list has per-game lines = True` |
+| **训练损失 / 环境奖励曲线** | 自绘 `CurveChart`（不引入 Qt Charts）+ `AgentBase::getLastTrainLoss()`；每局结束按走子方视角采样一次奖励 | 实测一局 2 手对弈后：损失 51 点（均值 0.159）、奖励每方 2 点。见 `docs/agents_design.md` §13 |
+| **即时奖励符号修正** | 五个 agent 的 `computeReward` 从"黑方视角"改成"走子方视角"（吃子永远 +value） | 红方吃子从 **−0.30 变成 +0.30**；`test_match` [2.6] 钉住约定。见 §零之二点十 |
+| **权重文件格式 v2** | 无损编码 + 结构指纹 + 每张量 CRC32 + 原子写 + 载入前零分配校验 | 往返**逐比特相同**、体积 **1.78×**、坏文件一律拒绝且不改动网络。见 §零之四 4.6 || **EVAB 三修**（初始化缩放 / blend 阶梯 / 搜索预算） | 见 §零之二点十一 | 6 局对抗从"0 胜"变成"2 胜 2 和 2 负"（同深度）；深一层 1 胜 5 和 0 负 |
+| **损失曲线上报补全** | `RL::DQN::lastLoss`（在 experienceReplay 累加）/ `RL::PPO::lastLoss` / `RL::DPG::reinforce+reinforce1`（PG agent 走的是 reinforce）；`EVABAgent::exploreAndTrain` 也写 `m_lastLoss`；SAC+AZ 的在线那次 `learnBatch` 改成按池大小夹批 | `test_match` [2.7]：7 个可训练 agent 都上报有限损失（修复前只有 PPO+MCTS / EVAB 两个上报），Alpha-Beta / MCTS 仍不上报 |
+| **曲线读数公式修正** | 窗口淘汰点时必须把它从 `sum/mn/mx` 里去掉 | 均值和纵轴范围以前会随淘汰漂移（"显示表示也是错的"） |
+| **双击放大曲线** | `CurveChartDialog`（跟随源控件、非模态、单实例） | 脚本断言"放大窗口的读数与源控件逐字一致" || **对弈结束静默存权重** | 去掉"另存为"与"成功"两个模态框；存到 `ChessBoard::defaultWeightPath()`（与启动加载/退出保存同一份）；后台线程写、结果写进逐局明细列表 | 顺带消灭了"另存为默认名 ≠ 启动读取名"的静默失效；`shutdownSave()` 也改成遍历同一张表（EVAB 当年就是这么漏存的） |
+| **程序图标** | `tools/make_app_icon.ps1` 生成 `src/app.png` + `src/app.ico`；运行时 `setWindowIcon`（走 res.qrc）+ exe 的 PE 图标（走 app.rc） | `tools/verify_app_icon.ps1` 33 项检查全过（ICO 结构 / 字形真的渲染出来 / 运行时加载 / ExtractAssociatedIcon 提取到我们的配色） || **载入/保存时的沙漏等待窗** | `src/busydialog.h/.cpp`：复用 `ThinkingIndicator`；`ChessBoard` 只发 `busyStarted/busyMessage/busyFinished`；保存放到工作线程（否则弹窗画面冻结）；加载中不可关闭 | `verify_busy_ui.ps1` + `verify_busy_lazy.ps1` 都 PASS；顺带把稀疏 MoE 变体的 3×146 MB 权重改成**懒加载**，启动 **19 s → 1.7 s**，首次使用时弹沙漏 ~15 s |
 | 关窗不再冻结 | 后台训练单轮规模从 4 局×200 步×50 模拟降到 `BG_TRAIN_*` | 关窗 join 的等待从"几分钟"降到秒级 |
 
 ### 4.4 验证手法的沉淀（这部分是本轮最有复用价值的产出）
@@ -525,10 +610,91 @@ Stone *stone = m_children[s->id];    /* std::array, 不检查 */
 | 脚本 / 测试 | 作用 | 为什么不能用"看起来对"代替 |
 |------|------|------|
 | `test_pretrain`（23 断言） | 盯住"探索不能改动真棋局" | 象棋没法像贪吃蛇那样在局部坐标上模拟，试走只能落在真棋盘上，必须原样回退；C5 就是它抓到的 |
-| `test_match`（18 断言） | arena 统计：交换先后手、比分归属、到上限判和、中止生效 | 把每局压到 4 手，结果可预测，断言才做得硬 |
+| `test_match`（**27 断言**） | arena 统计：交换先后手、比分归属、到上限判和、中止生效；第 [2.6] 节钉住**即时奖励的符号约定**（走子方视角 vs 棋盘层的黑方视角记账） | 把每局压到 4 手，结果可预测，断言才做得硬。奖励符号那条是"两侧都自洽、但彼此相反"的典型：只有把物理含义写下来对照才发现 |
 | `test_grad`（6 断言） | 有限差分核对 SIMD 之后的解析梯度；直接探测 MM 内核"累加 vs 覆盖" | "前向对"推不出"梯度对"（前向/反向用不同的 GEMM 形式）；C7 就是它量出来的 |
+| `test_weights`（**44 断言**） | 权重文件：逐比特往返、两次存出的文件逐字节相同、体积、**老格式仍可读**、截断/指纹/翻一位/结构不符/文件不存在都要失败、失败后网络逐比特不变、原子写不留 `.tmp` | "存下来再读回去一样"以前从来没验过 —— 一验就发现老格式是**有损**的（差 1.6e-06），而后台训练每轮都在存读 |
+| `test_sacaz`（**94 断言**，第 [10] 节会遍历四种骨干） | 掩码 softmax 雅可比、走法合法性、软价值里 α 熵项的形式、critic 是否真的在学、**四种骨干都能建/能走/能训/能存取** | α 的符号我第一版就写反了（断言 `V(α=0.5)−V(α=0) = +0.5H` 才发现）；骨干开关这种"多分支构造"最容易只在某一个分支上写对；分层的 write/read **顺序**错位是静默的，所以必须用"存了再读、比对输出"来查 |
+| `test_sparse_moe`（**67 断言**） | 稀疏路由的三个不变量：前向真的跳过未选中专家（改权重输出逐位不变）、`TopK==E` 时与上游 `MOE` 前向/反向逐位一致、未选中专家的梯度**恰好为 0**；加上辅助损失的有限差分与纠偏方向 | 假通过有两种：直接调 `layer->backward()` 时 `e` 全是 0，"两边都是 0"看起来也一致；拿**拷贝**出来的张量做差分时扰动改不到真权重，差分恒为 0。两次都发生在写这个测试的过程中 |
+| `bench_moe`（**不进 ctest**） | A/B/C/D 等时间对弈 + 标定 ms/模拟 + 专家使用分布 | 等"模拟次数"比强弱等于比谁算得多；TB 骨干一步几十毫秒，放 ctest 会既慢又偶发失败 |
 | `tools/verify_thinking_ui.ps1` | 驱动真实窗口 + 采样像素，量"思考中有状态条、空闲没有" | 两个坑：状态条是**混色**的（`QColor(28,38,54,230)` 叠在米黄上 ≈ `(47,52,62)`，按原色找不到）；默认 agent 只算 ~150 ms，点完再 sleep 就错过了 |
 | `tools/verify_match_ui.ps1` | 走 Windows UI Automation 驱动按钮并**读回结果文字** | `SendKeys` 只在窗口拥有前台时有效，而 `AppActivate` 在控制台占前台时会静默失败；UIA 的 `InvokePattern` 与焦点无关，还能直接读控件矩形与文本 |
+
+### 4.5 稀疏路由 MoE，以及一个把功能卡住两轮的拷贝构造 bug
+
+用户提的方案是"不降维、用另一套稀疏路由、减少专家数与 head 数，能不能提升"。
+过程与全部实测数据在 `docs/agents_design.md` §11.4.2，这里只留两条最该记住的：
+
+**(a) 收益是确定的、可复现的**：自己写的 `src/rl/sparse_moe.hpp` 只计算门控选中的
+top-k 个专家。同一个模板、**同样 28.70 M 参数**，`TopK=1`（稀疏）与 `TopK=E=4`（全算）
+在真实 agent 里是 **10.9 vs 42.0 ms/模拟（3.85×）**。这就是 MoE 唯一真正的卖点：
+容量不按算力付费。但它换不来绝对算力 —— `d=1260` 上一个 `TransformerBlock` 专家
+（O(d²) 注意力 + 8d² FFN）单价就是 3 ms 级，所以带 TB 专家的骨干只能配很低的
+模拟次数（界面上那个变体用 16 次，约 160 ms/步）。
+
+**(b) 真正花掉时间的是这个 bug**：`src/rl/layer.h` 里 `iFcLayer` 的**拷贝构造只复制了
+维度**，没有复制 `w` / `b` / `o` / `e` / `g` / `v` / `m`：
+
+```cpp
+// 修复前
+explicit iFcLayer(const iFcLayer &r)
+    : iLayer(r), inputDim(r.inputDim), outputDim(r.outputDim), bias(r.bias) {}
+```
+
+`SparseMoE` 里 `experts[i] = ExpertFactory<Expert>::make(...)` 是**按值返回再赋值**，
+于是只要 MSVC 没省略这次拷贝，专家就成了"维度对、权重空"的空壳（`w.size()==0`），
+之后所有 MM 内核都在越界读写 —— 表现是稀疏 MoE 的反向出现 **15615 个 NaN/1e28 元素**，
+而且**不同次构建结果不一样**（省略与不省略拷贝的差别），非常难查。
+
+12 行的最小复现把它钉死了（`build/copytest.cpp`，临时文件）：
+
+```
+a (直接构造) w.size=10080  w[0]=-0.847383
+b (拷贝构造) w.size=0      <-- 修复前
+b (拷贝构造) w.size=10080  w[0]=-0.847383  <-- 修复后
+```
+
+修复后门控梯度从 2.6e33 变成 2.7e-2（有限），稀疏 MoE 的反向才通过有限差分。
+
+**教训**：`Net` 的拷贝是浅拷贝（共享层指针），深拷贝必须走 `copyTo`；而"按值返回一个
+层"这种写法会静默走拷贝构造 —— 在一个含 `std::vector` 成员的类里，"只复制标量成员"
+的拷贝构造就是定时炸弹。同类隐患的检查办法：`test_grad` / `test_sparse_moe` 里的
+有限差分能同时覆盖"前向用了正确权重"和"梯度填对了位置"，这类 bug 活不过一个 eps。
+
+### 4.6 权重文件格式（有损 / 无校验 / 非原子）
+
+用户要求"实现使用更好的方法保存模型权重"。老格式的问题不只是"土"，而是**会静默毁掉
+训练成果**：
+
+| 问题 | 后果 | 现在 |
+|------|------|------|
+| 十进制文本（`ostream << float`，6 位有效数字）**有损** | 存一次读回来权重漂移 ~1e-6 相对；而后台训练**每轮**都在 `save -> load`（`TMP_WEIGHTS`），等于每轮往网络里注入一次不该有的扰动 | `Tensor::toString` 改成无损编码（base64 + CRC32），实测往返**逐比特相同**、两次存出的文件逐字节相同 |
+| 没有任何校验 | 文件被截断 / 翻一个字节 / 把别的 agent 的权重喂进来，都会静默载入一堆形状错乱或数值不对的张量，直到某次前向才崩（或者更糟：不崩但输出全是垃圾） | `CHWGT2 <层数> <结构指纹>` 头 + 每张量 CRC32 + 长度检查；结构不对/数据坏/被截断一律返回失败 |
+| 直接写目标文件 | 写一半崩掉或被 kill，**上一次训练好的模型就没了**（关窗正好会打断后台训练） | 先写 `.tmp` 再 `std::filesystem::rename` 原子替换；失败时删掉临时文件、保留原文件 |
+| 载入失败会把网络改成半成品 | `fromString` 失败返回空张量，赋给层成员后**下一次前向就是越界读** —— 一个坏文件能把"载入失败"升级成段错误 | 载入前先**零分配**地校验每一行（形状 + 数量 + CRC），全部通过才真正写进网络；`test_weights` 断言"失败后网络逐比特不变" |
+
+实测（`test_weights`，44 条断言）：
+
+```
+v2 (base64+CRC32): 497143 字节, save 2.8 ms, load 23.2 ms   (5.34 字节/float)
+v1 (十进制文本)   : 885386 字节                              -> 体积 1.78x
+truncated / fingerprint / one-bit-corrupt / wrong-structure / missing file -> 全部返回 -1
+载入失败后网络的变化 = 0.000e+00
+```
+
+另外**老格式的文件仍然能读**（不带 `CHWGT2` 头就走兼容分支），所以以前存下来的权重不用
+转换；`test_weights` 第 [3] 节专门验证这条路径（并顺便把老格式的有损程度量了出来：
+前向输出差 1.6e-06）。
+
+顺带的一个坑：第一版预校验直接调用 `Tensor::fromString` 做检查，于是 16 MB 的老格式权重
+文件要**解析两遍**、每行 `split()` 出几百万个 `std::string` —— GUI 启动从秒级变成 30 秒
+以上（脚本等不到"开始对弈"按钮变 enabled 才发现）。改成"扫一遍字节 + 数一遍逗号"的
+零分配校验后恢复。**教训**：校验逻辑要和解析逻辑一样在乎常数。
+
+界面的奖励曲线在 `ChessBoard::playMatchGame` 里显式换算成走子方视角。
+
+**影响**：这个 bug 从"给 RL 即时奖励"那一版代码起就存在，是"RL agent 学不动"的一个独立
+成因（另一个见 `docs/agents_design.md` §10 的样本效率分析）。它不影响搜索类 agent
+（Alpha-Beta / MCTS / EVAB 的搜索部分）。
 
 ---
 
@@ -872,8 +1038,14 @@ for (std::size_t j = 0; j < x.shape[1]; j++) xr[j*x.sizes[1]] += x1ik*x2r[j*x2.s
    产生的负值 → 结构上无法表示负 Q。上游只修了 `convdqn.cpp`，`dqn.cpp` 没修。 → B18
 7. **搜索的时间控制与迭代加深**：`AB_DEPTH`/`MCTS_SIMS`/`PPO_SIMS`/`DQNMCTS_ITERATIONS`
    都是固定值（已集中为常量，不再散落在注释里）；EVAB 有 `timeBudgetMs` 但其余没有。
+   **稀疏 MoE + TB 专家那个变体现在也是固定 16 次模拟** —— 它最需要时间控制
+   （一次模拟 10 ms，同一个预算下不同局面能跑的模拟数差很多）。
 8. **QSS 主题仍未接线**：`QssLoader::load()` 零调用（`res.qrc` 已编入目标，资源无人读）。
    → B17
+9. **没有一个骨干拿到棋力结论**：`bench_moe` 的 A/B/C/D 等时对弈**全是和棋**
+   （连自我对照也是），因为参赛的都是随机初始权重，预训 3 局等于零。要谈"稀疏 MoE
+   能否提升效果"必须投入真正的训练预算（自对弈几千局量级）+ 预训=0 的对照，
+   这件事**还没做**，见 `docs/agents_design.md` §11.4.2 (6)。
 
 ### P3（工程化）
 

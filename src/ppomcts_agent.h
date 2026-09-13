@@ -169,6 +169,12 @@ public:
 
     /* Statistics */
     int getTotalEpisodes() const { return totalEpisodes; }
+    /*
+     * 最近一次 trainStep 的 critic 价值 MSE (界面"训练损失曲线"用):
+     *   loss = (V(s) - 目标回报)²  —— 与 DQN 报的"平均平方 TD 误差"同类可比。
+     * (actor 的交叉熵在 RL::PPO::lastActorLoss 里, 目前不上图。)
+     */
+    float getLastTrainLoss() const override { return (float)ppo.lastLoss; }
     float getWinRate(int color = Stone::COLOR_BLACK) const {
         int idx = (color == Stone::COLOR_BLACK) ? 1 : 0;
         return totalEpisodes > 0 ? (float)totalWins[idx] / totalEpisodes : 0.0f;

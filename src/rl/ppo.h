@@ -9,6 +9,7 @@
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
+#include <limits>
 #include "net.hpp"
 #include "rl_basic.h"
 #include "parameter.hpp"
@@ -70,6 +71,13 @@ public:
     float gamma;
     float exploringRate;
     int learningSteps;
+    /*
+     * 最近一次 trainStep 的标量损失 (界面"训练损失曲线"用, **不参与任何计算**):
+     *   lastLoss      : critic 的价值 MSE (主曲线用它 —— 与 DQN 的 TD 误差同类)
+     *   lastActorLoss : actor 的交叉熵 (策略离"搜索给的走法"有多远)
+     */
+    double lastLoss = std::numeric_limits<double>::quiet_NaN();
+    double lastActorLoss = std::numeric_limits<double>::quiet_NaN();
 
     Net actorP;      /* Policy network:  state -> 128-dim Softmax */
     Net critic;      /* Value network:   state -> 1-dim scalar    */

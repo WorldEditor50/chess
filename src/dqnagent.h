@@ -54,6 +54,12 @@ public:
     int totalEpisodes;
     int totalWins[2];               /* [0]=red wins, [1]=black wins */
 
+    /*
+     * 最近一次 learn 的**平均平方 TD 误差** (界面"训练损失曲线"用)。
+     * 直接转发 RL::DQN::lastLoss —— 一个是窗口内平均, 一个是最近一批, 这里取后者。
+     */
+    float getLastTrainLoss() const override { return (float)dqn.lastLoss; }
+
     /* Encode current board state into state tensor (90-dim) */
     void encodeState(RL::Tensor &state);
 

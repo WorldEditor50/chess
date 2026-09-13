@@ -15,6 +15,8 @@ chess/
 │   ├── mainwindow.h/cpp/ui   # 主窗口 (Qt)
 │   ├── chessboard.h/cpp      # 棋盘控件 (Qt 绘制 + 交互 + AI 线程 + Agent 对弈 arena)
 │   ├── thinkingindicator.h/cpp # "AI 正在思考"指示器 (沙漏 + 旋转粒子 + 呼吸灯 + 实时耗时)
+│   ├── metricsview.h/cpp     # 自绘折线图控件 CurveChart (训练损失 / 每局环境奖励曲线) + 双击放大窗口
+│   ├── busydialog.h/cpp      # 载入/保存权重时的"请稍候"弹窗 (里面复用思考指示器的沙漏)
 │   ├── chess.h/cpp           # 棋局逻辑 + 评估函数 (+ Zobrist 键)
 │   ├── stone.h/cpp           # 棋子基类与派生类 + 走法/对象池
 │   ├── pos.h/cpp             # 坐标类
@@ -23,6 +25,7 @@ chess/
 │   ├── abagent.h/cpp         # Alpha-Beta 剪枝 agent (含静态搜索)
 │   ├── mcts.h/cpp            # MCTS (四阶段已实现, 已接入 GUI)
 │   ├── evagent.h/cpp         # EVAB: 学会评估的 Alpha-Beta (价值网 + TT/killer/history)
+│   ├── sacazagent.h/cpp      # SAC + MCTS + AlphaZero (最大熵 critic 给 PUCT 搜索估值)
 │   ├── pgagent.h/cpp         # 策略梯度 agent (RL::DPG)
 │   ├── dqnagent.h/cpp        # DQN agent (RL::DQN)
 │   ├── ppomcts_agent.h/cpp   # PPO + MCTS (AlphaZero 风格, 用 RL::PPO)
@@ -30,9 +33,11 @@ chess/
 │   ├── gamedb.h/cpp          # SQLite 棋局数据库
 │   ├── qssloader.hpp         # QSS 样式加载工具 (目前未接线)
 │   ├── appstyle.qss          # 样式文件
-│   ├── res.qrc               # 资源文件 (内嵌 appstyle.qss)
+│   ├── res.qrc               # 资源文件 (内嵌 appstyle.qss + app.png 程序图标)
+│   ├── app.rc / app.ico      # Windows exe 图标 (PE 资源; 由 tools/make_app_icon.ps1 生成)
 │   └── rl/                   # RL 内核 -> 静态库 RL_CORE (纯 C++, 不含 Qt)
 │       ├── simd_ops.hpp      # SIMD 分派层 (标量 / SSE2 / AVX2 三档)
+│       ├── sparse_moe.hpp    # 稀疏路由 MoE (只算门控选中的 top-k 个专家; TopK==E 即稠密对照)
 │       ├── simd/             # N-spirits 的 SSE2 / AVX2 张量内核
 │       └── cpuinfo.hpp       # CPUID 探测 + "本构建启用了哪套内核"
 ├── test/
@@ -44,19 +49,32 @@ chess/
 │   ├── test_pretrain_main.cpp # 决策前探索不得改动真棋局 -> test_pretrain
 │   ├── test_match_main.cpp    # Agent 对弈 arena 统计 -> test_match
 │   ├── test_grad_main.cpp     # SIMD 之后的梯度传播 (有限差分) -> test_grad
+│   ├── test_sacaz_main.cpp    # SAC+MCTS+AlphaZero -> test_sacaz
+│   ├── test_sparse_moe_main.cpp # 稀疏路由 MoE (稀疏不变量/等价性/有限差分/辅助损失) -> test_sparse_moe
+│   ├── test_weights_main.cpp  # 权重文件格式 (无损/校验/原子写/兼容老格式) -> test_weights
+│   ├── bench_moe_main.cpp     # 骨干 A/B/C/D 等时对弈基准 -> bench_moe (只构建不注册)
 │   ├── test_pg_main.cpp       # PG -> test_pg
 │   ├── test_dqn_main.cpp      # DQN -> test_dqn
 │   ├── test_ppomcts_main.cpp  # PPO+MCTS -> test_ppomcts
 │   └── test_dqnmcts_main.cpp  # DQN+MCTS -> test_dqnmcts
-├── tools/                # 界面验证脚本 (UI Automation / 像素采样)
+├── tools/                # 界面验证脚本 (UI Automation / 像素采样 / 进程窗口枚举)
 └── docs/                 # 本文档 + issues_review.md + rl_sync.md + agents_design.md
 ```
 
 构建产物（`build/Desktop_Qt_6_9_2_MSVC2022_64bit-Release`）：
-`RL_CORE.lib`（17 个 TU 的静态库）+ `chess.exe` + **11 个测试可执行文件**。
+`RL_CORE.lib`（17 个 TU 的静态库）+ `chess.exe` + **15 个测试/基准可执行文件**。
 其中 `test_ab` / `test_mcts` / `test_rules` / `test_pretrain` / `test_match` / `test_grad`
-注册进了 `ctest`（`test_match` 带 `QT_QPA_PLATFORM=offscreen`）；其余 5 个是分钟级的
-训练基准，只构建不注册（放进默认套件只会得到看起来像失败的超时）。
+/ `test_weights` / `test_sacaz` / `test_sparse_moe` 九个注册进了 `ctest`（`test_match` 需要
+Qt 的 DLL：`ctest` 通过 `ENVIRONMENT_MODIFICATION` 把 Qt 的 `bin` 前置进 `PATH`）；
+其余是分钟级的训练基准与对弈基准（`bench_moe` 会跑真实对局、依赖随机开局），
+只构建不注册 —— 放进默认套件只会得到看起来像失败的超时。
+
+文档：
+* `issues_review.md` — 问题清单与修复进度（含"零之二点十"的即时奖励符号 bug）
+* `agents_design.md` — 各 agent 的设计；§12 参数量理论分析、§13 界面可视化
+* `xiangqi_capacity.md` — "多少参数量才能覆盖象棋求解空间"的完整推导
+* `rl_sync.md` — 与上游 snakeAI `rl/` 的同步与差异（含权重文件格式 v2）
+* `analysis.md` — 本文档
 
 ---
 

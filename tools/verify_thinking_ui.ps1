@@ -29,6 +29,8 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type -MemberDefinition '[DllImport("user32.dll")]public static extern void mouse_event(uint f,uint dx,uint dy,uint d,int e);' -Name MU -Namespace W32 -PassThru | Out-Null
 
 if ($Exe -eq "") {
@@ -125,9 +127,116 @@ function ClickAt([int]$x, [int]$y) {
     [W32.MU]::mouse_event(0x0004, 0, 0, 0, 0)
 }
 
+# --- UI Automation: wait until the window is interactive, pick an agent ---
+# Qt's QComboBox popup items do not respond to SelectionItemPattern.Select()
+# (it silently does nothing), so the item is clicked with the mouse; see the
+# long note in tools/verify_match_ui.ps1.
+function Get-Root() {
+    if ($null -eq $script:uiaRoot) {
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+        $script:uiaRoot = [System.Windows.Automation.AutomationElement]::FromHandle(
+            (Get-Process -Id $proc.Id).MainWindowHandle)
+    }
+    return $script:uiaRoot
+}
+
+function Find-ByName([string]$name) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $name)
+    return (Get-Root).FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants, $cond)
+}
+
+function Wait-UiReady([int]$timeoutMs) {
+    # NOTE: this file is ASCII-only (no BOM), so the readiness probe must not
+    # compare against a Chinese widget name - Windows PowerShell would decode the
+    # literal as ANSI and the quoting breaks. Instead: wait until the FIRST Button
+    # in the window (the start button listens first in the layout) is enabled.
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $bs = (Get-Root).FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if ($bs.Count -gt 0 -and $bs.Item(0).Current.IsEnabled) { return $true }
+        Start-Sleep -Milliseconds 300
+    }
+    return $false
+}
+
+function Select-AgentItem([int]$comboIndex, [int]$itemIndex) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ComboBox)
+    $combos = (Get-Root).FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants, $cond)
+    if ($combos.Count -le $comboIndex) { throw "combo $comboIndex not found" }
+    $cb = $combos.Item($comboIndex)
+    $expand = $null
+    if (-not $cb.TryGetCurrentPattern(
+            [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) {
+        throw "combo $comboIndex cannot be expanded"
+    }
+    $expand.Expand()
+    Start-Sleep -Milliseconds 600
+    $liCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem)
+    $items = $cb.FindAll([System.Windows.Automation.TreeScope]::Descendants, $liCond)
+    if ($items.Count -le $itemIndex) {
+        $expand.Collapse()
+        throw "combo $comboIndex has no item $itemIndex (count=$($items.Count))"
+    }
+    $target = $items.Item($itemIndex)
+    $r = $target.Current.BoundingRectangle
+    ClickAt ([int]($r.X + $r.Width / 2)) ([int]($r.Y + $r.Height / 2))
+    Start-Sleep -Milliseconds 500
+    if ($cb.Current.ExpandCollapseState -ne
+        [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Collapse()
+    }
+    Start-Sleep -Milliseconds 400
+    return $target.Current.Name
+}
+
+# From a plain shell the Qt bin directory is usually not on PATH, and chess.exe
+# then dies immediately with 0xC0000135 (STATUS_DLL_NOT_FOUND) - which shows up
+# here as "chess board (tan background) not found on screen" because no window
+# was ever drawn. Prepend a Qt bin directory that actually has Qt6Widgets.dll.
+# (verify_match_ui.ps1 does the same thing; ctest does it via
+# ENVIRONMENT_MODIFICATION in CMakeLists.txt.)
+$qtFound = $false
+foreach ($d in ($env:PATH -split ';')) {
+    if ($d -ne "" -and (Test-Path (Join-Path $d "Qt6Widgets.dll"))) {
+        $qtFound = $true
+        break
+    }
+}
+if (-not $qtFound) {
+    $hit = Get-ChildItem -Path "C:\Qt\*\msvc*\bin\Qt6Widgets.dll" -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($null -ne $hit) {
+        $env:PATH = $hit.DirectoryName + ";" + $env:PATH
+        Write-Output ("Qt bin prepended = {0}" -f $hit.DirectoryName)
+    } else {
+        Write-Output "WARNING: Qt6Widgets.dll not found on PATH and not under C:\Qt\*\msvc*\bin"
+    }
+}
+
 $proc = Start-Process -FilePath $Exe -WorkingDirectory $exeDir -PassThru
 Write-Output "launched chess.exe pid=$($proc.Id)"
-Start-Sleep -Seconds 6
+Start-Sleep -Seconds 3
+if ($proc.HasExited) {
+    throw "chess.exe exited early (exit code $($proc.ExitCode)) - missing Qt DLLs?"
+}
+# The window being up does NOT mean it is interactive: every control is disabled
+# until startupLoad() finishes (and that now parses the old decimal-text weight
+# files, which can take a few seconds). Wait for the start button to be enabled.
+if (-not (Wait-UiReady 60000)) {
+    throw "UI never became ready (startup load failed?)"
+}
+Write-Output "UI ready"
 
 try {
     $origin = FindBoard
@@ -135,15 +244,13 @@ try {
     $by = $origin[1]
     Write-Output "board origin on screen = ($bx,$by)"
 
-    # Use a slow agent so the thinking window is wide: focus the combo box
-    # (Tab from the first button) and step it to MCTS (800 simulations, ~1 s).
-    $ws = New-Object -ComObject WScript.Shell
-    [void]$ws.AppActivate($proc.Id)
-    Start-Sleep -Milliseconds 500
-    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}")
-    Start-Sleep -Milliseconds 500
+    # Use a slow agent so the thinking window is wide: pick MCTS (800 sims, ~1 s)
+    # through UI Automation. (It used to be SendKeys TAB+DOWN, but that depends on
+    # the focus order - which changed as soon as the metrics panel was added - and
+    # on the controls already being enabled. UIA is focus independent, and it
+    # fails loudly if the combo is not there.)
+    $agi = Select-AgentItem 0 1
+    Write-Output ("agent selected = {0}" -f $agi)
 
     # status strip occupies widget-local x 64..534, y 2..24; sample its right
     # end (text is left aligned) so each frame stays cheap.

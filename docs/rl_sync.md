@@ -37,7 +37,7 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 直接覆盖会导致 7 个目标全部编译失败，因此保留 chess 版。
 `ppo.h` 顶部已注明它与上游的分歧。
 
-### 1.2 chess 侧保留/修补的三处（均在文件内以注释标明）
+### 1.2 chess 侧保留/修补的五处（均在文件内以注释标明）
 
 1. **`rl/dqn.cpp`** — chess 把 DQN 主干换成了 `MOE<16,16>` +
    `TransformerBlock<16>`（旧注释还写着 MOE<8,4>，属于注释未同步）。
@@ -59,6 +59,23 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
    做了等价还原（`路`→`·`、`鈫?`→`→`、`虏`→`²`）。
 4. **`rl/convdqn.cpp`** — chess 保留 snakeAI **已提交**的版本（Q 头 `Layer<Linear>`，
    与文件内那段"Q 头必须有界……不，必须无界"的审计注释一致）。
+5. **`rl/layer.h` 的 `iFcLayer` 拷贝构造** — 同步进来的版本**只复制了维度**，
+   `w` / `b` / `o` / `e` / `g` / `v` / `m` 全部丢失：
+
+   ```cpp
+   // 同步进来的版本 (坏了)
+   explicit iFcLayer(const iFcLayer &r)
+       : iLayer(r), inputDim(r.inputDim), outputDim(r.outputDim), bias(r.bias) {}
+   ```
+
+   平时看不出来（`Layer<T>` 的深拷贝走 `copyTo()`，是赋值而不是拷贝构造），但只要
+   有人**按值**返回/传递一个层，拿到的就是"维度对、权重空"的空壳（`w.size()==0`），
+   之后所有 MM 内核都在越界读写。chess 侧写稀疏 MoE 时正好踩上
+   （`experts[i] = ExpertFactory<E>::make(...)`），表现是反向出现上万个 NaN/1e28，
+   而且**换个构建就可能消失**（MSVC 是否省略那次拷贝）。已补全为逐成员复制，
+   并保留 `copyTo()` 作为真正的深拷贝入口。细节见
+   `docs/issues_review.md` §零之四 4.5 与 `docs/agents_design.md` §11.4.2 (2)，
+   回归覆盖在 `test_sparse_moe`。
 
 ### 1.3 同步后发现的上游未提交改动
 
@@ -255,8 +272,33 @@ B. 生产配置 (抽样)          eps=1e-2: 5.58e-03   eps=1e-3: 1.62e-04
    长时间训练下这点差异会被放大（混沌），因此"跨构建比对权重文件是否相同"
    这类测试是不成立的，只能比指标。
 
-### 数值 / 反向传播正确性
+4. **写自己的 MoE 时又做了一遍同样的核对**（`test_sparse_moe`，61 条断言）：稀疏
+   路由只计算门控选中的 top-k 个专家，破坏了两个原本显然的性质（"前向用了所有
+   专家"和"所有专家都有梯度"），所以逐条查：把未选中专家的权重改 0.5 → 输出
+   **逐位不变**（`0.000e+00`）；`TopK==E` 时与上游 `MOE<3,4>` 的前向与门控梯度差
+   也是 `0.000e+00`（等价性不是"0 比 0"的假通过，`|dL/dwg|=130.6`）；未选中专家的
+   梯度**恰好为 0**；门控/专家参数/辅助损失全部通过中心差分（1e-3 相对误差量级）。
+   这一轮顺带挖出的 `iFcLayer` 拷贝构造 bug 见 1.2 第 5 条。
 
+### 权重文件格式 v2（`tensor.hpp` 的 `toString/fromString` + `net.hpp` 的 `save/load`）
+
+chess 侧对 RL 内核做的一处**接口不变、行为升级**的改动（上游还是老的十进制文本格式）：
+
+| | v1（上游） | v2（现在） |
+|---|---|---|
+| 张量编码 | `shape\|v1,v2,...` 十进制文本（`ostream << float`，6 位有效数字） | `shape\|b64:<crc32>:<base64 原始 float32>` |
+| 精度 | **有损**：存读一次漂移 ~1e-6 相对 | **逐比特无损**（`test_weights` 断言两次存出的文件逐字节相同） |
+| 体积 | 一个 float 9~13 字节 | 5.34 字节/float（base64 的理论下限是 5.33） |
+| 文件头 | 无 | `CHWGT2 <层数> <结构指纹(FNV-1a of layer types)>`，载入时校验 |
+| 校验 | 无 | 每张量 CRC32 + 长度必须等于形状乘积 × sizeof(T) |
+| 写入 | 直接写目标文件 | 写 `.tmp` 再 `std::filesystem::rename` 原子替换 |
+| 载入失败 | 静默载入半个模型（空张量 → 之后越界读） | **先零分配校验每一行**，全部通过才写进网络；失败时网络逐比特不变 |
+| 兼容 | — | 不带 `CHWGT2` 头的老文件走兼容分支（`fromString` 同时认两种编码） |
+
+回归：`test_weights`（44 条断言，ctest 里 0.2 秒）。细节与实测见
+`docs/issues_review.md` §零之四 4.6。
+
+### 数值 / 反向传播正确性
 - `activate.h`：`Selu` 原来是 clamp 到 [-1,1] 的 hard-tanh，与 SELU 无关；改为真正的 SELU。
 - `layer.h`：`Optimize::SGD(w, g.w, lr, true)` 的第 4 个参数是 **gamma（weight decay）**
   而不是 `clipGrad`，传 `true` 等于让 `w = (1-1)·w - lr·dw`，每步把权重清零。

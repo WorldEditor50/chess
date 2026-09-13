@@ -123,6 +123,13 @@ public:
 
     /* Statistics */
     int getTotalEpisodes() const { return totalEpisodes; }
+    /*
+     * 最近一次 reinforce 的**策略梯度损失** (界面"训练损失曲线"用)。
+     * REINFORCE 没有"误差"量, 这里报 surrogate = -Σ A·log π(a|s) 的批均值:
+     * 策略越把概率压到正优势的动作上它越小。advantage 已被标准化, 所以量级只反映
+     * 信噪比, 不要跨 agent 比较 (曲线本来就是按 agent 分线的)。
+     */
+    float getLastTrainLoss() const override { return (float)dpg.lastLoss; }
     float getWinRate(int color = Stone::COLOR_BLACK) const {
         int idx = (color == Stone::COLOR_BLACK) ? 1 : 0;
         return totalEpisodes > 0 ? (float)totalWins[idx] / totalEpisodes : 0.0f;

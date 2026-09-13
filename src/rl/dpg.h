@@ -8,6 +8,7 @@
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
+#include <limits>
 #include "net.hpp"
 #include "rl_basic.h"
 #include "parameter.hpp"
@@ -44,6 +45,14 @@ public:
     float H0;
     GradValue alpha;
     Net policyNet;
+    /*
+     * 最近一次 reinforce1 的**策略梯度损失** (界面"训练损失曲线"用, 不参与计算):
+     *    surrogate = -Σ_t A_t · log π(a_t|s_t)   (取平均)
+     * REINFORCE 没有"误差"这种量, 这个代替目标就是它的标准损失 —— 策略越把概率放到
+     * 正优势的动作上, 它越小。advantage 已经在 reinforce1 里被标准化过, 所以它的
+     * 绝对量级只表示"信噪比", 跨 agent 之间不可比 (曲线是按 agent 分线的)。
+     */
+    double lastLoss = std::numeric_limits<double>::quiet_NaN();
 };
 }
 #endif // POLICY_GRADIENT_H

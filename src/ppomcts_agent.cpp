@@ -120,7 +120,18 @@ float PPOMCTSAgent::computeReward(const Step &s, int color)
     }
 
     float reward = victim->value * 10.0f;
-    return (color == Stone::COLOR_BLACK) ? reward : -reward;
+    /*
+       符号约定 (2026-09 修正): 即时奖励是**走子方视角**的 —— 吃掉对方一个子永远是
+       收益, 所以这里直接返回 +reward。
+
+       原来写的是 `(color == COLOR_BLACK) ? reward : -reward`, 那是"黑方视角"
+       (黑方吃子为正), 于是红方白吃一个黑车会拿到 **-0.5** —— 与同一批经验里的终局
+       奖励 (走子方视角的 ±1) 正好相反, 对红方等于在教它"吃子是坏事"。
+       Chess::moveForward 的 totalReward 也是黑方视角 (吃红子 +), 两者同源;
+       实测探针 build/reward_probe.cpp: 红炮吃黑马 totalReward = -0.30。
+       回归钉在 test_match 的 [2.6] 节。
+    */
+    return reward;
 }
 
 /* ------------------------------------------------------------------

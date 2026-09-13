@@ -27,6 +27,7 @@
 #include "ppomcts_agent.h"
 #include "dqnmcts_agent.h"
 #include "evagent.h"
+#include "sacazagent.h"
 
 class ChessBoard : public QWidget
 {
@@ -46,7 +47,15 @@ public:
         AGENT_DQN,               /* Deep Q-Network (DQNAgent) */
         AGENT_PPOMCTS,           /* PPO + MCTS AlphaZero-style (PPOMCTSAgent) */
         AGENT_DQNMCTS,           /* DQN + MCTS (DQNMCTSAgent) */
-        AGENT_EVAB               /* EVAB: 学会评估的 Alpha-Beta (EVABAgent) */
+        AGENT_EVAB,              /* EVAB: 学会评估的 Alpha-Beta (EVABAgent) */
+        AGENT_SACAZ,             /* SAC + MCTS + AlphaZero (SACAZAgent) */
+        /*
+           SAC + MCTS + AlphaZero, 但骨干换成**稀疏路由 MoE + TransformerBlock
+           专家** (E=4, top-1): 参数量 ~4 个 TB 专家, 算力只算 1 个。
+           代价实测 ~10.9 ms/模拟 (MLP 骨干 0.07 ms/模拟), 所以模拟次数要小得多
+           (见 SACAZ_MOE_SIMS), 一次走子约 175 ms。
+        */
+        AGENT_SACAZ_MOE
     };
 
 public:
@@ -109,6 +118,15 @@ public:
 
     /* 保存当前agent的权重文件 */
     bool saveCurrentAgentModel(AgentType agentType, const std::string &filepath);
+    /*
+     * 某个 agent 的"标准权重路径" (weights/ 下的正式文件名)。
+     * shutdownSave() 与"对弈结束后静默保存"都用它 —— 以前这两处各写一份, 很容易
+     * 出现"存到 A 处、启动时读 B 处"这种静默失效。
+     * SAC+AZ 系的一个模型是三个文件, 所以它返回的是**前缀**。
+     */
+    static std::string defaultWeightPath(AgentType agentType);
+    /* 这个 agent 是否已经实例化过 (没实例化就没有权重可存, 静默保存要跳过) */
+    bool hasAgentInstance(AgentType agentType) const;
 
     /*
      * 是否在每次走子前先"探索环境 + 预训练一次" (仿 snakeAI 的决策流程, 见 aiagent.h)。
@@ -159,6 +177,36 @@ signals:
     void matchStarted(const QString &agentA, const QString &agentB, int games);
     void matchGameFinished(int gameNo, int games, const QString &line);
     void matchFinished(const QString &summary, const QString &detail);
+    /*
+     * ---- 对弈实时比分 ----
+     * 每打完一局 emit 一次。界面用它把"当前几比几"实时显示出来 (以前只有在整场
+     * 结束时才弹一个结果框, 中途只能看到"第 n/N 局完成")。
+     * scoreLine 形如 "A 2 : 1 B   和 1", 已经算好可以直接显示。
+     */
+    void matchScoreChanged(const QString &scoreLine);
+    /*
+     * ---- 指标曲线用的采样 ----
+     * gameRewardSample : 每局结束后两位参赛者各自拿到的**环境奖励累计**
+     *                    (即时奖励之和, 走子方视角; 吃子与终局 ±1 都在里面)
+     * trainLossSample  : 每完成一次在线训练上报一次损失 (哪个 agent / 第几次)
+     * 两者都在后台线程 emit, 队列投递到 GUI 线程后进曲线。
+     */
+    void gameRewardSample(int gameNo, const QString &agentA, const QString &agentB,
+                          double rewardA, double rewardB);
+    void trainLossSample(double loss, const QString &agent, int step);
+
+    /*
+     * ---- "请稍候"(载入/保存模型权重) ----
+     * 权重读写可能很慢 (老格式的十进制文本权重一个文件 16 MB; 稀疏 MoE 骨干
+     * 28.7 M 参数), 期间界面必须给出"在干活"的反馈, 否则看起来就是卡死。
+     * 这里只负责**报告状态**, 弹窗长什么样由界面决定 (见 src/busydialog.h)。
+     *   busyStarted  : 开始读写 (标题 + 第一行说明)
+     *   busyMessage  : 进度说明变了 (例如"正在载入 EVAB 权重…")
+     *   busyFinished : 结束 (无论成功失败都要发, 否则弹窗会一直挂着)
+     */
+    void busyStarted(const QString &title, const QString &message);
+    void busyMessage(const QString &message);
+    void busyFinished();
     /* 回放状态变更信号 */
     void replayIndexChanged(int index, int total);
     void replayModeExited();
@@ -219,10 +267,14 @@ private:
     static PPOMCTSAgent *m_sfPPOMCTS;
     static DQNMCTSAgent *m_sfDQNMCTS;
     static EVABAgent *m_sfEVAB;
+    static SACAZAgent *m_sfSACAZ;
+    static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */
     std::atomic<bool> m_preTrainEnabled{true};
     std::atomic<int> m_preTrainSteps{64};
+    /* 训练损失样本的序号 (背景线程与 AI 线程都会 +1, 故用 atomic) */
+    std::atomic<int> m_trainSampleNo{0};
     std::string m_lastExploreInfo;
     mutable QMutex m_infoMutex;            /* 保护 m_lastExploreInfo (跨线程读写) */
 
@@ -257,7 +309,14 @@ private:
     std::atomic<int> m_matchGames{0};
     int m_maxPliesPerGame = DEFAULT_MAX_PLIES;   /* 单局手数上限, 到顶判和 */
     /* 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_* */
-    int playMatchGame(AgentType redType, AgentType blackType, MatchStats &st);
+    /*
+     * 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_*。
+     * rewardRed / rewardBlack 是**出参**: 本局双方各自累计到的即时环境奖励
+     * (走子方视角, 与 Chess::moveForward 的记账一致), 供界面的奖励曲线用。
+     */
+    int playMatchGame(AgentType redType, AgentType blackType, MatchStats &st,
+                      double &rewardRed, double &rewardBlack, double &rewardA,
+                      double &rewardB);
     /* 是否轮到这个 agent 走 (对弈中 arena 用) */
     AgentType typeForTurn(int turn, AgentType redType, AgentType blackType) const;
 

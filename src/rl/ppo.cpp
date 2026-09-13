@@ -46,6 +46,23 @@ void RL::PPO::trainStep(const Tensor &state,
     Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);
     critic.backward(state, mseLoss);
 
+    /*
+       记录标量损失, 只给界面画"训练损失曲线"用 (见 ppo.h 的注释)。
+       critic 取 MSE: err = v - target, loss = err² —— 与 DQN 报的"平均平方 TD 误差"
+       同类可比; actor 取交叉熵 -Σ target·log π (target 是搜索给出的 one-hot 走法)。
+    */
+    {
+        const double err = (double)v[0] - (double)valueTarget;
+        lastLoss = err * err;
+        double ce = 0.0;
+        for (std::size_t i = 0; i < policy.size() && i < actionTarget.size(); i++) {
+            if (actionTarget[i] > 0.0f) {
+                ce -= (double)actionTarget[i] * std::log((double)policy[i] + 1e-8);
+            }
+        }
+        lastActorLoss = ce;
+    }
+
     /* ---- Update both networks ---- */
     actorP.RMSProp(lr, 0.9f, 0.001f);
     critic.RMSProp(lr, 0.9f, 0.001f);

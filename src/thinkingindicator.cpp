@@ -273,7 +273,28 @@ void ThinkingIndicator::drawParticles(QPainter &p, const QPointF &c) const
     }
 }
 
-/* 沙漏: 上半部的沙子按相位线性漏到下半部, 漏完复位 */
+/*
+   沙漏: 上半部的沙子按相位漏到下半部, 漏完复位。
+
+   几何与"流量守恒" (这里原来画反了)
+   ---------------------------------
+   上下两个腔体都是三角形: 上半部**上宽下尖** (顶点在 mid), 下半部**上尖下宽**。
+   所以"剩余多少沙"和"沙面在哪"不是线性的 —— 对一个二维三角形, 从顶点往上到高度 u
+   的截面积是
+
+       A(u) = ∫₀^u 2·hw·(t/hh) dt = hw·u²/hh,     A(hh) = hw·hh = 总面积
+
+   于是"剩余比例 f"对应的高度是 `u = hh·√f` (而不是 `u = hh·f`): 沙面下降一开始快、
+   接近漏完时慢, 这才是真实沙漏看起来的样子。沙面处的半宽自然是 `hw·u/hh`。
+
+   原实现的两个问题:
+     1. 上半部的沙子被画成"贴着腔体顶部、从下往上被吃掉" —— 顶部那条边永远是满宽,
+        底边往上收。真实的沙面是**从上往下**落的, 所以减少方向正好反了。
+     2. 下半部的沙堆顶半宽用了 `hw·(1−drained)` (应该是 `hw·u/hh`), 除了 drained=0.5
+        那一点以外都偏胖。
+   现在上下两腔都用同一套 `u = hh·√f` 的换算, 上半部剩 `f = 1−drained`,
+   下半部积 `f = drained`, 于是"漏下去的"和"堆起来的"在任何相位都面积相等。
+*/
 void ThinkingIndicator::drawHourglass(QPainter &p, const QPointF &c) const
 {
     const qreal hw = kSandHalfW;
@@ -305,39 +326,42 @@ void ThinkingIndicator::drawHourglass(QPainter &p, const QPointF &c) const
         p.drawEllipse(mid, hh * 1.4, hh * 1.4);
     }
 
-    const qreal topDepth = (1.0 - drained) * hh;       /* 上半部剩余沙子的深度 */
-    const qreal topHalf = hw * drained;                /* 沙面处的半宽 (drained=1 -> 0) */
-    const qreal botTopY = bot.y() - drained * hh;      /* 下半部沙堆顶 */
-    const qreal botHalf = hw * (1.0 - drained);        /* 沙堆顶的半宽 (drained=1 -> 0) */
+    /* 面积守恒的液面换算: 高度 u = hh·√f, 该高度处的半宽 hw·u/hh */
+    const qreal fUp = 1.0 - drained;             /* 上半部剩余比例 */
+    const qreal fDn = drained;                   /* 下半部已积比例 */
+    const qreal uUp = hh * std::sqrt(fUp);       /* 上半部沙面高于 mid 的高度 */
+    const qreal uDn = hh * std::sqrt(fDn);       /* 下半部沙面低于 mid 的高度 */
+    const qreal halfUp = hw * (uUp / hh);
+    const qreal halfDn = hw * (uDn / hh);
+    const qreal topY = mid.y() - uUp;            /* 上半部沙面 y */
+    const qreal botY = mid.y() + uDn;            /* 下半部沙面 y */
 
     p.setPen(Qt::NoPen);
     p.setBrush(kSand);
 
-    /* 上半部的沙 */
-    if (topDepth > 0.6) {
+    /* 上半部的沙: 从沙面往下收到漏斗口 (三角形) */
+    if (uUp > 0.7) {
         QPolygonF poly;
-        poly << QPointF(c.x() - hw, top.y())
-             << QPointF(c.x() + hw, top.y())
-             << QPointF(c.x() + topHalf, top.y() + topDepth)
-             << QPointF(c.x() - topHalf, top.y() + topDepth);
+        poly << QPointF(c.x() - halfUp, topY)
+             << QPointF(c.x() + halfUp, topY)
+             << mid;
         p.drawPolygon(poly);
     }
 
-    /* 下半部的沙堆 */
-    if (drained > 0.005) {
+    /* 下半部的沙堆: 从漏斗口往下张开到沙面 (三角形) */
+    if (uDn > 0.7) {
         QPolygonF poly;
-        poly << QPointF(c.x() - botHalf, botTopY)
-             << QPointF(c.x() + botHalf, botTopY)
-             << QPointF(c.x() + hw, bot.y())
-             << QPointF(c.x() - hw, bot.y());
+        poly << mid
+             << QPointF(c.x() - halfDn, botY)
+             << QPointF(c.x() + halfDn, botY);
         p.drawPolygon(poly);
     }
 
-    /* 中间下落的一股细沙 */
-    if (m_running && drained > 0.02 && drained < 0.985) {
+    /* 中间下落的一股细沙 (从漏斗口到下方沙面) */
+    if (m_running && drained > 0.02 && drained < 0.985 && botY > mid.y() + 1.0) {
         p.setBrush(kSand);
         p.setPen(Qt::NoPen);
-        p.drawRect(QRectF(c.x() - 0.8, mid.y() + 1.0, 1.6, botTopY - mid.y() - 1.0));
+        p.drawRect(QRectF(c.x() - 0.8, mid.y() + 1.0, 1.6, botY - mid.y() - 1.0));
     }
 
     /* 玻璃外框 */

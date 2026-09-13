@@ -7,6 +7,39 @@
  * EVABAgent - 实现说明见 evagent.h 与 docs/agent_evab_design.md。
  */
 
+namespace {
+
+/*
+   初始化缩放 (1/sqrt(fan_in))。
+   `Layer` 的构造函数把权重初始化成 U(-1,1); 而 EVAB 的输入是 1260 维 one-hot
+   (一局最多 32 个子 -> 约 32 个 1), 于是第一层 pre-activation 的标准差约
+   sqrt(32/3) ≈ 3.3 —— tanh **一开始就饱和**, 网络输出恒为 ±1:
+   实测探针 (build/evab_probe2.cpp) 里任意局面的输出都是 0.998, 与手工评估的差距
+   |net-hand| ≈ 0.95。这样的网络既学不动 (梯度 ~0) 也帮不上忙 (输出是常数),
+   "学习到的评估"从来没有真正生效过。
+   按 1/sqrt(fan_in) 缩放一遍把 pre-activation 拉回 ~0.5, 网络才有表达力。
+   (同一个修法在 sacazagent.cpp / dqn 系里已经用了。
+*/
+void scaleLayerInit(RL::Net &net)
+{
+    for (std::size_t i = 0; i < net.size(); i++) {
+        RL::iFcLayer *fc = dynamic_cast<RL::iFcLayer *>(net[i]);
+        if (fc == nullptr) {
+            continue;
+        }
+        const float fanIn = (float)(fc->inputDim > 1 ? fc->inputDim : 1);
+        const float s = 1.0f / std::sqrt(fanIn);
+        for (std::size_t k = 0; k < fc->w.size(); k++) {
+            fc->w[k] *= s;
+        }
+        for (std::size_t k = 0; k < fc->b.size(); k++) {
+            fc->b[k] *= s;
+        }
+    }
+}
+
+} // namespace
+
 /* ============================================================
  *  构造 / 基本信息
  * ============================================================ */
@@ -16,8 +49,11 @@ EVABAgent::EVABAgent(Chess &chess_, int hiddenDim, int depth, long long budgetMs
       valueNet(RL::Layer<RL::Tanh>::_(STATE_DIM, hiddenDim, true, true),
                RL::Layer<RL::Tanh>::_(hiddenDim, 1, true, true)),
       blend(0.0f),
+      blendMax(0.3f),
+      blendStep(0.05f),
       maxDepth(depth),
       timeBudgetMs(budgetMs),
+      exploreBudgetMs(600),
       outcomeWeight(0.5f),
       exploreEps(0.15f),
       learningRate(0.002f),
@@ -35,13 +71,24 @@ EVABAgent::EVABAgent(Chess &chess_, int hiddenDim, int depth, long long budgetMs
     m_stateBuf = RL::Tensor(STATE_DIM, 1);
     m_killers.resize(2 * 64);
     m_tt.reserve(1 << 16);
+
+    /*
+       初始化缩放: 见文件开头 scaleLayerInit 的长注释 —— 不缩放的话网络一上来就
+       tanh 饱和, 输出恒为 ±1, "学习到的评估"这件事从来没有真正生效过。
+    */
+    scaleLayerInit(valueNet);
 }
 
 std::string EVABAgent::getName() const
 {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "EVAB (learned eval, depth=%d, blend=%.2f)",
-                  maxDepth, (double)blend);
+    /*
+       名字里**不放 blend**。它是损失曲线的分线键 (MainWindow::lossSeriesFor 用 agent
+       名字建曲线), 而 blend 在训练过程中是会变的 —— 一开始写成 "..., blend=%.2f" 的
+       结果是 EVAB 每变一次 blend 就多出一条曲线 (实测一局下来 6 条同名曲线)。
+       当前 blend 值照样看得到: 它在 getExploreInfo() 里 ("... blend 0.00->0.05")。
+    */
+    std::snprintf(buf, sizeof(buf), "EVAB (learned eval, depth=%d)", maxDepth);
     return buf;
 }
 
@@ -78,6 +125,7 @@ void EVABAgent::encodeCanonical(int color, RL::Tensor &state) const
 /* ============================================================
  *  叶子评估
  * ============================================================ */
+
 double EVABAgent::evaluateLeaf(int color)
 {
     const int over = chess.isGameOver();
@@ -646,6 +694,7 @@ double EVABAgent::pretrainFromHandEval(int positions, int maxPlies,
     for (int e = 0; e < epochs; e++) {
         err = trainBatch(valueNet, samples, batchSize, learningRate);
     }
+    m_lastLoss = (float)err;   /* 界面"训练损失曲线"用, 见 getLastTrainLoss */
     return err;
 }
 
@@ -766,7 +815,9 @@ double EVABAgent::trainSelfPlay(int games, int playDepth, int labelDepth,
         return 0.0;
     }
 
-    return trainBatch(valueNet, samples, batchSize, learningRate);
+    const double err = trainBatch(valueNet, samples, batchSize, learningRate);
+    m_lastLoss = (float)err;   /* 界面"训练损失曲线"用, 见 getLastTrainLoss */
+    return err;
 }
 
 bool EVABAgent::saveModel(const std::string &path)
@@ -855,9 +906,28 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
     */
     const int savedSideToMove = chess.sideToMove;
     chess.sideToMove = color;
-    const int labelDepth = (maxDepth > 2) ? (maxDepth - 1) : 2;
+    /*
+       标签深度 = 决策深度 - 1, 但**上限 4**: 探索每一步都要跑一次这个深度的
+       negamax, 而界面上"预训步数"默认 64 —— 深度 5 的标签就是 64 × ~90 ms ≈ 6 s/步,
+       深度 6 是 ~12 s/步, 界面直接没法用。标签只是训练目标, 不需要和决策一样深。
+    */
+    int labelDepth = (maxDepth > 2) ? (maxDepth - 1) : 2;
+    if (labelDepth > 4) {
+        labelDepth = 4;
+    }
+    /* 整轮探索的时间上限 (见 exploreBudgetMs 的注释); 0 = 不限 */
+    const auto exploreStart = std::chrono::steady_clock::now();
+    int rolled = 0;
 
     for (int i = 0; i < rolloutSteps; i++) {
+        if (exploreBudgetMs > 0) {
+            const long long used =
+                (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - exploreStart).count();
+            if (used >= exploreBudgetMs) {
+                break;
+            }
+        }
         std::vector<Step*> legal;
         chess.sample(turn, legal);
         if (legal.empty()) {
@@ -866,6 +936,7 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
         }
         Step chosen = *legal[(std::size_t)(std::rand() % (int)legal.size())];
         Steps::instance().put(legal);
+        rolled++;
 
         const int next = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
         double d = 0;
@@ -907,9 +978,11 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
     RL::Tensor target(1, 1);
     const int batch = 16;
     int inBatch = 0;
+    double errSum = 0.0;   /* 本轮的训练损失 (界面"训练损失曲线"用) */
     for (std::size_t i = 0; i < samples.size(); i++) {
         RL::Tensor &out = valueNet.forward(samples[i].state);
         target[0] = samples[i].target;
+        errSum += std::fabs((double)out[0] - (double)samples[i].target);
         valueNet.backward(samples[i].state, RL::Loss::MSE::df(out, target));
         if (++inBatch >= batch) {
             valueNet.RMSProp(learningRate*0.1f, 0.9f, 0.0f);
@@ -919,18 +992,53 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
     if (inBatch > 0) {
         valueNet.RMSProp(learningRate*0.1f, 0.9f, 0.0f);
     }
+    /*
+       上报这一轮的**训练损失** (平均 |预测 - 标签|)。以前只有离线训练
+       (trainBatch) 会写 m_lastLoss, 而界面走的是这里的在线训练 —— 于是界面上
+       EVAB 的损失曲线永远是空的 ("其他 agent 在对弈时无法显示训练损失")。
+       放在回滚判断**之前**报告: 即使这一轮被回滚, "这轮训练到了什么程度"也是真实的
+       数据, 而且回滚本身也要能在曲线上看出来 (下一轮损失会跳回去)。
+    */
+    m_lastLoss = (float)(errSum / (double)samples.size());
 
     /* 4) 变差就回滚: 与手工评估的差距明显变大 = 这一轮把网络带偏了 */
     const double gapAfter = netHandGap(12);
     if (gapAfter > gapBefore + 0.05) {
         backup.copyTo(valueNet);
+        /*
+           回滚时把 blend 也退回去: 网络刚被证明"这一轮把它带偏了", 那就更不该让
+           它参与决策。退两步、进一步, 所以坏网络会自然被压回 0。
+        */
+        blend = std::max(0.0f, blend - 2.0f * blendStep);
         m_exploreInfo = "探索 " + std::to_string((int)samples.size())
-                        + " 步, 更新后偏差 " + std::to_string(gapAfter)
-                        + " > " + std::to_string(gapBefore) + " -> 已回滚";
+                        + (samples.size() < (std::size_t)rolloutSteps ? " 步(时间上限)"
+                                                                     : " 步")
+                        + ", 更新后偏差 " + std::to_string(gapAfter)
+                        + " > " + std::to_string(gapBefore) + " -> 已回滚 (blend "
+                        + std::to_string(blend) + ")";
         return false;
     }
+
+    /*
+       5) 让学习到的评估真的参与决策 (blend 阶梯上升)。
+       为什么需要这一步: `blend` 的初值是 0, 而在这次修改之前**没有任何地方改过它**
+       —— 于是 EVAB 在界面上永远只用手工评估, 那个"learned eval"一次都没生效,
+       与 ABAgent 在同一深度下几乎只是"更快的 AB"(实测两者走法 22/30 相同),
+       自然很难赢。
+       阶梯是保守的: 只在**这一轮没有把网络带偏**(上面那道门) 时才爬一小步, 上限
+       blendMax (默认 0.5 —— 手工评估仍然是主力, 网络提供修正)。
+       (test_evab_main.cpp 里量过"blend 直接跳到 1.0 会 0 胜 6 负", 所以既不能不爬,
+       也不能一次爬到位。)
+    */
+    const float blendBefore = blend;
+    blend = std::min(blendMax, blend + blendStep);
+    if (blend != blendBefore) {
+        m_leafEvals = 0;   /* 统计口径变了: 从这里开始叶子会真的走网络 */
+    }
     m_exploreInfo = "探索 " + std::to_string((int)samples.size())
-                    + " 步, 价值网络更新 1 次 (|net-hand| "
-                    + std::to_string(gapAfter) + ")";
+                    + " 步" + (samples.size() < (std::size_t)rolloutSteps ? "(时间上限)" : "")
+                    + ", 价值网络更新 1 次 (|net-hand| "
+                    + std::to_string(gapAfter) + ", blend "
+                    + std::to_string(blendBefore) + "->" + std::to_string(blend) + ")";
     return true;
 }

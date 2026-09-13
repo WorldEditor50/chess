@@ -12,19 +12,21 @@ RL::SAC::SAC(size_t stateDim_, size_t hiddenDim, size_t actionDim_)
     alpha.val.fill(0.65);
     /* target entropy = -actionDim (standard SAC heuristic) */
     H0 = -std::log(actionDim);
-    actor = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, true),
-                LayerNorm<Sigmoid, LN::Post>::_(hiddenDim, hiddenDim, true, true),
+    actor = Net(MOE<16, 16>::_(stateDim, true),
+                Layer<Tanh>::_(stateDim, hiddenDim, true, true),
+                LayerNorm<Sigmoid, LN::Pre>::_(hiddenDim, hiddenDim, true, true),
                 Layer<Softmax>::_(hiddenDim, actionDim, true, true));
-
     for (int i = 0; i < QNET_NUM; i++) {
         /* Sigmoid output keeps Q in (0,1) — symmetric gradient around
            the midpoint of reward targets, preventing saturation asymmetry. */
-        critics[i] = Net(Layer<Tanh>::_(stateDim + actionDim, hiddenDim, true, true),
-                         TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
-                         Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+        critics[i] = Net(MOE<16, 16>::_(stateDim, true),
+                   TransformerBlock<16>::_(stateDim, true),
+                   TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, true),
+                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
 
-        criticsTarget[i] = Net(Layer<Tanh>::_(stateDim + actionDim, hiddenDim, true, false),
-                               TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
+        criticsTarget[i] = Net(MOE<16, 16>::_(stateDim, false),
+                               TransformerBlock<16>::_(stateDim, false),
+                               TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, false),
                                Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
         /* Independent random init + training naturally breaks symmetry */
         critics[i].copyTo(criticsTarget[i]);

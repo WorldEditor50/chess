@@ -91,6 +91,7 @@ void RL::DPG::reinforce(std::vector<Step>& x, float learningRate)
         discountedReward[i] = r;
     }
     float u = discountedReward.mean();
+    double lossSum = 0.0;   /* 界面曲线的策略梯度损失 (见 dpg.h 的 lastLoss) */
     for (std::size_t t = 0; t < x.size(); t++) {
         const Tensor &prob = x[t].action;
         int k = x[t].action.argmax();
@@ -99,8 +100,17 @@ void RL::DPG::reinforce(std::vector<Step>& x, float learningRate)
         x[t].action[k] = prob[k]*(discountedReward[t] - u);
         Tensor &out = policyNet.forward(x[t].state);
         Tensor dLoss = Loss::CrossEntropy::df(out, x[t].action);
+        /*
+           记录策略梯度损失 (只给界面画曲线用): 这里用的是与 dLoss 同一个
+           加权交叉熵, 所以它和实际优化的是同一个量。
+           注: 界面上的 PG agent 走的是这个 reinforce() (agentrollout 那条路),
+           不是 reinforce1() —— 两处都要填 lastLoss, 否则损失曲线还是空的。
+        */
+        const double w = (double)x[t].action[k];
+        lossSum += -w * std::log((double)out[k] + 1e-8);
         policyNet.backward(x[t].state, dLoss);
     }
+    lastLoss = lossSum / (double)x.size();
     alpha.RMSProp(1e-7, 0.9, 0);
     alpha.clamp(0.2, 0.2, 1);
     policyNet.RMSProp(learningRate, 0.9, 0);
@@ -169,6 +179,8 @@ void RL::DPG::reinforce1(std::vector<Step>& x, float learningRate)
         advantage[t] = (discountedReward[t] - u)/scale;
     }
 
+    double lossSum = 0.0;   /* 界面曲线的策略梯度损失累加 (见 dpg.h 的 lastLoss) */
+
     for (std::size_t t = 0; t < n; t++) {
         /* argmax of the stored action selects the action that was taken. The
            action tensor is only READ here: the original reinforce() above
@@ -179,6 +191,13 @@ void RL::DPG::reinforce1(std::vector<Step>& x, float learningRate)
 
         /* --- Forward pass to get current policy --- */
         Tensor &out = policyNet.forward(x[t].state);
+
+        /*
+           记录策略梯度损失 (只给界面画曲线用, 见 dpg.h):
+           surrogate = -A_t·log π(a_t|s_t), 最后取平均。
+           log 用 out[k] (已经过 softmax), 与下面 dLoss 用的是同一个 probK。
+        */
+        lossSum += -(double)advantage[t] * std::log((double)out[k] + 1e-8);
 
         /* --- alpha (temperature) gradient ---
            Entropy of the FULL policy distribution, H = -Σ π_i·log(π_i).
@@ -207,6 +226,8 @@ void RL::DPG::reinforce1(std::vector<Step>& x, float learningRate)
     /* Keep the temperature inside the same range reinforce() uses. */
     alpha.clamp(0.2f, 0.2f, 1.0f);
     policyNet.RMSProp(learningRate, 0.9, 0);
+    /* 本轮的策略梯度损失 (界面曲线用, 见 dpg.h) */
+    lastLoss = lossSum / (double)n;
     exploringRate *= 0.99999;
     exploringRate = exploringRate < 0.1 ? 0.1 : exploringRate;
     return;

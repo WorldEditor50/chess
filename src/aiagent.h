@@ -3,6 +3,7 @@
 
 #include <string>
 #include <fstream>
+#include <limits>
 #include "chess.h"
 
 /*
@@ -71,6 +72,21 @@ public:
 
     /* 最近一次 exploreAndTrain 的说明, 供界面显示 */
     virtual std::string getExploreInfo() const { return m_exploreInfo; }
+
+    /*
+     * 最近一次在线训练的损失, 供界面画"训练损失曲线"(见 mainwindow / metricsview)。
+     *
+     * 返回 NaN 表示这个 agent **不上报**损失 (纯搜索 agent 没有可训练参数, 或者该
+     * agent 的训练循环里没有 scalar loss 可报)。曲线控件对非有限值是**直接丢弃**的,
+     * 所以不上报不会画出一条假的水平线, 只会没有点。
+     *
+     * 已上报的: SACAZAgent (critic 的 MSE)、DQNAgent (平均平方 TD 误差)、
+     * EVABAgent (价值网蒸馏的 MSE)。
+     */
+    virtual float getLastTrainLoss() const
+    {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
 
 protected:
     std::string m_exploreInfo;

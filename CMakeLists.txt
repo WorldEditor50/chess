@@ -260,11 +260,24 @@ set(APP_SOURCES
     ${SRC_DIR}/pgagent.cpp
     ${SRC_DIR}/pos.cpp
     ${SRC_DIR}/ppomcts_agent.cpp
+    ${SRC_DIR}/sacazagent.cpp
     ${SRC_DIR}/stone.cpp
     ${SRC_DIR}/thinkingindicator.cpp
+    ${SRC_DIR}/metricsview.cpp
+    ${SRC_DIR}/busydialog.cpp
     ${SRC_DIR}/mainwindow.ui
     ${SRC_DIR}/res.qrc
 )
+# ---------------------------------------------------------------------------
+# Windows 可执行文件图标 (PE 资源里的 RT_GROUP_ICON)。
+# 注意它和"运行时窗口图标"是两件事:
+#   * src/app.rc / app.ico  -> 资源管理器/任务栏固定时看到的 exe 图标 (这里)
+#   * src/res.qrc / app.png -> main.cpp 里 QApplication::setWindowIcon (窗口/任务栏)
+# 两个都加上才算完整 (只做一个会出现"窗口有图标、文件没有")。
+# 图标由 tools/make_app_icon.ps1 生成, 不是手搓的二进制。
+if (WIN32)
+    list(APPEND APP_SOURCES ${SRC_DIR}/app.rc)
+endif()
 add_executable(chess ${APP_SOURCES})
 
 chess_add_header_deps(chess)
@@ -477,7 +490,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/dqnagent.cpp
         ${SRC_DIR}/pgagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp
-        ${SRC_DIR}/dqnmcts_agent.cpp)
+        ${SRC_DIR}/dqnmcts_agent.cpp
+        ${SRC_DIR}/sacazagent.cpp)
     target_include_directories(test_match PRIVATE ${SRC_DIR})
     target_link_libraries(test_match PRIVATE
         RL_CORE
@@ -491,8 +505,16 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(test_match)
     add_test(NAME test_match COMMAND test_match)
+    # ctest 从普通 shell 启动时 PATH 里没有 Qt 的 bin, test_match 会以
+    # 0xc0000135 (STATUS_DLL_NOT_FOUND) 立刻退出 —— 看起来像测试挂了, 其实
+    # 是环境问题。这里把 Qt 的 bin 目录显式前置到测试的 PATH 里。
+    # 用 ENVIRONMENT_MODIFICATION 而不是 ENVIRONMENT, 因为 PATH 自己就是用
+    # ';' 分隔的, 直接塞进 ENVIRONMENT 会被当成多条环境设置。
+    set(_qt_bin_dir "${Qt6_DIR}/../../../bin")
+    cmake_path(NORMAL_PATH _qt_bin_dir)
     set_tests_properties(test_match PROPERTIES TIMEOUT 600
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir}")
 
     # ------------------------------------------- 梯度传播正确性 (SIMD 之后)
     # 用中心差分核对 Net::backward 填出来的解析梯度, 覆盖普通 MLP 与 DQN 的
@@ -512,6 +534,93 @@ if(CHESS_BUILD_TESTS)
     chess_add_header_deps(test_grad)
     add_test(NAME test_grad COMMAND test_grad)
     set_tests_properties(test_grad PROPERTIES TIMEOUT 600)
+
+    # ------------------------------------------- 权重文件格式
+    # 权重文件是训练成果的唯一载体: 老格式是十进制文本 (有损! 存一次读回来权重就
+    # 漂移 ~1e-6)、没有校验、写一半崩掉就毁文件。这里逐条验证新格式: 逐比特无损、
+    # 结构指纹 + 每张量 CRC32、原子写入、以及**老文件仍然能读**。
+    add_executable(test_weights
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_weights_main.cpp)
+    target_include_directories(test_weights PRIVATE ${SRC_DIR})
+    target_link_libraries(test_weights PRIVATE RL_CORE)
+    target_compile_options(test_weights PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_weights PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_weights)
+    add_test(NAME test_weights COMMAND test_weights)
+    set_tests_properties(test_weights PROPERTIES TIMEOUT 300)
+
+    # ------------------------------------------- 稀疏路由 MoE    # 上游 moe.hpp 是稠密的 (全算 E 个专家), 在 d_model=1260 上不可用;
+    # sparse_moe.hpp 只算门控选中的 top-k 个。这个测试盯四件事:
+    #   * 前向真的跳过了未选中的专家 (改它们的权重输出要逐位不变)
+    #   * TopK==E 时与上游 MOE 的前向/反向完全一致 (证明门控约定没变)
+    #   * 反向的解析梯度 vs 有限差分 (含"未选中专家的梯度必须恰好为 0")
+    #   * 负载均衡辅助损失的梯度 vs 有限差分, 以及它确实把坍缩的路由拉回来
+    add_executable(test_sparse_moe
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sparse_moe_main.cpp)
+    target_include_directories(test_sparse_moe PRIVATE ${SRC_DIR})
+    target_link_libraries(test_sparse_moe PRIVATE RL_CORE)
+    target_compile_options(test_sparse_moe PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_sparse_moe PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_sparse_moe)
+    add_test(NAME test_sparse_moe COMMAND test_sparse_moe)
+    set_tests_properties(test_sparse_moe PROPERTIES TIMEOUT 600)
+
+    # ------------------------------------------- 骨干 A/B/C/D 等时对弈基准
+    # **不进 ctest**: 它跑真实对局, 依赖随机开局, 而且 TB 专家骨干一步几十毫秒,
+    # 放进 ctest 既慢又会偶发失败。手动跑:
+    #   cmake --build <build> --target bench_moe && <build>/bench_moe --games=4
+    add_executable(bench_moe
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_include_directories(bench_moe PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_moe PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_moe PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_moe PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_moe)
+
+    # ------------------------------------------- SAC + MCTS + AlphaZero agent
+    # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
+    # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。
+    add_executable(test_sacaz
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sacaz_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_include_directories(test_sacaz PRIVATE ${SRC_DIR})
+    target_link_libraries(test_sacaz PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_sacaz PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_sacaz PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_sacaz)
+    add_test(NAME test_sacaz COMMAND test_sacaz)
+    set_tests_properties(test_sacaz PROPERTIES TIMEOUT 600)
 
     # 想用 AddressSanitizer 查这类问题 (arena 里"agent 返回非法走法"/堆损坏),
     # 必须**整个构建**都带 /fsanitize=address —— 只给一个目标加会在链接时报

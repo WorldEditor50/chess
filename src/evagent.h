@@ -69,11 +69,36 @@ public:
      * 学习评估与手工评估的混合比例。
      *   0.0 -> 叶子 = tanh(手工评估/S), 行为等价于 ABAgent (但搜索更强)
      *   1.0 -> 叶子 = 价值网络输出
+     *
+     * **它不再是"永远 0"**: 每次成功的在线更新之后 blend 会向 blendMax 爬一步
+     * (见 exploreAndTrain 里的阶梯), 回滚时退回去。以前这里只有初值 0、没有任何
+     * 地方改它, 于是界面上那个"learned eval"其实一次都没参与过决策 —— 实测
+     * (build/evab_probe2.cpp) 20 次在线更新里网络输出只动了 1.4e-4, 而 blend 恒为 0。
      */
     float blend;
+    /*
+     * blend 的爬升上限与每步增量 (见 exploreAndTrain)。
+     * 上限取 0.3 而不是 1.0 有两个实测理由:
+     *   1. 网络是**照着"0.5 手工评估 + 0.5 搜索评分"训练的**, 训好之后它本来就
+     *      接近手工评估 (实测 |net-hand| ≈ 0.02), 再往上加权重买不到多少差别;
+     *   2. 只要 blend > 0, 叶子评估就要跑一次网络前向 (1260->48->1 ≈ 60k MAC,
+     *      而手工评估只有几十次运算) —— 实测 depth=5 时 blend=0 是 60 ms/步,
+     *      blend=0.5 是 724~858 ms/步 (12~14 倍)。**评估变贵 = 搜索变浅**,
+     *      所以让网络"接管评估"在当前实现下是亏的。
+     */
+    float blendMax;
+    float blendStep;
     /* 搜索预算: 深度上限 + 时间上限 (毫秒, 0 = 不限时) */
     int maxDepth;
     long long timeBudgetMs;
+    /*
+     * "探索 + 在线训练"这一轮的**时间上限** (毫秒, 0 = 不限时)。
+     * 为什么需要它: 探索的每一步都要跑一次 labelDepth 层的 negamax 当标签, 而界面上
+     * "预训步数"默认 64 —— 深度 4 时就是 64 × ~25 ms ≈ 1.6 s, 深度 5 时 ~12 s。
+     * 有了时间上限, 步数就变成"上限"而不是"承诺", 单步思考时间可控;
+     * 实际滚了多少步会写进 getExploreInfo()。
+     */
+    long long exploreBudgetMs;
     /* 训练时对局结果标签的权重 (其余权重给 TD-leaf 的搜索根评分) */
     float outcomeWeight;
     /* 训练时以 eps 概率随机走子, 保证自对弈数据的多样性 */
@@ -160,6 +185,12 @@ public:
     long long getLeafEvals() const { return m_leafEvals; }
     /* 最近一次 search() 的根评分 (当前走棋方视角): 训练时用作 TD-leaf 标签 */
     double getLastRootScore() const { return m_lastRootScore; }
+    /*
+     * 最近一次在线训练 (trainBatch) 的平均绝对误差, 界面的"训练损失曲线"用。
+     * 这里用 MAE 而不是 MSE: EVAB 的价值网目标就是"网络分 vs 手写评估分"的差,
+     * 报差值的绝对值最直观。
+     */
+    float getLastTrainLoss() const override { return m_lastLoss; }
     void resetStats();
 
 private:
@@ -179,6 +210,7 @@ private:
     long long m_leafEvals;
     int m_reachedDepth;
     double m_lastRootScore;
+    float m_lastLoss = std::numeric_limits<float>::quiet_NaN();  /* 见 getLastTrainLoss */
     /* 网络隐藏层宽度 (在线更新时要按同样的结构造一份备份用于回滚) */
     int m_hiddenDim;
     /* 复用缓冲, 避免每次评估都分配 1260 维张量 */

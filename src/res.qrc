@@ -1,5 +1,11 @@
 <RCC>
     <qresource prefix="/">
         <file>appstyle.qss</file>
+        <!--
+            程序图标 (256x256)。运行时由 main.cpp 的 QApplication::setWindowIcon()
+            加载, 于是所有窗口 (主窗口 / 请稍候弹窗 / 放大曲线窗口 / 消息框) 都带上它。
+            exe 文件本身的图标由 src/app.rc 用同一个设计 (src/app.ico) 编进 PE 资源。
+        -->
+        <file>app.png</file>
     </qresource>
 </RCC>

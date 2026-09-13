@@ -231,6 +231,95 @@
      </widget>
     </item>
     <item>
+     <widget class="QWidget" name="metricsPanel" native="true">
+      <property name="minimumSize">
+       <size>
+        <width>330</width>
+        <height>0</height>
+       </size>
+      </property>
+      <property name="maximumSize">
+       <size>
+        <width>430</width>
+        <height>16777215</height>
+       </size>
+      </property>
+      <layout class="QVBoxLayout" name="metricsLayout">
+       <item>
+        <widget class="QLabel" name="scoreLabel">
+         <property name="text">
+          <string>当前比分: -</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="metricsHintLabel">
+         <property name="text">
+          <string>曲线: 训练损失 / 每局环境奖励</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="CurveChart" name="lossChart"/>
+       </item>
+       <item>
+        <widget class="QLabel" name="lossValueLabel">
+         <property name="text">
+          <string>损失: -</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="CurveChart" name="rewardChart"/>
+       </item>
+       <item>
+        <widget class="QLabel" name="rewardValueLabel">
+         <property name="text">
+          <string>奖励: -</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="metricsBtnRow">
+         <item>
+          <widget class="QPushButton" name="clearMetricsBtn">
+           <property name="text">
+            <string>清空曲线</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="exportMetricsBtn">
+           <property name="text">
+            <string>导出 CSV</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="gameListLabel">
+         <property name="text">
+          <string>逐局明细</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QListWidget" name="gameListWidget"/>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
      <spacer name="horizontalSpacer">
       <property name="orientation">
        <enum>Qt::Orientation::Horizontal</enum>
@@ -257,6 +346,12 @@
    <class>ThinkingIndicator</class>
    <extends>QWidget</extends>
    <header location="global">src/thinkingindicator.h</header>
+   <container>0</container>
+  </customwidget>
+  <customwidget>
+   <class>CurveChart</class>
+   <extends>QWidget</extends>
+   <header location="global">src/metricsview.h</header>
    <container>0</container>
   </customwidget>
  </customwidgets>

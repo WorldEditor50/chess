@@ -61,8 +61,18 @@ public:
         Random::uniform(w, -1, 1);
         Random::uniform(b, -1, 1);
     }
+    /*
+       拷贝构造必须把**参数**也复制过来。
+       原来它只复制 inputDim/outputDim, 于是 w/b/o/e/g/v/m 全部退化空张量 ——
+       任何"按值返回 / 拷贝一个 Layer"的写法都会**静默丢掉所有权重**, 之后
+       前向就是空张量上的越界读, 结果是垃圾值/NaN (实测: 稀疏 MoE 的专家用
+       工厂按值返回时命中, 见 docs/rl_sync.md §1.2)。
+       Net 的拷贝语义不受影响: Net 复制的是 shared_ptr 容器 (浅拷贝, 有意为之),
+       真正的深拷贝仍然走 Net::copyTo()。
+    */
     explicit iFcLayer(const iFcLayer &r)
-        :inputDim(r.inputDim), outputDim(r.outputDim){}
+        :iLayer(r), inputDim(r.inputDim), outputDim(r.outputDim), bias(r.bias),
+         w(r.w), b(r.b), g(r.g), v(r.v), m(r.m){}
     virtual ~iFcLayer(){}
     virtual void initParams() override
     {

@@ -1,0 +1,13 @@
+/*
+ * app.rc - Windows 可执行文件图标
+ * ============================================================================
+ *
+ * 为什么需要这个文件: Qt 里的 QApplication::setWindowIcon() 只影响**运行时的窗口/
+ * 任务栏图标**, 而 exe 文件本身在资源管理器/任务栏固定时的图标来自 PE 资源的
+ * RT_GROUP_ICON —— 那一份必须由资源编译器 (rc.exe) 编进去。两者都做了才算"有图标"。
+ *
+ * 图标是 tools/make_app_icon.ps1 生成的 (脚本化生成的好处见那个文件的开头):
+ *   src/app.ico  7 个尺寸 (16/24/32/48/64/128/256)
+ *   src/app.png  256x256, 通过 res.qrc 嵌进二进制, 供 setWindowIcon 使用
+ */
+IDI_APPICON ICON "app.ico"
