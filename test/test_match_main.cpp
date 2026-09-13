@@ -248,6 +248,114 @@ int main(int argc, char *argv[])
         board.setPreTrainSteps(0);
     }
 
+    /* ------------------------------------------------- 2.8 对局过程中的奖励曲线 */
+    /*
+       用户反馈"对弈时奖励曲线没有更新"。原因不是信号断了, 而是**采样太稀**:
+       gameRewardSample 一局只发一次, 而一局可能有几百手、跑十几分钟 (实测 276 手
+       621 秒), 于是整局过程中曲线一动不动。现在 matchRewardProgress 每手发一次,
+       带的是"本局到目前为止"累计的 A/B 环境奖励。
+
+       这一节钉住三件事:
+         (1) 每手都有一个进度点 (一局 12 手 -> 十几个点, 而不是 1 个);
+         (2) 进度点按局分组, 组内手号从 1 开始连续;
+         (3) 进度账与局末账是**同一本账**: 每局最后一个进度点 + 终局 ±1 == 局末那个点,
+             且 A/B 的差恒为相反数 (谁赢谁 +1)。
+    */
+    std::printf("\n[2.8] 每手的奖励进度 (matchRewardProgress) 与局末奖励是同一本账\n");
+    {
+        board.setMaxPliesPerGame(12);
+        struct GameTrace {
+            QVector<int> plys;
+            QVector<double> progA;
+            QVector<double> progB;
+            bool hasFinal = false;
+            double finalA = 0.0;
+            double finalB = 0.0;
+        };
+        QVector<GameTrace> games;
+        const QMetaObject::Connection c1 = QObject::connect(
+            &board, &ChessBoard::matchRewardProgress,
+            [&games](int gameNo, int ply, double rewardA, double rewardB) {
+                if (gameNo < 1) {
+                    return;
+                }
+                while (games.size() < gameNo) {
+                    games.append(GameTrace());
+                }
+                GameTrace &g = games[gameNo - 1];
+                g.plys.append(ply);
+                g.progA.append(rewardA);
+                g.progB.append(rewardB);
+            });
+        const QMetaObject::Connection c2 = QObject::connect(
+            &board, &ChessBoard::gameRewardSample,
+            [&games](int gameNo, const QString &, const QString &,
+                     double rewardA, double rewardB) {
+                if (gameNo < 1 || gameNo > games.size()) {
+                    return;
+                }
+                GameTrace &g = games[gameNo - 1];
+                g.hasFinal = true;
+                g.finalA = rewardA;
+                g.finalB = rewardB;
+            });
+        const ChessBoard::MatchStats st2 =
+            board.matchAgents(ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_ALPHABETA, 2);
+        QObject::disconnect(c1);
+        QObject::disconnect(c2);
+
+        CHECK(games.size() == st2.games, "每局一组进度点");
+        CHECK(st2.games == 2, "这一节跑完 2 局");
+        int minPoints = -1;
+        int deltaSum = 0;
+        bool contiguous = true;
+        bool sameBook = true;
+        bool opposite = true;
+        for (int i = 0; i < games.size(); ++i) {
+            const GameTrace &g = games[i];
+            std::printf("    第 %d 局: 进度点 %d 个, 最后一手累计 A=%+.2f B=%+.2f, "
+                        "局末 A=%+.2f B=%+.2f\n",
+                        i + 1, (int)g.progA.size(),
+                        g.progA.isEmpty() ? 0.0 : g.progA.last(),
+                        g.progB.isEmpty() ? 0.0 : g.progB.last(),
+                        g.hasFinal ? g.finalA : 0.0, g.hasFinal ? g.finalB : 0.0);
+            if (minPoints < 0 || g.progA.size() < minPoints) {
+                minPoints = (int)g.progA.size();
+            }
+            /* 手号连续: 1,2,3,... (中途漏一手说明 emit 的位置漏了) */
+            for (int k = 0; k < g.plys.size(); ++k) {
+                if (g.plys[k] != k + 1) {
+                    contiguous = false;
+                }
+            }
+            CHECK(g.hasFinal, "这一局有局末奖励采样");
+            if (g.hasFinal && !g.progA.isEmpty()) {
+                const double dA = g.finalA - g.progA.last();
+                const double dB = g.finalB - g.progB.last();
+                /* 终局只加 ±1 (和棋 0), 所以差值只能是这三个值之一 */
+                if (!(std::fabs(dA) < 1e-9 || std::fabs(dA - 1.0) < 1e-9
+                      || std::fabs(dA + 1.0) < 1e-9)) {
+                    sameBook = false;
+                }
+                if (!(std::fabs(dA + dB) < 1e-9)) {
+                    opposite = false;
+                }
+                deltaSum += (int)std::lround(dA);
+            }
+        }
+        /*
+           一局 12 手 -> 进度点 11~12 个 (最后一手若是"被将死"那一次, 它不落子, 也就
+           没有对应的进度点)。关键是**远大于 1**: 用户看到的"不更新"就是 1 个点。
+        */
+        std::printf("    每组最少进度点 = %d (局手数上限 12)\n", minPoints);
+        CHECK(minPoints >= 11, "每局都有接近手数的进度点 (不是每局只 1 个点)");
+        CHECK(contiguous, "进度点的手号是连续的");
+        CHECK(sameBook, "最后一个进度点 + 终局 ±1 == 局末奖励 (同一本账)");
+        CHECK(opposite, "A/B 的局末增量互为相反数 (一方 +1 另一方 -1)");
+        CHECK(deltaSum == st2.winA - st2.winB,
+              "两局的胜负增量之和 == 比分差 (A 胜局数 - B 胜局数)");
+    }
+
     /* ---------------------------------------------------------------- 3. 中止 */    std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");
     board.setMaxPliesPerGame(300);
     ChessBoard::MatchStats aborted;

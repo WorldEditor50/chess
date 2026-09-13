@@ -265,6 +265,10 @@ try {
         $wantB = $shortName[$BIndex]
         Write-Output ("B side agent = {0}" -f (Select-ComboItem 2 $BIndex))
     }
+    # 这一场有没有"可训练 agent" (0=Alpha-Beta, 1=MCTS 没有可训练参数, 其余都有)。
+    # 它决定三件事适不适用: 损失曲线读数、静默保存那一行、保存计时日志 —— 都是
+    # "没有可训练参数就本来不该出现"的东西, 拿它们当失败会把配置问题报成产品 bug。
+    $expectSave = ($AIndex -gt 1) -or ($BIndex -gt 1)
 
     Set-Games $Games
     Start-Sleep -Milliseconds 300
@@ -277,6 +281,11 @@ try {
     Write-Output ("match_running = {0}  (button switched to the stop label)" -f $running)
 
     $final = ""
+    # ---- 对局进行中: 奖励曲线的点数必须在涨 ----
+    # 用户报过"对弈时奖励曲线没有更新": 原来一局只采一个点, 一局几百手、十几分钟
+    # 里曲线一动不动。现在每手一个点, 所以只要对局在走, 读数里的"N 点"就会变大。
+    # 这里在对局进行中隔一会儿取一次样, 最后要求"最后一次 > 第一次"。
+    $rewardPts = @()
     if ($Full) {
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
         while ((Get-Date) -lt $deadline) {
@@ -284,6 +293,12 @@ try {
                 if ($t -like "*共 *局*手*") { $final = $t }
             }
             if ($final -ne "" -and $final -notlike "*进行中*") { break }
+            foreach ($t in All-Texts) {
+                if ($t -like "奖励*" -and $t -match "(\d+)\s*点") {
+                    $rewardPts += [int]$Matches[1]
+                    break
+                }
+            }
             Start-Sleep -Milliseconds 700
         }
     } else {
@@ -326,15 +341,25 @@ try {
     $gameLines = @()
     foreach ($it in $items) { if ($it -like "第*局*") { $gameLines += $it } }
     $lossDesc = Get-Desc "训练损失 (每完成一次在线训练一个点)"
-    $rewardDesc = Get-Desc "每局环境奖励 (吃子 + 终局 ±1, 走子方视角)"
+    $rewardDesc = Get-Desc "环境奖励 (每手累计, 局末含终局 ±1; 走子方视角)"
     # 曲线内容是画出来的, UIA 读不到数字; 图下面的数字读数标签才是可读的凭据
     $lossText = ""
     $rewardText = ""
     foreach ($t in All-Texts) {
         if ($t -like "损失 *") { $lossText = $t }
-        if ($t -like "奖励 *") { $rewardText = $t }
+        if ($t -like "奖励*") { $rewardText = $t }
     }
     Write-Output ("score label = " + $score)
+    # ---- 对局过程中的增长 (取样在对局进行中完成) ----
+    if ($rewardPts.Count -ge 2) {
+        $grew = ($rewardPts[$rewardPts.Count - 1] -gt $rewardPts[0])
+        Write-Output ("reward curve grew during the match = {0}  (n: {1} -> {2}, {3} 次采样)" -f `
+            $grew, $rewardPts[0], $rewardPts[$rewardPts.Count - 1], $rewardPts.Count)
+        $rewardOk = $rewardOk -and $grew
+    } else {
+        Write-Output ("reward curve grew during the match = 跳过 (对局太短, 只采到 {0} 次)" -f `
+            $rewardPts.Count)
+    }
     Write-Output ("game list items = {0} (其中逐局行 {1})" -f $items.Count, $gameLines.Count)
     foreach ($it in $items) { Write-Output ("   | " + $it) }
     Write-Output ("loss readout   = " + $lossText)
@@ -345,16 +370,50 @@ try {
     # 每局一行明细 (且行里要有奖励信息)
     $listOk = ($gameLines.Count -ge 1) -and ($gameLines[0] -like "*奖励*")
     $scoreOk = ($score -match "\d+\s*:\s*\d+")
-    # 奖励曲线每局两个点 (A/B 各一个) -> 读数里必须出现"N 点"
+    # 奖励曲线每手一个点 (局末再多一个含 ±1 的点) -> 点数至少要赶上总手数。
+    # 这是用户那个"对弈时奖励曲线没有更新"的**防回归断言**: 点数≈1 就是 bug 复现。
     $rewardOk = ($rewardText -match "(\d+)\s*点") -and ([int]$Matches[1] -ge 1)
-    # 损失读数: 会上报损失的 agent 才有数字, 不上报的显示"暂无"
-    $lossOk = ($lossText -like "*暂无*") -or ($lossText -match "\d+\s*点")
+    $rewardPtsFinal = -1
+    if ($rewardText -match "(\d+)\s*点") { $rewardPtsFinal = [int]$Matches[1] }
+    $plies = -1
+    if ($final -match "(\d+)\s*手") { $plies = [int]$Matches[1] }
+    $gamesDone = -1
+    if ($final -match "共\s*(\d+)\s*局") { $gamesDone = [int]$Matches[1] }
+    if ($rewardPtsFinal -ge 0 -and $plies -ge 0 -and $gamesDone -ge 0) {
+        # 一手一个点, 每局再多一个"局末含 ±1"的点; 被将死那一手不落子所以每局可能少一个,
+        # 于是下界取 (手数 - 局数)。
+        $wantPts = $plies - $gamesDone
+        $perMoveOk = ($rewardPtsFinal -ge $wantPts)
+        Write-Output ("reward points vs plies = {0} 点 / {1} 手 (下界 {2}) -> {3}" -f `
+            $rewardPtsFinal, $plies, $wantPts, $perMoveOk)
+        $rewardOk = $rewardOk -and $perMoveOk
+    }
+    # 损失读数: 会上报损失的 agent 才有数字; 两边都是 Alpha-Beta/MCTS 时读数就是 "-"
+    # (没有可训练参数 -> 不上报, 曲线里没有点, 这是**正确**行为, 不能算失败)。
+    # 注意 $lossText 是**带前缀**的 ("损失 ..."), 要先把前缀去掉再比 —— 否则
+    # "-" 永远匹配不上, 这个跳过分支就是死代码 (第一版就是这么写的)。
+    $lossBody = $lossText -replace "^损失\s*", ""
+    $lossOk = $true
+    if ($lossBody -eq "-" -or $lossBody -eq "") {
+        if (-not $expectSave) {
+            Write-Output "   (跳过损失读数检查: 两边都没有可训练参数, 本来就不该有曲线)"
+        } else {
+            $lossOk = $false
+        }
+    } else {
+        $lossOk = ($lossText -match "\d+\s*点")
+    }
     # ---- 静默保存: 列表里应出现"已静默保存权重"的行, 且不该有文件对话框的残留 ----
-    # 保存跑在后台线程, 而且稀疏 MoE 变体的权重是 3x146 MB (十几秒), 所以这里要**等**
+    # 保存跑在后台线程, 而且稀疏 MoE 变体的权重是 3x146 MB, 所以这里要**等**
     # 它出现, 不能在下棋结束的一瞬间就去读列表 (第一版就是这么误报失败的)。
+    #
+    # 但"该不该有这一行"取决于参赛的是谁: Alpha-Beta 与 MCTS 没有可训练参数、
+    # 也就没有权重文件, saveWeightsAfterMatch 会跳过它们。所以两边都是 0/1 的时候
+    # **本来就不该有**这一行 —— 不当成失败, 打印跳过原因 (否则脚本会把自己的配置错误
+    # 报成产品 bug)。$expectSave 在上面按 A/B 序号算好了。
     $silentSave = $false
     $saveDeadline = (Get-Date).AddSeconds(60)
-    while (-not $silentSave -and (Get-Date) -lt $saveDeadline) {
+    while ($expectSave -and -not $silentSave -and (Get-Date) -lt $saveDeadline) {
         foreach ($it in (All-ListItems)) {
             if ($it -like "*静默保存权重*") { $silentSave = $true; Write-Output ("   | " + $it) }
         }
@@ -364,6 +423,10 @@ try {
         foreach ($it in $items) {
             if ($it -like "*静默保存权重*") { $silentSave = $true }
         }
+    }
+    if (-not $expectSave) {
+        Write-Output ("   (跳过静默保存检查: A/B 都是无可训练参数的 agent, 本来就不存权重)")
+        $silentSave = $true
     }
     # 以前对弈结束会弹一个**模态**文件对话框, 它的文件列表会混进 ListItem 里
     # (目录项、.dat 文件名...)。现在静默保存, 这些"杂物"必须一条都没有。
@@ -447,8 +510,15 @@ try {
     if ($largeText -ne "") {
         $a = $largeText -replace "^读数\s*", ""
         $b = $lossText -replace "^损失\s*", ""
-        $largeDataOk = ($a -eq $b) -and ($a -ne "-")
-        Write-Output ("   large window mirrors the source label = {0}" -f $largeDataOk)
+        if (($a -eq "-") -and (-not $expectSave)) {
+            # 没有可训练 agent -> 源控件本来就是空的, 放大窗口也只能是空的,
+            # 没有"镜像"可比 (报 False 就是把配置问题当成 bug)
+            Write-Output "   (跳过放大窗口数据比对: 这一场没有损失曲线)"
+            $largeDataOk = $true
+        } else {
+            $largeDataOk = ($a -eq $b) -and ($a -ne "-")
+            Write-Output ("   large window mirrors the source label = {0}" -f $largeDataOk)
+        }
     }
     Write-Output ("large window has data = {0}" -f $largeDataOk)
 
@@ -491,6 +561,10 @@ try {
         # 也带 ms, 拿它去满足这个检查就会"对局还没打完也报通过"(第一版就是这么错的)。
         foreach ($ln in $saveLines) {
             if ($ln -like "*保存*" -and $ln -match "\d+\s*ms") { $timed = $true }
+        }
+        if (-not $expectSave) {
+            Write-Output ("   (跳过保存计时检查: 这一场没有可保存权重的 agent)")
+            $timed = $true
         }
         Write-Output ("save timing logged = {0}" -f $timed)
         $ok = $ok -and $timed

@@ -293,6 +293,25 @@ MainWindow::MainWindow(QWidget *parent)
             }
             updateMetricsLabels();
         });
+    /*
+        ---- 一局进行中的奖励进度 (每手一个点) ----
+       只有上面那个"每局一个点"的话, 一局几百手、十几分钟里奖励曲线一动不动
+       (用户反馈: "对弈时奖励曲线没有更新")。这里每手补一个点, 值是本局**到目前为止**
+       累计到的环境奖励, 于是曲线随着对局往前走; 局末的 ±1 由上面那个信号补上最后一点
+       (所以每局最后一个点会比倒数第二个"多出一个胜负")。
+    */
+    connect(ui->gameWidget, &ChessBoard::matchRewardProgress, this,
+        [this](int gameNo, int ply, double rewardA, double rewardB) {
+            (void)gameNo;
+            (void)ply;
+            if (m_rewardSeriesA >= 0) {
+                ui->rewardChart->addPoint(m_rewardSeriesA, rewardA);
+            }
+            if (m_rewardSeriesB >= 0) {
+                ui->rewardChart->addPoint(m_rewardSeriesB, rewardB);
+            }
+            updateMetricsLabels();
+        });
     /* 本次"探索环境 + 预训练"到底做了什么 */
     connect(ui->gameWidget, &ChessBoard::aiExploreInfo, this,
         [this](const QString &info) {
@@ -632,7 +651,10 @@ void MainWindow::onStartMatch()
  *    lossChart   : 训练损失。**每个 agent 一条**(名字进图例) —— 不同 agent 的
  *                  损失尺度完全不同 (SAC+AZ 是 critic 的 MSE, EVAB 是价值网蒸馏
  *                  的 MAE, DQN 是平方 TD 误差), 混在一条线上没有可比性。
- *    rewardChart : 每局环境奖励。每场对弈两条 (A / B), 每局结束各加一个点。
+ *    rewardChart : 环境奖励。每场对弈两条 (A / B), **每手一个点** —— 值是"本局
+ *                  到目前为止"的累计, 局末再补一个含终局 ±1 的点 (每局最后一个点
+ *                  因此会比它前面那个多出胜负那一份)。一局可能几百手、跑十几分钟,
+ *                  只在局末给一个点的话整局都看不到变化。
  *                  纵轴含 0 线, 所以"正贡献/负贡献"一眼能看出来。
  *
  *  曲线只保留最近 2000 个点 (setWindow): 后台训练会一直往里塞样本, 不设上限就是
@@ -644,7 +666,8 @@ void MainWindow::setupMetricsPanel()
     ui->lossChart->setValueSuffix(QString());
     ui->lossChart->setWindow(2000);
 
-    ui->rewardChart->setTitle(QStringLiteral("每局环境奖励 (吃子 + 终局 ±1, 走子方视角)"));
+    ui->rewardChart->setTitle(
+        QStringLiteral("环境奖励 (每手累计, 局末含终局 ±1; 走子方视角)"));
     ui->rewardChart->setValueSuffix(QString());
     ui->rewardChart->setWindow(2000);
 
@@ -670,7 +693,8 @@ void MainWindow::setupMetricsPanel()
         openLargeChart(ui->lossChart, QStringLiteral("训练损失 (放大)"));
     });
     connect(ui->rewardChart, &CurveChart::doubleClicked, this, [this]() {
-        openLargeChart(ui->rewardChart, QStringLiteral("每局环境奖励 (放大)"));
+        openLargeChart(ui->rewardChart,
+                       QStringLiteral("环境奖励 (每手累计, 局末含 ±1) — 放大"));
     });
 }
 
@@ -711,8 +735,13 @@ void MainWindow::updateMetricsLabels()
     /* 读数格式化统一在 CurveChart::readoutText 里, 免得三处各写一份 (以前就不一致) */
     ui->lossValueLabel->setText(
         ui->lossChart->readoutText(QStringLiteral("损失")));
+    /*
+       奖励那条的前缀写明"局内累计": 它的点不是"每局一个终值", 而是**一局之内逐步
+       累加**的曲线 (每手一个点), 所以"均值/最小/最大"描述的是**累计值**的分布 ——
+       不写清楚的话, 均值很容易被误读成"平均每局奖励"。
+    */
     ui->rewardValueLabel->setText(
-        ui->rewardChart->readoutText(QStringLiteral("奖励")));
+        ui->rewardChart->readoutText(QStringLiteral("奖励(局内累计)")));
 }
 
 /* 每场对弈开始: 重建奖励曲线的两条序列 (名字换成这一场的两位参赛者) */

@@ -186,13 +186,21 @@ signals:
     void matchScoreChanged(const QString &scoreLine);
     /*
      * ---- 指标曲线用的采样 ----
-     * gameRewardSample : 每局结束后两位参赛者各自拿到的**环境奖励累计**
-     *                    (即时奖励之和, 走子方视角; 吃子与终局 ±1 都在里面)
-     * trainLossSample  : 每完成一次在线训练上报一次损失 (哪个 agent / 第几次)
-     * 两者都在后台线程 emit, 队列投递到 GUI 线程后进曲线。
+     * gameRewardSample   : 每局结束后两位参赛者各自拿到的**环境奖励累计**
+     *                      (即时奖励之和, 走子方视角; 吃子与终局 ±1 都在里面)
+     * matchRewardProgress: 一局**进行中**每手一次的"本局累计"环境奖励 (同样走子方
+     *                      视角, 同样含吃子, 但**不含**局末的 ±1 —— 那个由
+     *                      gameRewardSample 补上最后一点)
+     * trainLossSample    : 每完成一次在线训练上报一次损失 (哪个 agent / 第几次)
+     * 三者都在后台线程 emit, 队列投递到 GUI 线程后进曲线。
+     *
+     * 为什么要有 matchRewardProgress: 一局可能有几百手、跑十几分钟 (实测 276 手
+     * 621 秒), 而 gameRewardSample 一局只发一次 —— 用户看到的是"对弈时奖励曲线
+     * 一直不动", 会以为曲线坏了。现在每手一个点, 曲线在对局过程中就在走。
      */
     void gameRewardSample(int gameNo, const QString &agentA, const QString &agentB,
                           double rewardA, double rewardB);
+    void matchRewardProgress(int gameNo, int ply, double rewardA, double rewardB);
     void trainLossSample(double loss, const QString &agent, int step);
 
     /*
@@ -311,10 +319,14 @@ private:
     /* 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_* */
     /*
      * 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_*。
-     * rewardRed / rewardBlack 是**出参**: 本局双方各自累计到的即时环境奖励
-     * (走子方视角, 与 Chess::moveForward 的记账一致), 供界面的奖励曲线用。
+     * aIsRed 说明"这一局 A 方是不是执红", 只用来把红/黑两本账换算成 A/B 两本账
+     * (换算出来的值同时用于 rewardA/rewardB 出参和每手的 matchRewardProgress)。
+     * rewardRed / rewardBlack / rewardA / rewardB 都是**出参**: 本局各方累计到的
+     * 即时环境奖励 (走子方视角) + 终局 ±1。A/B 的换算是**唯一**在这里做的,
+     * 调用方不要再自己算一遍 (以前 matchAgents 里重复算了一次, 两处规则万一不一致
+     * 就是"曲线和逐局明细对不上")。被中止时返回 ONGOING, 四个出参停在中止那一刻的值。
      */
-    int playMatchGame(AgentType redType, AgentType blackType, MatchStats &st,
+    int playMatchGame(AgentType redType, AgentType blackType, bool aIsRed, MatchStats &st,
                       double &rewardRed, double &rewardBlack, double &rewardA,
                       double &rewardB);
     /* 是否轮到这个 agent 走 (对弈中 arena 用) */

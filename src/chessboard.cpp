@@ -1346,14 +1346,23 @@ ChessBoard::AgentType ChessBoard::typeForTurn(int turn, AgentType redType,
 }
 
 /* 打一局: 红方 redType, 黑方 blackType。返回 Chess::RESULT_*, 被中止则返回 ONGOING */
-int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats &st,
-                              double &rewardRed, double &rewardBlack, double &rewardA,
-                              double &rewardB)
+int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRed,
+                              MatchStats &st, double &rewardRed, double &rewardBlack,
+                              double &rewardA, double &rewardB)
 {
     rewardRed = 0.0;
     rewardBlack = 0.0;
     rewardA = 0.0;
     rewardB = 0.0;
+    /*
+      红/黑 -> A/B 的换算只写一次 (以前 matchAgents 里又算了一遍, 两处规则必须永远
+      一致, 否则"逐局明细里的奖励"和"曲线上的点"会对不上)。被中止时也要同步一次,
+      所以包成 lambda, 每个出口都调。
+    */
+    auto syncAB = [&]() {
+        rewardA = aIsRed ? rewardRed : rewardBlack;
+        rewardB = aIsRed ? rewardBlack : rewardRed;
+    };
     {
         QMutexLocker locker(&mutex);
         chess.reset();
@@ -1364,6 +1373,7 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats
 
     while (moves < m_maxPliesPerGame) {
         if (m_matchAbort.load()) {
+            syncAB();
             return Chess::RESULT_ONGOING;
         }
         m_selfPlayMoveNo = moves + 1;
@@ -1453,11 +1463,19 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats
             } else {
                 rewardBlack += moverReward;
             }
-            /* A/B 的归属由 matchAgents 按"这一局谁执红"换算, 这里只管红黑 */
+            /* A/B 的归属由 aIsRed 换算, 这里只管红黑 */
             /* sideToMove 必须跟着 turn 走, 否则下一手 getResult 会看错方 */
             turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
             chess.sideToMove = turn;
         }
+        /*
+            每手报一次"本局累计"奖励进度 (锁外 emit: 信号是队列投递到 GUI 线程的,
+            持锁期间碰 Qt 的元对象系统没必要)。
+            一局几百手、十几分钟, 只在局末报一次的话, 整局过程中奖励曲线一动不动 ——
+            用户反馈"对弈时奖励曲线没有更新"就是这个原因。
+        */
+        syncAB();
+        emit matchRewardProgress(m_matchGameNo.load(), moves + 1, rewardA, rewardB);
         moves++;
     }
 
@@ -1472,6 +1490,8 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats
         rewardBlack += 1.0;
         rewardRed -= 1.0;
     }
+    /* 局末的 ±1 也换算进去, 于是出参就是"本局最终环境奖励" */
+    syncAB();
 
     /*
        达到步数上限: 原来 selfPlay 按 evaluate() 判胜 (score == 0 也返回红胜),
@@ -1533,16 +1553,19 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         double rewardBlack = 0.0;
         double rewardA = 0.0;
         double rewardB = 0.0;
-        const int res = playMatchGame(redType, blackType, st, rewardRed, rewardBlack,
-                                      rewardA, rewardB);
+        const int res = playMatchGame(redType, blackType, aIsRed, st, rewardRed,
+                                      rewardBlack, rewardA, rewardB);
         if (res == Chess::RESULT_ONGOING) {
             st.aborted = true;      /* playMatchGame 用 ONGOING 表示"被中止" */
             break;
         }
 
-        /* A/B 视角的本局环境奖励 (谁执红就把红方那份记给谁) */
-        const double rA = aIsRed ? rewardRed : rewardBlack;
-        const double rB = aIsRed ? rewardBlack : rewardRed;
+        /*
+            A/B 视角的本局环境奖励: playMatchGame 已经按 aIsRed 换算好了 (出参),
+            这里直接用 —— 不要再自己算一遍 (两份规则迟早会分叉)。
+        */
+        const double rA = rewardA;
+        const double rB = rewardB;
 
         QString line = QStringLiteral("  第 %1 局: 红=%2 黑=%3 -> ")
                            .arg(g + 1)
