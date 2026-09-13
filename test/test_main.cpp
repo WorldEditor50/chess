@@ -32,7 +32,14 @@ static SearchStats stats;
 static Step aiSearch(Chess &chess, int color, int depth)
 {
     Timer timer;
-    static ABAgent abAI(chess, 8);
+    /*
+       以前这里是 `static ABAgent abAI(chess, 8);` —— static 只在第一次调用时构造,
+       于是它永远绑定在"第一局那个 Chess" 上; 而 playOneGame() 每局都新建局部
+       Chess chess, 第一局结束后该对象被销毁, 后续所有测试都在对已析构对象搜索
+       (use-after-free, 也是 test_ab 段错误的来源之一)。ABAgent 只保存一个引用
+       和一个深度整数, 每步新建的代价可以忽略。
+    */
+    ABAgent abAI(chess, depth);
     Step best = abAI.getBestMove(color, depth);
     long long elapsedUs = timer.elapsedUs();
     stats.totalTimeMs += timer.elapsedMs();
@@ -66,7 +73,7 @@ static int playOneGame(int redDepth, int blackDepth, bool verbose, int maxMoves)
         Step step = aiSearch(chess, turn, depth);
 
         // 检查是否无合法走法
-        if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
+        if (!step.valid) {
             if (verbose) {
                 printf("%s 无合法走法, 游戏结束\n",
                        turn == Stone::COLOR_RED ? "红方" : "黑方");
@@ -363,7 +370,7 @@ static void interactiveMode()
             Timer timer;
             Step step = aiSearch(chess, turn, depth);
 
-            if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
+            if (!step.valid) {
                 printf("无合法走法, 游戏结束!\n");
                 break;
             }

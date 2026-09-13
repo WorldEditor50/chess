@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <cstdio>
+#include "rl/cpuinfo.hpp"
 #include "dqnmcts_agent.h"
 
 /* ============================================================
@@ -82,7 +84,7 @@ static void runVsRandomTest(Chess &chess)
         for (moves = 0; moves < 200; moves++) {
             /* Black (AI) uses DQN+MCTS with training=false */
             Step aiMove = agent.selectMove(Stone::COLOR_BLACK, 200, false);
-            if (aiMove.id == Stone::ID_NONE) { redWins++; break; }
+            if (!aiMove.valid) { redWins++; break; }
             double dummy = 0.0;
             chess.moveForward(&aiMove, dummy);
             if (chess.isGameOver() != Stone::COLOR_NONE) { blackWins++; break; }
@@ -121,6 +123,10 @@ static void runSelfPlayTest(Chess &chess)
 
 int main()
 {
+    /* 这些程序是分钟级的训练基准: 关掉 stdout 缓冲, 这样重定向到文件或用管道
+       采集时也能实时看到进度 (默认的块缓冲会在崩溃/被 kill 时把输出全部丢掉)。 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    std::printf("  SIMD: %s\n", RL::cpuinfo::describe().c_str());
     std::srand((unsigned int)std::time(nullptr));
 
     Chess chess;

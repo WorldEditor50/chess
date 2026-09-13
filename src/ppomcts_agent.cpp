@@ -1,6 +1,7 @@
 #include "ppomcts_agent.h"
 #include "rl/layer.h"
 #include "rl/loss.h"
+#include "agentrollout.hpp"
 #include "rl/util.hpp"
 
 /* ================================================================
@@ -107,7 +108,12 @@ float PPOMCTSAgent::computeReward(const Step &s, int color)
     if (s.nextId == Stone::ID_NONE) return 0.0f;
 
     Stone *victim = chess.stones[s.nextId];
-    if (victim == nullptr || victim->alive == false) return 0.0f;
+    /*
+       不检查 victim->alive —— 见 pgagent.cpp 里同一处的说明: 调用方常在
+       moveForward() 之后求奖励, 那时被吃子已 alive=false, 加判断会让吃子奖励
+       恒为 0 (吃将的 +100 也不可达)。
+    */
+    if (victim == nullptr) return 0.0f;
 
     if (victim->type == Stone::TYPE_JIANG) {
         return 100.0f;
@@ -684,7 +690,14 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
         }
 
         /* Draw if maxMoves reached */
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经计数过一次之后, 这里会再
+       计一次局数。改用 getResult() 判断是否已分胜负。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
                 ppo.learnSelfPlay(trajectory, 0.0f, learningRate);
             }
@@ -937,7 +950,14 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
             Steps::instance().put(rootSteps);
         }
 
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经计数过一次之后, 这里会再
+       计一次局数。改用 getResult() 判断是否已分胜负。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
                 ppo.learnSelfPlay(trajectory, 0.0f, learningRate);
             }
@@ -967,12 +987,16 @@ bool PPOMCTSAgent::saveModel(const std::string &actorPath,
                              const std::string &criticPath)
 {
     ppo.save(actorPath, criticPath);
-    return true;
+    /* 不无条件返回 true: 两个文件都写成功才算成功 */
+    return weightFileWritten(actorPath) && weightFileWritten(criticPath);
 }
 
 bool PPOMCTSAgent::loadModel(const std::string &actorPath,
                              const std::string &criticPath)
 {
+    if (!weightFileReadable(actorPath) || !weightFileReadable(criticPath)) {
+        return false;
+    }
     ppo.load(actorPath, criticPath);
     return true;
 }
@@ -1023,3 +1047,43 @@ void PPOMCTSAgent::endOnline(int winner, int myColor)
 }
 
 
+
+/* ------------------------------------------------------------------ */
+/*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
+/* ------------------------------------------------------------------ */
+bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
+{
+    if (rolloutSteps <= 0) {
+        return false;
+    }
+
+    /* 探索策略: 从 PPO actor 的策略分布里采样 (对应 snakeAI 的 gumbelMax/采样) */
+    auto pick = [this](const RL::Tensor &state, int /*turn*/) -> int {
+        RL::Tensor &p = ppo.action(state);
+        return RL::Random::categorical(p);
+    };
+
+    std::vector<RL::Step> traj;
+    traj.reserve((std::size_t)rolloutSteps);
+    float lastReward = 0.0f;
+    auto onTrans = [&traj, &lastReward](const Step &/*chosen*/, int actionIdx,
+                                        const RL::Tensor &s, const RL::Tensor &/*ns*/,
+                                        float r, bool /*done*/) {
+        RL::Tensor oneHot(ACTION_DIM, 1);
+        oneHot.zero();
+        oneHot[actionIdx] = 1.0f;
+        traj.emplace_back(s, oneHot, r);
+        lastReward = r;
+    };
+
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+
+    bool trained = false;
+    if (!traj.empty()) {
+        /* 与 snakeAI 一致: 用刚刚这段轨迹的最终回报做 PPO 更新 */
+        ppo.learnSelfPlay(traj, lastReward, learningRate);
+        trained = true;
+    }
+    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, PPO 更新 1 次";
+    return trained;
+}

@@ -54,12 +54,100 @@
         </widget>
        </item>
        <item>
-        <widget class="QComboBox" name="agentComboBox"/>
+        <layout class="QHBoxLayout" name="vsRow">
+         <item>
+          <widget class="QLabel" name="vsLabel">
+           <property name="toolTip">
+            <string>你执红, 由它执黑跟你下</string>
+           </property>
+           <property name="text">
+            <string>对战AI</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="agentComboBox"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="preTrainCheck">
+         <property name="toolTip">
+          <string>走子前先从当前局面出发探索若干步、用新鲜经验在线训练一次, 然后再决策 (仿 snakeAI 的决策流程)。探索步数由下面的"预训"调节, 设成 0 等价于关闭。</string>
+         </property>
+         <property name="text">
+          <string>走子前先探索+预训练</string>
+         </property>
+         <property name="checked">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="matchARow">
+         <item>
+          <widget class="QLabel" name="matchALabel">
+           <property name="text">
+            <string>A方</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="matchAComboBox"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="matchBRow">
+         <item>
+          <widget class="QLabel" name="matchBLabel">
+           <property name="text">
+            <string>B方</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="matchBComboBox"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="matchOptsRow">
+         <item>
+          <widget class="QLabel" name="gamesLabel">
+           <property name="toolTip">
+            <string>对弈局数。每局交换先后手, 胜负按 A/B 记 —— 中国象棋先手优势大, 固定红黑的话只是在测"谁执红"。</string>
+           </property>
+           <property name="text">
+            <string>局数</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="gamesSpin"/>
+         </item>
+         <item>
+          <widget class="QLabel" name="stepsLabel">
+           <property name="toolTip">
+            <string>每手决策前的探索(预训练)步数上限, 0 = 不探索</string>
+           </property>
+           <property name="text">
+            <string>预训</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="preTrainStepsSpin"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="ThinkingIndicator" name="thinkIndicator"/>
        </item>
        <item>
         <widget class="QPushButton" name="selfPlayBtn">
          <property name="text">
-          <string>AI Self Play</string>
+          <string>开始对弈</string>
          </property>
         </widget>
        </item>
@@ -77,6 +165,38 @@
          <widget class="QLabel" name="timeLabel">
           <property name="text">
            <string>AI思考时间: -</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="exploreLabel">
+          <property name="maximumSize">
+           <size>
+            <width>16777215</width>
+            <height>46</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>探索+预训练: -</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="matchResultLabel">
+          <property name="maximumSize">
+           <size>
+            <width>16777215</width>
+            <height>46</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>对弈结果: -</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
           </property>
          </widget>
         </item>
@@ -132,6 +252,12 @@
    <extends>QWidget</extends>
    <header location="global">src/chessboard.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ThinkingIndicator</class>
+   <extends>QWidget</extends>
+   <header location="global">src/thinkingindicator.h</header>
+   <container>0</container>
   </customwidget>
  </customwidgets>
  <resources/>

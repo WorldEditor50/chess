@@ -9,24 +9,23 @@
 RL::DQN::DQN(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim_)
     :stateDim(stateDim_), actionDim(actionDim_), gamma(0.99), exploringRate(1), learningSteps(0)
 {
-    /*
-     * Deep DQN network architecture:
-     *
-     *   Input:  stateDim (90-dim board state)
-     *     ↓
-     *   MOE<8,4>  —  Mixture of Experts feature extraction
-     *     ↓
-     *   TanhNorm<Sigmoid>(stateDim → hiddenDim)   —  1st hidden layer
-     *     ↓
-     *   TanhNorm<Sigmoid>(hiddenDim → hiddenDim)   —  2nd hidden layer (deeper!)
-     *     ↓
-     *   Layer<Sigmoid>(hiddenDim → actionDim)      —  Q-value output
-     *
-     * Compared to the original 2-layer (MOE→TanhNorm→Output),
-     * we now have 3 trainable layers + MOE, giving more representational
-     * power for learning complex chess patterns.
-     */
 #if 1
+    /*
+       chess-side divergence from snakeAI/rl/dqn.cpp.
+       The chess DQN used an MOE<16,16> + TransformerBlock<16> backbone (the
+       comment that used to sit here still described the 3-layer MOE<8,4>
+       network, which is why it looked like a mismatch). That architecture is
+       kept ACTIVE so no chess-side work is lost; the three snakeAI variants
+       follow below as #if 0 branches. They are mutually exclusive — move the
+       `1` to the branch you want.
+
+       NOTE: TransformerBlock<16> / MOE<16,16> over the 90-wide chess state only
+       works with the CURRENT rl/attention.hpp, which clamps the head count to
+       the largest divisor of d_model (15 heads, d_k = 6) instead of rounding
+       d_model UP to d_k*NumHeads. With the previous attention.hpp, d_model was
+       silently bumped from 90 to 96 while TransformerBlock kept 90-wide cached
+       buffers, so this branch wrote and read out of bounds.
+    */
     QMainNet = Net(MOE<16, 16>::_(stateDim, true),
                    TransformerBlock<16>::_(stateDim, true),
                    TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, true),
@@ -36,20 +35,39 @@ RL::DQN::DQN(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim
                      TransformerBlock<16>::_(stateDim, false),
                      TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, false),
                      Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
-    QMainNet.copyTo(QTargetNet);
-#else
-    QMainNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 16, true, true), stateDim, 256, true),
-                   TanhNorm<Sigmoid>::_(256, hiddenDim, true, true),
+#elif 0
+    /* snakeAI variant A: 4 trainable layers, no MOE */
+    QMainNet = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, true),
+                   TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
                    Layer<Tanh>::_(hiddenDim, hiddenDim, true, true),
                    TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
                    Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
 
-    QTargetNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 16, true, false), stateDim, 256, false),
-                     TanhNorm<Sigmoid>::_(256, hiddenDim, true, false),
+    QTargetNet = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, false),
+                     TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
                      Layer<Tanh>::_(hiddenDim, hiddenDim, true, false),
                      TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
                      Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+#elif 0
+    /* snakeAI variant B: 16-way ScaledConcat feature extractor */
+    QMainNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, true), stateDim, 4, true),
+                   TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, true),
+                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+
+    QTargetNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, false), stateDim, 4, false),
+                     TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, false),
+                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+#else
+    /* snakeAI audited default: MOE<8,4> + TanhNorm */
+    QMainNet = Net(MOE<8, 4>::_(stateDim, true),
+                   TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, true),
+                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+
+    QTargetNet = Net(MOE<8, 4>::_(stateDim, false),
+                     TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, false),
+                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
 #endif
+    QMainNet.copyTo(QTargetNet);
 }
 
 void RL::DQN::perceive(const Tensor& state,
@@ -140,7 +158,6 @@ void RL::DQN::learn(std::size_t maxMemorySize,
 
     /* update target network periodically (Polyak soft update) */
     if (learningSteps % replaceTargetIter == 0) {
-        std::cout<<"update target net"<<std::endl;
         QMainNet.softUpdateTo(QTargetNet, 0.01);
         learningSteps = 0;
     }

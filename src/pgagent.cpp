@@ -1,6 +1,7 @@
 #include "pgagent.h"
 #include "rl/layer.h"
 #include "rl/loss.h"
+#include "agentrollout.hpp"
 #include "rl/util.hpp"
 
 /* ------------------------------------------------------------------ */
@@ -97,7 +98,15 @@ float PGEagent::computeReward(const Step &s, int color)
     if (s.nextId == Stone::ID_NONE) return 0.0f;
 
     Stone *victim = chess.stones[s.nextId];
-    if (victim == nullptr || victim->alive == false) return 0.0f;
+    /*
+       这里**不**检查 victim->alive。
+       调用方普遍在 chess.moveForward() 之后才求即时奖励 (pgagent.cpp 的
+       trainSelfPlay/warmupFromCurrent、ppomcts_agent、dqnmcts_agent 都是如此),
+       而 moveTo() 会把被吃子置 alive=false —— 加上 alive 判断会让吃子奖励恒为
+       0.0f, 连"吃将 = 100"那条分支都永远不可达, 于是三个 agent 只能靠终局 ±1
+       学习。奖励只应由"这一步吃了谁"决定, 与调用时机无关。
+    */
+    if (victim == nullptr) return 0.0f;
 
     /* Capturing the Jiang/Shuai is an instant win */
     if (victim->type == Stone::TYPE_JIANG) {
@@ -342,7 +351,14 @@ void PGEagent::train(int episodes, int maxMoves,
         }
 
         /* If we hit maxMoves without terminal, treat as draw */
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经 reinforce + 计数过一次
+       之后, 这里会再 reinforce 一次、再计一次局数。改用 getResult() 判断。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             /* Draw: reward = 0 for all steps */
             for (auto &step : trajectory) {
                 step.reward = 0.0f;
@@ -406,7 +422,7 @@ void PGEagent::warmupFromCurrent(int episodes, int maxMoves)
             encodeState(stateBefore);
 
             Step step = selectMove(currentColor, true);  /* training=true (ε-greedy) */
-            if (step.id == Stone::ID_NONE) {
+            if (!step.valid) {
                 /* No legal moves → current player loses */
                 int winner = (currentColor == Stone::COLOR_RED)
                                  ? Stone::COLOR_BLACK : Stone::COLOR_RED;
@@ -513,3 +529,41 @@ void PGEagent::endOnline(int winner, int myColor)
 }
 
 
+
+/* ------------------------------------------------------------------ */
+/*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
+/* ------------------------------------------------------------------ */
+bool PGEagent::exploreAndTrain(int color, int rolloutSteps)
+{
+    if (rolloutSteps <= 0) {
+        return false;
+    }
+
+    /* 探索策略: snakeAI 的 dpgAction 用 gumbelMax() 采样 */
+    auto pick = [this](const RL::Tensor &state, int /*turn*/) -> int {
+        RL::Tensor &a = dpg.gumbelMax(state);
+        return a.argmax();
+    };
+
+    std::vector<RL::Step> traj;
+    traj.reserve((std::size_t)rolloutSteps);
+    auto onTrans = [&traj](const Step &/*chosen*/, int actionIdx,
+                           const RL::Tensor &s, const RL::Tensor &/*ns*/,
+                           float r, bool /*done*/) {
+        RL::Tensor oneHot(ACTION_DIM, 1);
+        oneHot.zero();
+        oneHot[actionIdx] = 1.0f;
+        traj.emplace_back(s, oneHot, r);
+    };
+
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+
+    bool trained = false;
+    if (!traj.empty()) {
+        /* snakeAI 用的是 reinforce(); 这里保持同样的选择 (它会给"当时犹豫"的步子降权) */
+        dpg.reinforce(traj, learningRate);
+        trained = true;
+    }
+    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, reinforce 1 次";
+    return trained;
+}

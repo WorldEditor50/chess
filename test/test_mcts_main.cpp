@@ -56,7 +56,7 @@ static int playOneGame(int redIter, int blackIter, bool verbose, int maxMoves)
         Step step = mctsSearch(chess, turn, iterations);
 
         // 检查是否无合法走法
-        if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
+        if (!step.valid) {
             if (verbose) {
                 printf("%s 无合法走法, 游戏结束\n",
                        turn == Stone::COLOR_RED ? "红方" : "黑方");
@@ -195,7 +195,7 @@ static int playABVsMCTS(Chess &chess, int turn, int abDepth, int mctsIter, int m
             stats.totalNodesExamined++;
         }
 
-        if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
+        if (!step.valid) {
             return (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
         }
 

@@ -33,18 +33,22 @@ public:
     RL::Tensor &gumbelMax(const RL::Tensor &state);
     Tensor &action(const Tensor &state);
     void reinforce(std::vector<Step>& x, float learningRate);
+    void reinforce1(std::vector<Step>& x, float learningRate);
     /* Reset persistent Mamba state to zero (call between independent episodes) */
-    void resetState() { mamba_h.zero(); }
+    void resetState() { mamba_h.zero(); mamba->h.zero(); }
 protected:
     std::size_t stateDim;
     std::size_t actionDim;
     float gamma;
     float exploringRate;
     float learningRate;
-    float entropy0;
+    float H0;
     GradValue alpha;
     std::shared_ptr<MambaLayer> mamba;
-    Tensor mamba_h;     /* persistent Mamba hidden state (saved/restored) */
+    Tensor mamba_h;     /* Mamba state after the last trajectory: saved before a
+                           training replay and restored when the replay ends, so
+                           inference keeps its temporal context. It is NOT read
+                           by the action selectors — see the note in mpg.cpp. */
     Net policyNet;
 };
 }

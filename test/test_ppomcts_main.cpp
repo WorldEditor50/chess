@@ -1,6 +1,8 @@
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
+#include <cstdio>
+#include "rl/cpuinfo.hpp"
 #include "ppomcts_agent.h"
 #include "mcts.h"
 #include "test_utils.h"
@@ -128,7 +130,7 @@ static void testVsRandom()
                 Steps::instance().put(steps);
             }
 
-            if (move.id == Stone::ID_NONE) {
+            if (!move.valid) {
                 if (currentColor == Stone::COLOR_BLACK) randomWins++; else ppoWins++;
                 break;
             }
@@ -191,6 +193,10 @@ static void testVsTraditionalMCTS()
  * ================================================================ */
 int main()
 {
+    /* 这些程序是分钟级的训练基准: 关掉 stdout 缓冲, 这样重定向到文件或用管道
+       采集时也能实时看到进度 (默认的块缓冲会在崩溃/被 kill 时把输出全部丢掉)。 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    std::printf("  SIMD: %s\n", RL::cpuinfo::describe().c_str());
     std::srand((unsigned int)std::time(nullptr));
 
     printf("========================================\n");

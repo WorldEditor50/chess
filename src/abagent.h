@@ -26,6 +26,13 @@ private:
     double minimizeAlpha(int color, int depth, double beta, double &totalReward);
     double maximizeBeta(int color, int depth, double alpha, double &totalReward);
     double quiescenceSearch(int color, double alpha, double beta, int depth);
+    /*
+     * 静态搜索入口, 统一转换到"黑方视角"(与 minimizeAlpha/maximizeBeta 的
+     * 返回值约定一致)。quiescenceSearch 内部是 negamax, 返回的是**当前走棋方**
+     * 视角的分值, 所以轮到红方走时必须取负。
+     *   lo / hi 是黑方视角的窗口上下界。
+     */
+    double quiescenceBlackView(int color, double lo, double hi);
     void orderMoves(std::vector<Step*> &steps);
 
 public:

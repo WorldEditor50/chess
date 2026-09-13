@@ -8,21 +8,55 @@
 
 ```
 chess/
-├── main.cpp              # 程序入口
-├── mainwindow.h/cpp/ui   # 主窗口 (Qt)
-├── chessboard.h/cpp      # 棋盘控件 (Qt 绘制 + 交互)
-├── chess.h/cpp           # 棋局逻辑 + AI搜索算法
-├── stone.h/cpp           # 棋子基类与派生类 + 走法/对象池
-├── pos.h/cpp             # 坐标类
-├── mcts.h/cpp            # MCTS 骨架 (未实现)
-├── qssloader.hpp         # QSS 样式加载工具
-├── appstyle.qss          # 样式文件
-├── res.qrc               # 资源文件
-├── test_utils.h          # 测试工具类 (新增)
-├── test_main.cpp         # 沙盒测试程序 (新增)
-├── test_build.pro        # 测试项目配置 (新增)
-└── chess.pro             # Qt 项目配置
+├── CMakeLists.txt        # 构建配置 (Qt6 Widgets+Sql; src/rl 编译为 RL_CORE 静态库)
+├── build_main.bat        # vcvars64 + cmake 配置/构建脚本
+├── src/
+│   ├── main.cpp              # 程序入口
+│   ├── mainwindow.h/cpp/ui   # 主窗口 (Qt)
+│   ├── chessboard.h/cpp      # 棋盘控件 (Qt 绘制 + 交互 + AI 线程 + Agent 对弈 arena)
+│   ├── thinkingindicator.h/cpp # "AI 正在思考"指示器 (沙漏 + 旋转粒子 + 呼吸灯 + 实时耗时)
+│   ├── chess.h/cpp           # 棋局逻辑 + 评估函数 (+ Zobrist 键)
+│   ├── stone.h/cpp           # 棋子基类与派生类 + 走法/对象池
+│   ├── pos.h/cpp             # 坐标类
+│   ├── aiagent.h             # AgentBase 接口 (+ exploreAndTrain / getExploreInfo)
+│   ├── agentrollout.hpp      # 决策前探索的共用实现 (试走 + 原样回退)
+│   ├── abagent.h/cpp         # Alpha-Beta 剪枝 agent (含静态搜索)
+│   ├── mcts.h/cpp            # MCTS (四阶段已实现, 已接入 GUI)
+│   ├── evagent.h/cpp         # EVAB: 学会评估的 Alpha-Beta (价值网 + TT/killer/history)
+│   ├── pgagent.h/cpp         # 策略梯度 agent (RL::DPG)
+│   ├── dqnagent.h/cpp        # DQN agent (RL::DQN)
+│   ├── ppomcts_agent.h/cpp   # PPO + MCTS (AlphaZero 风格, 用 RL::PPO)
+│   ├── dqnmcts_agent.h/cpp   # DQN + MCTS
+│   ├── gamedb.h/cpp          # SQLite 棋局数据库
+│   ├── qssloader.hpp         # QSS 样式加载工具 (目前未接线)
+│   ├── appstyle.qss          # 样式文件
+│   ├── res.qrc               # 资源文件 (内嵌 appstyle.qss)
+│   └── rl/                   # RL 内核 -> 静态库 RL_CORE (纯 C++, 不含 Qt)
+│       ├── simd_ops.hpp      # SIMD 分派层 (标量 / SSE2 / AVX2 三档)
+│       ├── simd/             # N-spirits 的 SSE2 / AVX2 张量内核
+│       └── cpuinfo.hpp       # CPUID 探测 + "本构建启用了哪套内核"
+├── test/
+│   ├── test_utils.h           # 测试工具 (SearchStats/Timer/打印)
+│   ├── test_main.cpp          # Alpha-Beta 沙盒 -> test_ab
+│   ├── test_mcts_main.cpp     # MCTS -> test_mcts
+│   ├── test_rules_main.cpp    # 棋规回归 (走法数/应将/将杀/重复) -> test_rules
+│   ├── test_evab_main.cpp     # EVAB 搜索/对抗/训练 -> test_evab
+│   ├── test_pretrain_main.cpp # 决策前探索不得改动真棋局 -> test_pretrain
+│   ├── test_match_main.cpp    # Agent 对弈 arena 统计 -> test_match
+│   ├── test_grad_main.cpp     # SIMD 之后的梯度传播 (有限差分) -> test_grad
+│   ├── test_pg_main.cpp       # PG -> test_pg
+│   ├── test_dqn_main.cpp      # DQN -> test_dqn
+│   ├── test_ppomcts_main.cpp  # PPO+MCTS -> test_ppomcts
+│   └── test_dqnmcts_main.cpp  # DQN+MCTS -> test_dqnmcts
+├── tools/                # 界面验证脚本 (UI Automation / 像素采样)
+└── docs/                 # 本文档 + issues_review.md + rl_sync.md + agents_design.md
 ```
+
+构建产物（`build/Desktop_Qt_6_9_2_MSVC2022_64bit-Release`）：
+`RL_CORE.lib`（17 个 TU 的静态库）+ `chess.exe` + **11 个测试可执行文件**。
+其中 `test_ab` / `test_mcts` / `test_rules` / `test_pretrain` / `test_match` / `test_grad`
+注册进了 `ctest`（`test_match` 带 `QT_QPA_PLATFORM=offscreen`）；其余 5 个是分钟级的
+训练基准，只构建不注册（放进默认套件只会得到看起来像失败的超时）。
 
 ---
 
@@ -132,7 +166,12 @@ alphaBetaPruning(color, depth)         # 顶层入口: 选最优走法
 
 ---
 
-## 三、新增测试工具
+## 三、测试工具
+
+> 这一节的早期版本只描述了 `test_utils.h` 与 `test_main.cpp`。现在测试已经扩到
+> **11 个可执行文件**（目录树见 §一），其中 6 个注册进 `ctest`。下面保留对最老的
+> 那套工具的说明作为背景，**新增测试的作用与验证手法的完整清单见
+> `docs/issues_review.md` 的"零之四 4.4 验证手法的沉淀"**。
 
 ### test_utils.h
 - `SearchStats` 结构体：搜索性能统计
@@ -141,7 +180,7 @@ alphaBetaPruning(color, depth)         # 顶层入口: 选最优走法
 - `printChessBoardPlain()`：无颜色文本棋盘输出
 - `printEvaluation()`：局面评估分析
 
-### test_main.cpp
+### test_main.cpp（最早的一套，→ `test_ab`）
 命令行测试程序，支持以下模式：
 
 | 命令行参数 | 功能 |
@@ -158,13 +197,14 @@ alphaBetaPruning(color, depth)         # 顶层入口: 选最优走法
 4. **testSelfPlay()** —— AI 自对弈统计
 5. **testDepthComparison()** —— 搜索深度优势对比
 
-编译命令：
-```bash
-# 需先运行 vcvars64.bat 配置 MSVC 环境
-cl /std:c++17 /utf-8 /O2 /EHsc -Fe:test_chess.exe chess.cpp pos.cpp stone.cpp test_main.cpp
-```
-
----
+### 后续新增（简要）
+- `test_rules`：棋规回归（初始走法数、应将过滤、将杀/困毙、三次重复），92 条断言
+- `test_pretrain`：决策前探索**不得改动真棋局**（`sideToMove` / `history` /
+  `halfMoveClock` 逐字段比对），23 条断言
+- `test_match`：Agent 对弈 arena 的统计正确性（交换先后手、比分归属、到上限判和、
+  中止生效），18 条断言；用 `setMaxPliesPerGame(4)` 让结果可预测
+- `test_grad`：**SIMD 之后的梯度传播**（有限差分核对解析梯度 + 直接探测 MM 内核
+  "累加 vs 覆盖"），6 条断言；只链 `RL_CORE`，不依赖 Qt
 
 ## 四、SQLite 棋局记录功能
 
@@ -231,7 +271,7 @@ SELECT * FROM moves WHERE game_id = 1 ORDER BY move_number;
 |---|------|------|
 | 1 | **Alpha-Beta 剪枝逻辑错误**：原代码中剪枝条件写反（`minimizeAlpha`中`r <= beta`应为`alpha <= beta`），且检查时机错误 | 修正为：先更新 MIN/MAX 最佳值，再与父节点的约束比较。`minimizeAlpha` 中 `alpha <= beta` 时剪枝；`maximizeBeta` 中 `beta >= alpha` 时剪枝 |
 | 2 | **评估函数视角矛盾**：`evaluate()` 原从红方视角计算（正值=红方有利），但 AI（黑方）在`minimizeAlpha`中试图最小化该值，导致搜索方向完全颠倒 | 修改 `evaluate()` 从 AI（黑方）视角：黑子加分，红子减分。正分值 = AI有利 |
-| 3 | **将/帅安全性检测缺失**：没有检测"将帅不可见面"| 新增 `isInCheck(color)`，包含飞将检测和对方棋子攻击检测 |
+| 3 | **将/帅安全性检测缺失**：没有检测"将帅不可见面"| 新增了 `isInCheck(color)`（含飞将检测和对方棋子攻击检测）。**该条现已闭环**：`sample()` 只返回合法走法，`isInCheck` 在 `sample`/`isLegalMoveInternal` 里被真正调用（见 `docs/issues_review.md` A2） |
 | 4 | **`isGameOver()` 误判**：`COLOR_NONE` 原本表示"将帅都在"（游戏未结束），但旧代码中没有正确处理 | `minimizeAlpha`/`maximizeBeta` 中，只在将帅被吃时（`COLOR_RED`/`COLOR_BLACK`）才返回极值；无走法时判负 |
 | 5 | **兵(卒)走法**：分析发现原代码逻辑正确，无功能性 Bug，已更新注释消除误导 | 明确注释：未过河时禁止左右走；过河后允许水平移动，delta == 1 校验正确 |
 | 6 | **叶节点评估粗糙**：`minimizeAlpha` 的叶节点原只返回 `totalReward`（纯材质差），未使用位置评估 | 改为调用 `evaluate()`（材质+位置 PST 综合评估） |
@@ -241,6 +281,44 @@ SELECT * FROM moves WHERE game_id = 1 ORDER BY move_number;
 
 ## 六、仍存在的问题
 
-1. **AI 缺乏应将/将军意识**：`sample()` 生成的走法未过滤"被将军时不移出"和"走后不可暴露将帅"的非法走法。`isInCheck()` 已实现但未集成到搜索中
-2. **游戏无法自然结束**：AI 缺乏长将检测（`isRepetition()` 已实现但未集成），自对弈往往达到最大步数
-3. **MCTS 未实现**：`mcts.h/cpp` 仅定义了框架结构，没有搜索实现
+> 本节已按最新一轮复查更新。完整清单（含 file:line 证据、失效场景、实测结果、
+> 优化手法汇总与修复优先级）见 **`docs/issues_review.md`**；RL 内核的同步、
+> SIMD/AVX2 优化与**梯度传播正确性验证**见 **`docs/rl_sync.md`**；
+> 各 agent 的设计与"探索预训练"的利弊分析见 **`docs/agents_design.md`**。
+>
+> **当前实测（与本文早先的记录已不同，早先那段数字已过期）**：
+> `ctest` **6/6 通过** —— `test_ab` ~4.1 s（曾段错误）、`test_mcts` ~228 s、
+> `test_rules` ~0.05 s、`test_pretrain` ~4.0 s、`test_match` ~1.8 s、`test_grad` ~19 s
+> （耗时随机器负载浮动，这里给的是量级）。
+> 四个训练基准也不再超时：`test_pg` ~18 s、`test_dqn` ~353 s、`test_ppomcts` ~78 s、
+> `test_dqnmcts` ~390 s（曾全部 >900 s 超时），根因 B19 已修（`Tensor::MM` 0.11 →
+> 27.8 GFLOP/s）。
+
+下面 1–3 条是本文档早先记录的"仍存在的问题"，**均已修复**，保留在此仅为对照
+（结论已更新）：
+
+1. ~~**AI 缺乏应将/将军意识**~~ —— **已修复**：`sample()` 只返回合法走法
+   （自杀 / 不应将 / 照面全部过滤），`Chess::isAttacked/isLegalMove/hasLegalMoves`
+   落地，GUI 玩家侧也走 `isLegalMove()`，并有 `getResult()` 做将杀/困毙/和棋判定。
+2. ~~**游戏无法自然结束**~~ —— **已修复**：`moveForward` 维护 `history`（含走棋方
+   哈希）与 `halfMoveClock`，`isDraw()` 实现三次重复 + 120 半回合；搜索里重复局面
+   返回 0 分；`matchAgents` 到达手数上限判和。
+3. ~~**MCTS 未实现**~~ —— **该条早已过期**：`src/mcts.cpp` 已完整实现
+   select / expand / simulate / backpropagate + UCB1 并接入 GUI。
+
+### 当前真正仍未做的（按优先级，详见 `issues_review.md` §五）
+
+4. **`Tensor::MM::ikjk/kijk` 的 SIMD 内核是赋值、标量是累加**（语义不一致）。
+   当前调用点 kdim=1 走标量，所以梯度是对的（`test_grad` 实测确认）；但只要改成
+   多样本批量（kdim ≥ 8）就会命中 SIMD 内核，**静默只保留最后一次的贡献**。
+   修法一行：内核改 `z[...] += dot(...)`。
+5. **反向 GEMV 没有 SIMD 内核**：`ei = wᵀ·e` 实测 0.991 ns/MAC，而前向 `o = w·x`
+   是 0.102 —— **9.7×**。SIMD 只加速了前向那一半，训练步现在卡在反向。
+   修法：补与 `gemv_ikkj` 对称的 `gemv_kikj`。
+6. **训练数据管线（理论层面的取舍）**：见 `agents_design.md` §10。要点是
+   DQN 系"每步一次更新"破坏回放缓冲的 i.i.d. 假设（建议改成只写回放、攒批更新），
+   PPO 系在稀疏终局奖励下需要显式自举，否则优势几乎全 0、梯度等于噪声。
+7. **SQLite 跨线程使用 + 写库接口未接线**（`recordMove/startGame/endGame` 全仓零调用），
+   需要设计决定。
+8. `DQN` 的 Q 头是 `Layer<Sigmoid>`（值域 `(0,1)`）而奖励含负值 → 结构上无法表示负 Q。
+9. QSS 主题仍未接线（`QssLoader::load()` 零调用）。

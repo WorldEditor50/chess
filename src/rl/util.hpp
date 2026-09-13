@@ -222,8 +222,18 @@ inline void lerp(Tensor &x, const Tensor xi, float r)
     return;
 }
 
+inline Tensor onehot(const Tensor &xi)
+{
+    Tensor xo(xi.shape);
+    int k = xi.argmax();
+    xo[k] = 1;
+    return xo;
+}
+
 float gaussian(float x, float u, float sigma);
-float clip(float x, float sup, float inf);
+/* Clamp x into [lo, hi]. The parameters used to be named (sup, inf), which
+   read as the opposite bounds of what they actually are. */
+float clip(float x, float lo, float hi);
 float hmean(const Tensor &x);
 float gmean(const Tensor &x);
 float variance(const Tensor &x, float u);
@@ -233,7 +243,7 @@ void normalize(Tensor &x);
 
 inline float entropy(float p)
 {
-    return -p*std::log(p);
+    return -p*std::log(p + 1e-7);
 }
 namespace Metrics {
 /* Kullback Leibler Divergence: KL(p||q) = Σ p*log(p/q) */
@@ -313,7 +323,11 @@ inline Tensor& noise(Tensor& x)
     Tensor epsilon(x.shape);
     Random::uniform(epsilon, 0, 2);
     x += epsilon;
-    x /= x.max();
+    float m = x.max();
+    /* Guard the normalization: dividing by a zero max produced inf/NaN. */
+    if (std::fabs(m) > 1e-12f) {
+        x /= m;
+    }
     return x;
 }
 
@@ -325,7 +339,10 @@ inline Tensor& noise(Tensor& x, float exploringRate)
         Tensor epsilon(x.shape);
         Random::uniform(epsilon, 0, 2);
         x += epsilon;
-        x /= x.max();
+        float m = x.max();
+        if (std::fabs(m) > 1e-12f) {
+            x /= m;
+        }
     }
     return x;
 }
@@ -348,7 +365,7 @@ inline Tensor& gumbelSoftmax(Tensor &x, float tau)
     Tensor epsilon(x.shape);
     Random::uniform(epsilon, 0, 1);
     for (std::size_t i = 0; i < epsilon.size(); i++) {
-        epsilon[i] = -std::log(-std::log(epsilon[i] + 1e-8) + 1e-8);
+        epsilon[i] = -std::log(-std::log(epsilon[i] + 1e-7) + 1e-7);
     }
     x += epsilon;
     x /= tau;
@@ -361,7 +378,7 @@ inline Tensor& gumbelSoftmax(Tensor &x, const Tensor& tau)
     Tensor epsilon(x.shape);
     Random::uniform(epsilon, 0, 1);
     for (std::size_t i = 0; i < epsilon.size(); i++) {
-        epsilon[i] = -std::log(-std::log(epsilon[i] + 1e-8) + 1e-8);
+        epsilon[i] = -std::log(-std::log(epsilon[i] + 1e-7) + 1e-7);
     }
     x += epsilon;
     x /= tau;

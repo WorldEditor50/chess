@@ -127,7 +127,12 @@ public:
     /* AgentBase interface */
     Step getBestMove(int color) override;
     std::string getName() const override;
-
+    /*
+     * 走子前先"探索环境 + 在线训练一次"再决策 (仿 snakeAI 的决策流程, 见 aiagent.h):
+     * 从当前局面用本 agent 的探索策略滚若干步收集经验, 在线训练一次, 然后才走子。
+     * 探索期间用 moveForward/moveBack 试走, 结束时会原样回退, 不影响真棋局。
+     */
+    bool exploreAndTrain(int color, int rolloutSteps) override;
     /* ----------------------------------------------------------------
      *  Public API
      * ---------------------------------------------------------------- */

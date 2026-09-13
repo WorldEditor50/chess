@@ -1,4 +1,5 @@
 #include "dqnagent.h"
+#include "agentrollout.hpp"
 #include "rl/util.hpp"
 
 /* ------------------------------------------------------------------ */
@@ -121,7 +122,12 @@ float DQNAgent::computeReward(const Step &s, int color)
     if (s.nextId == Stone::ID_NONE) return 0.0f;
 
     Stone *victim = chess.stones[s.nextId];
-    if (victim == nullptr || !victim->alive) return 0.0f;
+    /*
+       不检查 victim->alive —— 见 pgagent.cpp 里同一处的说明: DQNAgent::trainAfterMove
+       是在 moveForward() 之后被调用的, 那时被吃子已 alive=false, 加判断会让吃子
+       奖励恒为 0 (吃将的 +100 也不可达)。
+    */
+    if (victim == nullptr) return 0.0f;
 
     if (victim->type == Stone::TYPE_JIANG) {
         return 100.0f;
@@ -335,7 +341,14 @@ void DQNAgent::trainVsRandom(int episodes, int maxMoves, bool verbose)
             }
         }
 
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经计数过一次之后, 这里会再
+       计一次局数。改用 getResult() 判断是否已分胜负。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                 printf("  Episode %4d/%d: Draw, win_rate=%.2f, eps=%.4f\n",
@@ -465,7 +478,14 @@ void DQNAgent::trainSelfPlay(int episodes, int maxMoves, bool verbose)
             }
         }
 
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经计数过一次之后, 这里会再
+       计一次局数。改用 getResult() 判断是否已分胜负。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                 printf("  Episode %4d/%d: Draw, win_rate=%.2f, eps=%.4f\n",
@@ -600,7 +620,14 @@ void DQNAgent::warmupFromCurrent(int episodes, int maxMoves)
             }
         }
 
-        if (chess.isGameOver() == Stone::COLOR_NONE) {
+        /*
+       只有在"循环跑到步数上限、并且没有分出胜负"时才计为和棋。
+       这里原来只判断 isGameOver() == COLOR_NONE, 而"轮到走的一方没有合法走法"
+       (将杀/困毙) 并不会让将帅消失 —— 于是那条分支已经计数过一次之后, 这里会再
+       计一次局数。改用 getResult() 判断是否已分胜负。
+    */
+        const int finalResult = chess.getResult(chess.sideToMove);
+        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             totalEpisodes++;
         }
     }
@@ -626,20 +653,57 @@ void DQNAgent::warmupFromCurrent(int episodes, int maxMoves)
 bool DQNAgent::saveModel(const std::string &filepath)
 {
     dqn.save(filepath);
-    return true;
+    /* 不无条件返回 true: 写盘失败时 UI 会弹假的"保存成功" */
+    return weightFileWritten(filepath);
 }
 
 bool DQNAgent::loadModel(const std::string &filepath)
 {
+    if (!weightFileReadable(filepath)) {
+        return false;
+    }
     dqn.load(filepath);
     return true;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Online training: observe and learn after each AI move              */
-/*  Called by ChessBoard after executing the AI move.                  */
-/*  DQN trains incrementally via perceive()+learn().                   */
+/*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
 /* ------------------------------------------------------------------ */
+bool DQNAgent::exploreAndTrain(int color, int rolloutSteps)
+{
+    if (rolloutSteps <= 0 || batchSize <= 0) {
+        return false;
+    }
+
+    /* 探索策略: snakeAI 的 dqnAction 用的是 noiseAction() */
+    auto pick = [this](const RL::Tensor &state, int /*turn*/) -> int {
+        RL::Tensor &q = dqn.noiseAction(state);
+        return q.argmax();
+    };
+    /* 每收集一条转移, 就把它放进回放池 (perceive) */
+    auto onTrans = [this](const Step &/*chosen*/, int actionIdx,
+                          const RL::Tensor &s, const RL::Tensor &ns,
+                          float r, bool done) {
+        RL::Tensor oneHot(ACTION_DIM, 1);
+        oneHot.zero();
+        oneHot[actionIdx] = 1.0f;
+        dqn.perceive(s, oneHot, ns, r, done);
+    };
+
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+
+    bool trained = false;
+    if (collected > 0) {
+        /* 用这批新鲜经验在线训练一次 (回放池不足 batchSize 时 learn() 自己会跳过) */
+        dqn.learn(maxMemorySize, replaceTargetInterval, batchSize, learningRate);
+        learnCounter++;
+        trained = true;
+    }
+    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, 训练 1 次(池 "
+                    + std::to_string((int)dqn.memories.size()) + ")";
+    return trained;
+}
+
 void DQNAgent::trainAfterMove(const RL::Tensor& stateBefore,
                                const Step& chosenStep,
                                int color,

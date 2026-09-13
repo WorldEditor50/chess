@@ -186,15 +186,43 @@ double ABAgent::quiescenceSearch(int color, double alpha, double beta, int depth
 
     /* 生成当前方的所有走法, 只保留吃子走法 */
     std::vector<Step*> allSteps;
-    chess.sample(color, allSteps);
+    /*
+     * 这里用 samplePseudo(): sample() 会对每个走法做一次"走后是否被将"的完整
+     * 校验, 而静态搜索只用得上吃子走法 —— 对几十个安静走法做校验纯属浪费。
+     * 吃子走法在下面逐个用 isLegalMove() 校验, 被拒绝的还回对象池。
+     */
+    chess.samplePseudo(color, allSteps);
 
     std::vector<Step*> captures;
+    /* 安静走法攒起来一次还回对象池 (热路径上不要逐个分配临时 vector) */
+    std::vector<Step*> quiet;
+    quiet.reserve(allSteps.size());
     for (Step *s : allSteps) {
         if (s->nextId != Stone::ID_NONE) {
             captures.push_back(s);
         } else {
-            Steps::instance().put(std::vector<Step*>(1, s));
+            quiet.push_back(s);
         }
+    }
+    Steps::instance().put(quiet);
+
+    /* 过滤掉不合法的吃子 (例如吃子后自己被将) */
+    {
+        const bool inCheck = chess.isInCheck(color);
+        std::vector<Step*> legalCaptures;
+        legalCaptures.reserve(captures.size());
+        std::vector<Step*> rejected;
+        for (Step *s : captures) {
+            if (chess.isLegalMoveInternal(color, s, inCheck)) {
+                legalCaptures.push_back(s);
+            } else {
+                rejected.push_back(s);
+            }
+        }
+        if (!rejected.empty()) {
+            Steps::instance().put(rejected);
+        }
+        captures.swap(legalCaptures);
     }
 
     /* MVV-LVA 排序 */
@@ -247,6 +275,18 @@ double ABAgent::quiescenceSearch(int color, double alpha, double beta, int depth
     return alpha;
 }
 
+/*
+ * quiescenceBlackView: 把 negamax 静态搜索的结果换算成"黑方视角"分值。
+ *   lo / hi 为黑方视角窗口; 轮到红方走时窗口需要上下翻转 (-hi, -lo)。
+ */
+double ABAgent::quiescenceBlackView(int color, double lo, double hi)
+{
+    double a = (color == Stone::COLOR_BLACK) ? lo : -hi;
+    double b = (color == Stone::COLOR_BLACK) ? hi : -lo;
+    double q = quiescenceSearch(color, a, b, 3);
+    return (color == Stone::COLOR_RED) ? -q : q;
+}
+
 /* ============================================================
  *  minimizeAlpha - MIN 节点
  *
@@ -263,8 +303,25 @@ double ABAgent::minimizeAlpha(int color, int depth, double beta, double &totalRe
         return -Stone::value_infi;  /* 红方赢 -> AI(黑方)不利 */
     }
 
+    /* 三次重复局面判和: 黑方视角的和棋分值是 0 */
+    if (chess.isRepetition()) {
+        return 0.0;
+    }
+
+    /*
+       叶节点同样要进静态搜索 —— 以前只有 maximizeBeta (MAX/黑方节点) 会进,
+       MIN 节点直接返回 evaluate()。结果是奇数深度和偶数深度的评估口径不同
+       (一方有 3 层吃子延伸、另一方没有), 同一个局面在不同奇偶深度会得到系统性
+       偏差, 而且红方的吃子序列完全看不见。
+
+       窗口必须传**本节点自己的**黑方视角窗口。MIN 节点收到的 `beta` 参数其实是
+       父 MAX 节点的当前最优值 (见函数注释: 参数名有误导性), MIN 节点的窗口就是
+       (beta, +infi) —— 注意上界是 +infi, 不是 beta 本身: 若把 beta 当上界,
+       根节点初始的 beta = -value_infi 会退化成零宽窗口 (alpha=beta=-infi),
+       静态搜索直接返回边界值, 于是所有走法得分相同、根节点选不出走法。
+    */
     if (depth == 0) {
-        return chess.evaluate();
+        return quiescenceBlackView(color, beta, Stone::value_infi);
     }
 
     std::vector<Step*> steps;
@@ -312,10 +369,20 @@ double ABAgent::maximizeBeta(int color, int depth, double alpha, double &totalRe
         return -Stone::value_infi;  /* 红方赢 -> AI(黑方)不利 */
     }
 
-    /* 进入静态搜索时使用完全开放的窗口 (-infi, +infi)
-     * 避免父节点 (MIN 节点) 传入的 alpha = value_infi 导致零宽窗口误剪枝 */
+    /* 三次重复局面判和 */
+    if (chess.isRepetition()) {
+        return 0.0;
+    }
+
+    /*
+       叶节点进入静态搜索。以前这里固定用完全开放窗口 (-infi, +infi), 于是父节点
+       传下来的边界被丢掉, quiescenceSearch 里的 standPat >= beta 永远不成立 ——
+       从"错误剪枝"变成了"完全不剪枝", 每个叶节点都要展开全部吃子序列。
+       现在把父边界真正传进去。MAX 节点收到的 `alpha` 参数是父 MIN 节点的当前
+       最优值, 所以本节点的黑方视角窗口是 (-infi, alpha)。
+    */
     if (depth == 0) {
-        return quiescenceSearch(color, -Stone::value_infi, Stone::value_infi, 3);
+        return quiescenceBlackView(color, -Stone::value_infi, alpha);
     }
 
     std::vector<Step*> steps;

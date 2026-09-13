@@ -21,8 +21,23 @@ public:
     virtual Step getBestMove(int color) = 0;  // 核心：获取最佳走法
     virtual std::string getName() const = 0;  // 名称
     virtual void resetState() {}              // 可选重置
+
+    // 走子前的"先探索环境、预训练一次"（仿 snakeAI 的 observe → train → act）
+    // 默认实现是 no-op 并返回 false，无参数的 agent（ABAgent）直接跳过。
+    virtual bool exploreAndTrain(int color, int rolloutSteps) {
+        (void)color; (void)rolloutSteps;
+        return false;
+    }
+    virtual std::string getExploreInfo() const { return m_exploreInfo; }
+protected:
+    std::string m_exploreInfo;
 };
 ```
+
+`exploreAndTrain` 由 `ChessBoard::preTrainThenDecide()` 在每次决策前调用，
+**必须在返回时让棋盘逐字节复原**（含 `sideToMove`）。共用实现见
+`src/agentrollout.hpp` 的 `rolloutFromCurrent()`，契约与实测见
+`docs/issues_review.md` 的"零之二点七"。
 
 ### 公共约定
 
@@ -656,16 +671,16 @@ void trainStep(state, actionTarget, valueTarget) {
 
 ## 6. Agent 对比总结
 
-| 特性 | ABAgent | MCTS | PGEagent | DQNAgent | PPOMCTSAgent |
-|------|---------|------|----------|----------|--------------|
-| **类型** | 确定性搜索 | 随机搜索 | 策略梯度 | 值函数 | 搜索+学习 |
-| **神经网络** | ❌ | ❌ | ✅ DPG | ✅ DQN | ✅ PPO |
-| **需要训练** | ❌ | ❌ | ✅ 自对弈 | ✅ 自对弈 | ✅ 自对弈 |
-| **搜索深度** | 固定4层 | 可变(迭代) | 1步 | 1步 | 可变(MCTS) |
-| **随机性** | 无 | 模拟随机 | 策略采样 | ε-greedy | MCTS+PUCT |
-| **评估方式** | 手工特征 | 随机模拟 | 策略网络 | Q值网络 | 价值网络 |
-| **走法排序** | MVV-LVA | UCB1 | Softmax | argmax/ε | PUCT |
-| **适合场景** | 有限深度最优 | 纯树搜索 | 学习策略 | 学习Q值 | 搜索+学习 |
+| 特性 | ABAgent | MCTS | PGEagent | DQNAgent | PPOMCTSAgent | EVABAgent |
+|------|---------|------|----------|----------|--------------|-----------|
+| **类型** | 确定性搜索 | 随机搜索 | 策略梯度 | 值函数 | 搜索+学习 | 搜索+学习 |
+| **神经网络** | ❌ | ❌ | ✅ DPG | ✅ DQN | ✅ PPO | ✅ 价值网(1260维) |
+| **需要训练** | ❌ | ❌ | ✅ 自对弈 | ✅ 自对弈 | ✅ 自对弈 | ✅ 手工评估引导 + TD-leaf |
+| **搜索深度** | 固定4层 | 可变(迭代) | 1步 | 1步 | 可变(MCTS) | 固定/限时(可到5层) |
+| **随机性** | 无 | 模拟随机 | 策略采样 | ε-greedy | MCTS+PUCT | 无（探索期 ε-greedy） |
+| **评估方式** | 手工特征 | 随机模拟 | 策略网络 | Q值网络 | 价值网络 | 手工特征 ⊕ 价值网络 |
+| **走法排序** | MVV-LVA | UCB1 | Softmax | argmax/ε | PUCT | TT + killer + history |
+| **适合场景** | 有限深度最优 | 纯树搜索 | 学习策略 | 学习Q值 | 搜索+学习 | 搜索深度受限但要求强度 |
 
 ## 7. 各 Agent 耗时测试数据
 
@@ -676,5 +691,170 @@ void trainStep(state, actionTarget, valueTarget) {
 | PGEagent (推理) | <5ms | 弱（未经大量训练） |
 | DQNAgent (推理) | <5ms | 弱（未经大量训练） |
 | PPOMCTSAgent (400 sim) | ~2000ms | 潜力最大（需训练） |
+| EVABAgent (depth=5) | ~146ms | **强**（等时间下与 ABAgent 相当或更好） |
 
 > *注：以上为基于测试程序的实测数据，实际耗时和强度取决于训练程度和参数调优。*
+> EVAB 的搜索比 ABAgent 快约 21 倍（深度 5：146 ms vs 3133 ms），对抗与训练数据见
+> `docs/agent_evab_design.md` §8。*
+
+## 8. 决策前探索（5 个 agent 统一协议）
+
+GUI 每次让 agent 走子前都会先走 `ChessBoard::preTrainThenDecide(agent, color)`，
+对应 snakeAI 的 `observe → train → act`：
+
+| Agent | 探索时的动作选择 | 训练调用 | 经验来源 |
+|-------|------------------|----------|----------|
+| `ABAgent` | —（无参数，默认跳过） | — | — |
+| `PGEagent` | `gumbelMax` | `reinforce` | 回合内 log-prob / 奖励 |
+| `DQNAgent` | `noiseAction` | `perceive` + `learn` | 自己的 replay buffer |
+| `PPOMCTSAgent` | `ppo.action` + `Random::categorical` | `ppo.learnSelfPlay` | PPO 轨迹缓冲 |
+| `DQNMCTSAgent` | `noiseAction` | `perceive` + `learn` | 自己的 replay buffer |
+| `EVABAgent` | 根节点 ε-greedy 搜索 | 门控 TD-leaf 更新 | 树搜索叶节点样本 |
+
+GUI 侧用复选框"走子前先探索训练"开关（默认开），步数由 `setPreTrainSteps()` 控制；
+关闭时 `preTrainThenDecide` 退化为纯粹的 `selectMove`，与旧行为一致。
+
+## 9. Agent 对 Agent 对弈（arena）
+
+原来只有 `selfPlay(agentType)`：**同一个 agent** 自己跟自己下。它能说明"能不能收敛"，
+但没法回答"哪个 agent 更强"。现在换成 `ChessBoard::matchAgents(typeA, typeB, games)`。
+
+### 9.1 两条方法学要求
+
+1. **每局交换先后手。** 中国象棋先手（红）优势很大，固定谁执红的话，结果只是在测
+   "谁执红"而不是"谁更强"。所以胜负按**参赛者 A/B** 记，不按红黑记；
+   偶数局 A 执红，奇数局 B 执红。日志里会把每局的执红方写清楚。
+2. **局数要够，且可配置。** 单局的偶然性足以翻转结论，所以局数做成了界面参数，
+   并且逐局列出明细（谁执红、谁胜、多少手）。
+
+`matchAgents(A, A, games)` 就是原来的自对弈，所以旧功能没有丢。
+
+### 9.2 界面
+
+控制栏新增（都在 `mainwindow.ui`）：
+
+| 控件 | 作用 |
+|------|------|
+| `matchAComboBox` / `matchBComboBox` | 两个参赛 agent（默认 A=Alpha-Beta, B=EVAB，都快，且正好是"纯搜索 vs 学会评估的搜索"） |
+| `gamesSpin`（局数，1–100，默认 4） | 对弈局数 |
+| `preTrainStepsSpin`（预训，0–2000，默认 64） | 每手决策前的探索步数上限，**0 = 不探索**（用来做对照） |
+| `selfPlayBtn`（"开始对弈"） | 开始；对弈进行中同一个按钮变成"停止对弈" |
+| `matchResultLabel` | 实时进度 → 最终比分，tooltip 里是逐局明细 |
+
+对弈跑在后台线程，进度通过 `matchStarted` / `matchGameFinished` 信号回到 GUI 线程；
+状态条与右侧指示器沿用第 8 节那套，阶段文字会带上"对弈 2/4 局 · 第 17 手"。
+
+### 9.3 实测（`test_match`，18 条断言全过，约 2 s）
+
+用 `setMaxPliesPerGame(4)` 把每局压到 4 手 —— 4 手之内不可能将杀，于是每局必然判和，
+断言就能做得很硬：
+
+```
+Alpha-Beta 0 : 0 EVAB (和 2)  共 2 局 / 8 手
+  第 1 局: 红=Alpha-Beta 黑=EVAB -> 和棋  (4 手)
+  第 2 局: 红=EVAB 黑=Alpha-Beta -> 和棋  (4 手)
+```
+
+界面侧用 `tools/verify_match_ui.ps1`（走 Windows UI Automation，不依赖焦点、
+不做像素识别，直接从无障碍树里读控件矩形和结果文字）：
+
+```
+start button rect = 1454,751,238,23
+spinner count = 2 (expect 2: 局数 / 预训)
+match_running = True  (button switched to 停止对弈)
+result label = Alpha-Beta 1 : 0 EVAB (和 1)  共 2 局 / 368 手
+   探索+预训练: 探索 64 步, 价值网络更新 1 次 (|net-hand| 0.814368)
+RESULT: PASS
+```
+
+即"局数设置生效、预训练步数生效、对弈真的跑完、比分真的显示出来"。
+
+### 9.4 这个方法顺带挖出来的三个真问题
+
+写 arena 的过程中，ASan 抓到一个远比功能本身重要的 bug —— 详见
+`docs/issues_review.md` 的"零之二点九"：AI 工作线程会被无谓地唤醒，和 arena 线程
+**同时搜索同一张 `env`**，导致 `env.history` 双重释放。这也解释了为什么"agent 偶尔
+返回一步非法走法"，而非法走法以前会被当成"走棋方被将死"直接判胜负。
+
+---
+
+## 10. "走子前先探索 + 预训练"的利弊（理论分析）
+
+这一节是设计取舍的记录，不是实测报告；相关的实测数字见
+`docs/issues_review.md` 的"零之二点七"与 `agent_evab_design.md` §8.3。
+
+### 10.1 它到底是什么算法
+
+对每个 agent，`exploreAndTrain(color, N)` 做的是：从**当前局面**出发，用自己的
+探索策略滚 ≤N 步，收集 transition，做**一次**参数更新，然后仍然用 argmax/搜索决策。
+用 RL 的术语说：这是**单条轨迹片段 + 每步一次更新的在线（continual）学习**，
+更新次数与"真实对局的手数"同阶。
+
+对比三种标准做法：
+
+| | 数据来源 | 每次更新用多少样本 | 数据是否 i.i.d. |
+|---|---|---|---|
+| 经验回放 (DQN) | 大 buffer 里均匀采样 | mini-batch（几十~几百） | 近似（回放的意义就在这） |
+| 批量 on-policy (PPO) | 一整批 rollout | 几千~几万步 | 是（同一批策略） |
+| **本工程的预训练** | **当前局面的 ≤N 步** | **N ≈ 32~64** | **不是，高度相关** |
+
+### 10.2 好处（为什么值得做）
+
+1. **把"GUI 里从来不训练"这个洞补上了。** 之前所有在线训练接口在界面侧零调用
+   （A15），GUI 对局纯粹是拿初始随机网络在下棋，玩家下 100 局模型也毫无变化。
+   预训练至少让每一步都产出一份梯度。
+2. **对 EVAB 这类"学习评估函数"的 agent，蒸馏是有意义的。** 搜索本身是昂贵的
+   教师信号：把搜索出来的叶节点价值回填给价值网络，是 AlphaZero 式的正路。
+   实测 |net−hand| 从 1.23 降到 0.05，说明这条通路确实能学到东西。
+3. **它给了"确定性决策"一条探索通道。** 决策走 argmax、搜索走确定性走法时，
+   智能体永远不会访问未被选中的分支，也就永远没有新数据。探索 rollout 打破了
+   这个闭环（这也是为什么实现里必须用 `noiseAction`/`gumbelMax`/采样，
+   而不是在探索阶段也 argmax）。
+4. **训练与对局的时间尺度一致。** 不需要额外的训练循环，玩家下棋的同时就在训练，
+   对单机小工程是很实际的选择。
+
+### 10.3 坏处（为什么不能指望它带来棋力提升）
+
+1. **单条轨迹片段的梯度方差极大、且高度相关。** 一次更新只有 N 个样本，且它们
+   来自同一条（自己生成的）轨迹，有效样本量远小于 N。用它做一步随机梯度下降，
+   方向噪声远大于批量训练。
+2. **目标在动。** 每步都更新 ⇒ 策略变 ⇒ 数据分布变 ⇒ 价值函数追着一个移动的
+   目标。理论上的收敛条件（策略固定时的策略评估）在这里根本不成立，做的是
+   "非平稳目标上的在线逼近"，没有收敛保证。
+3. **致命三元组风险。** 函数逼近 + 自举（TD 目标用同一张网）+ 偏离 on-policy 的
+   数据 —— 三者同时出现时值函数可能发散。EVAB 的实测正是这样：TD-leaf 精修在
+   4 局/轮的样本量下误差从 0.35 涨到 0.70，最后只能靠 `acceptNet` 门控（不通过就
+   整体回滚）兜住。**门控是补丁，不是解法**：它保证"不变坏"，不保证"变好"。
+4. **对 DQN 系是**有害的**。DQN 依赖回放缓冲近似 i.i.d.；每步塞进 32 条**刚刚
+   由当前网络自己生成**的、时序高度相关的样本，会系统性地把回放分布拉向当前
+   对局的局部状态（近因偏置），并让 TD 误差被当前网络的自洽性压低 ——
+   学到的信号反而变弱，同时冲掉早期经验（遗忘）。**对 DQN 来说，
+   "每步训练一次"在数据分布上比"什么都不训练"更糟**（后者至少不会破坏回放假设）。
+5. **对 PPO 系是"基本无害但要小心"。** PPO 的裁剪目标假设数据来自**最近的**策略，
+   而"每步从当前局面重新采一批"恰好是最新鲜的 on-policy 数据，所以偏差最小。
+   但优势估计依赖那 N 步的回放：**如果 N 步之内没有终局、又没有用价值网络自举
+   做 GAE 截断**，优势几乎全是 0，梯度等于噪声。象棋的奖励是**稀疏终局奖励**
+   （几乎全是 0，只有将杀 ±1），64 步内通常到不了终局 —— 这是本工程最关键的
+   结构性问题。
+6. **信息效率很低。** 探索是**真下在真棋盘上**的（`env` 副本上试走），
+   单步成本实测 69~471 ms（32 步）。对 MCTS 类 agent，搜索本来就已经访问了大量
+   状态，再从根节点重新滚一遍是**重复劳动**，边际信息接近 0，却付出成倍时间。
+   在 arena 里这个代价尤其直接：**单步时间翻倍 = 同样时间里能打的局数减半 =
+   统计功效减半**，"哪个 agent 更强"这个结论更难做出来。
+7. **它改动了测评的对象。** 打开预训练之后，被测评的已经不是"这个 agent"，
+   而是"这个 agent + 每步一次在线更新"这个复合系统；两边的结果不再可比。
+   这也是为什么 arena 必须把"预训"步数做成显式参数并允许设 0。
+
+### 10.4 结论与建议
+
+- **保留，但按 agent 区别对待**：EVAB（学习评估）与 PPO（最新 on-policy 数据）
+  受益；**DQN 系建议默认关闭**（它破坏回放假设），或改成"只写回放、不立即更新"
+  （把更新攒到 buffer 满再做 mini-batch），这与"预训练"的直觉相反但符合 DQN 的理论。
+- **优势/回报要么有终局信号，要么显式自举**：N 步内没到终局时不要用"未折扣的
+  终局奖励"当目标，应当用价值网络在 N 步处自举（TD(λ)/GAE 截断）。
+- **棋力结论只能来自"预训练 = 0"的对照**；arena 的对照组就是为此存在的。
+- 可检验的预测（尚未做）：把预训练打开去打它自己冻结的副本，**应当不优于**
+  且很可能劣于冻结副本 —— 如果结果是显著更好，说明当前的更新规模/门控确实
+  在起作用，值得进一步投入；如果持平或更差，就该把预算转向离线批量训练。
+
+

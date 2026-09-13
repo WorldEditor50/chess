@@ -5,6 +5,7 @@
 #include <list>
 #include <array>
 #include <iostream>
+#include <mutex>
 #include "pos.h"
 
 class Step
@@ -15,11 +16,20 @@ public:
     Pos pos;
     Pos nextPos;
     double reward;
+    /*
+     * true  = 由走法生成器 (getPossibleSteps / 飞将分支) 产生, 可以拿去落子;
+     * false = 默认构造的"无走法"占位对象。
+     *
+     * 这个字段取代了以前那种 "id == Stone::ID_NONE" / "pos == (0,0)" 的哨兵判断:
+     * 前者永远不成立 (默认 Step 的 id 是 0, 而 ID_NONE 是 33), 后者会被黑方
+     * 底线起点的合法走法误命中。
+     */
+    bool valid;
 public:
-    Step():id(0), nextId(0){}
+    Step():id(0), nextId(0), reward(0.0), valid(false){}
     Step(int fromID_, const Pos &fromPos_, int toID_, const Pos &toPos_, double r):
-        id(fromID_), nextId(toID_), pos(fromPos_), nextPos(toPos_), reward(r){}
-    Step(const Step &s):id(s.id),nextId(s.nextId),pos(s.pos),nextPos(s.nextPos),reward(s.reward){}
+        id(fromID_), nextId(toID_), pos(fromPos_), nextPos(toPos_), reward(r), valid(true){}
+    Step(const Step &s):id(s.id),nextId(s.nextId),pos(s.pos),nextPos(s.nextPos),reward(s.reward),valid(s.valid){}
     Step& operator=(const Step& s)
     {
         if (this == &s) {
@@ -29,22 +39,34 @@ public:
         nextId = s.nextId;
         pos = s.pos;
         nextPos = s.nextPos;
+        /* reward / valid 以前漏掉了: 拷贝构造会复制而赋值不会, 行为不一致 */
+        reward = s.reward;
+        valid = s.valid;
         return *this;
     }
 };
 class Steps
 {
 private:
-    std::list<Step*> stepList;
+    /*
+       空闲链改为 thread_local —— 每条线程一份, get()/put() 不需要任何同步。
+
+       历史: 这里先是完全无锁的全局 std::list (并发使用会破坏链表指针), 我给它
+       加了一把 std::mutex; 但走法生成是搜索的热路径, 每个候选走法都要 get() 一次,
+       一次 sample() 就是几十次加解锁, 于是又改成按线程分开。
+
+       Step 只在申请的线程里归还 (每个搜索/训练线程自成一体, 不会把 Step 交给别的
+       线程), 所以不存在跨线程访问。线程退出时它的空闲链就地销毁 —— Step 是只有
+       基本成员的 POD, 泄漏量等于该线程的峰值同时使用量 (几十~几百个), 有界。
+    */
+    static std::vector<Step*> &freeList()
+    {
+        static thread_local std::vector<Step*> list;
+        return list;
+    }
 public:
     Steps(){}
-    ~Steps()
-    {
-        for (auto it = stepList.begin(); it != stepList.end(); it++) {
-            Step *p = *it;
-            delete p;
-        }
-    }
+    ~Steps() = default;
     inline static Steps& instance()
     {
         static Steps pool;
@@ -52,24 +74,30 @@ public:
     }
     Step* get()
     {
-        Step *ptr = nullptr;
-        if (stepList.empty()) {
-            ptr = new Step;
-        } else {
-            ptr = stepList.back();
-            stepList.pop_back();
+        std::vector<Step*> &list = freeList();
+        if (list.empty()) {
+            return new Step;
         }
+        Step *ptr = list.back();
+        list.pop_back();
         return ptr;
     }
     void put(const std::vector<Step*> &steps)
     {
+        std::vector<Step*> &list = freeList();
         for (size_t i = 0; i < steps.size(); i++) {
             Step *ptr = steps.at(i);
             if (ptr != nullptr) {
-                stepList.push_back(ptr);
+                list.push_back(ptr);
             }
         }
         return;
+    }
+    void put(Step *step)
+    {
+        if (step != nullptr) {
+            freeList().push_back(step);
+        }
     }
 };
 
@@ -83,7 +111,13 @@ public:
     constexpr static int col = 9;
     T* data[10][9];
 public:
-    StoneMap(){}
+    /*
+       data 以前完全没有初始化, 而 Chess 的 32 个棋子构造函数只写自己所在的
+       32 个格子, 剩下 58 个格子保持不确定值。只要在 reset() 之前访问空交叉点
+       (chessboard.cpp 的 selectStone / moveStone, 以及 isAttacked) 就会解引用
+       垃圾指针 —— MSVC Debug 下 0xCDCDCDCD 必崩。
+    */
+    StoneMap(){ clear(); }
     inline T* &operator[](const Pos &pos) {return data[pos.x][pos.y];}
     inline bool isInner(const Pos &pos) const
     {
@@ -319,6 +353,7 @@ public:
             }
             step->nextPos = dstPos;
             step->reward = 0;
+            step->valid = true;
             steps.push_back(step);
         }
         return;
@@ -456,12 +491,13 @@ public:
     }
     bool tryMoveTo(const Pos &pos_)override
     {
+        /* 相/象不能过河: 红方限 x>=5, 黑方限 x<=4 (原来两边各放宽了一格) */
         if (color == Stone::COLOR_RED) {
-            if (pos_.x < 4) {
+            if (pos_.x < 5) {
                 return false;
             }
         } else {
-            if (pos_.x > 5) {
+            if (pos_.x > 4) {
                 return false;
             }
         }
@@ -597,6 +633,10 @@ public:
         if (stone == nullptr) {
             return;
         }
+        if (stone->alive == false) {
+            /* 对方将/帅已被吃, 它留在 pos 上的坐标已经失效 */
+            return;
+        }
         if (tryMoveTo(stone->pos) == false) {
             return;
         }
@@ -606,6 +646,7 @@ public:
         step->nextId = stone->id;
         step->nextPos = stone->pos;
         step->reward = 0;
+        step->valid = true;
         steps.push_back(step);
         return;
     }

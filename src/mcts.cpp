@@ -197,7 +197,13 @@ double MCTS::simulateRandomPlay(int color)
     double dummy = 0.0;
     int currColor = color;
 
-    while (true) {
+    /*
+       回放步数上限: 原来是 while(true), 只要随机走子一直没吃到将/帅就会无限
+       循环下去 (没有重复局面判和、也没有自然限着)。到上限按和棋处理。
+    */
+    const int maxPlies = 200;
+
+    while ((int)simSteps.size() < maxPlies) {
         /* Check for terminal state (checkmate) */
         int gameResult = chess.isGameOver();
         if (gameResult != Stone::COLOR_NONE) {
@@ -236,6 +242,12 @@ double MCTS::simulateRandomPlay(int color)
                         ? Stone::COLOR_BLACK
                         : Stone::COLOR_RED;
     }
+
+    /* 到达步数上限仍未终局 -> 按和棋收尾, 并回退全部走法 */
+    for (auto it = simSteps.rbegin(); it != simSteps.rend(); ++it) {
+        chess.moveBack(&(*it), dummy);
+    }
+    return 0.0;
 }
 
 /* ------------------------------------------------------------

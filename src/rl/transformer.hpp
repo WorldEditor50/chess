@@ -59,6 +59,7 @@ public:
     Layer<Linear> ffn_down;  // d_ff → d_model
 
     /* Cached intermediate values for backward */
+    //Tensor x_orig;           // original input x
     Tensor x_norm1;          // normalized x (pre-attention norm)
     float mu1, sig1;         // mean + std for norm1
     Tensor x_res1;           // after residual 1: x + attn_out
@@ -105,6 +106,7 @@ public:
         e = Tensor(d_model, 1);
 
         /* Cached intermediates */
+        //x_orig    = Tensor(d_model, 1);
         x_norm1   = Tensor(d_model, 1);
         x_res1    = Tensor(d_model, 1);
         x_norm2   = Tensor(d_model, 1);
@@ -132,6 +134,8 @@ public:
 
     Tensor& forward(const Tensor& x, bool inference=false) override
     {
+        /* Save original input for backward */
+        //x_orig = x;
 
         /* LayerNorm 1: x_norm1 = gamma1 * (x - mu1) / sig1 + beta1 */
         mu1 = x.mean();

@@ -92,6 +92,13 @@ public:
     Step getBestMove(int color) override;
     std::string getName() const override;
 
+    /*
+     * 走子前先"探索环境 + 在线训练一次"再决策 (仿 snakeAI 的 dqnAction)。
+     * 用 dqn.noiseAction() 从当前局面滚 rolloutSteps 步, 每条转移 perceive 进
+     * 回放池, 然后 learn() 一次。
+     */
+    bool exploreAndTrain(int color, int rolloutSteps) override;
+
     /* Select a move:
      *   training=true  : ε-greedy (sample random with prob ε)
      *   training=false : argmax over Q-values */

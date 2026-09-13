@@ -72,6 +72,10 @@ public:
     }
     virtual Tensor& forward(const Tensor& x, bool inference=false) override
     {
+        /* MM::ikkj ACCUMULATES into o; o must be cleared first, otherwise a
+           second forward without an intervening backward sums onto the stale
+           output (forward() no longer relies on backward() to zero o). */
+        o.zero();
         Tensor::MM::ikkj(o, w, x);
         if (bias) {
             o += b;
@@ -93,9 +97,12 @@ public:
     }
     virtual void SGD(float lr) override
     {
-        Optimize::SGD(w, g.w, lr, true);
+        /* Optimize::SGD(w, dw, lr, gamma, clipGrad): the 4th argument is gamma
+           (weight decay), not clipGrad. Passing `true` set gamma=1, which zeroed
+           the weights (w = (1-1)*w - lr*dw) on every step. */
+        Optimize::SGD(w, g.w, lr);
         if (bias) {
-            Optimize::SGD(b, g.b, lr, true);
+            Optimize::SGD(b, g.b, lr);
         }
         g.zero();
         return;
@@ -197,6 +204,7 @@ public:
 
     Tensor& forward(const Tensor& x, bool inference=false) override
     {
+        o.zero();
         Tensor::MM::ikkj(o, w, x);
         if (bias) {
             o += b;
@@ -246,6 +254,7 @@ public:
     }
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        o.zero();
         Tensor::MM::ikkj(o, w, x);
         if (bias) {
             o += b;
@@ -496,6 +505,7 @@ public:
     }
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        op.zero();
         Tensor::MM::ikkj(op, w, x);
         u = op.mean();
         float sigma = op.variance(u);
@@ -572,6 +582,7 @@ public:
         for (std::size_t i = 0; i < x.size(); i++) {
             x_[i] = (x[i] - u)*gamma;
         }
+        op.zero();
         Tensor::MM::ikkj(op, w, x_);
         if (bias) {
             for (std::size_t i = 0; i < o.size(); i++) {
@@ -639,6 +650,7 @@ public:
     }
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        o1.zero();
         Tensor::MM::ikkj(o1, w, x);
         if (bias) {
             for (std::size_t i = 0; i < o.size(); i++) {
@@ -707,6 +719,7 @@ public:
     }
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        op.zero();
         Tensor::MM::ikkj(op, w, x);
         float sigma = op.variance(0);
         gamma = 1.0/std::sqrt(sigma + 1e-9);
@@ -773,6 +786,7 @@ public:
 
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        o1.zero();
         Tensor::MM::ikkj(o1, w, x);
         o1 *= r;
         o2 = RL::tanh(o1);

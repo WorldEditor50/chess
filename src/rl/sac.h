@@ -20,7 +20,7 @@ namespace RL {
 class SAC
 {
 public:
-    static constexpr int QNET_NUM = 2;
+    static constexpr int QNET_NUM = 4;
 public:
     SAC(){}
     explicit SAC(std::size_t stateDim, std::size_t hiddenDim, std::size_t actionDim);
@@ -43,7 +43,7 @@ protected:
     int stateDim;
     int actionDim;
     float gamma;
-    float entropy0;
+    float H0;
     float exploringRate;
     int learningSteps;
     std::deque<Transition> memories;

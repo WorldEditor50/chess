@@ -31,6 +31,14 @@ public:
                float learningRate = 0.001);
     void save(const std::string& fileName);
     void load(const std::string& fileName);
+    /*
+       chess-side divergence from snakeAI/rl/dqn.h:
+       upstream made these members `protected`, but the chess agents
+       (src/dqnagent.cpp, src/dqnmcts_agent.cpp, src/dqnagent.h:getExploreRate,
+       src/dqnmcts_agent.h:getExploreRate) read/write `gamma` and `exploringRate`
+       directly. They are kept public here so the chess agent code keeps compiling;
+       tighten them to `protected` only together with adding accessors.
+    */
 public:
     std::size_t stateDim;
     std::size_t actionDim;

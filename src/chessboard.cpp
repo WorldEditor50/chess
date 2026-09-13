@@ -1,18 +1,99 @@
 #include "chessboard.h"
+#include "rl/cpuinfo.hpp"
 #include <QDebug>
 #include <QDir>
+#include <QFontMetrics>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+/* agent 的短名字, 显示在"AI 正在思考"提示里 */
+QString agentDisplayName(ChessBoard::AgentType type)
+{
+    switch (type) {
+    case ChessBoard::AGENT_ALPHABETA: return QStringLiteral("Alpha-Beta");
+    case ChessBoard::AGENT_MCTS:      return QStringLiteral("MCTS");
+    case ChessBoard::AGENT_PG:        return QStringLiteral("Policy Gradient");
+    case ChessBoard::AGENT_DQN:       return QStringLiteral("DQN");
+    case ChessBoard::AGENT_PPOMCTS:   return QStringLiteral("PPO+MCTS");
+    case ChessBoard::AGENT_DQNMCTS:   return QStringLiteral("DQN+MCTS");
+    case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
+    }
+    return QStringLiteral("agent");
+}
+
+/* 哪些 agent 真的实现了 exploreAndTrain (决定状态条显示"① 探索"还是"① 搜索") */
+bool agentCanExplore(ChessBoard::AgentType type)
+{
+    switch (type) {
+    case ChessBoard::AGENT_PG:
+    case ChessBoard::AGENT_DQN:
+    case ChessBoard::AGENT_PPOMCTS:
+    case ChessBoard::AGENT_DQNMCTS:
+    case ChessBoard::AGENT_EVAB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* 状态条上的短耗时: "3.24s" / "1:05" */
+QString shortElapsed(long long ms)
+{
+    if (ms < 0) {
+        ms = 0;
+    }
+    const long long totalSec = ms / 1000;
+    const int centi = static_cast<int>((ms % 1000) / 10);
+    if (totalSec >= 60) {
+        return QStringLiteral("%1:%2").arg(totalSec / 60).arg(totalSec % 60, 2, 10, QChar('0'));
+    }
+    return QStringLiteral("%1.%2s").arg(totalSec).arg(centi, 2, 10, QChar('0'));
+}
+
+} // namespace
 
 /*
  * ChessBoard - 核心游戏面板
  * 负责: 棋盘绘制、走法执行、AI调度、数据库记录、回放
  */
 
+/*
+ * AI 搜索预算。这几个数字以前散落在注释里, 而且和真实参数对不上
+ * (注释写"深度=8"、UI 标签写"深度=4"、实际是 5; 注释写 800 次模拟、实际 80;
+ *  注释写 400 次迭代、实际 6)。集中在这里, 只留一个来源。
+ *
+ * AB_DEPTH 取 4 的依据 (本机实测, test_ab 的搜索基准):
+ *   深度 3 = 63 ms, 深度 4 = 169 ms, 深度 5 = 3605 ms
+ * 走法合法性过滤 (sample() 会剔除自杀/不应将/照面) 与"两个节点类型都做静态
+ * 搜索"都会增加节点成本, 深度 5 在 GUI 里已经是 3.6 秒一步。需要更强棋力时把
+ * 这里调大即可。
+ */
+static constexpr int AB_DEPTH = 4;            /* Alpha-Beta 搜索深度 */
+static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
+static constexpr int PPO_SIMS = 80;           /* PPO+MCTS 每次决策的模拟次数 */
+static constexpr int DQNMCTS_ITERATIONS = 200;/* DQN+MCTS 每次决策的迭代次数 */
+/* 单局手数上限已集中到 ChessBoard::DEFAULT_MAX_PLIES (界面上可用 setMaxPliesPerGame 调) */
+
+/*
+ * 后台训练的单轮规模。训练线程只在每轮开始时检查停止标志, 所以这几个数字直接
+ * 决定"关窗要等多久"。原来是 4 局 x 200 步 x 50 次 MCTS 模拟 —— 每步都要跑网络
+ * 前向, 一轮可能几分钟, 关窗时 GUI 线程会冻在 join() 上。
+ */
+static constexpr int BG_TRAIN_EPISODES = 1;   /* 每轮训练局数 */
+static constexpr int BG_TRAIN_MAX_MOVES = 60; /* 每局步数上限 */
+static constexpr int BG_TRAIN_SIMS = 20;      /* MCTS 类 agent 每步的模拟次数 */
+
 /* Static member initialization */
 PGEagent *ChessBoard::m_sfPG = nullptr;
 DQNAgent *ChessBoard::m_sfDQN = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTS = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
+EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
 /*
@@ -28,6 +109,13 @@ std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
  */
 void ChessBoard::startupLoad()
 {
+    /*
+       报告本构建实际启用的 SIMD 指令集。SIMD 内核是编译期选的 (见 rl/cpuinfo.hpp),
+       所以"这个二进制到底会不会用 AVX2"没法靠猜 —— 启动时打一行日志, 排查性能
+       问题时就不用先怀疑环境。
+    */
+    qInfo().noquote() << "[SIMD]" << QString::fromStdString(RL::cpuinfo::describe());
+
     /* ---- 1. 打开数据库 ---- */
     GameDatabase::instance().open("chess_games.db");
 
@@ -41,7 +129,8 @@ void ChessBoard::startupLoad()
         {AGENT_PG,        "weights/pg_agent.dat"},
         {AGENT_DQN,       "weights/dqn_agent.dat"},
         {AGENT_PPOMCTS,   "weights/ppomcts_agent.dat"},
-        {AGENT_DQNMCTS,   "weights/dqnmcts_agent.dat"}
+        {AGENT_DQNMCTS,   "weights/dqnmcts_agent.dat"},
+        {AGENT_EVAB,      "weights/evab_agent.dat"}
     };
 
     for (const auto &we : weightFiles) {
@@ -67,6 +156,11 @@ void ChessBoard::startupLoad()
         if (m_sfPPOMCTS == nullptr)
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
         m_sfPPOMCTS->loadModel(s_weightPaths[AGENT_PPOMCTS]);
+    }
+    if (s_weightPaths.count(AGENT_EVAB)) {
+        if (m_sfEVAB == nullptr)
+            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+        m_sfEVAB->loadModel(s_weightPaths[AGENT_EVAB]);
     }
     if (s_weightPaths.count(AGENT_DQNMCTS)) {
         if (m_sfDQNMCTS == nullptr)
@@ -99,7 +193,64 @@ ChessBoard::ChessBoard(QWidget *parent) :
 {
     connect(this, &ChessBoard::sendResult,
             this, &ChessBoard::checkGameOver, Qt::QueuedConnection);
+    initThinkVisuals();
     processThread = std::thread(&ChessBoard::process, this);
+}
+
+/*
+ * initThinkVisuals - 建立"思考中"状态条的动画与信号连线
+ *
+ * 所有跨线程信号都用 AutoConnection: emit 发生在工作线程/AI 线程, 而本对象
+ * (以及主窗口) 住在 GUI 线程, Qt 在 emit 时判定接收者线程不同 -> 自动排队,
+ * 于是下面这些槽都在 GUI 线程执行, 可以安全地读写控件状态。
+ */
+void ChessBoard::initThinkVisuals()
+{
+    m_animTimer = new QTimer(this);
+    m_animTimer->setInterval(40);            /* 25 fps, 只重绘顶部一小条 */
+    connect(m_animTimer, &QTimer::timeout, this, [this]() {
+        ++m_animPhase;
+        if (m_animPhase > 100000) {
+            m_animPhase = 0;
+        }
+        update(thinkingOverlayRect());
+    });
+
+    m_busyClickTimer = new QTimer(this);
+    m_busyClickTimer->setSingleShot(true);
+    m_busyClickTimer->setInterval(2500);
+    connect(m_busyClickTimer, &QTimer::timeout, this, [this]() {
+        if (!m_busyClickSeen) {
+            return;
+        }
+        m_busyClickSeen = false;
+        update(thinkingOverlayRect());
+    });
+
+    connect(this, &ChessBoard::aiThinkingStarted, this,
+            [this](const QString &, int) {
+                m_thinkClock.start();
+                m_thinkStage.clear();
+                m_busyClickSeen = false;
+                if (m_animTimer != nullptr && !m_animTimer->isActive()) {
+                    m_animPhase = 0;
+                    m_animTimer->start();
+                }
+                update(thinkingOverlayRect());
+            });
+    connect(this, &ChessBoard::aiThinkingStage, this, [this](const QString &stage) {
+        m_thinkStage = stage;
+        update(thinkingOverlayRect());
+    });
+    connect(this, &ChessBoard::aiThinkingStopped, this, [this]() {
+        if (m_animTimer != nullptr) {
+            m_animTimer->stop();
+        }
+        m_busyClickTimer->stop();
+        m_busyClickSeen = false;
+        m_thinkStage.clear();
+        update(thinkingOverlayRect());
+    });
 }
 
 ChessBoard::~ChessBoard()
@@ -126,8 +277,14 @@ QPoint ChessBoard::getStoneCenter(int x, int y)
 /* 获取石头位置 (棋盘坐标) */
 Pos ChessBoard::getStonePos(const QPoint &point)
 {
-    int x = (point.y() - offsetY + gridSize / 2) / gridSize;
-    int y = (point.x() - offsetX + gridSize / 2) / gridSize;
+    /*
+       用 floor 语义做舍入。原来写的是 (p - offset + grid/2) / grid, C++ 的整数
+       除法向零截断, 于是 point.y() ∈ [0,19] 时 (py-20)/60 得到 0 而不是 -1 ——
+       棋盘上/左各 20px 的空白被误判成第 0 行/第 0 列; 相与地, x<0 / y<0 这两个
+       守卫永远不会成立。
+    */
+    const int x = static_cast<int>(std::floor((point.y() - offsetY + gridSize / 2.0) / gridSize));
+    const int y = static_cast<int>(std::floor((point.x() - offsetX + gridSize / 2.0) / gridSize));
     if (x < 0 || x > 9 || y < 0 || y > 8) {
         return Pos(-1, -1);
     }
@@ -153,63 +310,50 @@ Stone *ChessBoard::selectStone(const QPoint &point)
 
 bool ChessBoard::moveStone(const QPoint &point)
 {
-    bool ret = false;
     Pos pos = getStonePos(point);
     if (pos.x < 0 || pos.y < 0) {
         return false;
     }
     Stone *stone = chess.m_map[pos];
-    if (stone != nullptr) {
-        if (stone->color != color) {
-            /* 点击对方棋子: 如果当前有选中, 尝试吃子 */
-            if (selectID != -1) {
-                Stone *selected = chess.m_map.get(selectID);
-                if (selected != nullptr) {
-                    if (selected->tryMoveTo(pos)) {
-                        /* 执行吃子走法 */
-                        Step *step = Steps::instance().get();
-                        step->id = selectID;
-                        step->pos = selected->pos;
-                        step->nextId = stone->id;
-                        step->nextPos = pos;
-                        step->reward = 0;
-                        double totalReward = 0;
-                        chess.moveForward(step, totalReward);
-                        Steps::instance().put(std::vector<Step*>(1, step));
-                        selectID = -1;
-                        color = (color == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
-                        ret = true;
-                    }
-                }
-            }
-        } else {
-            /* 点击己方棋子: 选中它 */
-            selectID = stone->id;
-            ret = false;
-        }
-    } else {
-        /* 点击空位: 如果当前有选中, 尝试移动 */
-        if (selectID != -1) {
-            Stone *selected = chess.m_map.get(selectID);
-            if (selected != nullptr) {
-                if (selected->tryMoveTo(pos)) {
-                    Step *step = Steps::instance().get();
-                    step->id = selectID;
-                    step->pos = selected->pos;
-                    step->nextId = Stone::ID_NONE;
-                    step->nextPos = pos;
-                    step->reward = 0;
-                    double totalReward = 0;
-                    chess.moveForward(step, totalReward);
-                    Steps::instance().put(std::vector<Step*>(1, step));
-                    selectID = -1;
-                    color = (color == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
-                    ret = true;
-                }
-            }
-        }
+
+    /* 点击己方棋子: 选中它 (不落子) */
+    if (stone != nullptr && stone->color == color) {
+        selectID = stone->id;
+        return false;
     }
-    return ret;
+    if (selectID == -1) {
+        return false;
+    }
+
+    Stone *selected = chess.m_map.get(selectID);
+    if (selected == nullptr || selected->alive == false) {
+        selectID = -1;
+        return false;
+    }
+
+    /*
+       构造候选走法, 由 Chess::isLegalMove 统一校验: 走法形状 + 走后自己是否被将
+       (含"不应将"与两将照面)。原来这里只看 selected->tryMoveTo(pos), 于是玩家
+       可以自杀、可以在被将时走别的子、也可以主动走出照面。
+    */
+    Step step;
+    step.id = selectID;
+    step.pos = selected->pos;
+    step.nextId = (stone != nullptr) ? stone->id : Stone::ID_NONE;
+    step.nextPos = pos;
+    step.reward = 0;
+    step.valid = true;
+
+    if (chess.isLegalMove(color, &step) == false) {
+        return false;
+    }
+
+    double totalReward = 0;
+    chess.moveForward(&step, totalReward);
+    selectID = -1;
+    color = (color == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+    chess.sideToMove = color;
+    return true;
 }
 
 void ChessBoard::paintEvent(QPaintEvent *)
@@ -232,42 +376,145 @@ void ChessBoard::paintEvent(QPaintEvent *)
         painter.drawLine(offsetX + i * gridSize, offsetY + 5 * gridSize, offsetX + i * gridSize, offsetY + 9 * gridSize);
     }
 
-    /* 绘制棋子 */
-    for (int i = 0; i < 32; i++) {
-        Stone *stone = chess.m_children[i];
-        if (stone == nullptr || stone->alive == false) {
-            continue;
+    /*
+       棋子与选中高亮都在锁内画: AI 工作线程 (process) 和 Agent 对弈线程都在改
+       chess, 而绘制发生在 GUI 线程。锁的临界区很短 (只读一遍棋子), 不与搜索重叠
+       —— 两个写者都只在"落子"那一瞬间持锁, 思考期间不持锁。
+    */
+    {
+        QMutexLocker locker(&mutex);
+
+        /* 绘制棋子 */
+        for (int i = 0; i < 32; i++) {
+            Stone *stone = chess.m_children[i];
+            if (stone == nullptr || stone->alive == false) {
+                continue;
+            }
+            drawStone(painter, stone);
         }
-        drawStone(painter, stone);
+
+        /* 绘制选中高亮 (灰色边框) */
+        if (selectID != -1) {
+            Stone *selected = chess.m_map.get(selectID);
+            if (selected != nullptr) {
+                QPoint center = getStoneCenter(selected->pos.x, selected->pos.y);
+                QRect highlightRect = getRect(center).adjusted(-3, -3, 3, 3);
+
+                /* 1. 外发光光晕 (半透明灰色圆环) */
+                QRadialGradient glow(center, stoneRadius + 8);
+                glow.setColorAt(0.0, QColor(160, 160, 160, 120));
+                glow.setColorAt(0.7, QColor(160, 160, 160, 60));
+                glow.setColorAt(1.0, QColor(160, 160, 160, 0));
+                painter.setBrush(glow);
+                painter.setPen(Qt::NoPen);
+                painter.drawEllipse(center, stoneRadius + 8, stoneRadius + 8);
+
+                /* 2. 高亮边框 (灰色粗线) */
+                painter.setBrush(Qt::NoBrush);
+                painter.setPen(QPen(QColor(128, 128, 128), 4));
+                painter.drawEllipse(highlightRect);
+
+                /* 3. 内发光 (半透明灰色填充) */
+                painter.setBrush(QColor(160, 160, 160, 30));
+                painter.setPen(QPen(QColor(128, 128, 128), 2));
+                painter.drawEllipse(getRect(center));
+            }
+        }
     }
 
-    /* 绘制选中高亮 (灰色边框) */
-    if (selectID != -1) {
-        Stone *selected = chess.m_map.get(selectID);
-        if (selected != nullptr) {
-            QPoint center = getStoneCenter(selected->pos.x, selected->pos.y);
-            QRect highlightRect = getRect(center).adjusted(-3, -3, 3, 3);
+    /* "AI 正在思考"的状态条画在最上层 */
+    drawThinkingOverlay(painter);
+}
 
-            /* 1. 外发光光晕 (半透明灰色圆环) */
-            QRadialGradient glow(center, stoneRadius + 8);
-            glow.setColorAt(0.0, QColor(160, 160, 160, 120));
-            glow.setColorAt(0.7, QColor(160, 160, 160, 60));
-            glow.setColorAt(1.0, QColor(160, 160, 160, 0));
-            painter.setBrush(glow);
-            painter.setPen(Qt::NoPen);
-            painter.drawEllipse(center, stoneRadius + 8, stoneRadius + 8);
-
-            /* 2. 高亮边框 (灰色粗线) */
-            painter.setBrush(Qt::NoBrush);
-            painter.setPen(QPen(QColor(128, 128, 128), 4));
-            painter.drawEllipse(highlightRect);
-
-            /* 3. 内发光 (半透明灰色填充) */
-            painter.setBrush(QColor(160, 160, 160, 30));
-            painter.setPen(QPen(QColor(128, 128, 128), 2));
-            painter.drawEllipse(getRect(center));
-        }
+/*
+ * thinkingOverlayRect - 状态条的位置
+ *
+ * 画在棋盘**上方的空白带**里: 最上面一排棋子的圆心在 offsetY=50, 半径 24, 所以
+ * y < 26 这条横带是完全空着的。放在这里既不遮挡任何棋子, 又正好在玩家盯着的
+ * 棋盘内部, 不需要去右边的控制栏找。
+ */
+QRect ChessBoard::thinkingOverlayRect() const
+{
+    constexpr int kBoxH = 22;
+    int boxW = width() - 16;
+    if (boxW > 470) {
+        boxW = 470;
     }
+    if (boxW < 160) {
+        boxW = qMax(100, width() - 4);
+    }
+    return QRect((width() - boxW) / 2, 2, boxW, kBoxH);
+}
+
+void ChessBoard::drawThinkingOverlay(QPainter &painter)
+{
+    const bool selfPlay = m_selfPlaying.load();
+    if (state != STATE_THINKING && !selfPlay) {
+        return;
+    }
+
+    const QRect box = thinkingOverlayRect();
+    /* 40ms 一帧 * 40 帧 = 1.6 秒转一圈 */
+    const qreal phase = (m_animPhase % 40) / 40.0;
+    const qreal wave = 0.5 + 0.5 * std::sin(phase * 2.0 * kPi);
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    /* 深色药丸底 (棋盘是米黄, 深底浅字最醒目) */
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(28, 38, 54, 230));
+    painter.drawRoundedRect(box, box.height() / 2.0, box.height() / 2.0);
+
+    /* 左端: 一圈旋转的粒子 (呼吸 + 公转 + 彗尾), 与 ThinkingIndicator 同款视觉 */
+    const QPointF c(box.left() + 13.0, box.center().y() + 0.5);
+    const qreal ringR = 6.4 + 0.9 * wave;
+    constexpr int kDots = 8;
+    for (int i = 0; i < kDots; ++i) {
+        const qreal k = 1.0 - i / static_cast<qreal>(kDots);   /* 彗头 = 1 */
+        const qreal ang = phase * 2.0 * kPi - i * (2.0 * kPi / kDots);
+        QColor dot(96, 180, 255);
+        dot.setAlphaF(0.18 + 0.82 * k * k);
+        painter.setBrush(dot);
+        const qreal r = 1.0 + 1.5 * k;
+        painter.drawEllipse(QPointF(c.x() + ringR * std::cos(ang),
+                                    c.y() + ringR * std::sin(ang)), r, r);
+    }
+
+    /* 文字: [agent] 正在思考 3.24s · ① 探索环境 + 预训练 (≤64 步) */
+    const long long ms = m_thinkClock.isValid() ? m_thinkClock.elapsed() : 0;
+    QString text = selfPlay ? QStringLiteral("AI 对弈中") : QStringLiteral("AI 正在思考");
+    text += QStringLiteral("  ") + shortElapsed(ms);
+    if (!m_thinkStage.isEmpty()) {
+        text += QStringLiteral("   ·   ") + m_thinkStage;
+    }
+
+    QFont f = painter.font();
+    f.setPointSize(8);
+    f.setBold(true);
+    painter.setFont(f);
+
+    const int textLeft = box.left() + 25;
+    const int textRight = box.right() - 8;
+    const QFontMetrics fm(f);
+    if (m_busyClickSeen) {
+        const QString hint = QStringLiteral("请稍候, 现在还不能走子");
+        const int hintW = fm.horizontalAdvance(hint) + 10;
+        painter.setPen(QColor(255, 196, 92));
+        painter.drawText(QRect(textRight - hintW, box.top(), hintW, box.height()),
+                         Qt::AlignVCenter | Qt::AlignRight, hint);
+        painter.setPen(QColor(236, 242, 250));
+        painter.drawText(QRect(textLeft, box.top(), textRight - textLeft - hintW, box.height()),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         fm.elidedText(text, Qt::ElideRight, textRight - textLeft - hintW));
+    } else {
+        painter.setPen(QColor(236, 242, 250));
+        painter.drawText(QRect(textLeft, box.top(), textRight - textLeft, box.height()),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         fm.elidedText(text, Qt::ElideRight, textRight - textLeft));
+    }
+
+    painter.restore();
 }
 
 void ChessBoard::drawStone(QPainter &painter, const Stone *stone)
@@ -292,10 +539,25 @@ void ChessBoard::drawStone(QPainter &painter, const Stone *stone)
 void ChessBoard::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() != Qt::LeftButton) return;
+
+    /*
+       AI 思考期间点棋盘: 拒绝落子是对的 (轮到 AI 走), 但必须给出反馈。
+       原来的实现只是静默 return, 玩家看到的是"棋子没动, 我也点不动", 分不清
+       是"还在算"还是"已经卡死" —— 加入"走子前先探索+预训练"之后单步思考涨到
+       秒级, 这个问题就很突出了。这里在状态条上闪一句"请稍候"。
+    */
+    if (state == STATE_THINKING || m_selfPlaying.load()) {
+        if (state == STATE_THINKING && !m_busyClickSeen) {
+            m_busyClickSeen = true;
+            m_busyClickTimer->start();
+            update(thinkingOverlayRect());
+        }
+        return;
+    }
     if (state != STATE_IDEL) return;
     if (isReplayMode()) return;
 
-    if (selectID == Stone::ID_NONE) {
+    if (selectID == -1) {
         /* 选择己方棋子 */
         Stone *stone = selectStone(event->pos());
         if (stone == nullptr) return;
@@ -308,38 +570,77 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
     /* 已有选中棋子 -> 尝试移动 */
     bool moved = moveStone(event->pos());
     if (!moved) {
-        /* 移动失败: 可能是点到了己方另一棋子,重新选 */
+        /* 移动失败 (含非法走法): 可能是点到了己方另一棋子, 重新选 */
         Stone *stone = selectStone(event->pos());
         if (stone != nullptr && stone->color == color) {
             selectID = stone->id;
         } else {
-            selectID = Stone::ID_NONE;
+            selectID = -1;
         }
         update();
         return;
     }
 
-    /* 玩家走棋成功 → 检查是否将杀 */
-    if (chess.isGameOver() != Stone::COLOR_NONE) {
+    /* 玩家走棋成功 → 判定是否将杀 / 困毙 / 和棋 */
+    int result = chess.getResult(chess.sideToMove);
+    if (result != Chess::RESULT_ONGOING) {
         state = STATE_TERMINATE;
         update();
-        emit sendResult(chess.isGameOver());
+        emit sendResult(result);
         return;
     }
 
     /* 切换为AI思考 */
-    selectID = Stone::ID_NONE;
+    selectID = -1;
     state = STATE_THINKING;
     update();
-    condit.wakeAll();
+    /*
+       wakeAll() 必须在持有同一个 mutex 时调用。原来这里是无锁调用, 存在经典的
+       丢唤醒窗口: worker 已判定 state != STATE_THINKING (此时还是 IDLE) 但还没
+       进入 wait(), GUI 此刻把 state 改成 THINKING 并 wakeAll() —— 由于 GUI 不
+       持锁, 这一步可以被插进 worker 的判断与等待之间, worker 随后长睡, 棋盘
+       再也不会有 AI 落子。
+    */
+    {
+        QMutexLocker locker(&mutex);
+        condit.wakeAll();
+    }
 }
 
 void ChessBoard::process()
 {
+    /*
+       回到"等待玩家走棋"并宣告思考结束。
+       顺序很重要: 必须**先把 state 落成 IDLE, 再**发 aiThinkingStopped ——
+       状态条的可见性看的就是 state, 反过来的话 GUI 处理队列消息时可能又多画一帧。
+    */
+    auto backToIdle = [this]() {
+        {
+            QMutexLocker locker(&mutex);
+            color = Stone::COLOR_RED;
+            state = STATE_IDEL;
+            selectID = -1;
+            condit.wakeAll();
+        }
+        emit aiThinkingStopped();
+        QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
+    };
+
     while (state != STATE_TERMINATE) {
         {
             QMutexLocker locker(&mutex);
-            if (state != STATE_THINKING) {
+            /*
+               这里必须是 while 而不是 if, 而且醒来后**必须重新检查 state**。
+
+               原来写的是 `if (state != STATE_THINKING) condit.wait(&mutex);`, 醒来就
+               直接往下走去搜索。条件变量本来就会虚假唤醒, 而 reset() 和 matchAgents()
+               都会在 state 仍是 IDLE 的时候 wakeAll() (它们只是想叫醒"正在思考"的
+               worker, 让它作废在飞的那一步) —— 于是空闲的 worker 被叫醒后照跑
+               aiThink(), 一边搜索一边往 env 的 history 里 push_back。
+               如果这时另一个线程 (Agent 对弈线程) 也在用同一个 env, 两边同时改
+               env.history 就是 double-free / 堆损坏 (ASan 实测抓到的就是这个)。
+            */
+            while (state != STATE_THINKING && state != STATE_TERMINATE) {
                 condit.wait(&mutex);
             }
             if (state == STATE_TERMINATE) {
@@ -349,6 +650,10 @@ void ChessBoard::process()
 
         /* 计时开始 */
         auto t0 = std::chrono::steady_clock::now();
+        /* 记下代数, 用来识别"思考途中被按了开局" */
+        const unsigned gen = m_thinkGeneration.load();
+
+        emit aiThinkingStarted(agentDisplayName(m_agentType), m_preTrainSteps.load());
 
         /* AI(黑方) 决策 */
         Step step = aiThink(Stone::COLOR_BLACK);
@@ -357,25 +662,71 @@ void ChessBoard::process()
         auto t1 = std::chrono::steady_clock::now();
         long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        /* 检查是否有合法走法 */
-        if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
-            /* AI无合法走法 */
-            emit sendResult(Stone::COLOR_RED); /* 红方胜 */
-            state = STATE_TERMINATE;
-            update();
+        /* 思考期间玩家按了"开局" -> 这一步连同它的计时一起作废 */
+        if (gen != m_thinkGeneration.load()) {
+            backToIdle();
             continue;
         }
 
-        /* 通过引擎执行走法 */
-        double totalReward = 0;
-        chess.moveForward(&step, totalReward);
+        /* 检查AI是否有合法走法 (将杀 / 困毙) */
+        if (!step.valid) {
+            /*
+               先分清"真的没棋可走"和"agent 返回了一个无效走法"。后者不是将杀:
+               以前直接把 !step.valid 当成"AI 被将死", 于是一个抽风的 agent 会让对局
+               在**一步都没落子**的情况下判红方胜 —— 界面上就是"棋子没动, 我却赢了",
+               而且从此不能走棋。这里用第一个合法走法兜底。
+            */
+            std::vector<Step *> legal;
+            {
+                QMutexLocker locker(&mutex);
+                chess.sample(Stone::COLOR_BLACK, legal);
+                if (!legal.empty()) {
+                    std::fprintf(stderr,
+                                 "[aiThink] agent 返回无效走法 (有 %zu 个合法走法), "
+                                 "已用第一个合法走法兜底\n", legal.size());
+                    step = *legal[0];
+                }
+            }
+            Steps::instance().put(legal);
+        }
 
-        /* 检查将杀 */
-        int gameResult = chess.isGameOver();
-        if (gameResult != Stone::COLOR_NONE) {
-            emit sendResult(gameResult);
+        if (!step.valid) {
+            /* 确实没有合法走法 -> 红方胜 */
             state = STATE_TERMINATE;
-            update();
+            emit aiThinkingStopped();
+            emit sendResult(Chess::RESULT_RED_WIN);
+            QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
+            continue;
+        }
+
+        emitStage(QStringLiteral("③ 落子"));
+
+        /* 通过引擎执行走法 (与 GUI 线程的绘制互斥) */
+        int result = Chess::RESULT_ONGOING;
+        bool discarded = false;
+        {
+            QMutexLocker locker(&mutex);
+            /* 在锁内再确认一次代数: reset() 也是在这个锁内 +1 的, 两者不会交错 */
+            if (gen != m_thinkGeneration.load()) {
+                discarded = true;
+            } else {
+                double totalReward = 0;
+                chess.moveForward(&step, totalReward);
+                chess.sideToMove = Stone::COLOR_RED;
+                result = chess.getResult(chess.sideToMove);
+            }
+        }
+        if (discarded) {
+            backToIdle();
+            continue;
+        }
+
+        if (result != Chess::RESULT_ONGOING) {
+            emit aiThinkFinished(elapsedMs);
+            state = STATE_TERMINATE;
+            emit aiThinkingStopped();
+            emit sendResult(result);
+            QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
             continue;
         }
 
@@ -383,34 +734,61 @@ void ChessBoard::process()
         emit aiThinkFinished(elapsedMs);
 
         /* 回到等待玩家状态 */
-        {
-            QMutexLocker locker(&mutex);
-            color = Stone::COLOR_RED;
-            state = STATE_IDEL;
-            selectID = Stone::ID_NONE;
-            condit.wakeAll();
-        }
-        QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
+        backToIdle();
     }
 }
 
 void ChessBoard::reset()
 {
-    chess.reset();
-    selectID = -1;
-    color = Stone::COLOR_RED;
-    state = STATE_IDEL;
+    /*
+       reset() 必须同时退出回放模式。原来的实现只重置棋盘, 不清 m_replayGameId,
+       而 mousePressEvent 开头是 `if (isReplayMode()) return;` —— 只要在"历史对局"
+       下拉框里选过一次, 之后按"开局"也只重置棋盘、点击继续被吞掉, 只能重启程序
+       (replayModeExited 信号声明了、也连接了, 但从来没有被 emit 过)。
+    */
+    bool wasReplay = isReplayMode();
+    m_replayGameId = -1;
+    m_replayIndex = 0;
+    m_replaySteps.clear();
+
+    {
+        QMutexLocker locker(&mutex);
+        /*
+            +1 之后, 正在思考的那一步会在 process() 里发现"代数变了"而主动作废。
+           没有这一条时, reset() 只把 state 改回 IDEL 就返回, 而工作线程还在算,
+           算完照样落子 —— 落到**重置后的新棋盘**上, 表现为"我刚开了新局, 对方
+           却已经走了一步"。
+        */
+        ++m_thinkGeneration;
+        chess.reset();
+        selectID = -1;
+        color = Stone::COLOR_RED;
+        state = STATE_IDEL;
+        condit.wakeAll();
+    }
+    if (m_animTimer != nullptr) {
+        m_animTimer->stop();
+    }
+    if (m_busyClickTimer != nullptr) {
+        m_busyClickTimer->stop();
+    }
+    m_busyClickSeen = false;
+    m_thinkStage.clear();
+    if (wasReplay) {
+        emit replayModeExited();
+    }
     update();
 }
 
 void ChessBoard::checkGameOver(int result)
 {
     QString msg;
-    if (result == Stone::COLOR_RED) {
+    if (result == Chess::RESULT_RED_WIN) {
         msg = "红方胜!";
-    } else if (result == Stone::COLOR_BLACK) {
+    } else if (result == Chess::RESULT_BLACK_WIN) {
         msg = "黑方胜!";
     } else {
+        /* RESULT_DRAW: 三次重复局面 或 60 回合自然限着 */
         msg = "平局!";
     }
     QMessageBox::information(this, "游戏结束", msg);
@@ -425,13 +803,90 @@ void ChessBoard::setAgentType(AgentType type)
  *  aiThink - 根据当前选中的agent类型选择走法
  *
  *  AI Agent 类型:
- *    AGENT_ALPHABETA : 内置Alpha-Beta剪枝 (深度=8)
+ *    AGENT_ALPHABETA : Alpha-Beta 剪枝 (默认深度 5, 见 AB_DEPTH)
  *    AGENT_MCTS      : 蒙特卡洛树搜索 (800次模拟)
  *    AGENT_PG        : Policy Gradient (PGEagent)
  *    AGENT_DQN       : Deep Q-Network (DQNAgent)
- *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (800次模拟)
- *    AGENT_DQNMCTS   : DQN+MCTS
+ *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (默认 80 次模拟, 见 PPO_SIMS)
+ *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
+ *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
  * ================================================================ */
+/* ================================================================
+ *  preTrainThenDecide - 走子前的"先探索环境 + 预训练" (仿 snakeAI)
+ *
+ *  snakeAI 的每个 Agent::xxxAction() 都是三步: 先把当前状态记下来, 再从当前状态
+ *  出发用探索策略滚若干步、用这批新鲜经验在线训练一次, 最后才基于当前状态做决策。
+ *  这里把同一套流程套在所有 agent 上 —— 有监督式的 agent (Alpha-Beta / MCTS)
+ *  的 exploreAndTrain() 是空实现, EVAB 则把探索结果蒸馏回评估网络, 所以调用它对
+ *  它们无害; 而且探索全程用 moveForward/moveBack 试走并原样回退, 不会改动真棋局。
+ * ================================================================ */
+std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
+{
+    if (agent == nullptr) {
+        emitStage(QStringLiteral("① 搜索 / 决策"));
+        return std::string();
+    }
+    if (!m_preTrainEnabled.load()) {
+        emitStage(QStringLiteral("① 搜索 / 决策"));
+        return std::string("探索+预训练: 已关闭");
+    }
+    const int steps = m_preTrainSteps.load();
+    if (steps <= 0) {
+        /* 步数设成 0 等价于关掉探索 (界面上允许这么设, 用来做对照) */
+        emitStage(QStringLiteral("① 搜索 / 决策 (探索步数=0)"));
+        return std::string("探索+预训练: 已关闭 (步数=0)");
+    }
+    emitStage(QStringLiteral("① 探索环境 + 预训练 (≤%1 步)").arg(steps));
+    const bool trained = agent->exploreAndTrain(color, steps);
+    std::string info = agent->getExploreInfo();
+    if (info.empty()) {
+        info = trained ? "已预训练" : "无需预训练 (该 agent 没有在线可训练参数)";
+    }
+    {
+        QMutexLocker locker(&m_infoMutex);
+        m_lastExploreInfo = info;
+    }
+    /*
+       用信号把说明送到界面, 而不是让 GUI 线程去读 m_lastExploreInfo ——
+       这里在 AI 工作线程, 直接读同一个 std::string 是数据竞争 (A7 那一类)。
+    */
+    emit aiExploreInfo(QString::fromStdString(info));
+    emitStage(QStringLiteral("② 搜索 / 决策"));
+    return info;
+}
+
+std::string ChessBoard::getLastExploreInfo() const
+{
+    QMutexLocker locker(&m_infoMutex);
+    return m_lastExploreInfo;
+}
+
+QString ChessBoard::stagePrefix() const
+{
+    if (m_matchRunning.load()) {
+        const int g = m_matchGameNo.load();
+        const int tot = m_matchGames.load();
+        const int ply = m_selfPlayMoveNo.load();
+        if (g > 0) {
+            return QStringLiteral("对弈 %1/%2 局 · 第 %3 手 · ").arg(g).arg(tot).arg(ply);
+        }
+        return QStringLiteral("对弈 · ");
+    }
+    if (m_selfPlaying.load()) {
+        const int no = m_selfPlayMoveNo.load();
+        if (no > 0) {
+            return QStringLiteral("自对弈 第 %1 步 · ").arg(no);
+        }
+        return QStringLiteral("自对弈 · ");
+    }
+    return QString();
+}
+
+void ChessBoard::emitStage(const QString &stage)
+{
+    emit aiThinkingStage(stagePrefix() + stage);
+}
+
 Step ChessBoard::aiThink(int color)
 {
     /* Copy current game state to env so agents can mutate env freely
@@ -440,58 +895,94 @@ Step ChessBoard::aiThink(int color)
 
     switch (m_agentType) {
     case AGENT_ALPHABETA: {
-        /* Alpha-Beta Pruning: 深度=8 */
-        static ABAgent abAI(env, 5);
+        /*
+           Agent 以前声明成函数内的 static, 于是它只在第一次调用时构造, 永远绑定
+           在"当时那个 env" 上 —— 一旦出现第二个 ChessBoard (或 env 先被销毁),
+           就是悬垂引用。ABAgent 本身只是一个引用 + 一个深度整数, 每步新建的代价
+           可以忽略。
+        */
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
+        ABAgent abAI(env, AB_DEPTH);
         return abAI.getBestMove(color);
     }
     case AGENT_MCTS: {
-        /* 蒙特卡洛树搜索: 800次模拟 */
-        static MCTS mctsAI(env, 1.414);
-        return mctsAI.findBestMove(color, 800);
+        /* 蒙特卡洛树搜索 */
+        emitStage(QStringLiteral("① 搜索 / 决策 (MCTS %1 次模拟)").arg(MCTS_SIMS));
+        MCTS mctsAI(env, 1.414f);
+        return mctsAI.findBestMove(color, MCTS_SIMS);
     }
     case AGENT_PG: {
         /* Policy Gradient: 按概率分布采样 */
+        /* 与后台训练线程互斥: 训练线程会在同一把锁内 loadPolicy() 改写网络权重 */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPG == nullptr) {
             m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
             auto it = s_weightPaths.find(AGENT_PG);
             if (it != s_weightPaths.end())
                 m_sfPG->loadPolicy(it->second);
         }
+        preTrainThenDecide(m_sfPG, color);   /* 先探索环境+预训练, 再决策 */
         return m_sfPG->selectMove(color, false); /* false = greedy/deterministic */
     }
     case AGENT_DQN: {
         /* Deep Q-Network: argmax Q-value */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfDQN == nullptr) {
             m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
             auto it = s_weightPaths.find(AGENT_DQN);
             if (it != s_weightPaths.end())
                 m_sfDQN->loadModel(it->second);
         }
+        preTrainThenDecide(m_sfDQN, color);
         return m_sfDQN->selectMove(color, false); /* false = no exploration */
     }
     case AGENT_PPOMCTS: {
-        /* PPO + MCTS (AlphaZero风格): 800次模拟, argmax */
+        /* PPO + MCTS (AlphaZero风格): argmax */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPPOMCTS == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
             auto it = s_weightPaths.find(AGENT_PPOMCTS);
             if (it != s_weightPaths.end())
                 m_sfPPOMCTS->loadModel(it->second);
         }
-        return m_sfPPOMCTS->selectMove(color, 80, 0.0f);
+        preTrainThenDecide(m_sfPPOMCTS, color);
+        return m_sfPPOMCTS->selectMove(color, PPO_SIMS, 0.0f);
     }
     case AGENT_DQNMCTS: {
-        /* DQN + MCTS: 400次迭代, 无探索 */
+        /*
+           training 必须是 false。以前传 true, 而 DQNMCTS 的 exploringRate 初值
+           是 1.0 且只在 endOnlineEpisode()/learn() 里衰减 (GUI 从不调用),
+           于是 selectMove 几乎必然在根节点挑一个**随机**子节点 —— 界面上的
+           "DQN+MCTS" 实际上一直在随机走子。迭代数也从 6 提到 200。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfDQNMCTS == nullptr) {
             m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
             auto it = s_weightPaths.find(AGENT_DQNMCTS);
             if (it != s_weightPaths.end())
                 m_sfDQNMCTS->loadModel(it->second);
         }
-        return m_sfDQNMCTS->selectMove(color, 6, true);
+        preTrainThenDecide(m_sfDQNMCTS, color);
+        return m_sfDQNMCTS->selectMove(color, DQNMCTS_ITERATIONS, false);
     }
-    default:
-        static ABAgent abAIDefault(env, 5);
+    case AGENT_EVAB: {
+        /* EVAB: 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md) */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfEVAB == nullptr) {
+            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+            auto it = s_weightPaths.find(AGENT_EVAB);
+            if (it != s_weightPaths.end())
+                m_sfEVAB->loadModel(it->second);
+        }
+        /* EVAB 的"探索"就是它的搜索; 这里额外把探索结果蒸馏回评估网络 */
+        preTrainThenDecide(m_sfEVAB, color);
+        return m_sfEVAB->getBestMove(color);
+    }
+    default: {
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
+        ABAgent abAIDefault(env, AB_DEPTH);
         return abAIDefault.getBestMove(color);
+    }
     }
 }
 
@@ -512,87 +1003,301 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
 
     switch (agentType) {
     case AGENT_ALPHABETA: {
-        static ABAgent abAIForAgent(env, 5);
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
+        ABAgent abAIForAgent(env, AB_DEPTH);
         return abAIForAgent.getBestMove(color);
     }
     case AGENT_MCTS: {
-        static MCTS mctsAI(env, 1.414);
-        return mctsAI.findBestMove(color, 800);
+        emitStage(QStringLiteral("① 搜索 / 决策 (MCTS %1 次模拟)").arg(MCTS_SIMS));
+        MCTS mctsAI(env, 1.414f);
+        return mctsAI.findBestMove(color, MCTS_SIMS);
     }
     case AGENT_PG: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPG == nullptr) {
             m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
         }
+        preTrainThenDecide(m_sfPG, color);
         return m_sfPG->selectMove(color, false);
     }
     case AGENT_DQN: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfDQN == nullptr) {
             m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
         }
+        preTrainThenDecide(m_sfDQN, color);
         return m_sfDQN->selectMove(color, false);
     }
     case AGENT_PPOMCTS: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPPOMCTS == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
         }
-        return m_sfPPOMCTS->selectMove(color, 8, 0.0f);
+        preTrainThenDecide(m_sfPPOMCTS, color);
+        return m_sfPPOMCTS->selectMove(color, PPO_SIMS, 0.0f);
     }
     case AGENT_DQNMCTS: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfDQNMCTS == nullptr) {
             m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
         }
-        return m_sfDQNMCTS->selectMove(color, 4, false);
+        preTrainThenDecide(m_sfDQNMCTS, color);
+        /* self-play 走贪心 (training=false), 否则恒为 1.0 的探索率会让它随机走子 */
+        return m_sfDQNMCTS->selectMove(color, DQNMCTS_ITERATIONS, false);
+    }
+    case AGENT_EVAB: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfEVAB == nullptr) {
+            m_sfEVAB = new EVABAgent(env, 48, AB_DEPTH, 0);
+        }
+        preTrainThenDecide(m_sfEVAB, color);
+        return m_sfEVAB->getBestMove(color);
     }
     default:
-        static ABAgent abAIForAgentDef(env, 5);
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
+        ABAgent abAIForAgentDef(env, AB_DEPTH);
         return abAIForAgentDef.getBestMove(color);
     }
 }
 
 /* ================================================================
- *  selfPlay - AI Self Play（带强化学习训练）
+ *  Agent 对 Agent 对弈 (arena)
  *
- *  同一 AI agent 同时控制红黑双方自对弈, 直到游戏结束.
+ *  和原来的 selfPlay 的区别: selfPlay 是"同一个 agent 自己跟自己下", 只能看
+ *  它能不能收敛; 这里让**两个不同的 agent** 打若干局, 用来比较强弱。
  *
- *  对于支持在线训练的 agent (目前 DQNMCTS), 每步走完后自动将经验
- *  存入 replay buffer, 并在对局结束时触发一次 learn 步骤.
+ *  两条方法学上的要求 (少任何一条, 结果都没有解释力):
  *
- *  参数:
- *    agentType - 使用的 AI agent 类型
- *
- *  返回:
- *    胜方: Stone::COLOR_RED 或 Stone::COLOR_BLACK
- *    平局: Stone::COLOR_NONE
+ *   1. 每局交换先后手。中国象棋先手(红)优势很大, 固定谁执红的话最后只是在测
+ *      "谁执红", 而不是"谁更强"。所以胜负按参赛者 A/B 记, 不按红黑记。
+ *   2. 局数要够。单局的偶然性足以翻转结论, 所以界面上局数做成可配置, 并且
+ *      逐局列出明细 (谁执红、谁胜、多少手)。
  * ================================================================ */
-int ChessBoard::selfPlay(AgentType agentType)
+
+QString ChessBoard::MatchStats::summary() const
 {
-    chess.reset();
+    QString s = QStringLiteral("%1 %2 : %3 %4")
+                    .arg(agentA).arg(winA).arg(winB).arg(agentB);
+    if (draws > 0) {
+        s += QStringLiteral(" (和 %1)").arg(draws);
+    }
+    s += QStringLiteral("  共 %1 局 / %2 手").arg(games).arg(plies);
+    if (agentErrors > 0) {
+        s += QStringLiteral("  [%1 次无效走法已兜底]").arg(agentErrors);
+    }
+    if (aborted) {
+        s += QStringLiteral("  [已中止]");
+    }
+    return s;
+}
+
+QString ChessBoard::MatchStats::detail() const
+{
+    QString d = summary();
+    d += QStringLiteral("\n\n参赛方:\n  A = %1\n  B = %2").arg(agentA, agentB);
+    d += QStringLiteral("\n\n每局明细 (每局交换先后手):\n");
+    d += log;
+    if (plies > 0) {
+        const double avg = double(totalThinkMs) / double(plies);
+        d += QStringLiteral("\n思考耗时: 累计 %1 s, 平均 %2 ms/手, 单步最长 %3 ms")
+                 .arg(totalThinkMs / 1000.0, 0, 'f', 1)
+                 .arg(avg, 0, 'f', 0)
+                 .arg(maxThinkMs);
+    }
+    return d;
+}
+
+ChessBoard::AgentType ChessBoard::typeForTurn(int turn, AgentType redType,
+                                              AgentType blackType) const
+{
+    return (turn == Stone::COLOR_RED) ? redType : blackType;
+}
+
+/* 打一局: 红方 redType, 黑方 blackType。返回 Chess::RESULT_*, 被中止则返回 ONGOING */
+int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, MatchStats &st)
+{
+    {
+        QMutexLocker locker(&mutex);
+        chess.reset();
+    }
     int turn = Stone::COLOR_RED;
-    int maxMoves = 300;
     int moves = 0;
+    int ret = Chess::RESULT_DRAW;
 
-    while (moves < maxMoves) {
-        int gameResult = chess.isGameOver();
-        if (gameResult != Stone::COLOR_NONE) {
-            return gameResult;
+    while (moves < m_maxPliesPerGame) {
+        if (m_matchAbort.load()) {
+            return Chess::RESULT_ONGOING;
+        }
+        m_selfPlayMoveNo = moves + 1;
+
+        {
+            QMutexLocker locker(&mutex);
+            const int r = chess.getResult(turn);
+            if (r != Chess::RESULT_ONGOING) {
+                ret = r;
+                break;
+            }
         }
 
-        Step step = aiThinkForAgent(turn, agentType);
+        const AgentType who = typeForTurn(turn, redType, blackType);
+        auto t0 = std::chrono::steady_clock::now();
+        Step step = aiThinkForAgent(turn, who);
+        auto t1 = std::chrono::steady_clock::now();
+        const long long ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        st.totalThinkMs += ms;
+        if (ms > st.maxThinkMs) {
+            st.maxThinkMs = ms;
+        }
+        st.plies++;
+        /* 让界面的"AI思考时间"标签逐手跳动 */
+        emit aiThinkFinished(ms);
 
-        /* 无合法走法 */
-        if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
-            return (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+        /* 无合法走法 (将杀 / 困毙) */
+        if (!step.valid) {
+            /*
+               先分清"真的无棋可走"和"agent 返回了一个无效走法"。
+               后者不是将杀 —— 以前直接把 !step.valid 当成"走棋方被将死", 于是一个
+               抽风的 agent 会让对局在没走过任何一步的情况下被判负 (界面上就是
+               "棋子没动, 我却输了")。这里用第一个合法走法兜底, 并把次数记下来。
+            */
+            std::vector<Step *> legal;
+            {
+                QMutexLocker locker(&mutex);
+                chess.sample(turn, legal);
+                if (!legal.empty()) {
+                    /*
+                       这个分支正常永远不该进。真进来了说明某个 agent 的搜索返回了
+                       无效走法 —— 那是个 bug, 但**不能让它决定胜负**: 用第一个合法
+                       走法兜底, 并把次数记进 MatchStats (显示在比分行里)。
+                    */
+                    std::fprintf(stderr,
+                                 "[arena] agent(%d) 返回无效走法 (第 %d 局第 %d 手): "
+                                 "valid=%d id=%d pos=(%d,%d)->(%d,%d), "
+                                 "仍有 %zu 个合法走法, 已兜底\n",
+                                 (int)who, st.games + 1, moves + 1,
+                                 (int)step.valid, step.id,
+                                 step.pos.x, step.pos.y, step.nextPos.x, step.nextPos.y,
+                                 legal.size());
+                    step = *legal[0];
+                    st.agentErrors++;
+                }
+            }
+            Steps::instance().put(legal);
         }
 
-        double totalReward = 0;
-        chess.moveForward(&step, totalReward);
-        turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+        if (!step.valid) {
+            /* 确实没有合法走法 -> 走棋方被将杀 / 困毙 */
+            ret = (turn == Stone::COLOR_RED) ? Chess::RESULT_BLACK_WIN
+                                             : Chess::RESULT_RED_WIN;
+            break;
+        }
+
+        {
+            QMutexLocker locker(&mutex);
+            double totalReward = 0;
+            chess.moveForward(&step, totalReward);
+            /* sideToMove 必须跟着 turn 走, 否则下一手 getResult 会看错方 */
+            turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+            chess.sideToMove = turn;
+        }
         moves++;
     }
 
-    /* 达到最大步数, 按评估判胜 */
-    double score = chess.evaluate();
-    return (score > 0) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+    /*
+       达到步数上限: 原来 selfPlay 按 evaluate() 判胜 (score == 0 也返回红胜),
+       于是"平局"分支永远不可达。现在直接判和棋 —— 中国象棋的自然限着本来就是和棋。
+    */
+    return ret;
+}
+
+ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB, int games)
+{
+    MatchStats st;
+    st.agentA = agentDisplayName(typeA);
+    st.agentB = agentDisplayName(typeB);
+    if (games < 1) {
+        games = 1;
+    }
+
+    /*
+       对弈期间屏蔽玩家点击。用独立标志而不是改 state —— state 是给 AI 工作线程
+       看的, 改它会把那个线程也唤醒起来思考, 于是两个线程同时写同一张棋盘。
+    */
+    m_selfPlaying = true;
+    m_selfPlayMoveNo = 0;
+    m_matchAbort = false;
+    m_matchRunning = true;
+    m_matchGames = games;
+    m_matchGameNo = 0;
+
+    /*
+       如果玩家是在"AI 正在思考"的时候按下的开始对弈, 棋盘上还有一个在飞的一手。
+       把代数 +1 让它作废、把 state 收回 IDLE, 否则工作线程会和这里的对弈线程
+       同时写 chess。
+    */
+    {
+        QMutexLocker locker(&mutex);
+        ++m_thinkGeneration;
+        state = STATE_IDEL;
+        selectID = -1;
+        condit.wakeAll();
+    }
+
+    emit aiThinkingStarted(QStringLiteral("%1 vs %2").arg(st.agentA, st.agentB),
+                           m_preTrainEnabled.load() ? m_preTrainSteps.load() : 0);
+    emit matchStarted(st.agentA, st.agentB, games);
+
+    for (int g = 0; g < games; ++g) {
+        if (m_matchAbort.load()) {
+            st.aborted = true;
+            break;
+        }
+        m_matchGameNo = g + 1;
+
+        /* 每局交换先后手: 偶数局 A 执红, 奇数局 B 执红 */
+        const bool aIsRed = (g % 2 == 0);
+        const AgentType redType = aIsRed ? typeA : typeB;
+        const AgentType blackType = aIsRed ? typeB : typeA;
+
+        const int res = playMatchGame(redType, blackType, st);
+        if (res == Chess::RESULT_ONGOING) {
+            st.aborted = true;      /* playMatchGame 用 ONGOING 表示"被中止" */
+            break;
+        }
+
+        QString line = QStringLiteral("  第 %1 局: 红=%2 黑=%3 -> ")
+                           .arg(g + 1)
+                           .arg(aIsRed ? st.agentA : st.agentB,
+                                aIsRed ? st.agentB : st.agentA);
+        if (res == Chess::RESULT_DRAW) {
+            line += QStringLiteral("和棋");
+            st.draws++;
+        } else {
+            const bool redWon = (res == Chess::RESULT_RED_WIN);
+            const bool aWon = (redWon == aIsRed);
+            line += aWon ? QStringLiteral("%1 胜").arg(st.agentA)
+                         : QStringLiteral("%1 胜").arg(st.agentB);
+            if (aWon) {
+                st.winA++;
+            } else {
+                st.winB++;
+            }
+        }
+        st.games++;
+        st.log += line + QStringLiteral("  (%1 手)\n").arg(m_selfPlayMoveNo.load());
+
+        emit matchGameFinished(st.games, games, line);
+    }
+
+    m_matchRunning = false;
+    m_selfPlaying = false;
+    m_selfPlayMoveNo = 0;
+    m_matchGameNo = 0;
+    m_matchGames = 0;
+    emit aiThinkingStopped();
+    emit matchFinished(st.summary(), st.detail());
+    return st;
 }
 
 /* ================================================================
@@ -616,6 +1321,10 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     case AGENT_DQNMCTS: {
         if (m_sfDQNMCTS == nullptr) return false;
         return m_sfDQNMCTS->saveModel(filepath);
+    }
+    case AGENT_EVAB: {
+        if (m_sfEVAB == nullptr) return false;
+        return m_sfEVAB->saveModel(filepath);
     }
     default:
         return false;
@@ -641,6 +1350,11 @@ void ChessBoard::stopBackgroundTraining()
 {
     m_bgTraining = false;
     if (m_bgTrainThread.joinable()) {
+        /*
+           注意: 训练线程只在**每轮**开始时检查 m_bgTraining, 而一轮是"克隆权重 ->
+           训练 BG_TRAIN_EPISODES 局", 所以关窗的等待时间由单轮时长决定。
+           轮次规模就是按这个约束选的 (见 BG_TRAIN_* 常量), 不要随手调大。
+        */
         m_bgTrainThread.join();
     }
 }
@@ -711,28 +1425,30 @@ void ChessBoard::backgroundTrainLoop()
             case AGENT_PG: {
                 PGEagent clone(trainChess, 64, 0.9f, 0.01f, 1.0f);
                 clone.loadPolicy(TMP_WEIGHTS);
-                clone.train(4, 200, true, false); /* 4 episodes, self-play, quiet */
+                clone.train(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, true, false);
                 clone.savePolicy(TMP_WEIGHTS);
                 break;
             }
             case AGENT_DQN: {
                 DQNAgent clone(trainChess, 64, 0.99f, 0.001f, 1.0f);
                 clone.loadModel(TMP_WEIGHTS);
-                clone.trainSelfPlay(4, 200, false); /* 4 episodes, quiet */
+                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, false);
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
             case AGENT_PPOMCTS: {
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f);
                 clone.loadModel(TMP_WEIGHTS);
-                clone.trainSelfPlay(4, 50, 200, false); /* 4 episodes, 50 sims, quiet */
+                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
+                                    BG_TRAIN_MAX_MOVES, false);
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
             case AGENT_DQNMCTS: {
                 DQNMCTSAgent clone(trainChess, 128, 0.99f, 0.001f, 1.0f, 1.414f);
                 clone.loadModel(TMP_WEIGHTS);
-                clone.trainSelfPlay(4, 50, 200, false); /* 4 episodes, 50 iters, quiet */
+                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
+                                    BG_TRAIN_MAX_MOVES, false);
                 clone.saveModel(TMP_WEIGHTS);
                 break;
             }
@@ -782,35 +1498,62 @@ void ChessBoard::shutdownSave()
         m_sfPPOMCTS->saveModel("weights/ppomcts_agent.dat");
     if (m_sfDQNMCTS != nullptr)
         m_sfDQNMCTS->saveModel("weights/dqnmcts_agent.dat");
+    /*
+       EVAB 原来漏在这里了: 它是界面上可选、能被在线训练的 agent, 但退出时从来不
+       落盘, 于是每次启动都从"随机价值网络"重新开始 —— 上一局学到的东西全丢。
+    */
+    if (m_sfEVAB != nullptr)
+        m_sfEVAB->saveModel("weights/evab_agent.dat");
 }
 
 /* ================================================================
  *  回放功能
  * ================================================================ */
+
+/*
+ * applyDbStep: 把一条数据库走法记录落到棋盘上。
+ *
+ * 三处回放代码原来都写成 `step->nextId = dbStep.toX;` —— 把终点**列坐标**
+ * (0..8) 当成了棋子 id。moveForward/moveBack 会用 nextId 去索引 m_children
+ * 并结算收益, 语义完全是错的; 而且 step->valid 一直是 false。
+ */
+bool ChessBoard::applyDbStep(const DBStep &dbStep)
+{
+    const Pos from(dbStep.fromX, dbStep.fromY);
+    const Pos to(dbStep.toX, dbStep.toY);
+    if (chess.m_map.isInner(from) == false || chess.m_map.isInner(to) == false) {
+        return false;
+    }
+    Stone *stone = chess.m_map[from];
+    if (stone == nullptr || stone->alive == false) {
+        return false;
+    }
+    Stone *victim = chess.m_map[to];
+    if (victim != nullptr && victim->color == stone->color) {
+        return false;   /* 记录与当前局面不一致 */
+    }
+
+    Step step;
+    step.id = stone->id;
+    step.pos = from;
+    step.nextId = (victim != nullptr) ? victim->id : Stone::ID_NONE;
+    step.nextPos = to;
+    step.reward = 0;
+    step.valid = true;
+
+    double totalReward = 0;
+    chess.moveForward(&step, totalReward);
+    return true;
+}
+
 void ChessBoard::loadReplayGame(int gameId, const QVector<DBStep> &steps)
 {
     m_replayGameId = gameId;
     m_replaySteps = steps;
-    m_replayIndex = 0;
     chess.reset();
     /* 应用到所有步 */
     for (int i = 0; i < steps.size(); i++) {
-        const DBStep &dbStep = steps[i];
-        /* 通过坐标查找棋子 */
-        Stone *stone = chess.m_map[Pos(dbStep.fromX, dbStep.fromY)];
-        if (stone == nullptr) {
-            continue;
-        }
-        /* 构造Step */
-        Step *step = Steps::instance().get();
-        step->id = stone->id;
-        step->pos = stone->pos;
-        step->nextId = dbStep.toX;
-        step->nextPos = Pos(dbStep.toX, dbStep.toY);
-        step->reward = 0;
-        double totalReward = 0;
-        chess.moveForward(step, totalReward);
-        Steps::instance().put(std::vector<Step*>(1, step));
+        applyDbStep(steps[i]);
     }
     m_replayIndex = steps.size();
     update();
@@ -832,21 +1575,10 @@ bool ChessBoard::replayNext()
 {
     if (m_replayGameId < 0) return false;
     if (m_replayIndex >= m_replaySteps.size()) return false;
-    const DBStep &dbStep = m_replaySteps[m_replayIndex];
-    Stone *stone = chess.m_map[Pos(dbStep.fromX, dbStep.fromY)];
-    if (stone == nullptr) {
+    if (applyDbStep(m_replaySteps[m_replayIndex]) == false) {
         m_replayIndex++;
         return false;
     }
-    Step *step = Steps::instance().get();
-    step->id = stone->id;
-    step->pos = stone->pos;
-    step->nextId = dbStep.toX;
-    step->nextPos = Pos(dbStep.toX, dbStep.toY);
-    step->reward = 0;
-    double totalReward = 0;
-    chess.moveForward(step, totalReward);
-    Steps::instance().put(std::vector<Step*>(1, step));
     m_replayIndex++;
     update();
     emit replayIndexChanged(m_replayIndex, m_replaySteps.size());
@@ -857,17 +1589,6 @@ void ChessBoard::applyReplayStep(int targetIndex)
 {
     chess.reset();
     for (int i = 0; i < targetIndex; i++) {
-        const DBStep &dbStep = m_replaySteps[i];
-        Stone *stone = chess.m_map[Pos(dbStep.fromX, dbStep.fromY)];
-        if (stone == nullptr) continue;
-        Step *step = Steps::instance().get();
-        step->id = stone->id;
-        step->pos = stone->pos;
-        step->nextId = dbStep.toX;
-        step->nextPos = Pos(dbStep.toX, dbStep.toY);
-        step->reward = 0;
-        double totalReward = 0;
-        chess.moveForward(step, totalReward);
-        Steps::instance().put(std::vector<Step*>(1, step));
+        applyDbStep(m_replaySteps[i]);
     }
 }

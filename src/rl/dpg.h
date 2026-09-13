@@ -27,13 +27,21 @@ public:
     void reinforce1(std::vector<Step>& x, float learningRate);
     void save(const std::string& fileName);
     void load(const std::string& fileName);
+    /*
+       chess-side divergence from snakeAI/rl/dpg.h:
+       upstream made these members `protected`, but src/pgagent.cpp reads and
+       writes `exploringRate` / `learningRate` and calls `policyNet.save/load`
+       directly. They are kept public here so the chess agent code keeps
+       compiling; tighten them to `protected` only together with adding
+       accessors to PGEagent.
+    */
 public:
     std::size_t stateDim;
     std::size_t actionDim;
     float gamma;
     float exploringRate;
     float learningRate;
-    float entropy0;
+    float H0;
     GradValue alpha;
     Net policyNet;
 };

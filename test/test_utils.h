@@ -120,7 +120,7 @@ private:
  * ============================================================ */
 static std::string stepToString(const Step &step, Chess &chess)
 {
-    if (step.id == 0 && step.nextId == 0 && step.pos.x == 0 && step.pos.y == 0) {
+    if (!step.valid) {
         return "(无合法走法)";
     }
     Stone *s = chess.stones[step.id];

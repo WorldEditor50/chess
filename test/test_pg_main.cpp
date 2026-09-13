@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <cstdio>
+#include "rl/cpuinfo.hpp"
 #include "pgagent.h"
 
 /* ============================================================
@@ -101,7 +103,7 @@ static void runVsRandomTest(Chess &chess)
         for (moves = 0; moves < maxMoves; moves++) {
             /* Black: PG Agent */
             Step aiMove = agent.selectMove(Stone::COLOR_BLACK, false);
-            if (aiMove.id == Stone::ID_NONE) {
+            if (!aiMove.valid) {
                 redWins++;  /* Black has no legal moves */
                 printf("  局 %d/%d: 红方(随机)胜 (黑方无子可走)\n",
                        ep + 1, numGames);
@@ -173,6 +175,10 @@ static void runSelfPlayTest(Chess &chess)
 
 int main()
 {
+    /* 这些程序是分钟级的训练基准: 关掉 stdout 缓冲, 这样重定向到文件或用管道
+       采集时也能实时看到进度 (默认的块缓冲会在崩溃/被 kill 时把输出全部丢掉)。 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    std::printf("  SIMD: %s\n", RL::cpuinfo::describe().c_str());
     std::srand((unsigned int)std::time(nullptr));
 
     Chess chess;

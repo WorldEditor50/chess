@@ -8,7 +8,8 @@ static const int ACTOR_LAYERS = 3;
 RL::TRPO::TRPO(int stateDim_, int hiddenDim, int actionDim_)
     :stateDim(stateDim_), actionDim(actionDim_), gamma(0.99)
 {
-    maxKL = 0.01;
+    /* Per-sample KL bound. Balanced for GAE advantages. */
+    maxKL = 0.002;
     learningSteps = 0;
     exploringRate = 1;
 
@@ -164,7 +165,10 @@ static void accumulateKLGrad(RL::Net &net,
         RL::Tensor &p = net.forward(states[i]);
         RL::Tensor dKL(actionDim, 1);
         for (int j = 0; j < actionDim; j++) {
-            dKL[j] = -oldProbs[i][j] / (p[j] + 1e-9f);
+            /* Clamp denominator to prevent division by near-zero
+               which would produce extreme gradients and NaN. */
+            float pj = p[j] < 1e-6f ? 1e-6f : p[j];
+            dKL[j] = -oldProbs[i][j] / pj;
         }
         net.backward(states[i], dKL);
     }
@@ -181,7 +185,9 @@ static float computeAvgKL(RL::Net &net,
         RL::Tensor &p = net.forward(states[i]);
         for (int j = 0; j < actionDim; j++) {
             if (oldProbs[i][j] > 1e-9f && p[j] > 1e-9f) {
-                kl += oldProbs[i][j] * std::log(oldProbs[i][j] / p[j]);
+                /* Clamp ratio denominator to avoid log(inf) → NaN */
+                float ratio = oldProbs[i][j] / (p[j] < 1e-9f ? 1e-9f : p[j]);
+                kl += oldProbs[i][j] * std::log(ratio);
             }
         }
     }
@@ -214,34 +220,54 @@ void RL::TRPO::learn(std::vector<RL::Step> &x, float learningRate)
 
     (void)learningRate; /* TRPO does not use a fixed LR; step size comes from KL constraint */
 
-    /* === Compute discounted returns (Monte Carlo) === */
-    std::vector<float> returns(N, 0.0f);
+    const float gaeLambda = 0.95f;
+
+    /* === Compute MC returns for critic training === */
+    std::vector<float> mcReturns(N, 0.0f);
     {
         int end = (int)N - 1;
-        returns[end] = x[end].reward;
+        mcReturns[end] = x[end].reward;
         for (int i = end - 1; i >= 0; i--) {
-            returns[i] = x[i].reward + gamma * returns[i + 1];
+            mcReturns[i] = x[i].reward + gamma * mcReturns[i + 1];
         }
     }
 
-    /* === Train state-value critic V(s) using MSE === */
+    /* === Train critic V(s) on MC returns === */
     {
         for (std::size_t i = 0; i < N; i++) {
             Tensor &v = critic.forward(x[i].state);
-            /* v is [1x1], target is scalar returns[i] */
             Tensor target(1, 1);
-            target[0] = returns[i];
+            target[0] = mcReturns[i];
             critic.backward(x[i].state, Loss::MSE::df(v, target));
         }
         critic.RMSProp(1e-3f, 0.9f, 0.0f);
     }
 
-    /* === Compute advantages A(s,a) = returns - V(s) === */
+    /* === Compute GAE advantages ===
+       δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
+       A_t = Σ_{l=0} (γλ)^l · δ_{t+l}
+       GAE generalizes TD(λ=0) and MC(λ=1). For independent bandit steps,
+       V(s_{t+1}) acts as a baseline, giving correct per-step advantages. */
     Tensor advantages(N, 1);
     {
+        /* Compute TD errors */
+        std::vector<float> tdErrors(N, 0.0f);
         for (std::size_t i = 0; i < N; i++) {
             Tensor &v = critic.forward(x[i].state);
-            advantages[i] = returns[i] - v[0];
+            float v_curr = v[0];
+            float v_next = 0.0f;
+            if (i + 1 < N) {
+                Tensor &vn = critic.forward(x[i + 1].state);
+                v_next = vn[0];
+            }
+            tdErrors[i] = x[i].reward + gamma * v_next - v_curr;
+        }
+
+        /* Backward GAE accumulation */
+        float gae = 0.0f;
+        for (int i = (int)N - 1; i >= 0; i--) {
+            gae = tdErrors[i] + gamma * gaeLambda * gae;
+            advantages[i] = gae;
         }
     }
 
@@ -249,16 +275,16 @@ void RL::TRPO::learn(std::vector<RL::Step> &x, float learningRate)
      * Only normalize when N > 1, otherwise single-step
      * advantages are zeroed by mean-subtraction.
      */
-    //if (N > 1) {
-    //    float advMean = advantages.mean();
-    //    float advStd = advantages.variance(advMean);
-    //    advStd = std::sqrt(advStd + 1e-9f);
-    //    if (advStd > 1e-9f) {
-    //        for (std::size_t i = 0; i < N; i++) {
-    //            advantages[i] = (advantages[i] - advMean)/advStd;
-    //        }
-    //    }
-    //}
+    if (N > 1) {
+        float advMean = advantages.mean();
+        float advStd = advantages.variance(advMean);
+        advStd = std::sqrt(advStd + 1e-9f);
+        if (advStd > 1e-9f) {
+            for (std::size_t i = 0; i < N; i++) {
+                advantages[i] = (advantages[i] - advMean) / advStd;
+            }
+        }
+    }
 
 
     /* Extract states, store old action probs and action indices */
@@ -423,7 +449,9 @@ void RL::TRPO::learn(std::vector<RL::Step> &x, float learningRate)
         if (dir_H_dir <= 0) {
             dir_H_dir = Tensor::dot(x_cg, x_cg) + 1e-12f;
         }
-        stepSize = std::sqrt(2.0f * maxKL / dir_H_dir);
+        /* N correction: dir_H_dir = N * (x^T * FIM_avg * x).
+           Step size for per-sample constraint: sqrt(2*maxKL*N/dir_H_dir) */
+        stepSize = std::sqrt(2.0f * maxKL * float(N) / dir_H_dir);
     }
 
     /* CG solves H·x_cg = g where g = w.grad = -∇_θ J (negative policy gradient).

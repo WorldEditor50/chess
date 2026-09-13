@@ -2,30 +2,31 @@
 #include "layer.h"
 #include "loss.h"
 #include <limits>
+#include "moe.hpp"
 
 RL::SAC::SAC(size_t stateDim_, size_t hiddenDim, size_t actionDim_)
     :stateDim(stateDim_), actionDim(actionDim_), gamma(0.99), exploringRate(1), learningSteps(0)
 {
-    annealing = ExpAnnealing(0.01, 0.12, 1e-4);
+    annealing = ExpAnnealing(0.25, 1, 1e-7);
     alpha = GradValue(actionDim, 1);
-    alpha.val.fill(1);
+    alpha.val.fill(0.65);
     /* target entropy = -actionDim (standard SAC heuristic) */
-    entropy0 = -actionDim;
+    H0 = -std::log(actionDim);
     actor = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, true),
                 LayerNorm<Sigmoid, LN::Post>::_(hiddenDim, hiddenDim, true, true),
                 Layer<Softmax>::_(hiddenDim, actionDim, true, true));
 
     for (int i = 0; i < QNET_NUM; i++) {
-        critics[i] = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, true),
+        /* Sigmoid output keeps Q in (0,1) — symmetric gradient around
+           the midpoint of reward targets, preventing saturation asymmetry. */
+        critics[i] = Net(Layer<Tanh>::_(stateDim + actionDim, hiddenDim, true, true),
                          TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
                          Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
-        criticsTarget[i] = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, false),
+
+        criticsTarget[i] = Net(Layer<Tanh>::_(stateDim + actionDim, hiddenDim, true, false),
                                TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
                                Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
-        /* Add noise to break symmetry between critics */
-        if (i > 0) {
-            critics[i].softUpdateTo(criticsTarget[i], 0.1);
-        }
+        /* Independent random init + training naturally breaks symmetry */
         critics[i].copyTo(criticsTarget[i]);
     }
 }
@@ -49,7 +50,7 @@ RL::Tensor &RL::SAC::eGreedyAction(const RL::Tensor &state)
 RL::Tensor &RL::SAC::gumbelMax(const RL::Tensor &state)
 {
     Tensor& out = actor.forward(state);
-    return RL::gumbelSoftmax(out, alpha.val);
+    return RL::gumbelSoftmax(out, 0.9);
 }
 
 RL::Tensor& RL::SAC::action(const RL::Tensor &state)
@@ -63,96 +64,90 @@ void RL::SAC::experienceReplay(const RL::Transition &x)
      * 1. Compute Q-target using Clipped Double Q-learning
      *    with expectation over actions (not argmax)
      * ================================================ */
-    {
-        /* Get policy probabilities for next state */
-        const Tensor& nextProb = actor.forward(x.nextState);
-
-        /* Compute min Q over all target critics for each action dimension */
-        Tensor minQ(actionDim, 1);
-        for (int j = 0; j < actionDim; j++) {
-            float q_min = std::numeric_limits<float>::max();
-            for (int i = 0; i < QNET_NUM; i++) {
-                const Tensor& qi = criticsTarget[i].forward(x.nextState);
-                q_min = std::min(q_min, qi[j]);
-            }
-            minQ[j] = q_min;
-        }
-
-        /* V(s') = Σ π(a'|s') * (minQ(s',a') - α*log(π(a'|s'))) */
-        float nextValue = 0;
-        for (int j = 0; j < actionDim; j++) {
-            float logp = std::log(nextProb[j] + 1e-8);
-            nextValue += nextProb[j] * (minQ[j] - alpha.val[j] * logp);
-        }
-
-        /* Compute Q-target for the taken action */
-        std::size_t k = x.action.argmax();
-        float qTarget = 0;
-        if (x.done) {
-            qTarget = x.reward;
-        } else {
-            qTarget = x.reward + gamma * nextValue;
-        }
-
-        /* Train each critic with MSE loss on the taken action only */
+    /* Cache target critic outputs — each is forwarded ONCE */
+    const Tensor* targetQs[QNET_NUM];
+    /* Get policy probabilities for next state (reused below).
+       NOTE: this must be a COPY, not a reference — actor.forward() is called
+       again below and overwrites the actor's output buffer, which would
+       silently change what a `const Tensor&` here refers to. */
+    Tensor nextProb = actor.forward(x.nextState);
+    Tensor nextState = Tensor::concat(0, x.nextState, nextProb);
+    for (int i = 0; i < QNET_NUM; i++) {
+        targetQs[i] = &criticsTarget[i].forward(nextState);
+    }
+    std::size_t k = x.action.argmax();
+    /* Soft value of the next state — the FULL expectation over actions:
+         V(s') = Σ_a π(a|s')·( min_i Q'_i(s',a) - α_a·log π(a|s') )
+       The previous version evaluated only the single action k taken in this
+       transition and weighted it by π(k|s'), which is not V(s'). */
+    float nextValue = 0;
+    for (int a = 0; a < actionDim; a++) {
+        float minQa = std::numeric_limits<float>::max();
         for (int i = 0; i < QNET_NUM; i++) {
-            const Tensor &out = critics[i].forward(x.state);
-            Tensor p = out;
-            p[k] = qTarget;
-            critics[i].backward(x.state, Loss::MSE::df(out, p));
+            minQa = std::min(minQa, (*targetQs[i])[a]);
         }
+        nextValue += nextProb[a]*(minQa - alpha[a]*std::log(nextProb[a] + 1e-8));
+    }
+
+    /* Train each critic with MSE loss — forward each online critic ONCE */
+    const Tensor &prob = actor.forward(x.state);
+    Tensor state = Tensor::concat(0, x.state, prob);
+    for (int i = 0; i < QNET_NUM; i++) {
+        const Tensor &out = critics[i].forward(state);
+        Tensor qTarget = out;
+        qTarget[k] = x.reward + (1 - x.done)*gamma*nextValue;
+        critics[i].backward(state, Loss::MSE::df(out, qTarget));
     }
 
     /* ================================================
      * 2. Train Policy Net
-     *    J(π) = Σ π(a|s) * (α*log(π(a|s)) - minQ(s,a))
-     *    gradient w.r.t π output: α*log(π) + α - Q
+     *    J(π) = Σ π(a|s) * (α·log(π(a|s)) - minQ(s,a))
+     *    gradient w.r.t π output: α·log(π) + α - Q
      * ================================================ */
-    {
-        /* Get current policy and min Q for current state */
-        const Tensor& p = actor.forward(x.state);
-
-        /* Compute min Q over all critics (not target) for current state */
-        Tensor minQ(actionDim, 1);
-        for (int j = 0; j < actionDim; j++) {
-            float q_min = std::numeric_limits<float>::max();
-            for (int i = 0; i < QNET_NUM; i++) {
-                const Tensor& qi = critics[i].forward(x.state);
-                q_min = std::min(q_min, qi[j]);
-            }
-            minQ[j] = q_min;
-        }
-
-        /* SAC policy gradient error on softmax output:
-         * dJ/dπ(a|s) = α*log(π(a|s)) + α - Q(s,a)
-         * The softmax layer's gradient function handles the
-         * backpropagation through the softmax nonlinearity. */
-        Tensor err(actionDim, 1);
-        for (int i = 0; i < actionDim; i++) {
-            float logp = std::log(p[i] + 1e-8);
-            err[i] = alpha.val[i] * logp + alpha.val[i] - minQ[i];
-        }
-        actor.backward(x.state, err);
+    /* Cache online critic outputs — each forwarded ONCE */
+    const Tensor* onlineQs[QNET_NUM];
+    Tensor prob_ = prob;  /* reused in step 3 */
+    //gumbelSoftmax(prob_, 0.9);
+    Tensor state_ = Tensor::concat(0, x.state, prob_);
+    for (int i = 0; i < QNET_NUM; i++) {
+        onlineQs[i] = &critics[i].forward(state_);
     }
+
+    /* Compute min Q over all online critics (element-wise) */
+    Tensor minQ(actionDim, 1);
+    for (int j = 0; j < actionDim; j++) {
+        float q_min = std::numeric_limits<float>::max();
+        for (int i = 0; i < QNET_NUM; i++) {
+            q_min = std::min(q_min, (*onlineQs[i])[j]);
+        }
+        minQ[j] = q_min;
+    }
+
+    /* SAC policy gradient error on softmax output:
+     * dJ/dπ(a|s) = α·log(π(a|s)) + α - Q(s,a)
+     * The softmax layer's gradient function handles the
+     * backpropagation through the softmax nonlinearity. */
+    Tensor loss(actionDim, 1);
+    for (int i = 0; i < actionDim; i++) {
+        loss[i] = -minQ[i] + alpha[i]*(std::log(prob_[i] + 1e-8) + 1);
+    }
+    actor.backward(x.state, loss);
 
     /* ================================================
      * 3. Update Temperature (alpha)
-     *    J(α) = -α * (H - H₀) where H = Σ π*log(π)
-     *    ∇α = -(H + actionDim) = logπ_avg + actionDim
-     *        = -(Σ π*log(π) - entropy0)
+     *    J(α) = -α * (H - H₀)  where  H₀ = -|A| = entropy0
+     *    ∇α = H₀ - H
      * ================================================ */
     {
-        const Tensor& p = actor.forward(x.state);
-        /* Compute current entropy H = -Σ π(a|s)*log(π(a|s)) */
-        float H = 0;
+        /* Use prob_, the COPY taken before actor.backward(): backward() zeroes
+           the actor's output buffer, so reading `prob` (a reference to that
+           buffer) here always produced H == 0 and a constant alpha gradient. */
+        float  H = 0;
         for (int i = 0; i < actionDim; i++) {
-            H -= p[i] * std::log(p[i] + 1e-8);
+            H += RL::entropy(prob_[i]);
         }
-        /* ∇α = -(H - H₀) = H₀ - H */
-        float alphaGrad = entropy0 - H;
-        for (int i = 0; i < actionDim; i++) {
-            alpha.g[i] += alphaGrad;
-        }
+        float alphaGrad = H0 - H;
+        alpha.g[k] += alphaGrad;
     }
     return;
 }
@@ -165,9 +160,10 @@ void RL::SAC::learn(size_t maxMemorySize, size_t replaceTargetIter, size_t batch
 
     if (learningSteps % replaceTargetIter == 0) {
         /* Polyak averaging with consistent tau for all critics */
-        float tau = 5e-3;
+        float tau = 1e-3;
         for (int i = 0; i < QNET_NUM; i++) {
             critics[i].softUpdateTo(criticsTarget[i], tau);
+            tau += 2e-3;
         }
         learningSteps = 0;
     }
@@ -182,21 +178,17 @@ void RL::SAC::learn(size_t maxMemorySize, size_t replaceTargetIter, size_t batch
     /* Apply gradient updates */
     actor.RMSProp(1e-2, 0.9, 0);
 
-#if 1
-    std::cout<<"annealing:"<<annealing.val<<",alpha:";
-    alpha.val.printValue();
-#endif
-
-    alpha.RMSProp(1e-5, 0.9, 0);
+    alpha.RMSProp(1e-7, 0.9, 1e-6);
     /* Keep alpha in reasonable range */
-    alpha.clamp(0.01, 20.0);
+    alpha.clamp(0.25, 0.64, 1);
+    annealing.step();
 
     for (int i = 0; i < QNET_NUM; i++) {
         critics[i].RMSProp(1e-3, 0.9, 0);
     }
 
     /* manage replay buffer: drop oldest entries when full */
-    if (memories.size() > maxMemorySize + batchSize) {
+    if (memories.size() > maxMemorySize) {
         std::size_t k = std::min(batchSize, memories.size() - maxMemorySize);
         for (std::size_t i = 0; i < k; i++) {
             memories.pop_front();

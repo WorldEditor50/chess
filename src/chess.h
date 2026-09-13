@@ -7,6 +7,20 @@
 class Chess
 {
 public:
+    /* 终局判定结果 (Chess::getResult) */
+    enum Result {
+        RESULT_ONGOING = 0,
+        RESULT_RED_WIN,
+        RESULT_BLACK_WIN,
+        RESULT_DRAW
+    };
+
+    /* 历史记录: 用于三次重复局面判定; halfMoveClock 在同一记录里以便精确回退 */
+    struct HistoryRecord {
+        unsigned long long hash;
+        int halfMoveClock;
+    };
+
     /* 棋盘映射 & 棋子数组 (原 static Stone::map / Stone::children) */
     StoneMap<Stone> m_map;
     std::array<Stone*, 32> m_children;
@@ -64,16 +78,54 @@ public:
     void reset();
     void moveForward(const Step* s, double &totalReward);
     void moveBack(const Step *s, double &totalReward);
+    /*
+     * sample() 只产生**合法**走法 (伪合法走法再过滤掉"走后自己被将/照面"),
+     * 所以所有 agent / GUI / 搜索都能直接用它, 不需要各自再校验一次。
+     * samplePseudo() 保留伪合法版本, 仅用于实现 sample() 自身。
+     */
     void sample(int color, std::vector<Step *> &steps);
+    void samplePseudo(int color, std::vector<Step *> &steps);
     int isGameOver();
     bool isInCheck(int color);
+    /* target 是否被 byColor 方的任何棋子攻击 (含飞将规则) */
+    bool isAttacked(const Pos &target, int byColor);
+    /* 把 s 落到棋盘上再撤销, 判断走后自己是否被将 */
+    bool isLegalMove(int color, const Step *s);
+    /*
+     * isLegalMove() 的热路径版本: inCheck 由调用方预先算好 (它的值只取决于走之前
+     * 的局面, 同一批候选走法共享)。搜索 / 走法生成里应当用这个重载, 避免每个
+     * 走法都重算一次 isInCheck()。
+     */
+    bool isLegalMoveInternal(int color, const Step *s, bool inCheck);
+    /* 该方是否还有合法走法 (将杀 / 困毙判定) */
+    bool hasLegalMoves(int color);
+    /* 三次重复局面 或 60 回合(120 半回合)内无吃子 -> 和棋 */
+    bool isDraw();
+    /* 完整终局判定 (含将杀/困毙/和棋); colorToMove = 轮到谁走 */
+    int getResult(int colorToMove);
     /* 优化: 增强评估函数 */
     double evaluate();
     /* 长将/循环走法检测 */
     void pushHistory();
     bool isRepetition();
-    std::vector<unsigned long long> history;
+    std::vector<HistoryRecord> history;
     unsigned long long computeHash();
+    /*
+     * Zobrist 随机键表 (32 棋子 x 90 格 + 1 个"轮到黑方"键)。
+     * computeHash() 用它算置换表键与重复局面键: 随机键之间的相关性远低于原来那种
+     * (id | x<<8 | y<<12) 的结构化异或, 因此适合作为 TT 的键。
+     */
+    static const std::array<unsigned long long, 32*90 + 1> &zobrist();
+
+    /* 当前走棋方 (由 moveForward/moveBack/reset 维护, 参与局面哈希) */
+    int sideToMove;
+    /* 距上一次吃子的半回合数 */
+    int halfMoveClock;
+
+private:
+    /* 只改棋盘, 不做 history / sideToMove / 收益记账 (供 moveForward 与 isLegalMove 共用) */
+    bool applyMove(const Step *s);
+    void undoMove(const Step *s);
 };
 
 #endif // CHESS_H
