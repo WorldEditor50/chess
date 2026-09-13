@@ -204,36 +204,52 @@ void ChessBoard::startupLoad()
         }
     }
 
-    /* ---- 3. 预创建 self-play agent 并加载权重 ---- */
+    /* ---- 3. 预创建 self-play agent 并加载权重 ----
+       每一组都记一条耗时日志: 权重可能有几百 MB, 启动慢的时候要能一眼看出是哪一组
+       (实测: 稀疏 MoE 那 3 个 146 MB 文件占了大头, 其余六组加起来不到 1 秒)。 */
+    auto loadClock = std::chrono::steady_clock::now();
+    auto logLoad = [&loadClock](const char *what) {
+        const auto now = std::chrono::steady_clock::now();
+        const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - loadClock).count();
+        qInfo().noquote() << QStringLiteral("[weights] %1: %2 ms")
+                                 .arg(QString::fromUtf8(what)).arg(ms);
+        loadClock = now;
+    };
     if (s_weightPaths.count(AGENT_PG)) {
         emit busyMessage(QStringLiteral("正在载入 Policy Gradient 权重…"));
         if (m_sfPG == nullptr)
             m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
         m_sfPG->loadPolicy(s_weightPaths[AGENT_PG]);
+        logLoad("PG");
     }
     if (s_weightPaths.count(AGENT_DQN)) {
         emit busyMessage(QStringLiteral("正在载入 DQN 权重…"));
         if (m_sfDQN == nullptr)
             m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
         m_sfDQN->loadModel(s_weightPaths[AGENT_DQN]);
+        logLoad("DQN");
     }
     if (s_weightPaths.count(AGENT_PPOMCTS)) {
         emit busyMessage(QStringLiteral("正在载入 PPO+MCTS 权重…"));
         if (m_sfPPOMCTS == nullptr)
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
         m_sfPPOMCTS->loadModel(s_weightPaths[AGENT_PPOMCTS]);
+        logLoad("PPO+MCTS");
     }
     if (s_weightPaths.count(AGENT_EVAB)) {
         emit busyMessage(QStringLiteral("正在载入 EVAB 权重…"));
         if (m_sfEVAB == nullptr)
             m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
         m_sfEVAB->loadModel(s_weightPaths[AGENT_EVAB]);
+        logLoad("EVAB");
     }
     if (s_weightPaths.count(AGENT_DQNMCTS)) {
         emit busyMessage(QStringLiteral("正在载入 DQN+MCTS 权重… (文件较大，可能要几秒)"));
         if (m_sfDQNMCTS == nullptr)
             m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
         m_sfDQNMCTS->loadModel(s_weightPaths[AGENT_DQNMCTS]);
+        logLoad("DQN+MCTS");
     }
     if (s_weightPaths.count(AGENT_SACAZ)) {
         emit busyMessage(QStringLiteral("正在载入 SAC+AZ 权重…"));
@@ -247,16 +263,32 @@ void ChessBoard::startupLoad()
             prefix.erase(prefix.size() - suffix.size());
         }
         m_sfSACAZ->loadModel(prefix);
+        logLoad("SAC+AZ");
     }
-    /*
-       SAC+AZ (稀疏 MoE + TB 专家) 的权重**故意不在这里预加载**。
-       它一个模型是三个文件、每个 146 MB (28.7 M 参数), 实测把启动时间从 ~2 秒
-       拉到 **19 秒** —— 而绝大多数会话根本不会用到这个变体。
-       路径已经在上面的扫描里登记进 s_weightPaths, 所以第一次真正选中它时
-       (aiThink / aiThinkForAgent 的懒创建分支) 会照常载入, 并同样弹出"请稍候"
-       沙漏 (见那两处的 busyStarted/busyFinished)。
-       实测: 预加载 19 s -> 改成懒加载后启动 ~2 s。
-    */
+    if (s_weightPaths.count(AGENT_SACAZ_MOE)) {
+        /*
+           用户要求"程序启动时加载所有模型": 这个变体也在这里预加载 (以前为了启动速度
+           改成了懒加载 —— 它一个模型是三个文件、每个 146 MB)。
+           代价是启动变慢, 所以: (a) 它在七组权重里放**最后**, 前面几组几秒就完事、
+           用户能在沙漏窗里看到进度一条条过; (b) 期间由"请稍候"沙漏窗给反馈;
+           (c) 下面每载一组都记一条耗时日志, 慢了能一眼看出是哪一组。
+        */
+        emit busyMessage(QStringLiteral("正在载入 SAC+AZ (稀疏MoE) 权重… (3 个 146 MB 文件)"));
+        if (m_sfSACAZMoe == nullptr)
+            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                          SACAZAgent::Backbone::SparseMoeTb,
+                                          64, SACAZ_MOE_AUX);
+        /* 拆开量: 5 个网络 x 28.7 M 参数的"分配 + 随机初始化"本身就不是小数目 */
+        logLoad("SAC+AZ-MoE 建网(5 x 28.7M 参数)");
+        std::string prefix = s_weightPaths[AGENT_SACAZ_MOE];
+        const std::string suffix = "_actor";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfSACAZMoe->loadModel(prefix);
+        logLoad("SAC+AZ-MoE 读权重(3 x 146 MB)");
+    }
 
     /* ---- 4. 启动后台训练 & 通知主线程加载完成 ---- */
     emit busyMessage(QStringLiteral("初始化完成"));
@@ -1105,18 +1137,25 @@ Step ChessBoard::aiThink(int color)
         /*
            SAC + MCTS + AlphaZero, 骨干 = 稀疏路由 MoE + TransformerBlock 专家
            (E=4, top-1)。刻意用很少的模拟次数: 一次模拟 ~10.9 ms, 16 次约 175 ms。
+           注意这 175 ms **只是搜索**: 每步还要跑一次在线 learnBatch, 界面上实测
+           约 2.3 s/手 (见 docs/agents_design.md 13.6)。
         */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfSACAZMoe == nullptr) {
+            /*
+               正常路径下这里**不会**是 nullptr —— startupLoad() 已经预加载过它了
+               (用户要求"程序启动时加载所有模型")。留着这一支是兜底: 权重文件缺失、
+               或者以后有人又把预加载改掉时, 至少能构造出一个可用 agent, 而不是
+               空指针崩掉。
+            */
             m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
                                           SACAZAgent::Backbone::SparseMoeTb,
                                           64, SACAZ_MOE_AUX);
             auto it = s_weightPaths.find(AGENT_SACAZ_MOE);
             if (it != s_weightPaths.end()) {
                 /*
-                   这个变体的权重是 3 x 146 MB, 读起来要十几秒 (所以启动时不预加载,
-                   见 startupLoad 里的说明)。第一次用到它时同样弹"请稍候"沙漏 ——
-                   这些信号是队列投递到 GUI 线程的, 在工作线程 emit 是安全的。
+                   兜底路径同样要弹"请稍候": 这个变体的权重是 3 x 146 MB, 读一次
+                   实测 6 秒。这些信号是队列投递到 GUI 线程的, 在工作线程 emit 是安全的。
                 */
                 emit busyStarted(QStringLiteral("正在载入"),
                                  QStringLiteral("首次使用 SAC+AZ (稀疏MoE): 读取 3 个 146 MB 权重文件…"));
@@ -1225,7 +1264,9 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
             /*
                以前这里**只建对象、不载权重** —— 于是对弈里用到这个 agent 时跑的是
                随机初始化的网络 (界面上"选了它却像没训练过"), 而它自己在 aiThink
-               路径里又会载权重, 两条路径行为不一致。现在两条都懒加载, 且都弹沙漏。
+               路径里又会载权重, 两条路径行为不一致。
+               现在正常路径都由 startupLoad() 预加载, 这一支只是兜底, 但仍然保持
+               "建了对象就把权重载上"的行为, 免得两条兜底路径再分叉。
             */
             auto it = s_weightPaths.find(AGENT_SACAZ_MOE);
             if (it != s_weightPaths.end()) {

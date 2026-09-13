@@ -18,16 +18,26 @@
 #   powershell -ExecutionPolicy Bypass -File tools/verify_match_ui.ps1
 #   powershell ... -File tools/verify_match_ui.ps1 -Games 2 -Full
 #   powershell ... -File tools/verify_match_ui.ps1 -AIndex 7 -BIndex 0 -Full
+#   powershell ... -File tools/verify_match_ui.ps1 -AIndex 8 -BIndex 0 -Full `
+#       -LogFile build\match_ui_app.log     # 顺便核对 "[weights] 保存" 的计时行
 #
 # Combo order in the window: 0 = 对战AI, 1 = A方, 2 = B方, 3 = 历史对局.
 # Agent order inside each agent combo: 0 Alpha-Beta, 1 MCTS, 2 PG, 3 DQN,
 # 4 PPO+MCTS, 5 DQN+MCTS, 6 EVAB, 7 SAC+MCTS+AlphaZero,
 # 8 SAC+MCTS+AlphaZero with the sparse-MoE / TransformerBlock-expert backbone
-# (short name "SAC+AZ-MoE"; it only gets 16 simulations per move, ~175 ms).
+# (short name "SAC+AZ-MoE"; 16 simulations per move is ~175 ms of *search* only --
+# a full move also runs one online learnBatch, and the measured end-to-end cost is
+# ~2.3 s/move, see docs/agents_design.md 13.6).
 #
 # ASCII only in code; the Chinese literals below are matched against the UI, so
 # this file must be saved as UTF-8 **with BOM** for Windows PowerShell to
 # decode it correctly.
+#
+# 注意: 有些编辑器/补丁工具保存 UTF-8 时会**丢掉 BOM** (本仓库踩过一次: 改完这个
+# 文件再跑, Windows PowerShell 按 ANSI 解码, 中文串被拆成乱码, 报出来的却是一堆
+# "Missing expression after ','" 之类**和真正原因毫无关系**的语法错)。
+# 改完请确认前三个字节是 EF BB BF:
+#   [System.IO.File]::ReadAllBytes("tools\verify_match_ui.ps1")[0..2]
 
 param(
     [string]$Exe = "",
@@ -36,7 +46,11 @@ param(
     [int]$TimeoutSec = 300,
     [int]$AIndex = -1,       # agent index for side A (-1 = leave the default)
     [int]$BIndex = -1,       # agent index for side B
-    [switch]$KeepOpen
+    [switch]$KeepOpen,
+    # 把 chess.exe 的 qInfo/qWarning 输出重定向到这里 (stdout 会写到 "<LogFile>.out")。
+    # 默认不重定向: 保持和以前完全一样的启动方式, 免得改了这个脚本的行为。
+    # 需要看 "[weights] 保存 ... : N ms" 这类计时行时才传它。
+    [string]$LogFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -196,7 +210,15 @@ function Select-ComboItem([int]$comboIndex, [int]$itemIndex) {
     return $want
 }
 
-$proc = Start-Process -FilePath $Exe -WorkingDirectory $exeDir -PassThru
+$proc = $null
+if ([string]::IsNullOrEmpty($LogFile)) {
+    $proc = Start-Process -FilePath $Exe -WorkingDirectory $exeDir -PassThru
+} else {
+    # Start-Process 不允许 stdout 和 stderr 用同一个文件, 所以用两个。
+    # Qt 的日志走 stderr, 关心的计时行都在 "<LogFile>" 里。
+    $proc = Start-Process -FilePath $Exe -WorkingDirectory $exeDir -PassThru `
+        -RedirectStandardError $LogFile -RedirectStandardOutput ($LogFile + ".out")
+}
 Write-Output "launched chess.exe pid=$($proc.Id)"
 # 等主窗口真的出来 (固定 sleep 在机器忙的时候会不够, 早先就因此报过
 # "hwnd cannot be IntPtr.Zero"; 这里改成最多等 30 s)
@@ -328,9 +350,20 @@ try {
     # 损失读数: 会上报损失的 agent 才有数字, 不上报的显示"暂无"
     $lossOk = ($lossText -like "*暂无*") -or ($lossText -match "\d+\s*点")
     # ---- 静默保存: 列表里应出现"已静默保存权重"的行, 且不该有文件对话框的残留 ----
+    # 保存跑在后台线程, 而且稀疏 MoE 变体的权重是 3x146 MB (十几秒), 所以这里要**等**
+    # 它出现, 不能在下棋结束的一瞬间就去读列表 (第一版就是这么误报失败的)。
     $silentSave = $false
-    foreach ($it in $items) {
-        if ($it -like "*静默保存权重*") { $silentSave = $true; Write-Output ("   | " + $it) }
+    $saveDeadline = (Get-Date).AddSeconds(60)
+    while (-not $silentSave -and (Get-Date) -lt $saveDeadline) {
+        foreach ($it in (All-ListItems)) {
+            if ($it -like "*静默保存权重*") { $silentSave = $true; Write-Output ("   | " + $it) }
+        }
+        if (-not $silentSave) { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $silentSave) {
+        foreach ($it in $items) {
+            if ($it -like "*静默保存权重*") { $silentSave = $true }
+        }
     }
     # 以前对弈结束会弹一个**模态**文件对话框, 它的文件列表会混进 ListItem 里
     # (目录项、.dat 文件名...)。现在静默保存, 这些"杂物"必须一条都没有。
@@ -442,6 +475,25 @@ try {
         $hitB = ($final -match ("(^|\s)" + [regex]::Escape($wantB) + "(\s|$)"))
         Write-Output ("B side in result = {0} (want '{1}')" -f $hitB, $wantB)
         $ok = $ok -and $hitB
+    }
+
+    # ---- 可选的日志校验: 传了 -LogFile 就顺手核对静默保存的**计时** ----
+    # 静默保存跑在后台线程, 界面上只能看到"存完了"这一行, 看不到花了多久。
+    # 稀疏 MoE 那三个权重是 3x146 MB, 十几秒的写入如果没人量, 下次再动
+    # 保存路径就不知道是快了还是慢了 —— 所以让它自己报一行。
+    if (-not [string]::IsNullOrEmpty($LogFile) -and (Test-Path $LogFile)) {
+        $saveLines = @()
+        foreach ($ln in (Get-Content $LogFile)) {
+            if ($ln -like "*[weights]*") { $saveLines += $ln; Write-Output ("   log | " + $ln) }
+        }
+        $timed = $false
+        # 只认**保存**那一行: 启动时的 "[weights] PG: 167 ms" 也是 [weights] 开头、
+        # 也带 ms, 拿它去满足这个检查就会"对局还没打完也报通过"(第一版就是这么错的)。
+        foreach ($ln in $saveLines) {
+            if ($ln -like "*保存*" -and $ln -match "\d+\s*ms") { $timed = $true }
+        }
+        Write-Output ("save timing logged = {0}" -f $timed)
+        $ok = $ok -and $timed
     }
 
     Write-Output ""

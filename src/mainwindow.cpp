@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include <chrono>
 #include "ui_mainwindow.h"
 #include "chessboard.h"
 #include "thinkingindicator.h"
@@ -847,7 +848,18 @@ void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &typ
         bool allOk = true;
         for (ChessBoard::AgentType t : todo) {
             const std::string path = ChessBoard::defaultWeightPath(t);
+            const auto t0 = std::chrono::steady_clock::now();
             const bool ok = ui->gameWidget->saveCurrentAgentModel(t, path);
+            const long long ms =
+                (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+            /*
+               记一条耗时: 稀疏 MoE 变体的权重是 3 x 146 MB, 存一次要十几秒 (后台,
+               界面不卡)。慢了/失败了要能一眼看出来, 而不是只看到列表里一行字。
+            */
+            qInfo().noquote() << QStringLiteral("[weights] 保存 %1: %2 ms -> %3")
+                                     .arg(agentLongName(t)).arg(ms)
+                                     .arg(QString::fromStdString(path));
             allOk = allOk && ok;
             lines << QStringLiteral("%1 -> %2%3")
                          .arg(agentLongName(t), QString::fromStdString(path),
