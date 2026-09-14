@@ -64,6 +64,11 @@ public:
     int dHidden;
 
 public:
+    long long paramCount() const override
+    {
+        return l1.paramCount() + l2.paramCount() + l3.paramCount();
+    }
+
     MlpExpert() : dIn(0), dHidden(0) {}
 
     MlpExpert(int dIn_, int dHidden_, bool withGrad)
@@ -187,6 +192,18 @@ class ISparseMoE : public iLayer
 public:
     /* 注入负载均衡辅助损失的梯度 (在 mini-batch 结束后调用一次) */
     virtual void addAuxGradient(float coef) = 0;
+    /*
+       只清掉"本批"的门控统计 (usageBatch / probSumBatch / xSum / batchForwardCount),
+       保留 usageTotal (生命周期累计, 坍缩诊断要用)。
+
+       为什么需要它: addAuxGradient 是按"自上次调用以来所有 forward"的均值算的。但
+       forward 有两种来源 —— 训练时的 forward, 和推理时(MCTS 展开/叶子估值)的 forward。
+       PPO::trainStep 是"一条样本一次更新", 两次 trainStep 之间可能已经跑了整局棋的
+       MCTS 估值, 那些推理 forward 会混进辅助损失的批统计里 (既有语义上的混淆, 也有
+       xSum 这种 float 累加器在几十万次累加后的精度损失)。trainStep 开头调用本函数,
+       辅助损失就严格只反映本次训练前向。
+    */
+    virtual void resetBatchStats() = 0;
     /* 每个专家累计被选中次数 (坍缩诊断) */
     virtual void usageSnapshot(std::vector<long long> &out) const = 0;
     virtual void resetUsage() = 0;
@@ -337,6 +354,15 @@ public:
         for (int i = 0; i < NumExperts; i++) {
             scaleExpertInit(experts[i]);
         }
+    }
+
+    long long paramCount() const override
+    {
+        long long total = (long long)wg.size() + (long long)bg.size();
+        for (int i = 0; i < NumExperts; i++) {
+            total += experts[i].paramCount();
+        }
+        return total;
     }
 
     int expertCount() const override { return NumExperts; }
@@ -492,6 +518,18 @@ public:
         g_bg += dz;
 
         /* 重置 batch 统计 */
+        for (int i = 0; i < NumExperts; i++) {
+            usageBatch[i] = 0;
+            probSumBatch[i] = 0.0;
+        }
+        for (int j = 0; j < d_model; j++) {
+            xSum[j] = 0.0f;
+        }
+        batchForwardCount = 0;
+    }
+
+    void resetBatchStats() override
+    {
         for (int i = 0; i < NumExperts; i++) {
             usageBatch[i] = 0;
             probSumBatch[i] = 0.0;

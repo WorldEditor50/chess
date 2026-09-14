@@ -44,6 +44,12 @@ public:
     FcGrad v;
     FcGrad m;
 public:
+    /* 参数量 = 权重 + 偏置 (iFcLayer 的全部可训练标量) */
+    long long paramCount() const override
+    {
+        return (long long)w.size() + (long long)b.size();
+    }
+
     iFcLayer(){}
     iFcLayer(std::size_t inputDim_, std::size_t outputDim_, bool bias_, bool withGrad)
         :inputDim(inputDim_), outputDim(outputDim_), bias(bias_)

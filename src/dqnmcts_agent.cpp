@@ -596,6 +596,11 @@ void DQNMCTSAgent::trainSelfPlay(int episodes, int iterations,
             oneHotAction.zero();
             oneHotAction[selectedAction] = 1.0f;
             float reward = computeReward(chosenStep, currentColor);
+            /* 视角换算 (2026-09): 本 agent 的编码是"黑为正", 而 computeReward 给的
+               是走子方视角 —— 红方走子时符号要翻。终局常量 (gameResult == BLACK ?
+               1 : -1) 本来就是黑方视角, 所以只有即时奖励那一支需要换算。
+               见 docs/agents_design.md §17。 */
+            reward = moverRewardToBlackFrame(reward, currentColor);
 
             double dummy = 0.0;
             chess.moveForward(&chosenStep, dummy);
@@ -769,6 +774,8 @@ void DQNMCTSAgent::recordExperience(const Step &chosenStep, int color)
     oneHotAction.zero();
     oneHotAction[selectedAction] = 1.0f;
     float reward = computeReward(chosenStep, color);
+    /* 视角换算 (2026-09): 走子方视角 -> 黑方视角 (见 docs/agents_design.md §17) */
+    reward = moverRewardToBlackFrame(reward, color);
 
     RL::Tensor nextState(STATE_DIM, 1);
     encodeState(nextState);
@@ -848,13 +855,16 @@ bool DQNMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
         RL::Tensor &q = dqn.noiseAction(state);
         return q.argmax();
     };
-    auto onTrans = [this](const Step &/*chosen*/, int actionIdx,
+    /* 视角换算 (2026-09, 同 trainSelfPlay): rolloutFromCurrent 给的 r 是走子方视角的,
+       本 agent 的编码是"黑为正", 用 chosen.id 认出走子方再翻符号。
+       见 docs/agents_design.md §17。 */
+    auto onTrans = [this](const Step &chosen, int actionIdx,
                           const RL::Tensor &s, const RL::Tensor &ns,
                           float r, bool done) {
         RL::Tensor oneHot(ACTION_DIM, 1);
         oneHot.zero();
         oneHot[actionIdx] = 1.0f;
-        dqn.perceive(s, oneHot, ns, r, done);
+        dqn.perceive(s, oneHot, ns, moverRewardToBlackFrame(r, chosen), done);
     };
 
     const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);

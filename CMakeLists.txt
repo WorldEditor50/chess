@@ -597,6 +597,60 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_moe)
 
+    # ------------------------------------------- PPO+MCTS vs Alpha-Beta 静默对弈
+    # **不进 ctest**: 同 bench_moe —— 跑真实对局、依赖随机开局, 而且默认双方用的是
+    # 随机初始权重, 几局之内翻转结论是常事。手动跑:
+    #   cmake --build <build> --target bench_ppo_vs_ab
+    #   <build>/bench_ppo_vs_ab --games=6 --budget=90      # 等时间
+    #   <build>/bench_ppo_vs_ab --load=weights/ppomcts_agent.dat   # 用 GUI 存下的权重
+    add_executable(bench_ppo_vs_ab
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_vs_ab_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_ppo_vs_ab PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_vs_ab PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_vs_ab PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_vs_ab PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_vs_ab)
+
+    # ------------------------------------------- PPO+MCTS 多线程分身训练吞吐
+    # **不进 ctest**: 同 bench_ppo_vs_ab —— 跑真实自对弈、依赖线程调度与随机开局,
+    # 耗时以分钟计。手动跑:
+    #   cmake --build <build> --target bench_ppo_mt
+    #   <build>/bench_ppo_mt --games=8 --sweep=1,2,4,6,8 --sims=80
+    # 它量的不是棋力, 而是"单位时间产出/消化多少样本", 以及 worker 数与加速比、
+    # 并行效率的关系 (串行基线用同样的学习配置, 见 test/bench_ppo_mt_main.cpp)。
+    add_executable(bench_ppo_mt
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_mt_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_ppo_mt PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_mt PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_mt PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_mt PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_mt)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。

@@ -386,7 +386,7 @@ int main(int /*argc*/, char * /*argv*/[])
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
     /* 固定随机种子: 这个测试必须可复现 */
-    Random::engine.seed(20240613);
+    Random::setSeed(20240613);
 
     std::printf("=== 梯度传播正确性检查 (SIMD 之后) ===\n");
     std::printf("SIMD 内核: %s\n", simdops::instructionSet());

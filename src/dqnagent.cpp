@@ -443,6 +443,14 @@ void DQNAgent::trainSelfPlay(int episodes, int maxMoves, bool verbose)
             oneHotAction.zero();
             oneHotAction[selectedAction] = 1.0f;
             float reward = computeReward(*chosenStep, currentColor);
+            /*
+               视角换算 (2026-09): 本 agent 的编码是"黑为正"的绝对坐标, 网络表达的
+               是**对黑方的价值**; 而 computeReward 现在给的是**走子方视角** (吃子者为
+               正)。原来这里直接存走子方视角的值, 于是红方吃子是 + 而终局红方胜是 -,
+               同一条轨迹里两种口径混用。终局常量本来就是黑方视角, 所以这里补上红方
+               的符号翻转。判定与全部同类位置见 docs/agents_design.md §17。
+            */
+            reward = moverRewardToBlackFrame(reward, currentColor);
 
             double dummy = 0.0;
             chess.moveForward(chosenStep, dummy);
@@ -595,6 +603,9 @@ void DQNAgent::warmupFromCurrent(int episodes, int maxMoves)
             oneHotAction.zero();
             oneHotAction[selectedAction] = 1.0f;
             float reward = computeReward(*chosenStep, currentColor);
+            /* 视角换算 (2026-09, 同 trainSelfPlay): 走子方视角 -> 黑方视角,
+               否则红方那一步的即时奖励符号是反的。见 docs/agents_design.md §17。 */
+            reward = moverRewardToBlackFrame(reward, currentColor);
 
             double dummy = 0.0;
             chess.moveForward(chosenStep, dummy);
@@ -692,13 +703,15 @@ bool DQNAgent::exploreAndTrain(int color, int rolloutSteps)
         return q.argmax();
     };
     /* 每收集一条转移, 就把它放进回放池 (perceive) */
-    auto onTrans = [this](const Step &/*chosen*/, int actionIdx,
+    /* 视角换算 (2026-09): rolloutFromCurrent 给的 r 是**走子方视角**的, 而本 agent
+       的编码是"黑为正" —— 用 chosen.id 认出走子方再翻符号。见 docs/agents_design.md §17。 */
+    auto onTrans = [this](const Step &chosen, int actionIdx,
                           const RL::Tensor &s, const RL::Tensor &ns,
                           float r, bool done) {
         RL::Tensor oneHot(ACTION_DIM, 1);
         oneHot.zero();
         oneHot[actionIdx] = 1.0f;
-        dqn.perceive(s, oneHot, ns, r, done);
+        dqn.perceive(s, oneHot, ns, moverRewardToBlackFrame(r, chosen), done);
     };
 
     const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
@@ -728,7 +741,9 @@ void DQNAgent::trainAfterMove(const RL::Tensor& stateBefore,
     oneHotAction[aidx] = 1.0f;
 
     /* Compute reward */
-    float reward = computeReward(chosenStep, color);
+    /* 视角换算 (2026-09, 同 trainSelfPlay): 走子方视角 -> 黑方视角。
+       trainAfterMove 目前没有调用方, 一并修掉只是不让它留在那里当反例。 */
+    float reward = moverRewardToBlackFrame(computeReward(chosenStep, color), color);
 
     if (done) {
         /* Determine terminal reward from game result */

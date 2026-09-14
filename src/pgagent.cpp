@@ -321,6 +321,14 @@ void PGEagent::train(int episodes, int maxMoves,
             chess.moveForward(chosenStep, dummy);
 
             /* 6. Compute immediate reward */
+            /*
+               注意: 这一条即时奖励**走不到学习者那里** —— 下面三个出口 (无合法走法 /
+               吃将 / 步数用尽) 都会用终局常量把整条轨迹的 reward 覆盖掉。所以本函数的
+               训练目标是"纯终局 ±1 的黑方视角", 是自洽的 (编码也是黑为正), 不存在符号
+               错 —— 但**即时奖励被整条丢掉了**, 物质收益完全没有进入学习信号。要接上它
+               需要先把量纲调平 (computeReward 给的是 value*10, 与 ±1 差一个量级),
+               属于独立一项。符号口径的审查见 docs/agents_design.md §17。
+            */
             float reward = computeReward(*chosenStep, currentColor);
 
             /* 7. Record transition */
@@ -510,6 +518,8 @@ void PGEagent::recordOnline(const Step& s, int color, const RL::Tensor& stateBef
     int aidx = stepToActionIdx(s);
     oneHotAction[aidx] = 1.0f;
     float reward = computeReward(s, color);
+    /* 同 trainSelfPlay: 这里存的即时奖励会被 endOnline 的终局常量整条覆盖
+       (524-533), 所以线上路径也是"纯终局 ±1 的黑方视角", 自洽但丢了物质收益。 */
     m_onlineTrajectory.emplace_back(stateBefore, oneHotAction, reward);
 }
 
@@ -558,13 +568,16 @@ bool PGEagent::exploreAndTrain(int color, int rolloutSteps)
 
     std::vector<RL::Step> traj;
     traj.reserve((std::size_t)rolloutSteps);
-    auto onTrans = [&traj](const Step &/*chosen*/, int actionIdx,
+    /* 视角换算: 本 agent 的编码是"黑为正"的绝对坐标, 而 rolloutFromCurrent 给的
+       奖励是**走子方视角**的 (吃子者为正) —— 红方走子时符号必须翻过来, 否则红方那
+       一半样本的目标整体是反的。判定与全部同类位置见 docs/agents_design.md §17。 */
+    auto onTrans = [&traj](const Step &chosen, int actionIdx,
                            const RL::Tensor &s, const RL::Tensor &/*ns*/,
                            float r, bool /*done*/) {
         RL::Tensor oneHot(ACTION_DIM, 1);
         oneHot.zero();
         oneHot[actionIdx] = 1.0f;
-        traj.emplace_back(s, oneHot, r);
+        traj.emplace_back(s, oneHot, moverRewardToBlackFrame(r, chosen));
     };
 
     const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);

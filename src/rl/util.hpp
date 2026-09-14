@@ -1,5 +1,6 @@
 #ifndef UTIL_HPP
 #define UTIL_HPP
+#include <atomic>
 #include <vector>
 #include <random>
 #include <ctime>
@@ -10,9 +11,37 @@ namespace RL {
 constexpr static float pi = 3.1415926535898;
 
 struct Random {
-    static std::default_random_engine engine;
-    static std::random_device device;
-    static std::mt19937 generator;
+    /*
+       线程安全: 引擎改成**每条线程一份**。
+
+       以前 engine / generator 是进程级全局静态量, 而 uniform()/categorical()/normal()
+       会被多处并发调用 —— 至少包括 GUI 的 m_bgTrainThread 与主线程 (chessboard.cpp
+       的自对弈/后台训练), 以及本项目新增的多线程分身自对弈 worker。std::minstd_rand
+       与 std::mt19937 都不是线程安全的, 并发使用是数据竞争 (UB), 症状是偶发的权重
+       初始化错乱、采样序列异常, 而且极难复现。这是**修一个既有缺陷**, 不只是为多线程
+       让路。
+
+       单线程行为完全不变: 所有访问都在同一条线程, 拿到的还是同一个引擎、同一条序列。
+       多线程下每条线程有独立引擎; 默认种子由线程身份派生, 所以两条线程**不会**退化成
+       同一条随机序列 (worker 忘了播种也不会跑出一样的棋); 需要整轮可复现时, worker
+       入口显式调 seedCurrentThread(index) —— index 由调用方给, 不依赖线程创建顺序,
+       因此并行跑也完全可复现。
+
+       **thread_local 的初始化式必须是"纯函数"** —— 这是踩过坑的硬约束:
+       初始化的值只能来自 threadSalt() 这种普通函数调用, 不能涉及任何静态对象、
+       std::call_once 或 std::random_device。原因写在 util.cpp 里 threadSalt() 的注释:
+       UCRT 的 _Init_thread_header/_Init_thread_footer 之间跑用户初始化代码, 而那把锁
+       不可重入, 在初始化式里再触发一次静态/TLS 初始化就会死锁。实测症状是
+       test_sparse_moe 在 main 之前挂死 (CPU 不再增长、线程全部 Wait), 而且**间歇**发作。
+    */
+    static std::atomic<unsigned> baseSeed;
+    static thread_local std::default_random_engine engine;
+    static thread_local std::mt19937 generator;
+
+    /* 设定进程级基种子并立即播种当前线程。用它替代 Random::engine.seed(x) */
+    static void setSeed(unsigned s);
+    /* worker 线程入口调用: 用 (baseSeed, index) 确定性地播种本线程 */
+    static void seedCurrentThread(unsigned index);
 
     inline static int categorical(const Tensor& p)
     {

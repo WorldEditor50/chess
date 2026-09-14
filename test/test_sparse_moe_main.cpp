@@ -945,18 +945,22 @@ static void part9()
 
 int main()
 {
+    /* 关掉 stdout 缓冲: 这个测试里有若干耗时较长的数值检查, 万一卡住或崩掉,
+       块缓冲会让"卡在哪一步"完全看不出来 (加这一段就是因为排查时吃过这个亏)。
+       其它分钟级的测试基准 (test_grad / test_ppomcts ...) 也都这么做。 */
+    setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== 稀疏路由 MoE (rl/sparse_moe.hpp) 测试 ===\n");
-    Random::engine.seed(20240501);
+    Random::setSeed(20240501);
 
-    part1();
-    part2();
-    part3();
-    part4();
-    part5();
-    part6();
-    part7();
-    part8();
-    part9();
+    std::printf("[1/9] 前向/反向基础\n"); part1();
+    std::printf("[2/9]\n"); part2();
+    std::printf("[3/9]\n"); part3();
+    std::printf("[4/9]\n"); part4();
+    std::printf("[5/9]\n"); part5();
+    std::printf("[6/9]\n"); part6();
+    std::printf("[7/9]\n"); part7();
+    std::printf("[8/9]\n"); part8();
+    std::printf("[9/9]\n"); part9();
 
     std::printf("\n=== %d 项断言, %d 项失败 ===\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

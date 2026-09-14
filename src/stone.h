@@ -768,4 +768,36 @@ public:
     }
 };
 
+/* ====================================================================
+ *  奖励的"视角"换算 —— 老一代 agent 必须显式做这一步 (2026-09)
+ * ====================================================================
+ *
+ *  本工程里同时存在两套**价值口径**, 用错不会报任何错, 只会让一半样本的训练目标
+ *  整体反号 (症状是"学不动", 不是崩溃), 所以把换算写成一个有名字的函数:
+ *
+ *    * 老一代 PG / DQN / DQN+MCTS: encodeState 是"棋盘绝对坐标 + 黑子为正"
+ *      (红子取负), 网络表达的是**对黑方的价值** -> 奖励必须是**黑方视角**。
+ *    * 新一代 PPOMCTS / SACAZ / EVAB: encodeState 是**规范视角** (轮到黑方时整盘
+ *      镜像), 网络表达的是**走子方**的价值 -> 奖励直接就是**走子方视角**,
+ *      **不要**调用下面这个函数。
+ *
+ *  而 Chess::moveForward 的 totalReward、computeReward、rolloutFromCurrent 产出的
+ *  都是走子方视角 (吃子者为正)。于是老一代 agent 在红方走子时要把符号翻过来。
+ *  审查结果与每一处的判定见 docs/agents_design.md 的 §17。
+ */
+inline float moverRewardToBlackFrame(float moverReward, int moverColor)
+{
+    return (moverColor == Stone::COLOR_RED) ? -moverReward : moverReward;
+}
+
+/*
+ *  同上, 但走子方是从 Step::id 推的 —— 给 rolloutFromCurrent 的回调用:
+ *  那个回调拿得到 Step, 拿不到"当前走子方"这个变量 (rollout 内部会换手)。
+ *  红方 id 是 0..15, 黑方是 16..31 (见上面 ID_* 枚举)。
+ */
+inline float moverRewardToBlackFrame(float moverReward, const Step &s)
+{
+    return (s.id < Stone::ID_BLACK) ? -moverReward : moverReward;
+}
+
 #endif // STONE_H

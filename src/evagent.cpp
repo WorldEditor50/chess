@@ -943,7 +943,16 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
         chess.moveForward(&chosen, d);
 
         /* 标签 = 0.5 * 手工评估 + 0.5 * 搜索评分, 都归一到 (-1,1), 刻意的保守 */
-        const double hand = std::tanh((next == Stone::COLOR_RED ? -chess.evaluate()
+        /*
+           视角修正 (2026-09): 这里必须用 **turn**, 不能用 next。
+           moveForward 之后轮到 next 走, 所以 Chess::evaluate() (黑为正的绝对口径)
+           翻到"走子方视角"得到的是 **next** 的视角; 而这一条样本的状态是按 turn 编码的
+           (下面 encodeCanonical(turn, ...)), searchV = -negamax(next, ...) 也是 turn
+           的视角。原来 hand 用 next、另两项用 turn, 于是手工那一半的符号是反的 ——
+           两项按 0.5/0.5 相加等于互相抵消掉一半信号, 而且不报任何错。
+           见 docs/agents_design.md §17。
+        */
+        const double hand = std::tanh((turn == Stone::COLOR_RED ? -chess.evaluate()
                                                                 : chess.evaluate())
                                       / (double)EVAL_SCALE);
         const double searchV = -negamax(next, labelDepth - 1, -INF, INF, 1);

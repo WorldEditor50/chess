@@ -792,7 +792,7 @@ int main()
     std::printf("=== SAC+MCTS+AlphaZero agent 测试 ===\n");
     std::printf("SIMD 内核: %s\n", RL::simdops::instructionSet());
     /* 固定随机种子, 让测试可复现 */
-    RL::Random::engine.seed(20240913);
+    RL::Random::setSeed(20240913);
 
     testMaskedSoftmax();
     testSelectMove();

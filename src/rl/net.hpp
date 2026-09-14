@@ -44,6 +44,16 @@ public:
 
     inline std::size_t size() const {return layers.size();}
 
+    /* 参数量 (只读诊断): 各层 paramCount 之和。见 iLayer::paramCount */
+    long long paramCount() const
+    {
+        long long total = 0;
+        for (std::size_t i = 0; i < layers.size(); i++) {
+            total += layers[i]->paramCount();
+        }
+        return total;
+    }
+
     Tensor &forward(const Tensor &x, bool inference=false)
     {
         layers[0]->forward(x, inference);
@@ -119,10 +129,20 @@ public:
         return;
     }
 
-    void RMSProp(float lr, float rho=0.9, float decay=0)
+    /*
+       clipGrad 以前是**写死 true** 的, 外面没法关。而 Optimize::RMSProp 里的
+       clipGrad 做的是 `dw /= dw.norm2()` —— 对每个张量各做一次全量范数 + 全量除法。
+       两点代价:
+         * 性能: 每步对全部参数多做一遍读 + 一遍读写 (实测占了一步 trainStep 的大头)
+         * 语义: 按范数归一化会把每层的梯度**缩成单位长度**, 梯度的大小信息被抹掉 ——
+           而 RMSProp 本身已经在做逐参数的尺度归一, 再叠一层全局归一之后, 每层的
+           有效步长恒等于 lr, 与真实梯度大小无关。
+       默认仍是 true (保持既有行为不变), 想关掉/做对比实验的调用方可以显式传 false。
+    */
+    void RMSProp(float lr, float rho=0.9, float decay=0, bool clipGrad=true)
     {
         for (std::size_t i = 0; i < layers.size(); i++) {
-            layers[i]->RMSProp(lr, rho, decay, true);
+            layers[i]->RMSProp(lr, rho, decay, clipGrad);
         }
         return;
     }

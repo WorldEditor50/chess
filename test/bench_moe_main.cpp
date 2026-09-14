@@ -249,7 +249,7 @@ static void parseArgs(int argc, char **argv)
 int main(int argc, char **argv)
 {
     parseArgs(argc, argv);
-    Random::engine.seed(g_cfg.seed);
+    Random::setSeed(g_cfg.seed);
 
     std::printf("=== 骨干 A/B/C/D 等时对弈基准 ===\n");
     std::printf("配置: 每对 %d 局, 每局最多 %d 手, 每步预算 %.0f ms, 随机开局 %d 步, "

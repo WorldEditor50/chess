@@ -47,6 +47,13 @@ public:
     virtual void clamp(float c0, float cn){}
     virtual void copyTo(iLayer* layer){}
     virtual void softUpdateTo(iLayer* layer, float alpha){}
+    /*
+       参数量 (只读诊断)。
+       层自己知道它有多少个可训练标量, 上层就不必对每种层做 dynamic_cast 去拼凑 ——
+       骨干每换一次就得重算一遍参数量的话, 没人会去维护那个数字。
+       默认 0; 容器型层 (SparseMoE / MlpExpert) 自己重载并累加子层。
+    */
+    virtual long long paramCount() const { return 0; }
     virtual void write(std::ofstream &file){}
     virtual void read(std::ifstream &file){}
 };
