@@ -12,7 +12,7 @@
 | `MCTS` | 无 | UCB1 + **随机**回放 | 随机回放的方差极大，800 次模拟的信息量远不如同代价的 alpha-beta |
 | `PGEagent` | `DPG`（REINFORCE + baseline） | 单步策略网络，**不搜索** | 90 维"子力值"状态 + 128 维**哈希**动作空间；无搜索 → 一步看不清 |
 | `DQNAgent` | `DQN`（`MOE`+`TransformerBlock`） | argmax Q，**不搜索** | 同上；且 Q 头是 `Sigmoid`，无法表示负 Q（见 issues_review B18） |
-| `PPOMCTSAgent` | `PPO` + MCTS | PUCT，价值头替代随机回放 | 策略/价值来自 90 维状态；动作是哈希索引 |
+| `PPOMCTSAgent` | `PPO` + MCTS | PUCT，价值头替代随机回放 | ~~策略/价值来自 90 维状态；动作是哈希索引~~ **2026-09 已修**：1440 维规范平面（含威胁平面）+ 无碰撞 8100 动作 + 稀疏 MoE（见 `agents_design.md` §5） |
 | `DQNMCTSAgent` | `DQN` + MCTS | 同上 | 同上，且探索率恒为 1.0 时退化成随机走子 |
 
 两个共同的、**根本性**的问题：

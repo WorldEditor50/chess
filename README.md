@@ -2,7 +2,8 @@
 
 一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**9 个可选 AI Agent**（从
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
-自带稀疏 MoE），以及一整套**可复现的验证手段**（9 个 ctest 套件 + 5 个界面自动化脚本 + 1 个基准）。
+自带稀疏 MoE），以及一整套**可复现的验证手段**（9 个 ctest 套件 + 5 个界面自动化脚本 +
+3 个手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt`）。
 
 > 这个工程的写法偏"工程审计"风格：每个非显然的决定都写成注释，每个结论都有实测数字，
 > 发现的问题（包括自己引入的）都记在 `docs/issues_review.md` 里，包括还没修好的。
@@ -164,6 +165,33 @@ ctest --output-on-failure
 build\...\bench_moe.exe --games=4 --plies=30 --budget=60 --pretrain=3
 ```
 
+**`bench_ppo_vs_ab`** 是 PPO+MCTS 对 Alpha-Beta 的**静默**（无界面、不弹窗、不写权重）
+对弈基准，同样是手动跑的：交换先后手、随机开局、可选**等时间**（`--budget` 先标定
+ms/模拟再反推每步模拟次数）。**不进 ctest** 的理由同上，而且默认双方是随机初始权重，
+几局之内翻转结论是常事。
+
+```bat
+build\...\bench_ppo_vs_ab.exe --games=20 --plies=120 --budget=106     # 等时间
+build\...\bench_ppo_vs_ab.exe --games=6 --sims=80 --depth=4           # 固定预算
+build\...\bench_ppo_vs_ab.exe --load=weights/ppomcts_agent.dat        # 用 GUI 存下的权重
+```
+
+实测（2026-09，未训练的随机权重，20 局等时间）：**PPO+MCTS 0 胜 / Alpha-Beta 20 胜，
+全部被将死，平均 36 手**；双方耗时 139 vs 143 ms/步。加 20 局自对弈热身仍是 0 胜
+（局均手数反而更短）。这与「已知限制」第 1 条一致 —— **它量的是链路的下限，不是棋力**。
+
+**`bench_ppo_mt`** 量的是**多线程分身训练的吞吐**（不是棋力）：串行基线、worker 数扫描、
+以及"每线程每模拟成本"。同样**不进 ctest**（跑真实自对弈、依赖线程调度，耗时以分钟计）。
+
+```bat
+build\...\bench_ppo_mt.exe --games=12 --sweep=1,2,3,4,6 --sims=80 --repeat=2
+build\...\bench_ppo_mt.exe --games=6  --sweep=1,2,3,4,6,8 --batch=2000000000   # 只搜索
+```
+
+实测数字与**它暴露出的并行上限问题**（搜索受访存带宽限制，不是 learner 拖后腿）记在
+[`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十三"，
+设计与成因分析见 [`docs/agents_design.md`](docs/agents_design.md) §17.6。
+
 ### 界面自动化（PowerShell + Windows UI Automation）
 
 | 脚本 | 验证什么 |
@@ -201,7 +229,7 @@ chess/
 │       ├── simd_ops.hpp simd/ cpuinfo.hpp          # SIMD 分派与内核
 │       ├── moe.hpp sparse_moe.hpp                  # 稠密 / 稀疏 MoE
 │       └── dqn.cpp dpg.cpp ppo.cpp sac.cpp ...     # RL 算法
-├── test/                   # ctest 套件 + bench_moe
+├── test/                   # ctest 套件 + 3 个手动基准 (bench_moe / bench_ppo_vs_ab / bench_ppo_mt)
 ├── tools/                  # 界面验证脚本 + 图标生成
 └── docs/                   # 设计/审查/同步/理论分析 (见下)
 ```
@@ -214,7 +242,7 @@ chess/
 
 | 文档 | 内容 |
 |------|------|
-| [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标 |
+| [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈） |
 | [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办 |
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
