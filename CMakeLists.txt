@@ -655,6 +655,39 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_ppo_mt)
 
+    # ------------------------------------------- 奖励/学习目标 诊断 (Phase 0)
+    # **不进 ctest**: 它跑真实自对弈并打印统计量, 数字本身会随奖励公式一起变,
+    # 是"改动前后对比"的尺子, 不是"通过/失败"的断言。手动跑:
+    #   cmake --build <build> --target test_reward_diag
+    #   <build>/test_reward_diag --games=1 --sims=8 --moves=20
+    # 它量五件事: ①跨 agent 的 computeReward 一致性 ②奖励尺度表与"终局是否压倒材质"
+    # 这条不变量 ③一局随机棋的材质/终局奖励比 ④PPO 的价值目标分布 (有多少样本真的有
+    # 信号) ⑤"最后一条样本"与"整条轨迹批平均"两种损失口径的差。
+    add_executable(test_reward_diag
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_reward_diag_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/pgagent.cpp
+        ${SRC_DIR}/dqnagent.cpp
+        ${SRC_DIR}/dqnmcts_agent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/evagent.cpp)
+    target_include_directories(test_reward_diag PRIVATE ${SRC_DIR})
+    target_link_libraries(test_reward_diag PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_reward_diag PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_reward_diag PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_reward_diag)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。

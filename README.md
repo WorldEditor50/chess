@@ -244,6 +244,7 @@ chess/
 |------|------|
 | [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈） |
 | [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办 |
+| [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项 |
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |

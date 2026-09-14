@@ -90,12 +90,17 @@ int PGEagent::stepToActionIdx(const Step &s)
 }
 
 /* ------------------------------------------------------------------ */
-/*  computeReward:  immediate material reward from a move              */
-/*  Returns value from `color`'s perspective:  positive = good         */
+/*  computeReward:  一步的即时奖励 (走子方视角, 含每步代价)             */
+/*                                                                     */
+/*  Phase 1 起统一走 stone.h 的 stepReward(): 材质系数 0.1、吃將不给材质 */
+/*  奖励 (终局常量负责)、每步代价 -0.005。实测原来"一方全材质奖励 =    */
+/*  35.0 vs 终局 1.0", 最优策略是吃子而不是赢棋。见 stone.h REWARD_*。  */
 /* ------------------------------------------------------------------ */
 float PGEagent::computeReward(const Step &s, int color)
 {
-    if (s.nextId == Stone::ID_NONE) return 0.0f;
+    (void)color;   /* 走子方视角, 与颜色无关 */
+
+    if (s.nextId == Stone::ID_NONE) return stepReward(false, false, 0.0);
 
     Stone *victim = chess.stones[s.nextId];
     /*
@@ -103,29 +108,18 @@ float PGEagent::computeReward(const Step &s, int color)
        调用方普遍在 chess.moveForward() 之后才求即时奖励 (pgagent.cpp 的
        trainSelfPlay/warmupFromCurrent、ppomcts_agent、dqnmcts_agent 都是如此),
        而 moveTo() 会把被吃子置 alive=false —— 加上 alive 判断会让吃子奖励恒为
-       0.0f, 连"吃将 = 100"那条分支都永远不可达, 于是三个 agent 只能靠终局 ±1
-       学习。奖励只应由"这一步吃了谁"决定, 与调用时机无关。
+       0.0f, 于是只能靠终局 ±1 学习。奖励只应由"这一步吃了谁"决定, 与调用时机无关。
     */
-    if (victim == nullptr) return 0.0f;
+    if (victim == nullptr) return stepReward(false, false, 0.0);
 
-    /* Capturing the Jiang/Shuai is an instant win */
-    if (victim->type == Stone::TYPE_JIANG) {
-        return 100.0f;
-    }
-
-    float reward = victim->value * 10.0f;   /* scale up material gain */
     /*
-       符号约定 (2026-09 修正): 即时奖励是**走子方视角**的 —— 吃掉对方一个子永远是
-       收益, 所以这里直接返回 +reward。
-
-       原来写的是 `(color == COLOR_BLACK) ? reward : -reward`, 那是"黑方视角"
-       (黑方吃子为正), 于是红方白吃一个黑车会拿到 **-0.5** —— 与同一批经验里的终局
-       奖励 (走子方视角的 ±1) 正好相反, 对红方等于在教它"吃子是坏事"。
-       Chess::moveForward 的 totalReward 也是黑方视角 (吃红子 +), 两者同源;
-       实测探针 build/reward_probe.cpp: 红炮吃黑马 totalReward = -0.30。
+       符号约定 (2026-09 修正, 见 docs/agents_design.md §17.2): 即时奖励是**走子方
+       视角**的 —— 吃掉对方一个子永远是收益。原来写的是
+       `(color == COLOR_BLACK) ? reward : -reward` (黑方视角), 于是红方白吃一个
+       黑车会拿到负奖励, 与同一批经验里的终局奖励 (走子方视角的 ±1) 正好相反。
        回归钉在 test_match 的 [2.6] 节。
     */
-    return reward;
+    return stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
 }
 
 /* ------------------------------------------------------------------ */

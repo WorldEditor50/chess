@@ -190,37 +190,99 @@ void PPOMCTSAgent::mirrorPlanes(const RL::Tensor &src, RL::Tensor &dst)
 }
 
 /* ------------------------------------------------------------------
- *  computeReward:  immediate material reward from a move
+ *  computeReward:  一步的即时奖励 (走子方视角, 含每步代价)
+ *
+ *  Phase 1 起统一走 stone.h 的 stepReward(): 材质系数 0.1、吃將按终局量级、
+ *  每步代价 -0.005。原因与实测数字见 stone.h 里 REWARD_* 的说明。
  * ------------------------------------------------------------------ */
 float PPOMCTSAgent::computeReward(const Step &s, int color)
 {
-    if (s.nextId == Stone::ID_NONE) return 0.0f;
+    (void)color;   /* 走子方视角, 与颜色无关 */
+
+    if (s.nextId == Stone::ID_NONE) return stepReward(false, false, 0.0);
 
     Stone *victim = chess.stones[s.nextId];
     /*
        不检查 victim->alive —— 见 pgagent.cpp 里同一处的说明: 调用方常在
        moveForward() 之后求奖励, 那时被吃子已 alive=false, 加判断会让吃子奖励
-       恒为 0 (吃将的 +100 也不可达)。
+       恒为 0 (吃将那条分支也不可达)。
     */
-    if (victim == nullptr) return 0.0f;
+    if (victim == nullptr) return stepReward(false, false, 0.0);
 
-    if (victim->type == Stone::TYPE_JIANG) {
-        return 100.0f;
-    }
-
-    float reward = victim->value * 10.0f;
     /*
-       符号约定 (2026-09 修正): 即时奖励是**走子方视角**的 —— 吃掉对方一个子永远是
-       收益, 所以这里直接返回 +reward。
+       吃將不再单设 +100: 吃將本来就是**终局**, 单设 100 会让同一个胜负事件同时有
+       100 (即时) 与 1 (终局常量) 两种量级, 而 100 还会经折现递推放大成 ±100 量级的
+       价值目标。现在按终局量级给。
 
-       原来写的是 `(color == COLOR_BLACK) ? reward : -reward`, 那是"黑方视角"
-       (黑方吃子为正), 于是红方白吃一个黑车会拿到 **-0.5** —— 与同一批经验里的终局
-       奖励 (走子方视角的 ±1) 正好相反, 对红方等于在教它"吃子是坏事"。
-       Chess::moveForward 的 totalReward 也是黑方视角 (吃红子 +), 两者同源;
-       实测探针 build/reward_probe.cpp: 红炮吃黑马 totalReward = -0.30。
+       符号约定 (2026-09 修正, 见 docs/agents_design.md §17.2): 即时奖励是**走子方
+       视角**的 —— 吃掉对方一个子永远是收益。原来写的是
+       `(color == COLOR_BLACK) ? reward : -reward` (黑方视角), 于是红方白吃一个
+       黑车会拿到负奖励, 与同一批经验里的终局奖励 (走子方视角的 ±1) 正好相反。
+       Chess::moveForward 的 totalReward 是另一套 (黑方视角) 记账, 两者同源;
        回归钉在 test_match 的 [2.6] 节。
     */
-    return reward;
+    return stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
+}
+
+/* ------------------------------------------------------------------
+ *  potentialOf: 当前棋盘的势能 Φ, 走子方视角, 归一化到 (-1,1)
+ *
+ *  Chess::evaluate() 是**黑方视角** (正 = 黑好), Φ 要的是**走子方视角**, 所以
+ *  colorToMove 是红方时取负 —— 与 encodeState 的规范视角是同一件事的两面。
+ * ------------------------------------------------------------------ */
+float PPOMCTSAgent::potentialOf(int colorToMove)
+{
+    /*
+       用 evaluatePositional() 而不是 evaluate(): 前者额外含"将安全 / 空间 / 机动性 /
+       士象完整度"这些**局面价值** —— 势能 Φ 正是把这份"藏在空间位置里的未来价值"
+       提前搬进当前学习目标的那条通道 (推导见 stone.h 的 PBRS 一节)。
+       它只在这里被调用 (每手两次), 所以可以算得细; ABAgent 的叶子评估仍用便宜的
+       evaluate(), 两边的分工见 chess.h 的说明。
+    */
+    const double e = chess.evaluatePositional();   /* 黑方视角 */
+    const double moverFrame = (colorToMove == Stone::COLOR_BLACK) ? e : -e;
+    return potentialReward((float)moverFrame);
+}
+
+/* ------------------------------------------------------------------
+ *  applyPotentialShaping: 把势能塑形原地写进轨迹 (Phase 2, 见头文件)
+ *
+ *  相邻两步共享同一个局面, 所以 Φ_before(i) = Φ_after(i-1) = trajectory[i-1].potential,
+ *  只有第 0 步需要额外的 m_phiInit (调用方在一局开始前设好)。
+ * ------------------------------------------------------------------ */
+void PPOMCTSAgent::applyPotentialShaping(std::vector<RL::Step> &trajectory) const
+{
+    float phiBefore = m_phiInit;
+    for (std::size_t t = 0; t < trajectory.size(); t++) {
+        trajectory[t].reward = shapedStepReward(trajectory[t].reward,
+                                               phiBefore,
+                                               trajectory[t].potential,
+                                               gamma);
+        phiBefore = trajectory[t].potential;
+    }
+}
+
+/* ------------------------------------------------------------------
+ *  pickUntriedByPrior: 按先验挑未展开着法 (Phase 4.1, 见头文件)
+ *
+ *  线性扫一遍未展开列表 (中局约 40 项, 代价可忽略), 取 pi(s_parent)[a] 最大的那个。
+ *  返回下标而不是动作, 因为调用方还要从 untriedSteps 里取同步的那一项。
+ * ------------------------------------------------------------------ */
+int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentPolicy) const
+{
+    const AZNode &node = nodes[nodeID];
+    int best = 0;
+    float bestP = -1.0f;
+    for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
+        const int a = node.untriedActionIndices[i];
+        const float p = (a >= 0 && (std::size_t)a < parentPolicy.size())
+                            ? parentPolicy[(std::size_t)a] : 0.0f;
+        if (p > bestP) {
+            bestP = p;
+            best = (int)i;
+        }
+    }
+    return best;
 }
 
 /* ------------------------------------------------------------------
@@ -314,14 +376,38 @@ bool PPOMCTSAgent::visitDistribution(int rootID, RL::Tensor &pi) const
  *  mirrorAugment (P6): 每条样本再存一份左右镜像 —— 价值目标不变 (局面对称, 胜负
  *  关系当然不变), 动作下标整体镜像 (双射, 所以同一份目标分布里的不同动作镜像后
  *  仍然互不相同, 不会把概率叠到同一个槽位上)。
+ *
+ *  势能塑形 (Phase 2): 进池前先把"棋盘局面价值评估"作为势能加进每步奖励 ——
+ *  见下面 shaped[] 那一段与 stone.h 的推导。没有它, 截断 rollout 的价值目标全是
+ *  0.005~0.01 量级 (诊断 [4] 实测 |target|>0.1 的样本占 0%), critic 只能学成常数。
  * ------------------------------------------------------------------ */
-void PPOMCTSAgent::commitEpisode(const std::vector<RL::Step> &trajectory,
+void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
                                  float finalOutcome)
 {
     if (trajectory.empty()) {
         return;
     }
-    const std::vector<float> returns = ppo.discountedReturns(trajectory, finalOutcome);
+
+    /*
+       ---- 势能塑形: r'_i = r_i + Φ(s_i) + γ·Φ(s_{i+1}) ----
+       直接原地写进轨迹, 之后照常算折现回报。Φ 的作用是给"安静局面"一个非零目标
+       (棋盘局面价值评估), 而且**不改变最优策略**: 同一局面下各着法的 Q 只被平移
+       同一个 Φ(s), 排序不变 (推导见 stone.h)。
+       (参数因此不再是 const —— 轨迹是调用方的局部变量, 用完即弃。)
+    */
+    applyPotentialShaping(trajectory);
+    /*
+       终局常量也必须跟着势能一起平移 —— 这是 PBRS 的**边界项**, 漏了它就不是严格的
+       势能塑形 (数值上表现为"塑形与不塑形之差 ≠ Φ(s_0)")。
+
+       推导: V'(x) = V(x) + Φ(x), 而 finalOutcome 的口径是"最后一步走子方"对
+       **落子后局面**的价值 (= -V(s_end+1), 因为那个局面轮到对手走)。平移后
+       -V'(s_end+1) = -V(s_end+1) - Φ(s_end+1) = finalOutcome - Φ(s_end+1),
+       而 Φ(s_end+1) 正是最后一步记下的 trajectory.back().potential。
+    */
+    const float shiftedOutcome = finalOutcome
+        - (trajectory.empty() ? 0.0f : trajectory.back().potential);
+    const std::vector<float> returns = ppo.discountedReturns(trajectory, shiftedOutcome);
 
     std::vector<int> idx;
     std::vector<float> prob;
@@ -467,32 +553,33 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
 
         /* ====== Phase 2: EXPANSION ====== */
         if (!nodes[nodeID].untriedActionIndices.empty()) {
-            /* Pick a random untried action */
-            int moveIdx = std::rand()
-                          % (int)nodes[nodeID].untriedActionIndices.size();
+            /*
+               Phase 4.1: 先求**父节点**的策略, 再按先验挑未展开着法。
+
+               边 (parent -> child) 的先验是 P(s_parent, a) = pi_theta(s_parent)[a],
+               必须用父节点的网络输出, 而且必须与动作下标处在同一个规范视角。原来的
+               代码拿的是子节点的策略 (`childPolicy[chosenAction]`): 那既用错了网络
+               (子节点的策略描述的是下一手走棋方的选择), 也用错了视角 —— 换成规范视角
+               后两个帧会直接错开, 先验会变成完全无关的数。此刻棋子还没落, 棋盘正是
+               父节点局面。
+
+               挑法也从 `std::rand() % size` (随机) 改成**按先验最大**: 随机挑等于让
+               先验完全不参与"展开哪个孩子", 而中局约 40 个合法着法、一次决策只有 80
+               次模拟, 于是前 ~40 次模拟全花在随机铺开 40 个孩子上。
+            */
+            encodeState(parentState);
+            RL::Tensor &parentPolicy = ppo.action(parentState);
+            const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
             int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
             Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
+            float prior = parentPolicy[chosenAction];
+            if (prior < 1e-9f) prior = 1e-9f; /* avoid zero prior */
 
             /* Remove from untried list */
             nodes[nodeID].untriedActionIndices.erase(
                 nodes[nodeID].untriedActionIndices.begin() + moveIdx);
             nodes[nodeID].untriedSteps.erase(
                 nodes[nodeID].untriedSteps.begin() + moveIdx);
-
-            /*
-               先把**父节点**的策略求出来 —— 边 (parent -> child) 的先验是
-                   P(s_parent, a) = pi_theta(s_parent)[a]
-               必须用父节点的网络输出, 而且必须与 chosenAction 处在同一个规范视角。
-               原来的代码拿的是子节点的策略 (`childPolicy[chosenAction]`): 那既用错了
-               网络 (子节点的策略描述的是下一手走棋方的选择), 也用错了视角。在旧的
-               "绝对坐标 + 哈希"编码下两者恰好吃同一个坐标帧, 错误只表现为先验质量差;
-               换成规范视角后父/子两个帧会直接错开 (父按红方、子按黑方), 先验会变成
-               完全无关的数。此刻棋子还没落, 棋盘正是父节点局面。
-            */
-            encodeState(parentState);
-            RL::Tensor &parentPolicy = ppo.action(parentState);
-            float prior = parentPolicy[chosenAction];
-            if (prior < 1e-9f) prior = 1e-9f; /* avoid zero prior */
 
             /* Execute the move */
             chess.moveForward(&chosenStep, dummyReward);
@@ -615,6 +702,8 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                之后 moveForward 会按落子方的颜色重设 sideToMove, 两者自然一致。
             */
             chess.sideToMove = currentColor;
+            /* 势能塑形 (Phase 2): 首手之前那个局面的势能, 是第 0 步的 Φ_before */
+            m_phiInit = potentialOf(currentColor);
 
             /* Encode current state */
             RL::Tensor state(STATE_DIM, 1);
@@ -716,23 +805,23 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 }
 
                 if (!nodes[nodeID].untriedActionIndices.empty()) {
-                    int moveIdx = std::rand()
-                        % (int)nodes[nodeID].untriedActionIndices.size();
+                    /* Phase 4.1: 先求父节点策略, 再**按先验**挑未展开着法
+                       (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
+                    encodeState(parentState);
+                    RL::Tensor &parentPolicy = ppo.action(parentState);
+                    const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
                     int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
                     Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
+                    float prior = parentPolicy[chosenAction];
+                    if (prior < 1e-9f) prior = 1e-9f;
 
                     nodes[nodeID].untriedActionIndices.erase(
                         nodes[nodeID].untriedActionIndices.begin() + moveIdx);
                     nodes[nodeID].untriedSteps.erase(
                         nodes[nodeID].untriedSteps.begin() + moveIdx);
 
-                    /* 边的先验来自**父节点**的策略, 且必须与 chosenAction 处在同一个
-                       规范视角 —— 详细理由见 selectMove 里同一处的长注释。此刻棋子
-                       还没落, 棋盘正是父节点局面。 */
-                    encodeState(parentState);
-                    RL::Tensor &parentPolicy = ppo.action(parentState);
-                    float prior = parentPolicy[chosenAction];
-                    if (prior < 1e-9f) prior = 1e-9f;
+                    /* 边的先验来自**父节点**的策略, 且必须与动作下标处在同一个
+                       规范视角 —— 详细理由见 selectMove 里同一处的长注释。 */
 
                     chess.moveForward(&chosenStep, dummyReward);
 
@@ -862,6 +951,8 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                     }
                     trajectory.emplace_back(state, policyTarget,
                                             computeReward(chosenStep, currentColor));
+                    /* 势能塑形 (Phase 2): 记下落子**之后**局面的势能 Φ(s_{i+1}) */
+                    trajectory.back().potential = potentialOf(chess.sideToMove);
 
                     /* Train PPO on complete trajectory */
                     if (!trajectory.empty()) {
@@ -890,6 +981,8 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 }
                 float reward = computeReward(chosenStep, currentColor);
                 trajectory.emplace_back(state, policyTarget, reward);
+                /* 势能塑形 (Phase 2): 落子后局面的势能 Φ(s_{i+1}) */
+                trajectory.back().potential = potentialOf(chess.sideToMove);
 
                 /* Switch side */
                 currentColor = (currentColor == Stone::COLOR_RED)
@@ -987,6 +1080,8 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
             /* 规范视角靠 chess.sideToMove, 而 Chess::reset() 把它置成 RED、本函数却
                从 BLACK 开始走 —— 不对齐的话第一步会用**对手**的视角编码 (同 trainSelfPlay) */
             chess.sideToMove = currentColor;
+            /* 势能塑形 (Phase 2): 首手之前那个局面的势能, 是第 0 步的 Φ_before */
+            m_phiInit = potentialOf(currentColor);
 
             RL::Tensor state(STATE_DIM, 1);
             encodeState(state);
@@ -1064,10 +1159,15 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                 }
 
                 if (!nodes[nodeID].untriedActionIndices.empty()) {
-                    int moveIdx = std::rand()
-                        % (int)nodes[nodeID].untriedActionIndices.size();
+                    /* Phase 4.1: 先求父节点策略, 再**按先验**挑未展开着法
+                       (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
+                    encodeState(parentState);
+                    RL::Tensor &parentPolicy = ppo.action(parentState);
+                    const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
                     int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
                     Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
+                    float prior = parentPolicy[chosenAction];
+                    if (prior < 1e-9f) prior = 1e-9f;
 
                     nodes[nodeID].untriedActionIndices.erase(
                         nodes[nodeID].untriedActionIndices.begin() + moveIdx);
@@ -1075,10 +1175,6 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                         nodes[nodeID].untriedSteps.begin() + moveIdx);
 
                     /* 边的先验来自**父节点**的策略, 同一规范视角 (理由见 selectMove) */
-                    encodeState(parentState);
-                    RL::Tensor &parentPolicy = ppo.action(parentState);
-                    float prior = parentPolicy[chosenAction];
-                    if (prior < 1e-9f) prior = 1e-9f;
 
                     chess.moveForward(&chosenStep, dummyReward);
 
@@ -1159,6 +1255,8 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                     }
                     trajectory.emplace_back(state, policyTarget,
                                             computeReward(chosenStep, currentColor));
+                    /* 势能塑形 (Phase 2): 记下落子**之后**局面的势能 Φ(s_{i+1}) */
+                    trajectory.back().potential = potentialOf(chess.sideToMove);
                     if (!trajectory.empty()) {
                         commitEpisode(trajectory, outcomeForLastMover);
                     }
@@ -1176,6 +1274,8 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                 }
                 float reward = computeReward(chosenStep, currentColor);
                 trajectory.emplace_back(state, policyTarget, reward);
+                /* 势能塑形 (Phase 2): 落子后局面的势能 Φ(s_{i+1}) */
+                trajectory.back().potential = potentialOf(chess.sideToMove);
 
                 currentColor = (currentColor == Stone::COLOR_RED)
                                    ? Stone::COLOR_BLACK : Stone::COLOR_RED;
@@ -1265,6 +1365,8 @@ bool PPOMCTSAgent::loadModel(const std::string &filepath)
 void PPOMCTSAgent::beginOnline()
 {
     m_onlineTrajectory.clear();
+    /* 势能塑形 (Phase 2): 线上路径同样需要首手之前的势能 */
+    m_phiInit = potentialOf(chess.sideToMove);
 }
 
 void PPOMCTSAgent::recordOnline(const Step& s, int color, const RL::Tensor& stateBefore)
@@ -1275,6 +1377,8 @@ void PPOMCTSAgent::recordOnline(const Step& s, int color, const RL::Tensor& stat
     oneHotAction[aidx] = 1.0f;
     float reward = computeReward(s, color);
     m_onlineTrajectory.emplace_back(stateBefore, oneHotAction, reward);
+    /* 势能塑形 (Phase 2): 线上路径的 Φ(s_{i+1})(调用方在落子之后才记录) */
+    m_onlineTrajectory.back().potential = potentialOf(chess.sideToMove);
 }
 
 void PPOMCTSAgent::endOnline(int winner, int myColor)
@@ -1284,6 +1388,8 @@ void PPOMCTSAgent::endOnline(int winner, int myColor)
     else if (winner != Stone::COLOR_NONE) finalOutcome = -1.0f;
 
     if (!m_onlineTrajectory.empty()) {
+        /* 势能塑形 (Phase 2): 与自对弈路径同一套 */
+        applyPotentialShaping(m_onlineTrajectory);
         ppo.learnSelfPlay(m_onlineTrajectory, finalOutcome, learningRate);
     }
 
@@ -1354,18 +1460,33 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
     traj.reserve((std::size_t)rolloutSteps);
     /*
        只记"轨迹是否真的走到了终局"以及那一手的奖励。终局值必须来自终局本身,
-       不能拿任意一手(可能是中局)的即时奖励冒充 —— 见下面 learnSelfPlay 调用处的说明。
+       不能拿任意一手(可能是中局)的即时奖励冒充。
     */
     bool rolloutEnded = false;
     float terminalReward = 0.0f;
-    auto onTrans = [&traj, &rolloutEnded, &terminalReward](
+    /*
+       自举 (Phase 2) 用: 留下最后一手的 nextState —— 截断时用它的价值当头。
+       Tensor 赋值是深拷贝, 所以这里存下来不会被后续 rollout 覆盖。
+    */
+    RL::Tensor lastNextState;
+    bool haveNextState = false;
+    auto onTrans = [this, &traj, &rolloutEnded, &terminalReward,
+                    &lastNextState, &haveNextState](
                        const Step &/*chosen*/, int actionIdx,
-                       const RL::Tensor &s, const RL::Tensor &/*ns*/,
+                       const RL::Tensor &s, const RL::Tensor &ns,
                        float r, bool done) {
         RL::Tensor oneHot(ACTION_DIM, 1);
         oneHot.zero();
         oneHot[actionIdx] = 1.0f;
         traj.emplace_back(s, oneHot, r);
+        /*
+           势能塑形 (Phase 2): agentrollout 是**先落子再回调**, 所以此刻棋盘的
+           sideToMove 已经是走子方的对手 —— potentialOf(chess.sideToMove) 正是
+           Φ(s_{i+1}) (落子后局面的势能), 与 Step::potential 的定义一致。
+        */
+        traj.back().potential = potentialOf(chess.sideToMove);
+        lastNextState = ns;
+        haveNextState = true;
         if (done) {
             /* agentrollout.hpp 在 done 时把 r 换成了 (gameResult == turn) ? 1 : -1,
                也就是**走子方视角**的终局结果 —— 正是 learnSelfPlay 需要的口径 */
@@ -1374,6 +1495,8 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
         }
     };
 
+    /* 首手之前的势能 (第 0 步的 Φ_before); 必须在下棋之前取 */
+    m_phiInit = potentialOf(chess.sideToMove);
     const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
 
     bool trained = false;
@@ -1381,19 +1504,39 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
         /*
            finalOutcome 的口径是"最后一步走子方视角" (见 rl/ppo.h)。
 
-           原来这里无条件传 lastReward —— 那是**最后一手的即时奖励**(吃子分/0),
-           不是终局结果。探索大多在终局前就截断了, 于是价值目标变成"这盘棋的最终
-           回报等于最后一步吃了个马", 基本是噪声。
-
            走到终局时: 用 agentrollout 给的那个走子方视角的 ±1 ✓
-           没走到终局时: 传 0。这是一个**截断**更新 (等于假设"此后双方均势"),
-           有偏但方向中性; 真正正确的做法是自举 (用 V(最终状态) 当终局值),
-           learnSelfPlay 目前不支持, 列为后续项。
+           **没走到终局时: 用自举** —— V(s_end+1) 是"轮到走棋的一方(即最后一步
+           走子方的对手)"的价值, 取负就换到最后一步走子方的视角。
+
+           原来是传 0 (截断)。那等于假设"此后双方均势", 而材质奖励缩小 20 倍之后
+           "0" 就等于"没有信号": 诊断实测改动前 |value target|>0.1 的样本占比 0%,
+           critic 只能学成一个常数 —— 这是"安静局面没有位置感"的直接原因。
         */
-        const float finalOutcome = rolloutEnded ? terminalReward : 0.0f;
+        float finalOutcome = 0.0f;
+        if (rolloutEnded) {
+            /*
+               终局常量要跟着势能一起平移 (PBRS 的边界项): 见 commitEpisode 里同一处
+               的推导 —— finalOutcome' = finalOutcome - Φ(落子后局面)。
+            */
+            finalOutcome = terminalReward
+                - (traj.empty() ? 0.0f : traj.back().potential);
+        } else if (haveNextState) {
+            /*
+               自举: V(s_end+1) 是"轮到走棋的一方(即最后一步走子方的对手)"的价值,
+               取负就换到最后一步走子方的视角。
+               **注意这里不需要再做势能平移** —— 价值头学到的目标已经是 V + Φ
+               (塑形后的口径), 所以 -V'(s_end+1) 本身就是平移过的终局值。
+            */
+            finalOutcome = -(float)ppo.value(lastNextState);
+            /* 价值头理论上在 (-1,1); 夹一下防止未收敛时给出离谱的自举值 */
+            finalOutcome = std::max(-1.0f, std::min(1.0f, finalOutcome));
+        }
+        /* 势能塑形 (Phase 2): 原地写进 reward, 再交给 RL 内核算折现回报 */
+        applyPotentialShaping(traj);
         ppo.learnSelfPlay(traj, finalOutcome, learningRate);
         trained = true;
     }
-    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, PPO 更新 1 次";
+    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, PPO 更新 1 次"
+                    + (rolloutEnded ? " (到终局)" : " (截断+自举)");
     return trained;
 }

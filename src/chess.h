@@ -69,6 +69,8 @@ public:
     static const double jiangPST[10][9];
     static const double shiPST[10][9];
     static const double xiangPST[10][9];
+    /* 局面价值项开关 (Phase 5): 默认开; 关掉用于 A/B 归因, 见 evaluate() 的说明 */
+    static bool g_positionalEvalEnabled;
 public:
     Chess();
     Chess(const Chess &other);
@@ -105,6 +107,34 @@ public:
     int getResult(int colorToMove);
     /* 优化: 增强评估函数 */
     double evaluate();
+    /*
+     * 完整局面价值 = evaluate() (材质+PST) + positionalScore() (将安全/空间/士象)。
+     * **刻意与 evaluate() 分开**: evaluate() 是 ABAgent 的叶子评估 (一步 depth-4 要调
+     * 约 170 万次, 叠加局面项会让它慢 6.5 倍、把等时间深度吃回去), 而这一路只给 RL 的
+     * 势能塑形 Φ 用 (每手两次)。
+     */
+    double evaluatePositional();
+    /*
+     * 局面价值项 (Phase 5, 2026-09): 将安全 / 九宫受攻 / 攻击对方将 / 士象完整度。
+     * 返回**黑方视角**的加权和 (与 evaluate() 同一口径), 由 evaluate() 在末尾叠加。
+     * 它同时是势能 Φ 的原料 —— Φ 把"棋盘局面价值评估"接进 PPO 的训练信号。
+     */
+    double positionalScore();
+    /*
+     * 空间 / 机动性 (Phase 5, 黑方视角): 逐子几何地数"可达格数"与"伸进对方半场的
+     * 格数" —— 它的意义是让**不吃子的着法也能改变局面价值** (材质要等吃子才动,
+     * 而调子/占位/争空间的价值在未来的选择权里)。不用 isAttacked, 因为这里是 AB
+     * 叶子热路径。被 positionalScore() 叠加。
+     */
+    double activityScore();
+    /* 单个棋子是否攻击 target (positionalScore 内部用) */
+    bool isAttackedOne(const Pos &target, const Stone *s);
+    /*
+     * 局面价值项的开关: 默认开。留它出来是为了做 A/B —— 改 evaluate() 会同时改掉
+     * ABAgent 与 EVAB 的预训练标签, 必须能"关掉再量一遍"才能归因。
+     */
+    static void setPositionalEvalEnabled(bool on) { g_positionalEvalEnabled = on; }
+    static bool positionalEvalEnabled() { return g_positionalEvalEnabled; }
     /* 长将/循环走法检测 */
     void pushHistory();
     bool isRepetition();

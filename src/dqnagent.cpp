@@ -115,37 +115,31 @@ void DQNAgent::stepToOneHot(const Step &s, RL::Tensor &onehot)
 }
 
 /* ------------------------------------------------------------------ */
-/*  computeReward                                                       */
+/*  computeReward:  一步的即时奖励 (走子方视角, 含每步代价)             */
+/*  Phase 1 起统一走 stone.h 的 stepReward(): 材质系数 0.1、吃將不给材质 */
+/*  奖励 (终局常量负责)、每步代价 -0.005。见 stone.h REWARD_* 的实测。  */
 /* ------------------------------------------------------------------ */
 float DQNAgent::computeReward(const Step &s, int color)
 {
-    if (s.nextId == Stone::ID_NONE) return 0.0f;
+    (void)color;   /* 走子方视角, 与颜色无关 */
+
+    if (s.nextId == Stone::ID_NONE) return stepReward(false, false, 0.0);
 
     Stone *victim = chess.stones[s.nextId];
     /*
        不检查 victim->alive —— 见 pgagent.cpp 里同一处的说明: DQNAgent::trainAfterMove
        是在 moveForward() 之后被调用的, 那时被吃子已 alive=false, 加判断会让吃子
-       奖励恒为 0 (吃将的 +100 也不可达)。
+       奖励恒为 0。
     */
-    if (victim == nullptr) return 0.0f;
+    if (victim == nullptr) return stepReward(false, false, 0.0);
 
-    if (victim->type == Stone::TYPE_JIANG) {
-        return 100.0f;
-    }
-
-    float reward = victim->value * 10.0f;
     /*
-       符号约定 (2026-09 修正): 即时奖励是**走子方视角**的 —— 吃掉对方一个子永远是
-       收益, 所以这里直接返回 +reward。
-
-       原来写的是 `(color == COLOR_BLACK) ? reward : -reward`, 那是"黑方视角"
-       (黑方吃子为正), 于是红方白吃一个黑车会拿到 **-0.5** —— 与同一批经验里的终局
-       奖励 (走子方视角的 ±1) 正好相反, 对红方等于在教它"吃子是坏事"。
-       Chess::moveForward 的 totalReward 也是黑方视角 (吃红子 +), 两者同源;
-       实测探针 build/reward_probe.cpp: 红炮吃黑马 totalReward = -0.30。
+       符号约定 (2026-09 修正, 见 docs/agents_design.md §17.2): 即时奖励是**走子方
+       视角**的 —— 吃掉对方一个子永远是收益。原来的黑方视角写法会让红方白吃一个
+       黑车拿到负奖励, 与终局 (走子方视角 ±1) 相反。
        回归钉在 test_match 的 [2.6] 节。
     */
-    return reward;
+    return stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
 }
 
 /* ------------------------------------------------------------------ */

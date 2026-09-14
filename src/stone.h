@@ -4,6 +4,7 @@
 #include <vector>
 #include <list>
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include "pos.h"
@@ -798,6 +799,118 @@ inline float moverRewardToBlackFrame(float moverReward, int moverColor)
 inline float moverRewardToBlackFrame(float moverReward, const Step &s)
 {
     return (s.id < Stone::ID_BLACK) ? -moverReward : moverReward;
+}
+
+/* ====================================================================
+ *  奖励尺度 —— 全部 agent 共用一处 (Phase 1, 2026-09)
+ * ====================================================================
+ *
+ *  诊断实测 (test_reward_diag 的 [2]/[3], 改动前):
+ *    * 一方全部非将子力 = 3.5 (value 单位), 原来换算成奖励是 x10 = **35.0**;
+ *    * 而终局奖励只有 **±1.0** → 终局/全材质 = 0.029;
+ *    * 一局随机棋实测 Σ|材质奖励| / |终局奖励| = **32 倍**;
+ *    * 吃將的即时奖励另设成 **100.0**, 同一个胜负事件因此有 100 与 1 两种量级。
+ *
+ *  这个尺度下的**最优策略是"吃子"而不是"赢"**: 吃一个車 (+5) 等于赢五盘棋, 吃光对方
+ *  (+35) 是赢棋的 35 倍。而"将受威胁时下得对"只是因为将附近的信号大到能压过一切 ——
+ *  也就是说价值函数只在将附近被训练出来了。
+ *
+ *  摆正之后:
+ *    * 材质系数 0.1 → 兵 0.01 / 仕相 0.02 / 馬炮 0.03 / 車 0.05, 一方全材质 **0.35**;
+ *    * 终局保持 ±1.0 → **终局 > 一方全部材质 (2.9x)**, 且 > 单次最大吃子 (20x);
+ *    * 量纲落在 ~[-1,1], 与 critic 的输出口径、SACAZ/EVAB 的归一化目标一致;
+ *    * 吃將不再单设 100, 直接按**终局量级**给 —— 同一个胜负事件只留一个量级。
+ *
+ *  另加**每步代价** REWARD_STEP_COST: 势能差/材质差这类塑形**不含时间成本**
+ *  (参考 snakeAI 的 stepCost), 不加会鼓励磨蹭。对应象棋的 60 回合无吃子判和规则。
+ *
+ *  步长必须小: 这是个**每步**量, 一局最长约 120 手 (60 回合规则), 累计起来是
+ *  120 x |步长|。取 -0.001 -> 最长一局的累计代价 0.12, 仍远小于终局 ±1 (8 倍),
+ *  于是"慢赢"不会被算成"输"。若取 -0.005, 120 手就累计到 0.6, 会把"200 手判和"
+ *  压到与"快速输棋"同价 (诊断 [3] 实测到过这个数)。
+ *  另注: gamma=0.99 的折现在本身就已经强烈偏好"早赢", 所以每步代价只需要承担
+ *  "在等价着法之间挑更快的那一个"这一件事, 不需要大。
+ *
+ *  不变量 (test_reward_diag 的 [2] 会断言):
+ *      |REWARD_TERMINAL| > 一方全部非将子力 * REWARD_MATERIAL_COEF
+ *      |REWARD_TERMINAL| > 120 * |REWARD_STEP_COST|
+ * ==================================================================== */
+constexpr float REWARD_MATERIAL_COEF = 0.1f;    /* 材质奖励系数 */
+constexpr float REWARD_TERMINAL      = 1.0f;    /* 终局奖励量级 (胜 +, 负 -) */
+constexpr float REWARD_STEP_COST     = -0.001f; /* 每步代价 (效率); 见上面的步长说明 */
+constexpr int   REWARD_MAX_PLIES     = 120;     /* 一局最长手数 (60 回合规则) */
+
+/*
+ *  一步的完整即时奖励 (**走子方视角**) —— 所有 agent 的 computeReward 都走这里,
+ *  免得 5 份实现各漂各的 (诊断的 [1] 会断言它们一致)。
+ *
+ *    capturedSomething=false          -> 只有每步代价
+ *    capturedJiang=true               -> 也不给材质奖励: 吃將**必然是终局**,
+ *                                        终局常量会给 ±1。单设 100 (老实现) 会让
+ *                                        同一事件有 100 与 1 两种量级; 单设 +1 又会
+ *                                        与终局常量重复计一次。SACAZ 原来就是 0,
+ *                                        这里把它推广到全部 agent。
+ *    其它吃子                          -> 系数 x 被吃子的 value + 每步代价
+ *
+ *  刻意**不检查 victim->alive**: 调用方普遍在 moveForward() 之后才求奖励, 那时被吃子
+ *  已被置为 alive=false, 检查它会让吃子奖励恒为 0 (见各 agent 原来的注释)。
+ */
+inline float stepReward(bool capturedSomething, bool capturedJiang, double victimValue)
+{
+    if (!capturedSomething || capturedJiang) {
+        return REWARD_STEP_COST;
+    }
+    return REWARD_MATERIAL_COEF * (float)victimValue + REWARD_STEP_COST;
+}
+
+/* ====================================================================
+ *  势能塑形 (PBRS, Phase 2) —— 把"棋盘局面价值评估"接进训练信号
+ * ====================================================================
+ *
+ *  问题: 终局奖励是稀疏的, 而截断的 rollout 一律把终局值当 0 —— 诊断实测
+ *  (test_reward_diag [4]) 改动后 |value target| > 0.1 的样本占比是 **0%**,
+ *  也就是绝大多数样本对 critic 来说"没有信号", 它只能学成一个常数。这正是
+ *  "安静局面没有位置感、只在将被威胁时下得对"的根因。
+ *
+ *  做法 (potential-based reward shaping, Ng/Harada/Russell 1999):
+ *  取势能 Φ(s) = 棋盘局面价值评估 (走子方视角, 归一化到 (-1,1)),
+ *  在每一步的奖励上加:
+ *
+ *      r'_i = r_i + Φ(s_i) + gamma * Φ(s_{i+1})
+ *
+ *  为什么是这个形式 (而不是教科书里的 gamma*Φ(s') - Φ(s)): 本工程的价值口径是
+ *  **negamax 的逐手翻号**形式 V(s_i) = r_i - gamma * V(s_{i+1}) —— 相邻两步的
+ *  走子方互为对手, 所以势能那一项在递推里也要跟着翻号。检验两条:
+ *
+ *   1) 平移性: 令 V'(x) = V(x) + Φ(x) (都是规范视角), 代入递推得
+ *        r'_i = V'(s_i) + gamma*V'(s_{i+1}) = r_i + Φ(s_i) + gamma*Φ(s_{i+1})  ✓
+ *      也就是说 critic 学到的目标整体平移了 Φ(s), 于是"安静局面"第一次有了非零目标。
+ *   2) 策略不变性: Q'(s,a) = r'_a - gamma*V'(s_a)
+ *        = [r_a + Φ(s) + gamma*Φ(s_a)] - gamma*[V(s_a) + Φ(s_a)]
+ *        = Q(s,a) + Φ(s)
+ *      Φ(s_a) 那两项**恰好相消**, 于是同一局面下各着法的排序完全不变 ——
+ *     塑形只"提前把位置信息传给沿途状态", 不改变最优策略 (与随手加"将军加分"
+ *      那种会诱发乱冲的奖励项有本质区别)。
+ *
+ *  归一化: evaluate() 的量程约 ±4.5 (材质 ±3.5 + PST), 直接当势能会压倒终局 ±1;
+ *  tanh 到 (-1,1) 后与终局同量级 —— 单个車的优势 (0.5) 映射成 0.24, 明显优势 (3.0)
+ *  映射成 0.90。
+ * ==================================================================== */
+constexpr float REWARD_POTENTIAL_SCALE = 2.0f;
+
+/* 把"走子方视角的局面评估值"变成势能 Φ ∈ (-1,1) */
+inline float potentialReward(float moverFrameEval)
+{
+    return std::tanh(moverFrameEval / REWARD_POTENTIAL_SCALE);
+}
+
+/*
+ *  一步的塑形奖励: r' = r + Φ(s_i) + gamma*Φ(s_{i+1})
+ *  (推导与"策略不变"的验证见上面那段注释)
+ */
+inline float shapedStepReward(float baseReward, float phiBefore, float phiAfter, float gamma)
+{
+    return baseReward + phiBefore + gamma * phiAfter;
 }
 
 #endif // STONE_H

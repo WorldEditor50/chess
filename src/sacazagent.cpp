@@ -315,38 +315,35 @@ void SACAZAgent::getLegalActions(int color,
 
 float SACAZAgent::computeReward(const Step &s, int color)
 {
+    (void)color;   /* 走子方视角, 与颜色无关 */
+
     if (s.nextId == Stone::ID_NONE) {
-        return 0.0f;
+        return stepReward(false, false, 0.0);
     }
     Stone *victim = chess.stones[s.nextId];
     if (victim == nullptr) {
-        return 0.0f;
+        return stepReward(false, false, 0.0);
     }
     /*
-       吃将这里不给奖励: 吃将意味着对局结束, 终局奖励 ±1 会覆盖它。
-       若按 value_jiang = 1000 给, Q 的尺度会被彻底压倒 (一步棋值 1000),
-       SAC 的软备份就没法看了。
-    */
-    if (victim->type == Stone::TYPE_JIANG) {
-        return 0.0f;
-    }
-    /*
-       奖励尺度: 直接用 Stone::value (车 0.5 / 马炮 0.3 / 兵 0.1 / 仕相 0.2),
-       与终局 ±1 同量级 —— 于是"赢棋"始终比任何吃子收益重要, 而吃子提供密集的
-       塑形信号 (象棋的终局奖励本身是稀疏的, 没有塑形很难学)。
-    */
-    const float v = (float)victim->value;
-    /*
-       符号约定 (2026-09 修正): 即时奖励是**走子方视角**的 —— 吃掉对方一个子永远是
-       收益, 所以直接返回 +v。原来写的是 `(color == COLOR_BLACK) ? v : -v`, 那是
-       "黑方视角" (黑方吃子为正), 于是红方白吃一个黑子会拿到 -v: 与同一批经验里的
-       终局奖励 (resultValue 给的走子方视角 ±1) 正好相反, 对红方等于在教它"吃子是
-       坏事"。所有 agent 的 computeReward 原来是同一个写法, 现在一致修正。
+       奖励尺度 (Phase 1 起与其他 agent 统一):
+       本 agent 原来就用 `Stone::value` 原值 (车 0.5 / 马炮 0.3 / 兵 0.1), 方向是对的
+       ——"单个吃子 < 终局 ±1"。但**一局累积**下来一方全材质 = 3.5 > 终局 1.0, 也就
+       是说"吃光对方"在数值上仍然是"赢棋"的 3.5 倍 (诊断 [2] 的不变量当场抓住这一条,
+       它对 SACAZ 同样成立)。现在统一到 stone.h 的 REWARD_MATERIAL_COEF = 0.1:
+       一方全材质 0.35 < 终局 1.0, 终局真正主导。
+
+       吃將仍然不给即时奖励 (这一点 SACAZ 原来就是对的, 现在推广到全部 agent):
+       它必然是终局, 终局奖励会覆盖; 若按 value_jiang = 1000 给, Q/价值的尺度会被
+       彻底压倒, 软备份与 MSE 都没法看。
+
+       符号约定 (2026-09 修正, 见 docs/agents_design.md §17.2): 即时奖励是**走子方
+       视角**的 —— 吃掉对方一个子永远是收益。原来的黑方视角写法会让红方白吃一个黑子
+       拿到负奖励, 与终局 (resultValue 给的走子方视角 ±1) 相反。
        (Chess::moveForward 的 totalReward 仍是黑方视角, 那是它的记账约定; 界面上的
        奖励曲线在 ChessBoard::playMatchGame 里显式换算成走子方视角。)
        回归钉在 test_match 的 [2.6] 节。
     */
-    return v;
+    return stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
 }
 
 /* ============================================================

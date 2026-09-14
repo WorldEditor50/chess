@@ -179,6 +179,35 @@ public:
     float computeReward(const Step &s, int color);
 
     /* ----------------------------------------------------------------
+     *  势能塑形 (PBRS, Phase 2): 把"棋盘局面价值评估"接进训练信号
+     * ----------------------------------------------------------------
+     *  Φ(局面) = tanh(走子方视角的 Chess::evaluate() / SCALE) ∈ (-1,1),
+     *  每步奖励加 Φ(s_i) + γ·Φ(s_{i+1})。推导与"不改变最优策略"的验证写在
+     *  stone.h 的 potentialReward()/shapedStepReward() 上面。
+     *
+     *  evaluate() 是**黑方视角** (正 = 黑好), 而 Φ 要的是**走子方视角**,
+     *  所以轮到红方时取负。这个换算与 encodeState 的规范视角是同一件事的两面。
+     * ---------------------------------------------------------------- */
+    float potentialOf(int colorToMove);
+
+    /*
+     *  把势能塑形**原地**写进轨迹每一手的 reward:
+     *      reward_i <- reward_i + Φ(s_i) + γ·Φ(s_{i+1})
+     *  (推导见 stone.h 的 shapedStepReward())。之后 learnSelfPlay / commitEpisode
+     *  正常算折现回报即可, RL 内核不需要知道"势能"这件事 —— 依赖方向保持
+     *  "agent 依赖 RL 内核", 不是反过来。
+     *
+     *  **只能对同一条轨迹调用一次**: 它原地累加, 重复调用会把塑形项叠加两次。
+     */
+    void applyPotentialShaping(std::vector<RL::Step> &trajectory) const;
+
+    /*
+     *  一局开始前必须先设好: 首手**之前**那个局面的势能 (它是第 0 步的 Φ_before)。
+     *  之所以不在 commitEpisode 里算, 是因为那时棋盘已经停在终局局面了。
+     */
+    float m_phiInit = 0.0f;
+
+    /* ----------------------------------------------------------------
      *  左右镜像 (P6, 2026-09)
      * ----------------------------------------------------------------
      *  中国象棋在 **y -> 8-y** (把棋盘左右翻一下) 下是一个**规则对称**:
@@ -209,6 +238,25 @@ public:
      * ---------------------------------------------------------------- */
     /* PUCT score for a child node */
     double getPUCT(int childID, int parentVisits) const;
+
+    /*
+     *  Phase 4.1: 按**先验**挑一个未展开着法 (AlphaZero 的做法), 返回它在
+     *  untriedActionIndices 里的下标。三个搜索入口 (selectMove / trainSelfPlay /
+     *  warmupFromCurrent) 共用它。
+     *
+     *  为什么必须改: 原来三处都是 `std::rand() % size` **随机**挑 —— 先验完全没参与
+     *  "展开哪个孩子"。中局约 40 个合法着法, 而一次决策只有 80 次模拟, 于是前 ~40 次
+     *  模拟全花在随机铺开 40 个孩子上 (每次还都要跑一遍 actor + critic 前向), PUCT 根本
+     *  没机会起作用。按先验挑之后, 最初几次模拟就集中在最有希望的候选上 —— 这正是
+     *  "把有效搜索空间压小"的机制本身 (见 docs/agents_design.md 的搜索一节)。
+     *
+     *  顺带: 搜索里不再用 std::rand(), 于是 RL::Random::setSeed() 能真正控制整条搜索的
+     *  可复现性 (多线程分身训练也受影响)。
+     *
+     *  parentPolicy 必须是**父节点**的策略输出 pi(s_parent)[a], 且与 untriedActionIndices
+     *  处在同一个规范视角 (理由见 selectMove 里那段长注释)。
+     */
+    int pickUntriedByPrior(int nodeID, const RL::Tensor &parentPolicy) const;
 
     /*
        把根节点的**访问计数**归一化成策略目标分布 (π ∝ N, τ=1), 与
@@ -260,8 +308,11 @@ public:
        一局结束: 按折现回报把这条轨迹推进回放池, 池子够大时触发一次批量学习。
        轨迹里的策略目标是稠密的 (RL::Step 只放得下一个 Tensor), 但**进池时立刻转成
        稀疏** —— 长期占内存的是回放池, 不是这条临时轨迹。
+
+       参数是**非 const** 引用: 函数会先把势能塑形原地写进每一手的 reward
+       (见 applyPotentialShaping)。轨迹是调用方的局部变量, 用完即弃。
     */
-    void commitEpisode(const std::vector<RL::Step> &trajectory, float finalOutcome);
+    void commitEpisode(std::vector<RL::Step> &trajectory, float finalOutcome);
 
     /* ----------------------------------------------------------------
      *  稀疏 MoE 诊断 (只读, 不参与决策; 给测试与调参用)
@@ -345,6 +396,12 @@ public:
      * (actor 的交叉熵在 RL::PPO::lastActorLoss 里, 目前不上图。)
      */
     float getLastTrainLoss() const override { return (float)ppo.lastLoss; }
+    /*
+       actor 的交叉熵 (同一批的批平均)。界面目前只画了 critic 的 MSE —— 只看一半训练:
+       策略离"搜索给出的走法"有多远, 是这个量才反映得出来的。留一个只读访问器,
+       供诊断程序与后续的曲线接线使用。
+    */
+    float getLastActorLoss() const { return (float)ppo.lastActorLoss; }
     float getWinRate(int color = Stone::COLOR_BLACK) const {
         int idx = (color == Stone::COLOR_BLACK) ? 1 : 0;
         return totalEpisodes > 0 ? (float)totalWins[idx] / totalEpisodes : 0.0f;

@@ -105,6 +105,9 @@ const double Chess::xiangPST[10][9] = {
     {0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00}
 };
 
+/* 局面价值项开关 (Phase 5): 定义在这里, 默认开 */
+bool Chess::g_positionalEvalEnabled = true;
+
 /* 位置价值函数 */
 static double getPositionValue(int type, int color, int x, int y, const double pst[10][9])
 {
@@ -144,7 +147,263 @@ double Chess::evaluate()
             score -= matVal + posVal;
         }
     }
+    /*
+       ---- 局面价值项刻意**不**并进这里 ----
+       evaluate() 是 ABAgent 的**叶子评估**, 一步 depth-4 搜索要调约 170 万次。实测
+       叠加局面项 (将安全/空间/士象) 之后一次评估从 0.10 us 涨到 0.65 us (**6.5 倍**),
+       depth-4 单步从约 0.5 s 涨到 1.27 s —— 在等时间对局里等于把搜索深度吃回去,
+       是"评估更准"换"搜得更浅"。而局面价值真正该去的地方是 **RL 的势能 Φ**
+       (每手只算两次, 开销可以忽略): 见 evaluatePositional()。
+    */
     return score;
+}
+
+/* ------------------------------------------------------------------
+ *  evaluatePositional: 完整局面价值 = 材质 + PST + 局面项 (供 RL 的势能 Φ 用)
+ *
+ *  与 evaluate() 的分工:
+ *    * evaluate()            给 ABAgent / EVAB 的**叶子评估**: 极便宜 (0.10 us), 不能动;
+ *    * evaluatePositional()  给 PPO 的**势能塑形** Φ: 每手两次, 可以算得细一点。
+ *  把"将安全 / 空间 / 机动性 / 士象完整度"放在后者, 既拿到了局面信息, 又不拖慢 AB。
+ *
+ *  开关 g_positionalEvalEnabled 只影响这一路 —— 用来做势能塑形的 A/B。
+ * ------------------------------------------------------------------ */
+double Chess::evaluatePositional()
+{
+    return evaluate() + (g_positionalEvalEnabled ? positionalScore() : 0.0);
+}
+
+/* ------------------------------------------------------------------
+ *  positionalScore: 局面价值项 (黑方视角, 与 evaluate() 同一口径)
+ *
+ *  为什么原来只有材质 + PST 不够: 材质差要等到吃子才变化, 而象棋里大量局面的差别
+ *  在"将有多危险、攻势有多强、士象是否完整"上。诊断 (test_reward_diag) 已经量出
+ *  critic 的价值目标在安静局面几乎全 0, 也就是没有任何位置信息可用 —— 这些项正是
+ *  势能 Φ 的原料 (Φ = tanh(走子方视角的 evaluate()/SCALE), 见 stone.h)。
+ *
+ *  四项, 都刻意取得比材质小一个量级 (材质差最大 ±3.5, 这些合计 ≤1.2):
+ *    * 被将军        : ±0.50  —— 被将军是失先手的硬信号 (将的机动性被限)
+ *    * 九宫受攻格数  : 每格 0.02 (最多 9 格 -> 0.18)
+ *    * 攻击对方将格  : 每个子 0.03 —— 多重攻击比单次攻击危险得多
+ *    * 缺士/象       : 每个 0.04 —— 象棋里"士象全"是防守完整度的标准项
+ *
+ *  成本: 18 次 isAttacked (双方九宫) + 一次 32 子扫描。isAttacked 是按棋子类型做
+ *  几何判定 (车同线/炮炮架/马腿/兵方向/飞将), 不去重建走法形状, 本来就是为搜索
+ *  热路径写的 —— 实测 depth-4 的一步大约多 3~5% (见 docs 的 Phase 5 实测)。
+ * ------------------------------------------------------------------ */
+double Chess::positionalScore()
+{
+    const Pos blackJiangPos = blackJiang.pos;
+    const Pos redJiangPos   = redJiang.pos;
+
+    double s = 0.0;
+
+    /* ---- 1) 被将军 (将所在格被对方攻击) ---- */
+    const bool blackInCheck = (blackJiang.alive && isAttacked(blackJiangPos, Stone::COLOR_RED));
+    const bool redInCheck   = (redJiang.alive && isAttacked(redJiangPos, Stone::COLOR_BLACK));
+    if (blackInCheck) s -= 0.50;
+    if (redInCheck)   s += 0.50;
+
+    /*
+       ---- 2) 将周围受攻: 已去掉 ----
+       它要给双方各 4 个将邻格做 isAttacked, 而 isAttacked 每次都要扫一遍敌方棋子
+       列表 (车/炮还要数中间有几个子)。实测: 这一项 + 被将军 (10 次 isAttacked) 让
+       一次 evaluate() 从 0.10 us 涨到 0.80 us (**8 倍**), 而 AB depth-4 一步要调约
+       170 万个叶子 —— 单步从约 0.5 s 涨到 1.34 s, 在等时间对局里等于把搜索深度
+       吃回去 (用"评估更准"换"搜得更浅")。所以只保留**被将军**这一项: 它是这份信息
+       里最关键、也最便宜 (2 次调用) 的, 而且将"周围"受攻与"被将军"高度重复。
+       剩下的预算给了 activityScore (纯数组访问, 便宜) —— 也就是"空间"那一项。
+    */
+
+    /*
+       ---- 3) 攻击对方将格的子数: 已去掉 ----
+       这一项与 (1) 被将军、(2) 将周围受攻 高度重复 (都是"将有多危险"), 而它要给
+       **双方全部 32 个子**各做一次攻击判定 —— 车/炮的判定还要算"中间有几个子"
+       (走线扫描)。实测它是这一整块里最贵的部分: 去掉它 depth-4 单步从 1621 ms 降到
+       约 950 ms, 而信息几乎没少。宁可少一项也不能把 AB 的等时间深度吃回去。
+    */
+
+    /* ---- 4) 士象完整度 ---- */
+    int blackGuards = 0, redGuards = 0;
+    for (int i = 0; i < 32; i++) {
+        Stone *st = m_children[i];
+        if (st == nullptr || st->alive == false) continue;
+        if (st->type != Stone::TYPE_SHI && st->type != Stone::TYPE_XIANG) continue;
+        if (st->color == Stone::COLOR_BLACK) blackGuards++; else redGuards++;
+    }
+    s -= 0.04 * (4 - blackGuards);
+    s += 0.04 * (4 - redGuards);
+
+    /*
+       ---- 5) 空间 / 机动性 ----
+       这一项的意义是"不吃子的着法也能改变局面价值": 材质要等吃子才动, 而调子/占位/
+       争空间的价值在**未来的选择权**里 —— 未来价值藏在空间位置中。势能 Φ 会把这份
+       空间价值提前搬进当前的学习目标 (见 stone.h 的 PBRS 推导)。
+    */
+    s += activityScore();
+
+    return s;
+}
+
+/* ------------------------------------------------------------------
+ *  activityScore: 空间 / 机动性 (Phase 5, 黑方视角)
+ *
+ *  为什么要它: **不吃子的着法也必须能改变局面价值**。材质差要等吃子才动, 而象棋里
+ *  绝大多数着法是"调子、占位、争空间"——它们的价值不在当下, 而在**未来的选择权**
+ *  (能到达的格子越多, 未来的威胁/防守机会越多)。这正是"未来价值藏在空间位置里"。
+ *
+ *  做法: 逐子几何地数"可达格数"与"伸进对方半场的格数", 不用 isAttacked —— 后者要
+ *  扫棋子列表, 而这里是 AB 的叶子热路径 (depth-4 一步约 1600 个叶子)。车/炮走射线、
+ *  马查马腿、兵只前进, 都是 O(1)~O(9) 的便宜操作。
+ *
+ *  两项 (都取得比材质小一个量级 —— 材质差最大 ±3.5):
+ *    * 机动性: 每个可达空格 0.004  —— 一车在开阔线路上约 10 格 -> 0.04
+ *    * 空间  : 可达格位于**对方半场**时再 +0.006 —— 伸进对方半场才是真正的空间优势
+ *
+ *  仕/士 与 相/象 不参与: 它们永远出不了己方半场/九宫, 机动性恒为常数, 对"空间"
+ *  没有贡献 (它们的作用已经由 positionalScore 的士象完整度项表达)。
+ * ------------------------------------------------------------------ */
+double Chess::activityScore()
+{
+    static const double W_MOBILITY = 0.004;   /* 每个可达格 */
+    static const double W_SPACE    = 0.006;   /* 可达格在对方半场时的额外权重 */
+
+    double s = 0.0;
+
+    for (int i = 0; i < 32; i++) {
+        Stone *st = m_children[i];
+        if (st == nullptr || st->alive == false) continue;
+
+        const int me = st->color;
+        const bool isRed = (me == Stone::COLOR_RED);
+        /* 对方半场: 红方的对方半场是 x<=4, 黑方的对方半场是 x>=5 */
+        auto inEnemyHalf = [isRed](const Pos &p) {
+            return isRed ? (p.x <= 4) : (p.x >= 5);
+        };
+
+        double pieceScore = 0.0;
+        /* 累计"这一步可到达的格子"(含被对方子占据的格 —— 那是可吃/可攻击的格) */
+        auto addSquare = [&](const Pos &p) {
+            pieceScore += W_MOBILITY;
+            if (inEnemyHalf(p)) {
+                pieceScore += W_SPACE;
+            }
+        };
+
+        switch (st->type) {
+        case Stone::TYPE_CHE:
+        case Stone::TYPE_PAO: {
+            /*
+               只算**车与炮**的空间: 它们是长程子, 可达格数最多、空间优势最明显;
+               马/兵/将/仕/相的活动范围小, 其位置价值已经由 PST 表达 (bingPST 里
+               过河兵的溢价就是这一项的替代)。少算 4 类子 = 少掉一大半 map 查找 ——
+               而这是 AB 的叶子热路径 (每步要走 ~1600 个叶子)。
+            */
+            const bool isPao = (st->type == Stone::TYPE_PAO);
+            static const int dirs[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+            for (int d = 0; d < 4; d++) {
+                int x = st->pos.x, y = st->pos.y;
+                bool jumped = false;
+                while (true) {
+                    x += dirs[d][0];
+                    y += dirs[d][1];
+                    if (x < 0 || x > 9 || y < 0 || y > 8) break;
+                    Stone *occ = m_map[Pos(x, y)];
+                    if (!isPao) {
+                        /* 车: 沿线路直到被挡住; 空位与可吃的敌子都算可达 */
+                        if (occ == nullptr) {
+                            addSquare(Pos(x, y));
+                            continue;
+                        }
+                        if (occ->color != me) addSquare(Pos(x, y));
+                        break;
+                    }
+                    /* 炮: 炮架之前可平移, 炮架之后第一个子是可击目标 */
+                    if (!jumped) {
+                        if (occ == nullptr) {
+                            addSquare(Pos(x, y));
+                            continue;
+                        }
+                        jumped = true;
+                        continue;
+                    }
+                    if (occ != nullptr) {
+                        if (occ->color != me) addSquare(Pos(x, y));
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case Stone::TYPE_MA: {
+            /* 马的活动范围小, 只给它"有没有被蹩腿"这一个粗信号: 蹩腿 = 机动性损失 */
+            static const int off[8][2] = {{2,1},{2,-1},{-2,1},{-2,-1},
+                                          {1,2},{1,-2},{-1,2},{-1,-2}};
+            for (int k = 0; k < 8; k++) {
+                const int x = st->pos.x + off[k][0];
+                const int y = st->pos.y + off[k][1];
+                if (x < 0 || x > 9 || y < 0 || y > 8) continue;
+                Pos leg = st->pos;
+                if (std::abs(off[k][0]) == 2) leg.x += (off[k][0] > 0) ? 1 : -1;
+                else                          leg.y += (off[k][1] > 0) ? 1 : -1;
+                if (m_map[leg] != nullptr) continue;   /* 蹩腿 */
+                Stone *occ = m_map[Pos(x, y)];
+                if (occ == nullptr || occ->color != me) {
+                    pieceScore += 0.002;   /* 只在"能走"这一层给分, 不再分辨远近 */
+                }
+            }
+            break;
+        }
+        default:
+            /* 兵/卒 与 将/帅/仕/士/相/象: 活动范围小或受九宫/半场锁死, 由 PST 表达 */
+            break;
+        }
+
+        if (isRed) {
+            s -= pieceScore;   /* 黑方视角: 红方得空间 -> 对黑不利 */
+        } else {
+            s += pieceScore;
+        }
+    }
+
+    return s;
+}
+
+/* 单个棋子是否攻击 target (供 positionalScore 的第 3 项用) */bool Chess::isAttackedOne(const Pos &target, const Stone *s)
+{
+    if (s == nullptr || s->alive == false) return false;
+    switch (s->type) {
+    case Stone::TYPE_CHE:
+        return (s->pos.x == target.x || s->pos.y == target.y)
+               && m_map.countStoneOnLine(s->pos, target) == 0;
+    case Stone::TYPE_PAO:
+        return (s->pos.x == target.x || s->pos.y == target.y)
+               && m_map.countStoneOnLine(s->pos, target) == 1;
+    case Stone::TYPE_MA: {
+        const int dx = std::abs(target.x - s->pos.x);
+        const int dy = std::abs(target.y - s->pos.y);
+        if (!((dx == 2 && dy == 1) || (dx == 1 && dy == 2))) return false;
+        Pos leg = s->pos;
+        if (dx == 2) leg.x += (target.x > s->pos.x) ? 1 : -1;
+        else         leg.y += (target.y > s->pos.y) ? 1 : -1;
+        return m_map[leg] == nullptr;
+    }
+    case Stone::TYPE_BING:
+        if (s->color == Stone::COLOR_RED) {
+            if (target.x == s->pos.x - 1 && target.y == s->pos.y) return true;
+            return (s->pos.x <= 4 && target.x == s->pos.x
+                    && std::abs(target.y - s->pos.y) == 1);
+        }
+        if (target.x == s->pos.x + 1 && target.y == s->pos.y) return true;
+        return (s->pos.x >= 5 && target.x == s->pos.x
+                && std::abs(target.y - s->pos.y) == 1);
+    case Stone::TYPE_JIANG:
+        /* 飞将: 同列且中间无子 */
+        return (s->pos.y == target.y && m_map.countStoneOnLine(s->pos, target) == 0);
+    default:
+        /* 仕/士 与 相/象 永远到不了对方九宫 */
+        return false;
+    }
 }
 
 Chess::Chess():

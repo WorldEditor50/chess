@@ -295,13 +295,26 @@ void RL::PPO::learnSelfPlay(std::vector<Step>& trajectory,
     */
     const std::vector<float> returns = discountedReturns(trajectory, finalOutcome);
 
-    /* Train each step: policy target = action taken (one-hot), value target = return */
+    /*
+       ---- 整条轨迹累积一次更新 (P3 的累积在在线路径上的落地) ----
+
+       原来是逐步 trainStep: 每步一次完整的全参数 RMSProp, 而且 lastLoss 只留**最后
+       一条样本**的值 —— 界面上那条"训练损失曲线"因此画的是单样本损失 (目标的量级
+       由最后一步吃了什么决定), 实测"最后一条 / 整条批平均"能差 1.5 倍以上, 遇到
+       吃車/吃將那种重尾样本差几个数量级, 曲线看起来就是低占空比的脉冲。
+
+       改成累积整条轨迹再 applyGradients 一次, 同时拿到两件事:
+         * 上报的是**批平均**损失 (与 DQN 报"平均平方 TD 误差"同一口径);
+         * 优化器调用次数从 N 次降到 1 次 —— 实测每样本便宜 2.9x
+           (见 test_ppomcts 的 [9] 与 docs/agents_design.md §17.3)。
+    */
+    resetMoeBatchStats();
     for (int t = 0; t <= end; t++) {
-        trainStep(trajectory[t].state,
-                  trajectory[t].action,
-                  returns[(std::size_t)t],
-                  learningRate);
+        accumulateGrad(trajectory[(std::size_t)t].state,
+                       trajectory[(std::size_t)t].action,
+                       returns[(std::size_t)t]);
     }
+    applyGradients(learningRate);
 
     exploringRate *= 0.99999f;
     if (exploringRate < 0.01f) exploringRate = 0.01f;
