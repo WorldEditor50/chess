@@ -1398,6 +1398,10 @@ reward chart has points = True      loss readout present    = True
 RESULT: PASS
 ```
 
+> 注意：上面这段是**奖励改成"每手一个点"之前**的实录 —— 所以 `reward readout` 里只有
+> "2 点"（一局一个点）。那正是 **13.7** 要修的现象：一局 51 手里曲线一直不动。同一条脚本
+> 现在的输出里奖励点数是与手数同量级的（见 13.7 与 16.3 的实测）。
+
 脚本这轮又踩了两个坑，都记在脚本注释里：
 
 1. **窗口出现 ≠ 可以交互**：`startupLoad()` 完成前所有控件都是 disabled，这时给
