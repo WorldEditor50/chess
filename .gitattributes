@@ -1,0 +1,80 @@
+# ============================================================================
+#  行尾与文本/二进制判定 (2026-09 新增)
+# ============================================================================
+#
+#  为什么需要它
+#  ------------
+#  本仓库长期没有 .gitattributes, 于是结存(object)里同时存在两种行尾:
+#  实测 70 个 i/lf + 51 个 i/crlf + 15 个 i/lf-w/crlf + 4 个 i/mixed。
+#  后果不是"编译不过", 而是:
+#
+#    * **同一个文件里混着两种行尾**, 任何一次工具编辑都会把它"规范化"一遍,
+#      在 diff 里灌进几十上百行"仅行尾不同"的噪声。实测: P1-P7 那一轮
+#      4472 行改动里有 278 行 (6.2%) 是这种噪声, 集中在
+#      pgagent.cpp(+92) / dqnmcts_agent.cpp(+86) / ppomcts_agent.cpp(+78) /
+#      dqnagent.cpp(+22)。评审时看不出"哪一行是真的改了"。
+#    * 不同的编辑器/工具对混行尾文件的行为不一致 (有的整文件重写, 有的保留),
+#      于是"改一行"变成"改半个文件"。
+#
+#  约定
+#  ----
+#  **仓库里一律存 LF**; 检出到工作区时按平台自动转换 (Windows + core.autocrlf=true
+#  -> CRLF, 其余 -> LF)。这正是 core.autocrlf=true 本来就要做的事, 只是对历史
+#  文件从未生效过 (它只作用于 add 时的转换, 不会回头改已提交的内容)。
+#
+#  注意: **.gitattributes 里的规则优先于 core.autocrlf 配置**。所以下面把常用
+#  扩展名都显式写出来, 不再依赖每台机器上的 git 配置 —— 这也是这里能"钉死"
+#  *.bat/*.ps1 必须 CRLF 的原因。
+#
+#  历史: 这次规范化是**纯行尾**改动 (提交里 `git diff --cached --numstat` 与
+#  `git diff --cached --ignore-cr-at-eol --numstat` 的差就是全部内容),
+#  与 bytecode/行为无关; 事后 `git diff --ignore-cr-at-eol` 处处为空可复核。
+# ============================================================================
+
+# 默认: 按内容自动判定文本, 文本一律按 LF 存
+* text=auto
+
+# ---- 明确按文本处理的类型 (避免"扩展名不认识 -> 当二进制"的意外) ----
+*.h      text
+*.hpp    text
+*.cpp    text
+*.c      text
+*.cc     text
+*.md     text
+*.txt    text
+*.cmake  text
+*.ui     text
+*.qrc    text
+*.rc     text
+*.pro    text
+*.pri    text
+*.ps1    text
+*.bat    text
+*.json   text
+*.yml    text
+*.yaml   text
+*.sh     text
+CMakeLists.txt text
+.gitignore     text
+
+# ---- Windows 脚本: 工作区必须是 CRLF ----
+# cmd.exe 对 LF 结尾的 .bat 在 goto/label/多行块里会出怪问题 (这个工程有
+# build_main.bat); PowerShell 两种都吃, 但保持一致更省心。
+# 显式 eol=crlf 与克隆者机器上的 core.autocrlf 无关。
+*.bat    text eol=crlf
+*.ps1    text eol=crlf
+
+# ---- 二进制: 明说, 不靠猜 ----
+*.ico    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.dat    binary
+*.bin    binary
+*.exe    binary
+*.dll    binary
+*.lib    binary
+*.pdb    binary
+*.zip    binary
+*.7z     binary
