@@ -1601,6 +1601,52 @@ RESULT: PASS
 2. `tools/verify_match_ui.ps1`：对局**进行中**每 700 ms 取一次奖励读数，要求点数在涨；
    并且赛后要求 `奖励点数 >= 总手数 - 局数`（一局 300 手却只有两三个点就会 FAIL）。
 
+### 13.8 每跑一场就多挂两条线（奖励曲线"换一批线"没清干净）
+
+13.7 之后，用户在一次 **100 局**对弈里读到的标签是这样的：
+
+```
+奖励(局内累计) SAC+AZ-MoE: 暂无  |  Alpha-Beta: 暂无  |
+               SAC+AZ-MoE: 最新 0, 均值 0.049185, 最小 -1, 最大 0.8, 982 点  |
+               Alpha-Beta: 最新 0.1, 均值 1.3437, 最小 0, 最大 4.5, 982 点
+```
+
+**四条线，前两条永远"暂无"。** 根因在"每场对弈开始重建两条奖励曲线"的写法：
+
+```cpp
+ui->rewardChart->clearData();                    // 只清**点**, 线还在
+m_rewardSeriesA = ui->rewardChart->addSeries(agentA, ...);   // 于是每场往后**再挂两条**
+m_rewardSeriesB = ui->rewardChart->addSeries(agentB, ...);
+```
+
+跑第 N 场时图上有 **2N 条**线（其中 2N−2 条是空的），读数标签里就是上面那串"暂无"，
+导出的 CSV 也会多出几列同名空数据。
+
+修法与钉子：
+
+| | 之前 | 现在 |
+|---|---|---|
+| 换一批线 | `clearData()`（只清点）+ 追加两条 | **`removeAllSeries()`**（连名字/颜色/数据一起清）+ 两条 |
+| "清空曲线"按钮 | 同上（`clearData` + `m_lossSeries.clear()`，于是下一次同名 agent 上报时会**再建一条同名线**） | 两个图都 `removeAllSeries()`，`m_lossSeries` 一并清空 |
+| 面板上的静态说明 | "曲线: 训练损失 / 每局环境奖励" | "曲线: 训练损失 / 环境奖励(每手累计)" |
+
+`CurveChart::clearData()` 的语义**保持不变**（只清点、保留线）—— 放大窗口的 `syncFromSource()`
+就是靠"线还在、点被清空"来同步的。两个语义分开，别再拿一个当另一个用。
+
+回归钉子在 `test/test_match_main.cpp` 的 **[2.9]**（`CurveChart` 是普通 QWidget，offscreen
+下直接构造即可，为此把 `metricsview.cpp` 加进了 `test_match` 的源文件列表）：
+
+```
+[2.9] 奖励曲线换一批线: clearData 只清点, removeAllSeries 才清线
+    readout = reward C: 最新 2, 均值 2, 最小 2, 最大 2, 1 点  |  D: 最新 3, ... 1 点
+=== 71 项断言, 0 项失败 ===
+```
+
+它按顺序钉五件事：`clearData()` 后线还在、**只 clearData 再加两条会变成 4 条**（把 bug 的
+形状写成断言）、`removeAllSeries()` 清到 0、换一批之后仍只有两条、读数里每个名字只出现一次
+且没有"暂无"。写这个测试时还顺手暴露了自己一个错误假设：`sampleCount()` 返回的是
+**各条线里最多的点数**（CSV 按它出行数）而不是总和，第一版断言写成 `== 2` 就正确地失败了。
+
 ---
 
 ## 14. EVAB 为什么赢不了 AB（三个真 bug），以及损失曲线的补全

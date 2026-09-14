@@ -491,7 +491,11 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pgagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        # [2.9] 节要直接构造 CurveChart, 钉住"换一批线"的语义 (clearData 只清点,
+        # removeAllSeries 才清线) —— 曲线控件只依赖 Qt Widgets, 不需要主窗口。
+        ${SRC_DIR}/metricsview.cpp
+        ${SRC_DIR}/metricsview.h)
     target_include_directories(test_match PRIVATE ${SRC_DIR})
     target_link_libraries(test_match PRIVATE
         RL_CORE

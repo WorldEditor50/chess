@@ -141,6 +141,20 @@ void CurveChart::setWindow(int maxPoints)
     updateAccessibility();
 }
 
+void CurveChart::removeAllSeries()
+{
+    if (m_series.isEmpty()) {
+        return;
+    }
+    m_series.clear();
+    m_hasData = false;
+    m_lo = 0.0;
+    m_hi = 1.0;
+    updateAccessibility();
+    emit dataChanged();
+    update();
+}
+
 void CurveChart::addPoint(int series, double value)
 {
     if (series < 0 || series >= m_series.size()) {

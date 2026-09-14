@@ -672,8 +672,13 @@ void MainWindow::setupMetricsPanel()
     ui->rewardChart->setWindow(2000);
 
     connect(ui->clearMetricsBtn, &QPushButton::clicked, this, [this]() {
-        ui->lossChart->clearData();
-        ui->rewardChart->clearData();
+        /*
+           "清空曲线"要连**曲线本身**一起清 (否则 m_lossSeries 清空了、图上那几条线
+           还在, 下次同一个 agent 上报损失时会按名字新建一条 —— 于是同名线并排出现,
+           和 resetMetricsForMatch 那个坑是同一类)。
+        */
+        ui->lossChart->removeAllSeries();
+        ui->rewardChart->removeAllSeries();
         m_lossSeries.clear();
         m_rewardSeriesA = -1;
         m_rewardSeriesB = -1;
@@ -744,10 +749,18 @@ void MainWindow::updateMetricsLabels()
         ui->rewardChart->readoutText(QStringLiteral("奖励(局内累计)")));
 }
 
-/* 每场对弈开始: 重建奖励曲线的两条序列 (名字换成这一场的两位参赛者) */
+/*
+   每场对弈开始: 重建奖励曲线的两条序列 (名字换成这一场的两位参赛者)。
+
+   注意这里必须用 `removeAllSeries()` 而不是 `clearData()`: 后者只清点、不清线,
+   于是每跑一场图上就**多挂两条**空线 —— 第三场时读数标签会变成
+   "SAC+AZ-MoE: 暂无 | Alpha-Beta: 暂无 | SAC+AZ-MoE: 最新 0 ... | Alpha-Beta: ..."
+   (用户在 100 局对弈里的实录, 见 docs/agents_design.md 13.8), 导出的 CSV 也会多出
+   几列同名空数据。
+*/
 void MainWindow::resetMetricsForMatch(const QString &agentA, const QString &agentB)
 {
-    ui->rewardChart->clearData();
+    ui->rewardChart->removeAllSeries();
     m_rewardSeriesA = ui->rewardChart->addSeries(agentA, kSeriesColors[0]);
     m_rewardSeriesB = ui->rewardChart->addSeries(agentB, kSeriesColors[1]);
 }

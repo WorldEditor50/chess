@@ -22,6 +22,7 @@
 #include <vector>
 #include "chessboard.h"
 #include "dqnagent.h"
+#include "metricsview.h"
 #include <cmath>
 #include <QVector>
 #include <QMetaObject>
@@ -354,6 +355,57 @@ int main(int argc, char *argv[])
         CHECK(opposite, "A/B 的局末增量互为相反数 (一方 +1 另一方 -1)");
         CHECK(deltaSum == st2.winA - st2.winB,
               "两局的胜负增量之和 == 比分差 (A 胜局数 - B 胜局数)");
+    }
+
+    /* ------------------------------------------------- 2.9 奖励曲线的"换一批线" */
+    /*
+       用户在一次 100 局对弈里的读数标签实录:
+         "奖励(局内累计) SAC+AZ-MoE: 暂无 | Alpha-Beta: 暂无 |
+          SAC+AZ-MoE: 最新 0, ... 982 点 | Alpha-Beta: ... 982 点"
+       四条线、两条永远"暂无" —— 因为"每场对弈重建两条奖励曲线"当时写成了
+       `clearData()` (只清点、**不清线**) + `addSeries()` x2, 于是每跑一场就往图上
+       多挂两条空线 (第三场 6 条、第十场 20 条), 导出的 CSV 也跟着多列。
+
+       这一节把两个 API 的语义钉死, 并验证 MainWindow 现在用的那条路径 (removeAllSeries
+       + addSeries x2) 真的只留两条线。CurveChart 是普通 QWidget, offscreen 下能直接构造。
+    */
+    std::printf("\n[2.9] 奖励曲线换一批线: clearData 只清点, removeAllSeries 才清线\n");
+    {
+        CurveChart chart;
+        chart.addSeries(QStringLiteral("A"), QColor(Qt::red));
+        chart.addSeries(QStringLiteral("B"), QColor(Qt::blue));
+        chart.addPoint(0, 1.0);
+        chart.addPoint(1, -1.0);
+        CHECK(chart.seriesCount() == 2, "两条线");
+        /* 注意 sampleCount() 是**各条线里最多的点数** (CSV 按它出行数), 不是总和 ——
+           第一版这里写成 == 2, 于是它正确地失败了。 */
+        CHECK(chart.sampleCount() == 1, "sampleCount 是'最多点数' = 1 (不是两条相加)");
+
+        /* clearData: 点没了, 线还在 (放大窗口靠它同步, 语义要保持) */
+        chart.clearData();
+        CHECK(chart.seriesCount() == 2, "clearData 之后线还在 (它只清点)");
+        CHECK(chart.sampleCount() == 0, "clearData 之后点没了");
+
+        /* 这正是 bug 的形状: 只 clearData 再加两条 -> 四条 (两条空的) */
+        chart.addSeries(QStringLiteral("A"), QColor(Qt::red));
+        chart.addSeries(QStringLiteral("B"), QColor(Qt::blue));
+        CHECK(chart.seriesCount() == 4, "旧的写法 (clearData+addSeries) 会挂成 4 条 -> 这就是那个 bug");
+
+        /* 正确路径: 每场对弈开始 = removeAllSeries + 两条新线 */
+        chart.removeAllSeries();
+        CHECK(chart.seriesCount() == 0, "removeAllSeries 把线全清掉");
+        chart.addSeries(QStringLiteral("C"), QColor(Qt::green));
+        chart.addSeries(QStringLiteral("D"), QColor(Qt::darkYellow));
+        chart.addPoint(0, 2.0);
+        chart.addPoint(1, 3.0);
+        CHECK(chart.seriesCount() == 2, "换一批线之后仍然只有两条 (不再每场多挂两条)");
+
+        /* 读数里每个名字只应出现一次 (重复的线会带来重复的同名读数) */
+        const QString readout = chart.readoutText(QStringLiteral("reward"));
+        std::printf("    readout = %s\n", readout.toUtf8().constData());
+        CHECK(readout.count(QStringLiteral("C:")) <= 1, "读数里同一个名字只出现一次");
+        CHECK(readout.count(QStringLiteral("D:")) <= 1, "读数里同一个名字只出现一次 (第二条)");
+        CHECK(!readout.contains(QStringLiteral("暂无")), "没有残留的空线 (不再出现'暂无')");
     }
 
     /* ---------------------------------------------------------------- 3. 中止 */    std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");

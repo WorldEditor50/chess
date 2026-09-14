@@ -65,6 +65,16 @@ public:
     void setWindow(int maxPoints);
     /* 清空所有曲线的数据 (保留曲线与颜色) */
     void clearData();
+    /*
+       连曲线本身一起清掉 (名字/颜色/数据全没)。
+
+       为什么要有这个: `clearData()` **只清点、不清线**, 于是"每场对弈重建两条奖励
+       曲线"的写法 (`clearData()` + `addSeries()` x2) 会每场往后**再挂两条** ——
+       跑第 3 场时图上有 6 条, 其中 4 条是空的, 读数标签里就出现
+       "SAC+AZ-MoE: 暂无 | Alpha-Beta: 暂无 | SAC+AZ-MoE: 最新 ... | ..." 这种
+       (用户界面实录, 见 docs/agents_design.md 13.8)。要"换一批曲线"就得用这个。
+    */
+    void removeAllSeries();
 
     int seriesCount() const { return m_series.size(); }
     const Series &series(int i) const { return m_series[i]; }
