@@ -15,7 +15,7 @@ chess/
 │   ├── mainwindow.h/cpp/ui   # 主窗口 (Qt)
 │   ├── chessboard.h/cpp      # 棋盘控件 (Qt 绘制 + 交互 + AI 线程 + Agent 对弈 arena)
 │   ├── thinkingindicator.h/cpp # "AI 正在思考"指示器 (沙漏 + 旋转粒子 + 呼吸灯 + 实时耗时)
-│   ├── metricsview.h/cpp     # 自绘折线图控件 CurveChart (训练损失 / 每局环境奖励曲线) + 双击放大窗口
+│   ├── metricsview.h/cpp     # 自绘折线图控件 CurveChart (训练损失 / 环境奖励曲线) + 双击放大窗口
 │   ├── busydialog.h/cpp      # 载入/保存权重时的"请稍候"弹窗 (里面复用思考指示器的沙漏)
 │   ├── chess.h/cpp           # 棋局逻辑 + 评估函数 (+ Zobrist 键)
 │   ├── stone.h/cpp           # 棋子基类与派生类 + 走法/对象池

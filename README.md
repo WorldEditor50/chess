@@ -90,6 +90,8 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 * 程序图标（窗口/任务栏 + exe 文件图标，由脚本生成）
 * 载入/保存权重时的沙漏等待窗（复用思考指示器；**快的操作不闪窗**，延迟 300 ms 才显示）
+* **启动时加载全部 7 组权重**（含稀疏 MoE 的 3×146 MB，约 10 s，沙漏全程给反馈）；
+  每组各记一条 `[weights] <名字>: N ms`，保存也记一条（慢了能一眼看出是哪一组）
 * 权重文件格式 v2：**逐比特无损** + 结构指纹 + 每张量 CRC32 + **原子写入**，
   并且**兼容旧的十进制文本格式**
 
@@ -169,7 +171,7 @@ build\...\bench_moe.exe --games=4 --plies=30 --budget=60 --pretrain=3
 | `tools/verify_match_ui.ps1` | 真界面选 agent → 开局 → 断言比分/逐局明细/曲线有数据/**静默保存权重**/**双击放大窗与源控件逐字一致** |
 | `tools/verify_thinking_ui.ps1` | 采样像素：思考中状态条出现、空闲/结束后干净 |
 | `tools/verify_busy_ui.ps1` | 启动载入权重时弹沙漏、载完收起（**不残留**） |
-| `tools/verify_busy_lazy.ps1` | 首次使用稀疏 MoE 变体（3×146 MB 懒加载）时弹沙漏 |
+| `tools/verify_eager_load.ps1` | **启动时加载所有模型**的两个后果：启动沙漏出现并收起；首次使用稀疏 MoE 变体**不再**弹沙漏（回到懒加载就会 FAIL），且对局确实在推进 |
 | `tools/verify_app_icon.ps1` | ICO 结构 / 字形真的渲染 / 运行时加载 / exe 图标是"我们的" |
 | `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） |
 

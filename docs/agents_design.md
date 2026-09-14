@@ -1747,11 +1747,12 @@ RESULT: PASS
   操作被取消了，其实后台线程还在写）、应用级模态、用 `show()` 而不是 `exec()`
   （加载在后台线程，GUI 事件循环要继续跑沙漏才会动）。
 
-### 15.3 顺带修掉的一处不一致：懒加载路径
+### 15.3 顺带修掉的一处不一致：两条分支行为不一样
 
 查这个功能时发现 `aiThinkForAgent` 的 `AGENT_SACAZ_MOE` 分支**只创建对象、不载权重**，
 而 `aiThink` 的分支会载 —— 两条路径行为不一致（对弈里用到它时跑的是随机初始化的网络）。
-现在两条都懒加载，且都弹沙漏。
+当时改成"两条都懒加载、都弹沙漏"；后来随着 15.4 改成启动时全量预加载，这两条分支里的
+载入成了兜底路径（见 15.5 末段的说明），但仍然保持"建了对象就把权重载上"的一致行为。
 
 ### 15.4 启动时加载所有模型（用户要求），以及为它做的加载提速
 
@@ -1804,10 +1805,16 @@ override 都找出来），预计还能省 2~3 s。
 ### 15.5 曾经试过又撤销的中间方案：懒加载
 
 为了启动速度，这一版一度把稀疏 MoE 变体改成**懒加载**（第一次用到时才读，启动只要 1.7 s），
-路径与相关代码都还在（`aiThink` / `aiThinkForAgent` 的懒创建分支照样会载权重并弹沙漏，
-`tools/verify_busy_lazy.ps1` 仍然能验它）。用户明确要求"启动时加载所有模型"之后，
-这条又改回预加载 —— 因为懒加载的代价是**第一次选中它时卡十几秒**，而"所有模型都就绪"
-对使用体验更重要。
+懒创建分支的代码还在（`aiThink` / `aiThinkForAgent` 里，仍然会载权重并弹沙漏）。用户明确
+要求"启动时加载所有模型"之后，这条又改回预加载 —— 因为懒加载的代价是**第一次选中它时卡十几
+秒**，而"所有模型都就绪"对使用体验更重要。
+
+需要如实说明一点：改回预加载之后，那两个懒创建分支里的 `loadModel()` **实际上不可达**了 ——
+权重文件存在时 `startupLoad()` 既登记路径也把它读进内存（`m_sfSACAZMoe != nullptr`），
+文件不存在时 `s_weightPaths` 里根本没有这一项、分支里也不会去读。它们现在的价值只剩"兜底":
+万一以后有人把预加载去掉，至少不会空指针崩。这也是 `tools/verify_busy_lazy.ps1`（断言"首次
+使用**会**弹沙漏"）必须被替换掉的原因 —— 它的断言在新行为下**只能失败**，留着它就是留一个
+永远红着的测试（见 15.6）。
 
 两种取法的实测对比：
 
@@ -1816,7 +1823,7 @@ override 都找出来），预计还能省 2~3 s。
 | 预加载（当前） | 10.1 s | 0（已经就绪） |
 | 懒加载（曾用） | 1.7 s | +15 s（弹沙漏） |
 
-### 15.6 验证（两个脚本，都 PASS）
+### 15.6 验证（三个脚本，都 PASS）
 
 `tools/verify_busy_ui.ps1`（ASCII-only，窗口名用码位拼）：启动 → 每 250 ms 枚举本进程的
 **可见**顶层窗口 → 断言"沙漏窗出现过"且"界面可用时它已经不在了"。
@@ -1833,21 +1840,29 @@ main UI became ready at 1.7s
 busy window still open after ready = False      -> RESULT: PASS
 ```
 
-`tools/verify_busy_lazy.ps1`（真界面：选 A 方 = 稀疏 MoE 变体 → 开局 → 盯沙漏窗）：
+`tools/verify_eager_load.ps1`（真界面：启动 → 选 A 方 = 稀疏 MoE 变体 → 开局 → 盯沙漏窗）
+—— 它**替换**了原来的 `verify_busy_lazy.ps1`（那个断言"首次使用会弹沙漏"，在全量预加载下
+只能失败）。新脚本一次验三件事：
 
 ```
-ui ready = True (1.1 s)
-A side = SAC+MCTS+AlphaZero (稀疏MoE+TB专家)
-match started at 5.8 s
-busy window appeared at 8.3s: '正在载入'
-busy window closed at 22.9s
+startup hourglass appeared at 1.8s: '正在载入'
+startup hourglass closed at 10.8s
+ui ready at 10.9s = True                      <- [1] 启动沙漏覆盖了全部 438 MB 的加载
+first-use hourglass appeared = False          <- [2] 首次使用**不再**加载 (全量预加载的钉子)
+reward samples during the watch = 2 -> 20     <- [3] 对局确实在推进 (不是"没开始所以没弹窗")
+match progressed while watching = True
 RESULT: PASS
 ```
 
-两个脚本都踩了坑，记在里面：**(1)** 判断"界面可用"不能取"第一个 enabled 的 Button"
+[2] 是这条要求的**核心断言**：把它改回懒加载（或者让预加载漏掉某一组），这里立刻会看到
+沙漏重新出现。[3] 是防止 [2] 变成"假通过"——对局根本没跑起来时也不会有沙漏。
+
+脚本自己踩的坑，记在里面：**(1)** 判断"界面可用"不能取"第一个 enabled 的 Button"
 （曲线面板那两个按钮一开始就是 enabled 的，于是脚本会在权重还在加载时谎报 ready —— 必须
 按名字找**开始**按钮）；**(2)** 只认**可见**顶层窗口，Qt 会创建名字非空但在屏幕外的辅助
-窗口，把它们算进来"弹窗还在"就永远为真。
+窗口，把它们算进来"弹窗还在"就永远为真；**(3)** PowerShell 里调函数**不能带空括号**
+（`RewardSamples()` 会报 `An expression was expected after '('`），这与 C/JS 的直觉相反，
+第一版就是这么挂的。
 ---
 
 ## 16. 对弈结束后静默保存权重 + 程序图标
@@ -1951,9 +1966,9 @@ ANSI 解码，中文串变成 `鐐?`、`闈欓粯淇濆瓨`，报出来的是
 [System.IO.File]::ReadAllBytes("tools\verify_match_ui.ps1")[0..2]   # 要 EF BB BF
 ```
 
-同理，`verify_thinking_ui.ps1` / `verify_busy_ui.ps1` / `verify_busy_lazy.ps1` 是**纯 ASCII**
-（它们只需要比对数字和英文标签），本来就不需要 BOM —— 只要不往里加中文，就永远不会踩
-到坑 (3)。
+同理，`verify_thinking_ui.ps1` / `verify_busy_ui.ps1` / `verify_eager_load.ps1` 是**纯 ASCII**
+（它们只需要比对数字和英文标签，中文窗口名一律用码位拼），本来就不需要 BOM —— 只要不往里加
+中文，就永远不会踩到坑 (3)。
 
 **(4) 拿"根本不该出现的东西"当失败 → 假失败（而且会把配置问题报成产品 bug）。**
 跑 `-AIndex 0 -BIndex 0`（两边都是 Alpha-Beta）时，脚本报了三处 FAIL：没有

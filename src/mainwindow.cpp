@@ -812,8 +812,12 @@ void MainWindow::exportMetricsCsv()
         }
         out << "\n";
     }
-    out << "\n# 每局环境奖励\n";
-    out << "game";
+    /*
+       奖励这一段的行号是**采样序号**(每手一个点), 不是局数 —— 表头写清楚,
+       否则导出的 CSV 很容易被当成"每行一局"来解读 (那是修复前的口径)。
+    */
+    out << "\n# 环境奖励 (每手一个点; 值是本局累计, 局末那点含终局 +-1)\n";
+    out << "sample";
     for (int s = 0; s < ui->rewardChart->seriesCount(); ++s) {
         out << "," << ui->rewardChart->series(s).name;
     }
