@@ -1172,6 +1172,40 @@ learner 还会拿同一批旧样本空转。改成先判停、再判够不够。
   `git status` + `git diff --numstat` + `cmd /c dir` + `cmd /c type` + 行读取工具
   五路都说是正常的 771 行 C++ 文本。**跨进程交叉验证才能定案，否则会去"修"一个不存在的问题。**
 
+### (5) 顺带做掉：行尾规范化（`.gitattributes` + 全仓 renormalize）
+
+**症状**：提交完 P1–P7 之后体检，4472 行改动里有 **278 行（6.2%）是"仅行尾不同"的噪声**，
+集中在 `pgagent.cpp`(+92) / `dqnmcts_agent.cpp`(+86) / `ppomcts_agent.cpp`(+78) /
+`dqnagent.cpp`(+22)。评审时看不出"哪一行是真的改了"。
+
+**根因不是那一次编辑，而是仓库长期没有 `.gitattributes`**：结存里同时存在两种行尾 ——
+实测 70 个 `i/lf` + 51 个 `i/crlf` + 15 个 `i/lf`-`w/crlf` + **4 个 `i/mixed`**。
+那几个文件**自身就是混行尾**（例如 `dqnagent.cpp` 755 行里 742 行 CRLF、13 行 LF），
+于是任何一次工具编辑都会把它"规范化"一遍，顺手把那十几行也改掉。
+`core.autocrlf=true` 只管 add 时的转换，**不会回头修正已提交的内容** —— 51 个 `i/crlf`
+就是这么留下的。
+
+**修法**：新增 `.gitattributes`（`* text=auto` 为主，`*.bat`/`*.ps1` 显式 `eol=crlf`，
+二进制类型显式声明），然后 `git add --renormalize .`。约定是**仓库里一律存 LF**，
+检出到工作区按平台转换（Windows + `core.autocrlf=true` → CRLF）。属性优先于
+`core.autocrlf`，所以从此不再依赖每台机器上的 git 配置。
+
+**安全复核**（这一步不能省，规范化会把 55 个文件都标成"改过"）：
+
+* 逐文件比对 `git diff --cached --numstat` 与 `git diff --cached --ignore-cr-at-eol --numstat`
+  —— 55 个文件忽略行尾后**全部为空**，唯一有真实内容变化的是新增的 `.gitattributes` 本身。
+  合计 19477 行 CRLF → LF，**没有一行代码/文字内容改变**。
+* 规范化后 index 行尾分布：**141 个 `i/lf` + 2 个 `i/-text`**（`app.ico` / `app.png`），
+  不再有 `i/crlf` 与 `i/mixed`。
+* **酸测试**：给一个 `w/crlf` 的文件用编辑工具加 1 行，`git diff --numstat` 返回
+  **1/0**（以前是整文件重写）—— 证明"改一行=改半个文件"的病根去掉了。
+* 这不是纯理论收益：仓库里 141 个文件的差异从此只反映真实改动。
+
+**一个反直觉的坑（复核手法本身）**：`git diff --ignore-cr-at-eol --name-only` **仍然会
+把纯行尾差异的文件列出来**（它影响的是 hunk 内容，不是"这个文件算不算不同"的判定），
+所以拿它当"有没有内容改动"的判据会得到"55 个文件都有内容改动"的错误结论。
+**可靠的判据是逐文件看 `--numstat`：忽略行尾后为空才算纯行尾。**
+
 ---
 
 ## 五、当前待办与优先级（未修复项）
