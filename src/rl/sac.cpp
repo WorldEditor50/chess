@@ -13,8 +13,8 @@ RL::SAC::SAC(size_t stateDim_, size_t hiddenDim, size_t actionDim_)
     /* target entropy = -actionDim (standard SAC heuristic) */
     H0 = -std::log(actionDim);
     actor = Net(MOE<16, 16>::_(stateDim, true),
-                Layer<Tanh>::_(stateDim, hiddenDim, true, true),
-                LayerNorm<Sigmoid, LN::Pre>::_(hiddenDim, hiddenDim, true, true),
+                TransformerBlock<16>::_(stateDim, true),
+                LayerNorm<Sigmoid, LN::Pre>::_(stateDim, hiddenDim, true, true),
                 Layer<Softmax>::_(hiddenDim, actionDim, true, true));
     for (int i = 0; i < QNET_NUM; i++) {
         /* Sigmoid output keeps Q in (0,1) — symmetric gradient around

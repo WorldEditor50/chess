@@ -26,18 +26,21 @@ RL::DPG::DPG(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim
        but the template argument is written to match d_model so the intent is
        explicit.
 
-       The LayerNorm<Sigmoid, LN::Pre> used to sit directly on the 2-wide state
-       (inputDim = stateDim = 2, outputDim = hiddenDim). LN::Pre standardises its
-       INPUT, so with a 2-element input it computes (x - mean)/std = [d/2, -d/2]
-       with d = x0 - x1: the 2-D state collapses onto a single direction and the
-       following projection becomes rank-1, which is why the policy periodically
-       converged to a state-independent distribution ("always action 0"). A
-       plain projection to hiddenDim is inserted first so LN::Pre standardises a
-       hiddenDim-wide activation instead.
+       第二层由 `Layer<Tanh>` **换成 `TransformerBlock<16>`** (2026-09): 与
+       rl/sac.cpp 里 actor/critics 的搭法一致 (MOE + TransformerBlock + 一层线性),
+       同一套骨干超参在两处可比。TB 不改变宽度, 所以进 LN::Pre 的激活仍是 stateDim
+       宽; "撑开/投影到 hiddenDim"这一步现在由下面那层
+       `LayerNorm<Sigmoid, LN::Pre>::_(stateDim, hiddenDim, ...)` 负责。
+
+       这段历史必须留着 (它解释了为什么中间**必须**有一层模块): `LN::Pre` 标准化的是
+       它的**输入**, 曾经直接坐在 2 宽的 state 上 (inputDim = stateDim = 2), 于是
+       (x - mean)/std = [d/2, -d/2] (d = x0 - x1) —— 2 维状态被压到一个方向上,
+       后面的投影退化成秩 1, 策略会周期性收敛成与状态无关的分布 ("永远走 action 0")。
     */
-    policyNet = Net(MOE<4, 2>::_(stateDim, true),
-                    Layer<Tanh>::_(stateDim, hiddenDim, true, true),
-                    LayerNorm<Sigmoid, LN::Pre>::_(hiddenDim, hiddenDim, true, true),
+
+    policyNet = Net(MOE<16, 16>::_(stateDim, true),
+                    TransformerBlock<16>::_(stateDim, true),
+                    LayerNorm<Sigmoid, LN::Pre>::_(stateDim, hiddenDim, true, true),
                     Layer<Softmax>::_(hiddenDim, actionDim, true, true));
 #endif
 }
