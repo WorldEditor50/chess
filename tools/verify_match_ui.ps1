@@ -50,7 +50,11 @@ param(
     # 把 chess.exe 的 qInfo/qWarning 输出重定向到这里 (stdout 会写到 "<LogFile>.out")。
     # 默认不重定向: 保持和以前完全一样的启动方式, 免得改了这个脚本的行为。
     # 需要看 "[weights] 保存 ... : N ms" 这类计时行时才传它。
-    [string]$LogFile = ""
+    [string]$LogFile = "",
+    # 打完第一场后**在同一进程里再打一场**, 并断言奖励读数里仍然只有两条线。
+    # 这是 C12("每跑一场就多挂两条空线")的端到端钉子: 那个 bug 只在第二场之后才看得见
+    # (第一场是 2 条, 第二场变 4 条, 两条永远"暂无")。
+    [switch]$TwoMatches
 )
 
 $ErrorActionPreference = "Stop"
@@ -388,6 +392,18 @@ try {
             $rewardPtsFinal, $plies, $wantPts, $perMoveOk)
         $rewardOk = $rewardOk -and $perMoveOk
     }
+    # ---- C12 的界面钉子: 奖励读数里只该有**两条**线, 而且不该有"暂无" ----
+    # 每开一场就 clearData()+addSeries()x2 的写法会让第 N 场出现 2N 条线 (2N-2 条空的),
+    # 读数里就是 "A: 暂无 | B: 暂无 | A: 最新 ... | B: ..." —— 用户在自己的 100 局对弈里
+    # 就是这么看到的。每条线的读数末尾是"N 点"或"暂无", 数一数就知道有几条线。
+    $seriesChunks = [regex]::Matches($rewardText, "点|暂无").Count
+    $noEmpty = ($rewardText -notlike "*暂无*")
+    Write-Output ("reward series in readout = {0} 条 (期望 2), 有空线 = {1}" -f `
+        $seriesChunks, (-not $noEmpty))
+    # 只在真打过点的时候要求"无空线" (一次都没采样过的场次本来就是空线, 不算 bug)
+    if ($rewardPtsFinal -ge 1) {
+        $rewardOk = $rewardOk -and ($seriesChunks -eq 2) -and $noEmpty
+    }
     # 损失读数: 会上报损失的 agent 才有数字; 两边都是 Alpha-Beta/MCTS 时读数就是 "-"
     # (没有可训练参数 -> 不上报, 曲线里没有点, 这是**正确**行为, 不能算失败)。
     # 注意 $lossText 是**带前缀**的 ("损失 ..."), 要先把前缀去掉再比 —— 否则
@@ -545,6 +561,43 @@ try {
         $hitB = ($final -match ("(^|\s)" + [regex]::Escape($wantB) + "(\s|$)"))
         Write-Output ("B side in result = {0} (want '{1}')" -f $hitB, $wantB)
         $ok = $ok -and $hitB
+    }
+
+    # ---- 可选: 同一进程里再打一场, 钉住 C12("每跑一场就多挂两条空线") ----
+    # 那个 bug 在第一场里看不出来 (第一场本来就该是 2 条线), 第二场才会变成 4 条
+    # (其中两条永远"暂无")。所以只在 -TwoMatches 时做这一步, 免得日常验证变慢。
+    if ($TwoMatches) {
+        $btn2 = Find-ByName "开始对弈"
+        if ($null -eq $btn2) {
+            Write-Output "second match: start button not found -> FAIL"
+            $ok = $false
+        } else {
+            # 先数一下逐局明细的行数: 第二场真的跑了的话, 列表里会多出
+            # "—— 第 2 场 ——" + 每局一行 + "本场结束" 至少 3 行。
+            # 没有这个证据的话, "第二场只有两条线"也可能是因为**第二场根本没跑**
+            # (读数还是第一场留下的) —— 那就是假通过。
+            $rowsBefore = (All-ListItems).Count
+            $btn2.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            Start-Sleep -Milliseconds 1200
+            $deadline2 = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $deadline2) {
+                if ($null -eq (Find-ByName "停止对弈")) { break }
+                Start-Sleep -Milliseconds 700
+            }
+            Start-Sleep -Seconds 2
+            $rowsAfter = (All-ListItems).Count
+            $ran2 = ($rowsAfter -gt $rowsBefore)
+            Write-Output ("second match ran = {0}  (逐局明细 {1} -> {2} 行)" -f `
+                $ran2, $rowsBefore, $rowsAfter)
+            $r2 = ""
+            foreach ($t in All-Texts) { if ($t -like "奖励*") { $r2 = $t } }
+            $chunks2 = [regex]::Matches($r2, "点|暂无").Count
+            $noEmpty2 = ($r2 -notlike "*暂无*")
+            Write-Output ("second match reward readout = " + $r2)
+            Write-Output ("second match series = {0} 条 (期望 2), 有空线 = {1}" -f `
+                $chunks2, (-not $noEmpty2))
+            $ok = $ok -and $ran2 -and ($chunks2 -eq 2) -and $noEmpty2
+        }
     }
 
     # ---- 可选的日志校验: 传了 -LogFile 就顺手核对静默保存的**计时** ----
