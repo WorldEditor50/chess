@@ -688,6 +688,36 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(test_reward_diag)
 
+    # ------------------------------------------- 选点一致率探针 (灵敏的代理指标)
+    # **不进 ctest**: 它跑 200 个局面的双方决策, 数字随权重变化 —— 是"改动前后对比"的
+    # 尺子, 不是通过/失败断言。手动跑:
+    #   cmake --build <build> --target bench_policy_agreement
+    #   <build>/bench_policy_agreement --positions=200 --sims=80 --depth=4
+    #   <build>/bench_policy_agreement --positions=200 --load=weights/verify_on
+    # 为什么需要它: 20 局等时间对局的噪声带实测是 ±5%, 测不出小改动; 而 200 个局面的
+    # 选点一致率每个局面一个二值样本, 标准误约 3.5%, 且局面集由种子固定、两个权重文件
+    # 跑的是同一批局面 (配对比较)。
+    add_executable(bench_policy_agreement
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_policy_agreement_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_policy_agreement PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_policy_agreement PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_policy_agreement PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_policy_agreement PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_policy_agreement)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。

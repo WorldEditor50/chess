@@ -3,7 +3,7 @@
 一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**9 个可选 AI Agent**（从
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
 自带稀疏 MoE），以及一整套**可复现的验证手段**（9 个 ctest 套件 + 5 个界面自动化脚本 +
-3 个手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt`）。
+4 个手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement`）。
 
 > 这个工程的写法偏"工程审计"风格：每个非显然的决定都写成注释，每个结论都有实测数字，
 > 发现的问题（包括自己引入的）都记在 `docs/issues_review.md` 里，包括还没修好的。
