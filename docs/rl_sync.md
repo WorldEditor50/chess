@@ -341,6 +341,98 @@ chess 侧对 RL 内核做的一处**接口不变、行为升级**的改动（上
 - `util.hpp`：`entropy()` 未加下限；`noise()` 除以可能为 0 的 `max()` 产生 inf/NaN；
   `gumbelSoftmax` 的 1e-8 下限提到 1e-7；新增 `onehot()`。
 
+### ScaledConcat 重写 + 专家模板参数（2026-09）
+
+这一轮不是"同步上游"，是**把上游一个结构性坏掉的层修好**，顺带把两个 MoE 类层的专家
+类型都做成模板参数。起因是先量了一次 `ScaledConcat` 的代价与门控分布（见下面的实测），
+发现它的问题不在速度而在**它其实没在做混合**。
+
+**(1) 旧实现的三条结构缺陷（都有实测）**
+
+数学是 `o = tanh(W1·softmax(sigmoid(W·x+b)) + W2·x + b)`（`ScaledConcatLegacy`）：
+
+| 缺陷 | 实测（D=90, N=16, u=4） |
+|---|---|
+| `Sigmoid::f ∈ (0,1)` ⇒ softmax 的 logits 跨度 < 1 ⇒ **gate_max/gate_min < e¹ = 2.718**，与训练轮次/规模无关 | gate 比值 2.62~2.72（顶到上界）；熵 4.07~4.12（均匀 4.159）⇒ **有效路数 58.6~61.3 / 64**，"门控"一个 bit 都传不出去 |
+| 特征与门控共用同一批数：过完 softmax 幅度信息全丢（每路 ≈ 1/Nu）⇒ `W1·g` 退化成"把 W1 的列平均一下" | 表达力几乎全落在 `W2·x` 上（占 37% 参数 @90、49% @1260） |
+| `U(-1,1)` 初始化 ⇒ 最终 pre-activation 到 ±3.7~11.2 | \|z\|>3 占 3~45%，平均 tanh'(o) 只有 **0.18~0.56**（fan-in 缩放后 0.90~0.98） |
+
+顺带量到的代价（同一台机、Release/AVX2）：前向 4.8 µs 里 **16 次 `Tensor::embedding`
+占 1.9 µs**（它每次调用都 new 一个 `std::vector<int>` 再逐元素通用索引，只为拷 4 个 float）；
+反向 40.9 µs 里有 ~20 µs 花在 `MM::ikjk` 上 —— 那条路径对**列向量操作数**（k 维=1 的
+rank-1 更新，也就是"单样本 FC 的权重梯度"）永远进不了 SIMD 内核（`mmShapeOk` 要求每一维
+≥ 8，而 `x1Col == x2Col == 1`），标量回退比连续指针外积慢 12~27×。**这一条与
+ScaledConcat 无关，是本工程每个网络每次训练都在付的钱**，值得单独一轮修 `tensor.hpp`。
+
+**(2) 新结构**（`ScaledConcat<Expert, NumExperts, UnitDim, OutDim=0>`）
+
+```
+e_i = expert_i(x)      d -> d      ExpertFactory 构造
+h_i = proj_i(e_i)      d -> u      细粒度特征
+h   = [h_1; …; h_N]    (N·u)       原样保留, 不做归一化
+g   = softmax(Wg·x + bg) (N·u)     逐单元门控, logits 是**实数**(无界)
+o   = tanh(W1·(g∘h) + W2·x + b)    (+ x, 若 residual 且 OutDim==dIn)
+```
+
+* 门控与特征解耦 ⇒ 改专家权重门控**逐位不变**，反之亦然（旧实现里两件事必然耦合）；
+* logits 无界 ⇒ 门控可以真的尖（实测同一组权重下 `gateScale=4` 让比值再翻十倍以上）；
+* 初始化：专家走 `scaleExpertInit`、投影走 `scaleFcInit`、W1/W2 各自按 fan-in 缩放，
+  `W2` **默认零初始化**（`zeroSkip`）—— 开局就是"纯门控混合"，而不是"混合 + 一条随机线性捷径"；
+* `OutDim`/`residual` 让它可以当保维变换块（旧实现 out 恒 = N·u，只能当提取器）；
+* 诊断：`IScaledConcat::gateUsage / gateEffectiveCount`（有效路数 = exp(熵)）。
+  **没有**配负载均衡辅助损失：逐单元稠密门控加均衡项等于把门控往均匀推，正是刚修掉的毛病。
+
+没做（免得下次当"忘了"）：top-k 稀疏门控、W1 低秩、子层共享底座 —— 前两者省的是
+`(N·u)²` 那一项（专家仍然全算，省不到算力大头），后者是参数效率问题，都该单独一轮。
+
+**(3) 专家模板参数：`expert.hpp` 抽出共享机制**
+
+`MlpExpert` / `ExpertFactory` / `scaleExpertInit` 原来长在 `sparse_moe.hpp` 里。现在
+`MOE` 与 `ScaledConcat` 都要按模板参数吃多种专家，于是抽到 `rl/expert.hpp` 共享，
+并补了 `Layer<Fn>`（单层 FC + 激活，最便宜的一档）这一族专家：
+
+| 专家 | 参数 | 谁在用 |
+|---|---|---|
+| `TransformerBlock<H,DFF>` | ~12·d² | `MOE<*,*>` 默认；`SparseMoE<TransformerBlock<4>,3,3>` |
+| `MlpExpert` | ~2·d·hidden | `SparseMoE` 现役；`ScaledConcat` 现役 |
+| `Layer<Fn>` | ~d² | 两者都可用 |
+
+`MOE<NumExperts, NumHeads, Expert>`：默认专家仍是 `TransformerBlock<NumHeads>`，所以
+`MOE<16,16>` / `MOE<8,4>`（DQN / SAC / DPG 的现役主干）**一个字都不用改**，
+`test_sparse_moe` 的 [3] 等价性检查（对 `SparseMoE<TransformerBlock<4>,3,3>` 前向与门控
+梯度逐位一致）继续钉住这条承诺。隐层宽度是**构造参数** `expertHidden`（与 `SparseMoE`
+一致），不做成模板参数 —— 否则同一个量有两个入口、其中一个静默失效（当场踩过一次）。
+`scaleExperts` 默认 **false**：给现役主干悄悄换初始化等于悄悄改掉一切。
+
+**(4) 顺带修掉的一个静默 bug：`MlpExpert` 没有 `copyTo` / `softUpdateTo`**
+
+`SparseMoE::copyTo` / `softUpdateTo` 是把工作**委托给专家**的
+（`experts[i].copyTo(&p->experts[i])`），而 `iLayer` 的这两个虚函数默认是**空实现**。
+`Layer<Fn>` 与 `TransformerBlock` 都实现了，只有 `MlpExpert` 没有 —— 于是用 MlpExpert
+当专家时（也就是本工程稀疏 MoE 的现役配置），**目标网络的专家权重根本不会被复制、
+也不会被软更新**，而门控与自适应层照常复制。实测复制前后 `|Δw|` 都是 1.57：
+目标是"专家永远停在各自那份随机初始化上、且不随训练演进"。不报错、只让训练变差。
+
+修法是在 `expert.hpp` 里给 `MlpExpert` 补上这两个方法（委托给 l1/l2/l3），
+回归写在 `test_sparse_moe` 的 [10]-(e)：复制后 `|Δw|` 必须**恰好为 0**、
+`softUpdateTo(0.5)` 的结果必须等于 `0.5×源`。断言写成"必须真的变过去"而不是"没崩"，
+就是为了挡住这种空实现。
+
+**(5) 回归**
+
+* 新增 `test_scaledconcat`（ctest，`test/test_scaledconcat_main.cpp`）：7 节，
+  含**把旧实现的上界 e¹ 写成断言**（旧的大于 1 且小于 e+1e-3、新的必须能 > 100×）、
+  门控/特征解耦的三条"逐位不变"、参数与**输入梯度**的中心差分（输入梯度特意分三条
+  通路隔离查：`W2ᵀdz` / `Wgᵀdlogit` / 专家 —— 只查合计的话"两条都写错正好抵掉"抓不到）、
+  三种专家类型、残差通路（关掉 W1/W2 后输出必须恰好是 `tanh(x)`）、存取往返与 copyTo。
+* `test_sparse_moe` 增补 [10]：老写法 `MOE<3,4>` 类型/行为不变、`MlpExpert` 与
+  `Layer<Gelu>` 专家的有限差分与输入梯度、`paramCount()` 真的把专家数进去了、
+  `scaleExperts` 的量级。
+* `paramCount()`：`MOE` 原来没实现（`Net::paramCount()` 对 MOE 主干恒报 0），
+  现在 `MOE` 累加专家；为此给 `TransformerBlock` / `MultiHeadAttention` 也补上了
+  `paramCount()`（后者只数**在用**的 `numHeads` 个 head：d_model 不能被 `NumHeads`
+  整除时多构造出来的那些 head 常驻内存、永不训练、也不写盘，不是"参数"）。
+
 ### 时序 / 循环状态
 
 - `dpg.cpp` / `mpg.cpp` / `drpg.cpp`：`action()` 每次调用都把循环状态从快照恢复，

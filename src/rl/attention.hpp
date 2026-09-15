@@ -717,6 +717,24 @@ public:
         return std::make_shared<MultiHeadAttention>(inputDim, d_model, withGrad);
     }
 
+    /*
+        参数量 (只读诊断): 输出投影 + 每个**在用** head 的 q/k/v 投影。
+
+        只数 `numHeads` 而不是模板参数 `NumHeads`: 当 d_model 不能被 NumHeads 整除
+        时构造循环建了 NumHeads 个 head 而计算只用到 numHeads 个 (多出来的那些
+        常驻内存、永不训练、也不写进权重文件) —— 它们不是"参数", 只是内存占用。
+    */
+    long long paramCount() const override
+    {
+        long long t = (long long)wo.size();
+        for (int i = 0; i < numHeads; i++) {
+            t += (long long)heads[i].wq.size()
+               + (long long)heads[i].wk.size()
+               + (long long)heads[i].wv.size();
+        }
+        return t;
+    }
+
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
         /*

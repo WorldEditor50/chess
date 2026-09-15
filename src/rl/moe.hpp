@@ -7,45 +7,59 @@
 #include "activate.h"
 #include "ilayer.h"
 #include "layer.h"
+#include "expert.hpp"
 #include "transformer.hpp"
 
 namespace RL {
 
 /*
-    MOE<NumExperts, NumHeads> — Mixture of Experts with TransformerBlock experts
+    MOE<NumExperts, NumHeads, Expert> — Mixture of Experts
 
-    Architecture (Pre-LN TransformerBlock as each expert):
+    Architecture (每个专家是一个"d_model -> d_model"的 iLayer):
 
         Input x (d_model × 1):
 
         1. Gating: gate_logits = Wg · x + b        (NumExperts × 1)
                    gate       = softmax(gate_logits)
 
-        2. For each expert i (TransformerBlock<NumHeads>):
-               expert_output_i = TransformerBlock_i(x)   (d_model × 1)
+        2. For each expert i:
+               expert_output_i = expert_i(x)       (d_model × 1)
 
         3. Weighted output: o = Σ_i gate[i] · expert_output_i   (d_model × 1)
 
-        Each expert is a full Pre-LN TransformerBlock:
-            x_norm1 = LayerNorm(x)
-            attn_out = MultiHeadAttention<NumHeads>(x_norm1)
-            x_res1 = x + attn_out
-            x_norm2 = LayerNorm(x_res1)
-            ffn_out = Linear(GELU(Linear(x_norm2)))
-            expert_output = x_res1 + ffn_out
+    ---------------------------------------------------------------------------
+    专家模板参数 (2026-09 扩展)
+    ---------------------------------------------------------------------------
+    原来 `experts[]` 写死成 `TransformerBlock<NumHeads>`: 想换一种专家就得复制一份
+    这个类。现在专家类型是模板参数, 默认仍是 `TransformerBlock<NumHeads>` ——
+    所以 `MOE<16,16>` / `MOE<8,4>` 这些既有写法**一个字都不用改**, 行为也逐位不变
+    (等价性由 test_sparse_moe 的 [3] 钉住: 它把 MOE<3,4> 与
+    SparseMoE<TransformerBlock<4>,3,3> 的权重复制对齐后比对前向与门控梯度)。
 
-    Gradient flow:
-        e = dL/do  (d_model × 1)
+    专家的构造与初始化缩放走 `rl/expert.hpp` 里那套**与 sparse_moe.hpp 完全相同**的
+    约定: `ExpertFactory<Expert>::make(d_model, expertHidden, withGrad)` +
+    `scaleExpertInit(expert)`。于是可用的专家类型与 SparseMoE 完全一致:
 
-        dL/d_expert_output[i] = gate[i] · e          (d_model × 1)
-        dL/d_gate[i]          = e · expert_output[i]  (scalar)
+        TransformerBlock<H,DFF>   容量最大, 参数 ~12·d²   <- 默认
+        MlpExpert                 中等,   参数 ~2·d·hidden
+        Layer<Fn>                 最便宜, 参数 ~d²
 
-        dL/dx = Σ_i TransformerBlock_i.backward(dL/d_expert_output[i])
-                + Wg^T · (J_softmax^T · dL/d_gate)
+    隐层宽度是**构造参数** `expertHidden` (与 SparseMoE 一致), 不做成模板参数 ——
+    否则同一个量有两个入口, 其中一个静默失效 (这个坑当场踩过一次)。
+
+    例:
+        MOE<4, 4>                            // 4 个 TransformerBlock<4> 专家 (老写法)
+        MOE<4, 4, MlpExpert>::_(d, true, 64) // 4 个隐层 64 的 MLP 专家
+        MOE<8, 4, Layer<Gelu> >::_(d, true)  // 8 个单层 FC 专家
+
+    `scaleExperts` 默认 **false**: MOE 是 DQN / SAC 的现役主干 (`MOE<16,16>`), 给它们
+    悄悄换一套初始化等于悄悄改掉已训练权重之外的一切。要 fan-in 缩放就显式传 true
+    (SparseMoE 是**总是**缩放的, 因为它生来只服务新配置)。
 
     Type registration: LAYER_MOE
 */
-template<int NumExperts, int NumHeads = 4>
+template<int NumExperts, int NumHeads = 4,
+         typename Expert = TransformerBlock<NumHeads> >
 class MOE : public iLayer
 {
 public:
@@ -57,7 +71,7 @@ public:
     };
 
     int d_model;             // model dimension (shared across all experts)
-    int d_ff_;               // FFN hidden dimension (defaults to 4*d_model)
+    int d_ff_;               // FFN hidden dimension (TransformerBlock 专家的; 其它专家忽略)
 
     /* Gating network */
     Tensor wg;               // gating weights (NumExperts × d_model)
@@ -65,8 +79,8 @@ public:
     //Tensor gate_logits;      // pre-softmax gating logits (NumExperts × 1)
     Tensor gate;             // post-softmax gating weights (NumExperts × 1)
 
-    /* Experts — each is a full TransformerBlock */
-    TransformerBlock<NumHeads> experts[NumExperts];
+    /* Experts — 类型由模板参数给, 由 ExpertFactory 构造 (见 rl/expert.hpp) */
+    Expert experts[NumExperts];
 
     /* Cached intermediate values for backward/gradient */
     Tensor expert_out[NumExperts];  // each expert's output (d_model × 1)
@@ -79,12 +93,14 @@ public:
     virtual ~MOE() {}
 
     static std::shared_ptr<MOE> _(
-        int d_model_, bool withGrad)
+        int d_model_, bool withGrad,
+        int expertHidden = 0, bool scaleExperts = false)
     {
-        return std::make_shared<MOE>(d_model_, withGrad);
+        return std::make_shared<MOE>(d_model_, withGrad, expertHidden, scaleExperts);
     }
 
-    explicit MOE(int d_model_, bool withGrad)
+    explicit MOE(int d_model_, bool withGrad,
+                 int expertHidden = 0, bool scaleExperts = false)
         : d_model(d_model_)
     {
         type = LAYER_MOE;
@@ -97,9 +113,12 @@ public:
         Random::uniform(b,  -0.1f, 0.1f);
         gate        = Tensor(NumExperts, 1);
 
-        /* Experts — each a full TransformerBlock */
+        /* Experts — 一律走工厂, 这样"换专家"不需要改这个类 */
         for (int i = 0; i < NumExperts; i++) {
-            experts[i] = TransformerBlock<NumHeads>(d_model, withGrad);
+            experts[i] = ExpertFactory<Expert>::make(d_model, expertHidden, withGrad);
+            if (scaleExperts) {
+                scaleExpertInit(experts[i]);
+            }
         }
 
         /* Output and error */
@@ -121,6 +140,21 @@ public:
             m.wg = Tensor(NumExperts, d_model);
             m.b  = Tensor(NumExperts, 1);
         }
+    }
+
+    /*
+        参数量 (只读诊断)。原来没实现 -> `Net::paramCount()` 对 MOE 主干只报 0
+        (它只统计实现了 paramCount 的层), 于是"参数量"这件事在日志里是错的。
+        这里按 门控 + 各专家 累加; 专家自己也要实现 paramCount 才有意义
+        (TransformerBlock / MultiHeadAttention / MlpExpert / Layer 都已实现)。
+    */
+    long long paramCount() const override
+    {
+        long long total = (long long)wg.size() + (long long)b.size();
+        for (int i = 0; i < NumExperts; i++) {
+            total += experts[i].paramCount();
+        }
+        return total;
     }
 
     /* ==================== Forward ==================== */

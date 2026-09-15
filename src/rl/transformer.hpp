@@ -132,6 +132,19 @@ public:
 
     /* ==================== Forward ==================== */
 
+    /*
+        参数量 (只读诊断): 注意力 + 两处 LayerNorm 的 gamma/beta + FFN。
+        实现它是为了让 `MOE::paramCount()` 这类上层统计不再少算一大块 ——
+        以前默认返回 0, 于是 `Net::paramCount()` 对 MOE/TransformerBlock 主干报 0。
+    */
+    long long paramCount() const override
+    {
+        return attn.paramCount()
+             + (long long)gamma1.size() + (long long)beta1.size()
+             + (long long)gamma2.size() + (long long)beta2.size()
+             + ffn_up.paramCount() + ffn_down.paramCount();
+    }
+
     Tensor& forward(const Tensor& x, bool inference=false) override
     {
         /* Save original input for backward */

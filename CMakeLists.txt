@@ -577,6 +577,28 @@ if(CHESS_BUILD_TESTS)
     add_test(NAME test_sparse_moe COMMAND test_sparse_moe)
     set_tests_properties(test_sparse_moe PROPERTIES TIMEOUT 600)
 
+    # ------------------------------------------- ScaledConcat (结构不变量)
+    # 这个层在这之前**一个测试都没有** (它只活在 dqn.cpp 的一棵 #elif 0 里)。
+    # 2026-09 重写之后, 三类东西必须钉住:
+    #   * 旧实现的结构性缺陷真的修掉了 —— 旧门控 softmax(sigmoid(·)) 的
+    #     gate_max/gate_min 被 e^1 卡死 (实测有效路数 58.6~61.3/64), 新门控无界;
+    #   * 门控与特征真的解耦 —— 改专家权重门控必须逐位不变, 反之亦然;
+    #   * 反向 vs 中心差分, 含**输入梯度的三条累加通路** (W2ᵀdz / Wgᵀdlogit / 专家)
+    #     以及专家模板参数 (MlpExpert / TransformerBlock / Layer<Fn>)。
+    add_executable(test_scaledconcat
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_scaledconcat_main.cpp)
+    target_include_directories(test_scaledconcat PRIVATE ${SRC_DIR})
+    target_link_libraries(test_scaledconcat PRIVATE RL_CORE)
+    target_compile_options(test_scaledconcat PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_scaledconcat PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_scaledconcat)
+    add_test(NAME test_scaledconcat COMMAND test_scaledconcat)
+    set_tests_properties(test_scaledconcat PROPERTIES TIMEOUT 600)
+
     # ------------------------------------------- 骨干 A/B/C/D 等时对弈基准
     # **不进 ctest**: 它跑真实对局, 依赖随机开局, 而且 TB 专家骨干一步几十毫秒,
     # 放进 ctest 既慢又会偶发失败。手动跑:

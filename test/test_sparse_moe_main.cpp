@@ -943,6 +943,167 @@ static void part9()
     std::printf("      TB 专家骨干 (全算)  : %7.1f ms (实际不可用)\n", msC * 256 * 3);
 }
 
+/* ============================================================
+ *  [10] MOE 的专家模板参数 (2026-09 扩展)
+ *
+ *  原来 `MOE<NumExperts, NumHeads>` 把专家写死成 `TransformerBlock<NumHeads>`:
+ *  想用一种更便宜/更贵的专家就得复制一份这个类。现在专家是模板参数, 走的是
+ *  `sparse_moe.hpp` 从第一天就在用的那套机制 (`rl/expert.hpp` 的
+ *  ExpertFactory + scaleExpertInit), 所以两种 MoE 能用的专家类型完全一致。
+ *
+ *  这一节盯三件事:
+ *    * 老写法 `MOE<3,4>` **类型与行为都没变** (默认专家仍是 TransformerBlock<4>);
+ *    * 换专家之后梯度和以前一样对 (有限差分), 输入梯度的两条累加通路都在;
+ *    * `paramCount()` 真的把专家数进去了 (以前 MOE 没实现它, 恒返回 0,
+ *      于是 `Net::paramCount()` 对 MOE 主干报 0)。
+ * ============================================================ */
+static void part10()
+{
+    std::printf("\n[10] MOE 的专家模板参数: 默认 TB 保兼容 / MlpExpert / Layer<Fn>\n");
+    const int D = 24;
+    const float eps = 1e-3f;
+    Tensor x = randTensor(D, 1, 2468, 1.0f);
+    Tensor t = randTensor(D, 1, 1357, 0.3f);
+
+    /* 输入梯度: 扰动 x, 与 Net::inputGrad 比 */
+    auto checkInput = [&](Net &net, const Tensor &tt) {
+        FdResult r;
+        r.worst = 0; r.maxNum = 0; r.maxAna = 0; r.n = 0;
+        for (std::size_t j = 0; j < x.size(); j++) {
+            const float save = x[j];
+            x[j] = save + eps;
+            const double lp = lossOf(net, x, tt);
+            x[j] = save - eps;
+            const double lm = lossOf(net, x, tt);
+            x[j] = save;
+            const double num = (lp - lm) / (2.0 * (double)eps);
+            const double ana = (double)net.inputGrad[j];
+            r.maxNum = std::fmax(r.maxNum, std::fabs(num));
+            r.maxAna = std::fmax(r.maxAna, std::fabs(ana));
+            const double denom = std::fmax(1.0, std::fmax(std::fabs(num), std::fabs(ana)));
+            r.worst = std::fmax(r.worst, std::fabs(num - ana) / denom);
+            r.n++;
+        }
+        return r;
+    };
+
+    /* (a) 老写法: 类型没变, 行为没变 */
+    {
+        Net net(MOE<3, 4>::_(D, true));
+        auto m = dynamic_cast<MOE<3, 4>*>(net[0]);
+        CHECK(m != nullptr, "MOE<3,4> 这个类型仍然存在 (老写法不受影响)");
+        Tensor &o = net.forward(x, true);
+        CHECK((int)o.size() == D, "MOE<3,4> 输出宽度 = d_model");
+        net.backward(x, Loss::MSE::df(o, t));
+        CHECK(allFinite(m->g.wg), "MOE<3,4> 门控梯度有限");
+        const long long p = net.paramCount();
+        const long long gate = (long long)m->wg.size() + (long long)m->b.size();
+        std::printf("    MOE<3,4> 参数 = %lld (门控 %lld + 专家 %lld)\n", p, gate, p - gate);
+        CHECK(p > gate * 10, "paramCount 把专家数进去了 (以前 MOE 没实现, 恒返回 0)");
+        CHECK(m->paramCount() == p, "MOE::paramCount 与 Net::paramCount 一致");
+    }
+
+    /* (b) MlpExpert 专家 + 有限差分 */
+    {
+        Net net(MOE<3, 4, MlpExpert>::_(D, true, 8));
+        auto m = dynamic_cast<MOE<3, 4, MlpExpert>*>(net[0]);
+        CHECK(m != nullptr, "MOE<3,4,MlpExpert> 能构造 (专家类型是模板参数)");
+        Tensor &o = net.forward(x, true);
+        net.backward(x, Loss::MSE::df(o, t));
+        report("MOE+MLP: wg", checkParam(net, m->wg, m->g.wg, x, t, eps, 3));
+        report("MOE+MLP: expert1.l2.w",
+               checkParam(net, m->experts[1].l2.w, m->experts[1].l2.g.w, x, t, eps, 7));
+        report("MOE+MLP: dL/dx", checkInput(net, t));
+        std::printf("    MOE<3,4,MlpExpert> 参数 = %lld\n", net.paramCount());
+    }
+
+    /* (c) Layer<Fn> 专家 (最便宜的一档) */
+    {
+        Net net(MOE<4, 4, Layer<Gelu> >::_(D, true));
+        auto m = dynamic_cast<MOE<4, 4, Layer<Gelu> >*>(net[0]);
+        CHECK(m != nullptr, "MOE<4,4,Layer<Gelu>> 能构造");
+        Tensor &o = net.forward(x, true);
+        net.backward(x, Loss::MSE::df(o, t));
+        CHECK(allFinite(o) && allFinite(m->g.wg), "Layer<Gelu> 专家: 前向与门控梯度有限");
+        report("MOE+Gelu: expert2.w",
+               checkParam(net, m->experts[2].w, m->experts[2].g.w, x, t, eps, 5));
+        std::printf("    MOE<4,4,Layer<Gelu>> 参数 = %lld (同规模 TB 专家是 %lld 量级)\n",
+                    net.paramCount(), MOE<4, 4>::_(D, false)->paramCount());
+    }
+
+    /* (d) scaleExperts: 初始化缩放 (默认关, 开了之后量级必须真的变小) */
+    {
+        auto plain = MOE<2, 4>::_(D, false);
+        auto scaled = MOE<2, 4>::_(D, false, 0, true);
+        double mp = 0, ms = 0;
+        for (std::size_t i = 0; i < plain->experts[0].ffn_up.w.size(); i++) {
+            mp = std::fmax(mp, std::fabs((double)plain->experts[0].ffn_up.w[i]));
+            ms = std::fmax(ms, std::fabs((double)scaled->experts[0].ffn_up.w[i]));
+        }
+        std::printf("    scaleExperts: |ffn_up.w|max %.4f -> %.4f (fan_in=%d, 期望 ~%.3f 倍)\n",
+                    mp, ms, D, 1.0/std::sqrt((double)D));
+        CHECK(mp > 0.0 && ms > 0.0, "两种初始化都不是全 0");
+        CHECK(ms < 0.5 * mp, "scaleExperts=true 把专家权重按 fan-in 缩小了");
+        CHECK(plain->paramCount() == scaled->paramCount(), "缩放不改参数量 (只是量级)");
+    }
+
+    /*
+        (e) copyTo / softUpdateTo 必须把**专家权重**也带过去
+
+        这一条是 2026-09 修完 MlpExpert 的 copyTo/softUpdateTo 之后补的回归。
+        原来 MlpExpert **没有实现这两个虚函数**, 而 `iLayer` 的默认实现是空的,
+        于是 `SparseMoE::copyTo` 里那句 `experts[i].copyTo(&p->experts[i])` 是个
+        **静默空操作**: 门控和应用层照常复制, 专家的权重一个都没过去。后果是
+        "目标网络的专家永远停在各自那份随机初始化上、也不随训练演进" ——
+        不报错, 只是训练效果变差 (SACAZ 的稀疏 MoE 主干就走这条路)。
+        改权重前后差 1.57 -> 0 才是对的; 断言写成"必须真的变过去"而不是
+        "没崩", 就是为了挡住这种空实现。
+    */
+    {
+        auto src = SparseMoE<MlpExpert, 3, 2>(D, true, 8);
+        auto dst = SparseMoE<MlpExpert, 3, 2>(D, true, 8);
+        /* 让源和目标明显不同 */
+        for (std::size_t k = 0; k < src.experts[0].l1.w.size(); k++) {
+            src.experts[0].l1.w[k] += 0.5f;
+        }
+        for (std::size_t k = 0; k < src.experts[1].l3.b.size(); k++) {
+            src.experts[1].l3.b[k] += 0.25f;
+        }
+        double before = 0;
+        for (std::size_t k = 0; k < src.experts[0].l1.w.size(); k++) {
+            before = std::fmax(before, std::fabs((double)src.experts[0].l1.w[k]
+                                                 - (double)dst.experts[0].l1.w[k]));
+        }
+        src.copyTo(&dst);
+        double after = 0;
+        for (std::size_t k = 0; k < src.experts[0].l1.w.size(); k++) {
+            after = std::fmax(after, std::fabs((double)src.experts[0].l1.w[k]
+                                               - (double)dst.experts[0].l1.w[k]));
+        }
+        std::printf("    copyTo: 专家权重差 %.4f -> %.4f\n", before, after);
+        CHECK(before > 1e-3, "复制前两边确实不同 (不是拿 0 比 0)");
+        CHECK(after == 0.0, "SparseMoE::copyTo 把专家权重也复制过去了");
+
+        /* softUpdateTo: 目标是 0, 软更新之后必须非 0 (源的一半) */
+        SparseMoE<MlpExpert, 3, 2> zero(D, true, 8);
+        for (int i = 0; i < 3; i++) {
+            zero.experts[i].l1.w.zero();
+            zero.experts[i].l2.w.zero();
+            zero.experts[i].l3.w.zero();
+        }
+        src.softUpdateTo(&zero, 0.5f);
+        double m = 0, d = 0;
+        for (std::size_t k = 0; k < zero.experts[0].l1.w.size(); k++) {
+            m = std::fmax(m, std::fabs((double)zero.experts[0].l1.w[k]));
+            d = std::fmax(d, std::fabs((double)zero.experts[0].l1.w[k]
+                                       - 0.5*(double)src.experts[0].l1.w[k]));
+        }
+        std::printf("    softUpdateTo(0.5): 目标 |w|max = %.4f (应为源的一半), 最大偏差 %.2e\n", m, d);
+        CHECK(m > 1e-6, "softUpdateTo 真的动了专家权重 (空实现时这里恒为 0)");
+        CHECK(d < 1e-6, "softUpdateTo 的结果 = 0.5×源 (lerp 语义)");
+    }
+}
+
 int main()
 {
     /* 关掉 stdout 缓冲: 这个测试里有若干耗时较长的数值检查, 万一卡住或崩掉,
@@ -952,15 +1113,16 @@ int main()
     std::printf("=== 稀疏路由 MoE (rl/sparse_moe.hpp) 测试 ===\n");
     Random::setSeed(20240501);
 
-    std::printf("[1/9] 前向/反向基础\n"); part1();
-    std::printf("[2/9]\n"); part2();
-    std::printf("[3/9]\n"); part3();
-    std::printf("[4/9]\n"); part4();
-    std::printf("[5/9]\n"); part5();
-    std::printf("[6/9]\n"); part6();
-    std::printf("[7/9]\n"); part7();
-    std::printf("[8/9]\n"); part8();
-    std::printf("[9/9]\n"); part9();
+    std::printf("[1/10] 前向/反向基础\n"); part1();
+    std::printf("[2/10]\n"); part2();
+    std::printf("[3/10]\n"); part3();
+    std::printf("[4/10]\n"); part4();
+    std::printf("[5/10]\n"); part5();
+    std::printf("[6/10]\n"); part6();
+    std::printf("[7/10]\n"); part7();
+    std::printf("[8/10]\n"); part8();
+    std::printf("[9/10]\n"); part9();
+    std::printf("[10/10]\n"); part10();
 
     std::printf("\n=== %d 项断言, %d 项失败 ===\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

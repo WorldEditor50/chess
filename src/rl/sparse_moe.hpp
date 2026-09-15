@@ -40,6 +40,7 @@
 #include <memory>
 #include <vector>
 #include "activate.h"
+#include "expert.hpp"
 #include "ilayer.h"
 #include "layer.h"
 #include "optimize.h"
@@ -48,140 +49,11 @@
 
 namespace RL {
 
-/* ============================================================
- *  MlpExpert — 把"普通 MLP"包装成一个 iLayer, 以便当稀疏 MoE 的专家
- *
- *  dIn -> dHidden -> dHidden -> dIn (输入输出同维, 才能做门控加权和)
- *  代价 ~ 2·dIn·dHidden, 比 TransformerBlock 专家便宜两个数量级。
- * ============================================================ */
-class MlpExpert : public iLayer
-{
-public:
-    Layer<Tanh> l1;
-    Layer<Tanh> l2;
-    Layer<Linear> l3;
-    int dIn;
-    int dHidden;
-
-public:
-    long long paramCount() const override
-    {
-        return l1.paramCount() + l2.paramCount() + l3.paramCount();
-    }
-
-    MlpExpert() : dIn(0), dHidden(0) {}
-
-    MlpExpert(int dIn_, int dHidden_, bool withGrad)
-        : l1(dIn_, dHidden_, true, withGrad),
-          l2(dHidden_, dHidden_, true, withGrad),
-          l3(dHidden_, dIn_, true, withGrad),
-          dIn(dIn_), dHidden(dHidden_)
-    {
-        type = LAYER_FC;
-        o = Tensor(dIn_, 1);
-        e = Tensor(dIn_, 1);
-    }
-
-    Tensor& forward(const Tensor& x, bool inference=false) override
-    {
-        Tensor &h1 = l1.forward(x, inference);
-        Tensor &h2 = l2.forward(h1, inference);
-        o = l3.forward(h2, inference);
-        return o;
-    }
-
-    void backward(const Tensor& x, Tensor &ei) override
-    {
-        /*
-           链式往回走。注意 `Layer::backward` 会清掉它自己的 o/e, 所以要按
-           "后层先回" 的顺序, 并且借用的中间激活 (l1.o / l2.o) 在那之前必须还活着。
-        */
-        Tensor &h1 = l1.o;   /* 引用: 前向缓存 */
-        Tensor &h2 = l2.o;
-
-        Tensor e2((std::size_t)dHidden, 1);
-        Tensor e1((std::size_t)dHidden, 1);
-        Tensor e0((std::size_t)dIn, 1);
-        e2.zero();
-        e1.zero();
-        e0.zero();
-
-        l3.e = e;                 /* 上一层注入的 dL/do 拷进来 */
-        l3.backward(h2, e2);      /* e2 = dL/dh2 */
-        l2.e = e2;
-        l2.backward(h1, e1);      /* e1 = dL/dh1 */
-        l1.e = e1;
-        l1.backward(x, e0);       /* e0 = dL/dx */
-
-        /* 累加进 ei (与 MOE::backward 的约定一致, 便于多个专家/门控路径叠加) */
-        for (int j = 0; j < dIn; j++) {
-            ei[j] += e0[j];
-        }
-
-        o.zero();
-        e.zero();
-        return;
-    }
-
-    void SGD(float lr) override
-    {
-        l1.SGD(lr);
-        l2.SGD(lr);
-        l3.SGD(lr);
-    }
-
-    void RMSProp(float lr, float rho, float decay, bool clipGrad) override
-    {
-        l1.RMSProp(lr, rho, decay, clipGrad);
-        l2.RMSProp(lr, rho, decay, clipGrad);
-        l3.RMSProp(lr, rho, decay, clipGrad);
-    }
-
-    void Adam(float lr, float alpha, float beta, float alpha_, float beta_,
-              float decay, bool clipGrad) override
-    {
-        l1.Adam(lr, alpha, beta, alpha_, beta_, decay, clipGrad);
-        l2.Adam(lr, alpha, beta, alpha_, beta_, decay, clipGrad);
-        l3.Adam(lr, alpha, beta, alpha_, beta_, decay, clipGrad);
-    }
-
-    void clamp(float c0, float cn) override
-    {
-        l1.clamp(c0, cn);
-        l2.clamp(c0, cn);
-        l3.clamp(c0, cn);
-    }
-
-    void write(std::ofstream &file) override
-    {
-        l1.write(file);
-        l2.write(file);
-        l3.write(file);
-    }
-
-    void read(std::ifstream &file) override
-    {
-        l1.read(file);
-        l2.read(file);
-        l3.read(file);
-    }
-
-    /* 初始化缩放: 权重默认是 U(-1,1), 对 1260 维输入会直接把 Tanh 顶到饱和 */
-    void scaleInit()
-    {
-        iFcLayer *ls[3] = {&l1, &l2, &l3};   /* 都继承自 iFcLayer */
-        for (int i = 0; i < 3; i++) {
-            const float fanIn = (float)(ls[i]->inputDim > 1 ? ls[i]->inputDim : 1);
-            const float s = 1.0f / std::sqrt(fanIn);
-            for (std::size_t k = 0; k < ls[i]->w.size(); k++) {
-                ls[i]->w[k] *= s;
-            }
-            for (std::size_t k = 0; k < ls[i]->b.size(); k++) {
-                ls[i]->b[k] *= s;
-            }
-        }
-    }
-};
+/*
+ * 专家 (MlpExpert / TransformerBlock / Layer<Fn>) 与它们的工厂、初始化缩放现在
+ * 统一放在 `rl/expert.hpp` —— 因为 `moe.hpp` 与 `concat.hpp` 的 ScaledConcat 都要
+ * 按模板参数接受多种专家, 三份拷贝迟早漂移。这里的用法与语义一个字都没变。
+ */
 
 /* ============================================================
  *  ISparseMoE — 非模板接口, 让上层可以 dynamic_cast 到"任何"稀疏 MoE 层
@@ -211,70 +83,7 @@ public:
     virtual int topK() const = 0;
 };
 
-/* 两个专家类型的初始化缩放: MlpExpert 用成员方法, TransformerBlock 用这个自由函数 */
-inline void scaleExpertInit(MlpExpert &e)
-{
-    e.scaleInit();
-}
-
-template<int H, int DFF>
-void scaleExpertInit(TransformerBlock<H, DFF> &e)
-{
-    auto scaleLayer = [](iFcLayer &fc) {
-        const float fanIn = (float)(fc.inputDim > 1 ? fc.inputDim : 1);
-        const float s = 1.0f / std::sqrt(fanIn);
-        for (std::size_t k = 0; k < fc.w.size(); k++) {
-            fc.w[k] *= s;
-        }
-        for (std::size_t k = 0; k < fc.b.size(); k++) {
-            fc.b[k] *= s;
-        }
-    };
-    auto scaleTensor = [](Tensor &t, float s) {
-        for (std::size_t k = 0; k < t.size(); k++) {
-            t[k] *= s;
-        }
-    };
-
-    /* FFN: fan_in 分别是 d_model 与 d_ff_ */
-    scaleLayer(e.ffn_up);
-    scaleLayer(e.ffn_down);
-
-    /* 注意力: 每个 head 的 q/k/v 投影 fan_in 都是 d_model; 输出投影 fan_in = d_model */
-    const float s = 1.0f / std::sqrt((float)(e.d_model > 1 ? e.d_model : 1));
-    for (int i = 0; i < e.attn.numHeads; i++) {
-        scaleTensor(e.attn.heads[i].wq, s);
-        scaleTensor(e.attn.heads[i].wk, s);
-        scaleTensor(e.attn.heads[i].wv, s);
-    }
-    scaleTensor(e.attn.wo, s);
-}
-
-/* ============================================================
- *  专家工厂: 两种专家的构造签名不同 (TransformerBlock 只要 d_model,
- *  MlpExpert 还要一个隐层宽度), 用 trait 把它统一掉。
- * ============================================================ */
-template<typename E>
-struct ExpertFactory;
-
-template<int H, int DFF>
-struct ExpertFactory<TransformerBlock<H, DFF> >
-{
-    static TransformerBlock<H, DFF> make(int d_model, int hidden, bool withGrad)
-    {
-        (void)hidden;   /* TransformerBlock 的 FFN 宽度由模板参数 DFF 决定 */
-        return TransformerBlock<H, DFF>(d_model, withGrad);
-    }
-};
-
-template<>
-struct ExpertFactory<MlpExpert>
-{
-    static MlpExpert make(int d_model, int hidden, bool withGrad)
-    {
-        return MlpExpert(d_model, hidden > 0 ? hidden : (d_model / 16), withGrad);
-    }
-};
+/* 专家初始化缩放 / 工厂: 见 rl/expert.hpp (scaleExpertInit / ExpertFactory) */
 
 /* ============================================================
  *  SparseMoE<Expert, NumExperts, TopK>

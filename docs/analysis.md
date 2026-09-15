@@ -51,6 +51,7 @@ chess/
 │   ├── test_grad_main.cpp     # SIMD 之后的梯度传播 (有限差分) -> test_grad
 │   ├── test_sacaz_main.cpp    # SAC+MCTS+AlphaZero -> test_sacaz
 │   ├── test_sparse_moe_main.cpp # 稀疏路由 MoE (稀疏不变量/等价性/有限差分/辅助损失) -> test_sparse_moe
+│   ├── test_scaledconcat_main.cpp # ScaledConcat (门控选择性与上界/解耦不变量/有限差分/专家模板参数) -> test_scaledconcat
 │   ├── test_weights_main.cpp  # 权重文件格式 (无损/校验/原子写/兼容老格式) -> test_weights
 │   ├── bench_moe_main.cpp     # 骨干 A/B/C/D 等时对弈基准 -> bench_moe (只构建不注册)
 │   ├── test_pg_main.cpp       # PG -> test_pg
@@ -62,9 +63,10 @@ chess/
 ```
 
 构建产物（`build/Desktop_Qt_6_9_2_MSVC2022_64bit-Release`）：
-`RL_CORE.lib`（17 个 TU 的静态库）+ `chess.exe` + **15 个测试/基准可执行文件**。
+`RL_CORE.lib`（17 个 TU 的静态库）+ `chess.exe` + **16 个测试/基准可执行文件**。
 其中 `test_ab` / `test_mcts` / `test_rules` / `test_pretrain` / `test_match` / `test_grad`
-/ `test_weights` / `test_sacaz` / `test_sparse_moe` 九个注册进了 `ctest`（`test_match` 需要
+/ `test_weights` / `test_sacaz` / `test_sparse_moe` / `test_scaledconcat` 十个注册进了
+`ctest`（`test_match` 需要
 Qt 的 DLL：`ctest` 通过 `ENVIRONMENT_MODIFICATION` 把 Qt 的 `bin` 前置进 `PATH`）；
 其余是分钟级的训练基准与对弈基准（`bench_moe` 会跑真实对局、依赖随机开局），
 只构建不注册 —— 放进默认套件只会得到看起来像失败的超时。
@@ -74,6 +76,9 @@ Qt 的 DLL：`ctest` 通过 `ENVIRONMENT_MODIFICATION` 把 Qt 的 `bin` 前置�
 * `agents_design.md` — 各 agent 的设计；§12 参数量理论分析、§13 界面可视化
 * `xiangqi_capacity.md` — "多少参数量才能覆盖象棋求解空间"的完整推导
 * `rl_sync.md` — 与上游 snakeAI `rl/` 的同步与差异（含权重文件格式 v2）
+* `tanh_norm_analysis.md` — TanhNorm 模块特性分析（梯度审计、与 RMSNorm 的关系、DQN 里为什么有效、
+  优化项与风险）；配套独立探针 `test/probe_norm_layers_main.cpp` / `test/probe_layer_audit_main.cpp`
+  / `test/probe_tanh_norm_ops_main.cpp`（**故意不注册 CMake**，编译方法见该文 §12）
 * `analysis.md` — 本文档
 
 ---

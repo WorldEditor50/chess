@@ -60,12 +60,19 @@ RL::DQN::DQN(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim
                      TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
                      Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #elif 0
-    /* snakeAI variant B: 16-way ScaledConcat feature extractor */
-    QMainNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, true), stateDim, 4, true),
+    /* snakeAI variant B: 16-way ScaledConcat feature extractor
+
+       2026-09: `ScaledConcat` 重写过 (门控与特征解耦 / 门控 logits 无界 / 初始化按
+       fan-in 缩放 / 专家类型是模板参数), 所以这一分支跟着换成新 API:
+       `ScaledConcat<专家类型, 专家数, 每路单元数>`, 输出宽度仍是 16*4 = 64, 与下面
+       那层 TanhNorm(16*4, hiddenDim) 对得上。
+       专家取 MlpExpert (隐层 16): 一个才 ~1.6K 参数, 而 d->d 的 Layer<Gelu> 专家是
+       90x90 = 8.2K/个。 */
+    QMainNet = Net(ScaledConcat<MlpExpert, 16, 4>::_(stateDim, true, 16),
                    TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, true),
                    Layer<Linear>::_(hiddenDim, actionDim, true, true));
 
-    QTargetNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, false), stateDim, 4, false),
+    QTargetNet = Net(ScaledConcat<MlpExpert, 16, 4>::_(stateDim, false, 16),
                      TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, false),
                      Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #else
