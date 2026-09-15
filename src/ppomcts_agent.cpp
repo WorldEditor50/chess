@@ -199,6 +199,15 @@ float PPOMCTSAgent::computeReward(const Step &s, int color)
 {
     (void)color;   /* 走子方视角, 与颜色无关 */
 
+    if (!materialRewardEnabled) {
+        /*
+           材质完全交给势能 Φ (A/B 对照, 见头文件 materialRewardEnabled 的说明):
+           显式奖励只留每步代价。两处都给会让"吃子"变成不受 PBRS 不变性保护的额外
+           稠密奖励, 把策略推向吃子优先。
+        */
+        return REWARD_STEP_COST;
+    }
+
     if (s.nextId == Stone::ID_NONE) return stepReward(false, false, 0.0);
 
     Stone *victim = chess.stones[s.nextId];
@@ -250,18 +259,32 @@ float PPOMCTSAgent::potentialOf(int colorToMove)
  *  相邻两步共享同一个局面, 所以 Φ_before(i) = Φ_after(i-1) = trajectory[i-1].potential,
  *  只有第 0 步需要额外的 m_phiInit (调用方在一局开始前设好)。
  * ------------------------------------------------------------------ */
+/* 边界项用的"最后一步落子后"的势能 (已乘 α; 塑形关闭或 α=0 时为 0) */
+float PPOMCTSAgent::finalPhiScaled(const std::vector<RL::Step> &traj) const
+{
+    if (!potentialShaping || shapingAlpha == 0.0f || traj.empty()) {
+        return 0.0f;
+    }
+    return traj.back().potential * shapingAlpha;
+}
+
 void PPOMCTSAgent::applyPotentialShaping(std::vector<RL::Step> &trajectory) const
 {
-    if (!potentialShaping || trajectory.empty()) {
-        return;   /* A/B 消融: 关掉之后 Φ 恒为 0, 奖励保持原样 */
+    if (!potentialShaping || shapingAlpha == 0.0f || trajectory.empty()) {
+        return;   /* A/B 消融 (α=0) 或关掉塑形: Φ 恒为 0, 奖励保持原样 */
     }
-    float phiBefore = m_phiInit;
+    /*
+       α 是势能强度 (可退火): α·Φ 仍然是状态函数, 所以**任何 α 都保持策略不变性**
+       (推导里把 Φ 换成 αΦ 即可), 于是"由弱到强"连续过渡不会让价值函数失效。
+    */
+    float phiBefore = m_phiInit * shapingAlpha;
     for (std::size_t t = 0; t < trajectory.size(); t++) {
+        const float phiAfter = trajectory[t].potential * shapingAlpha;
         trajectory[t].reward = shapedStepReward(trajectory[t].reward,
                                                phiBefore,
-                                               trajectory[t].potential,
+                                               phiAfter,
                                                gamma);
-        phiBefore = trajectory[t].potential;
+        phiBefore = phiAfter;
     }
 }
 
@@ -408,8 +431,7 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
        -V'(s_end+1) = -V(s_end+1) - Φ(s_end+1) = finalOutcome - Φ(s_end+1),
        而 Φ(s_end+1) 正是最后一步记下的 trajectory.back().potential。
     */
-    const float shiftedOutcome = finalOutcome
-        - (trajectory.empty() ? 0.0f : trajectory.back().potential);
+    const float shiftedOutcome = finalOutcome - finalPhiScaled(trajectory);
     const std::vector<float> returns = ppo.discountedReturns(trajectory, shiftedOutcome);
 
     std::vector<int> idx;
@@ -926,23 +948,19 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 double dummyReward = 0.0;
                 chess.moveForward(&chosenStep, dummyReward);
 
-                /* Check game over */
-                int gameResult = chess.isGameOver();
-                if (gameResult != Stone::COLOR_NONE) {
+                /* Check game over —— Phase 6: 统一走 getResult()
+                   (一次覆盖 将杀/困毙/吃将/三次重复/60 回合判和; 原来 isGameOver()
+                   只认"将不在了", 于是将杀与判和都不会让这一局结束)。 */
+                int gameResult = chess.getResult(chess.sideToMove);
+                if (gameResult != Chess::RESULT_ONGOING) {
                     /*
                        终局值必须按**最后一步走子方**的视角给 —— 此刻走子方就是
-                       currentColor (还没翻转)。
-
-                       原来传的是 (gameResult == BLACK) ? 1 : -1, 也就是**黑方视角**;
-                       而每一步的即时奖励 computeReward() 是走子方视角, 状态编码又是
-                       规范视角 (价值头输出的就是走子方的价值)。三者不一致的后果:
-                       红方走的每一步拿到的终局分量符号都是反的 —— 红方赢的棋, 对红方
-                       反而成了"在输"。另外原来那条 emplace_back 把"奖励"直接写成了
-                       黑方视角的终局值, 等于把终局信号记了两遍 (一遍当奖励、一遍当
-                       finalOutcome)。
+                       currentColor (还没翻转)。原先各处按黑方视角算, 与走子方视角的
+                       即时奖励、规范视角的状态编码三者不一致 ⇒ 红方赢的棋对红方
+                       反而成了"在输" (不报错, 只是学不动)。
                     */
                     const float outcomeForLastMover =
-                        (gameResult == currentColor) ? 1.0f : -1.0f;
+                        outcomeForMover(gameResult, currentColor);
 
                     /* Store final transition:
                        即时奖励与其它步同一口径, 终局由 finalOutcome 统一加。
@@ -1244,12 +1262,12 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                 double dummyReward = 0.0;
                 chess.moveForward(&chosenStep, dummyReward);
 
-                int gameResult = chess.isGameOver();
-                if (gameResult != Stone::COLOR_NONE) {
+                int gameResult = chess.getResult(chess.sideToMove);
+                if (gameResult != Chess::RESULT_ONGOING) {
                     /* 终局值按最后一步走子方 (= currentColor, 还没翻转) 的视角 ——
-                       与 trainSelfPlay 同一处修正, 理由见那里的长注释 */
+                       与 trainSelfPlay 同一处修正, Phase 6 起统一走 getResult() */
                     const float outcomeForLastMover =
-                        (gameResult == currentColor) ? 1.0f : -1.0f;
+                        outcomeForMover(gameResult, currentColor);
                     /* 策略目标 = 根节点的访问分布 (同 trainSelfPlay) */
                     RL::Tensor policyTarget(ACTION_DIM, 1);
                     if (!visitDistribution(rootID, policyTarget)) {
@@ -1521,8 +1539,7 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
                终局常量要跟着势能一起平移 (PBRS 的边界项): 见 commitEpisode 里同一处
                的推导 —— finalOutcome' = finalOutcome - Φ(落子后局面)。
             */
-            finalOutcome = terminalReward
-                - (traj.empty() ? 0.0f : traj.back().potential);
+            finalOutcome = terminalReward - finalPhiScaled(traj);
         } else if (haveNextState) {
             /*
                自举: V(s_end+1) 是"轮到走棋的一方(即最后一步走子方的对手)"的价值,

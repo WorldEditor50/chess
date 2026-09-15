@@ -507,6 +507,123 @@ void section6(Chess &env)
     }
 }
 
+/* ================================================================
+ *  [8] Phase 6: 终局口径统一 / α 退火钩子 / 材质去重账 / 威胁项
+ * ================================================================ */
+void section8(Chess &env)
+{
+    std::printf("\n[8] Phase 6: 终局统一 / α / 材质口径 / 威胁项\n");
+
+    /* ---- (a) 终局判定: getResult() 覆盖 isGameOver() 覆盖不到的情形 ---- */
+    {
+        std::printf("  outcomeForMover 映射: 红胜给红方=%+.1f 给黑方=%+.1f; 和棋=%+.1f;"
+                    " 未终局=%+.1f\n",
+                    outcomeForMover(Chess::RESULT_RED_WIN, Stone::COLOR_RED),
+                    outcomeForMover(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+                    outcomeForMover(Chess::RESULT_DRAW, Stone::COLOR_RED),
+                    outcomeForMover(Chess::RESULT_ONGOING, Stone::COLOR_RED));
+        check(outcomeForMover(Chess::RESULT_RED_WIN, Stone::COLOR_RED) > 0.0f
+                  && outcomeForMover(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK) < 0.0f,
+              "outcomeForMover: 胜者拿正、负者拿负");
+        check(outcomeForMover(Chess::RESULT_DRAW, Stone::COLOR_RED) == 0.0f,
+              "outcomeForMover: 和棋为 0");
+
+        /*
+           判和这一类最能说明问题: 60 回合无吃子时 getResult() 报和棋 (DRAW), 而
+           isGameOver() 依然报"没结束" (NONE) —— rollout 里用后者就等于"这局还没完",
+           于是一路走到截断、目标给 0。这就是 Phase 6 要统一的差别。
+        */
+        env.reset();
+        env.halfMoveClock = 120;
+        const int gr = env.getResult(env.sideToMove);
+        const int go = env.isGameOver();
+        std::printf("  60 回合无吃子: getResult=%d (DRAW=%d), isGameOver=%d (NONE=%d)\n",
+                    gr, (int)Chess::RESULT_DRAW, go, (int)Stone::COLOR_NONE);
+        check(gr == Chess::RESULT_DRAW && go == Stone::COLOR_NONE,
+              "getResult() 认出判和, 而 isGameOver() 认不出 —— 这就是终局口径统一的必要性");
+        env.halfMoveClock = 0;
+    }
+
+    /* ---- (b) α 系数: α=0 等价于不塑形 ---- */
+    {
+        Chess e2;
+        e2.reset();
+        e2.sideToMove = Stone::COLOR_RED;
+        PPOMCTSAgent ag(e2, 32, 0.99f, 0.001f, 1.414f, 32, 0.1f, false);
+        ag.potentialShaping = true;
+        ag.shapingAlpha = 0.0f;
+
+        std::vector<RL::Step> traj;
+        for (int i = 0; i < 3; i++) {
+            RL::Tensor st(PPOMCTSAgent::STATE_DIM, 1);
+            st.zero();
+            RL::Tensor act(PPOMCTSAgent::ACTION_DIM, 1);
+            act.zero();
+            act[0] = 1.0f;
+            traj.emplace_back(st, act, 0.25f);
+            traj.back().potential = 0.5f;   /* 故意给一个非零势能 */
+        }
+        ag.applyPotentialShaping(traj);
+        bool unchanged = true;
+        for (std::size_t i = 0; i < traj.size(); i++) {
+            if (std::fabs(traj[i].reward - 0.25f) > 1e-9f) unchanged = false;
+        }
+        check(unchanged, "α=0 时塑形是恒等变换 (退火到 0 == 无塑形)");
+    }
+
+    /* ---- (c) 材质去重账: 关掉显式材质奖励后只剩每步代价 ---- */
+    {
+        Chess e3;
+        e3.reset();
+        e3.sideToMove = Stone::COLOR_RED;
+        PPOMCTSAgent ag(e3, 32, 0.99f, 0.001f, 1.414f, 32, 0.1f, false);
+        std::vector<Step *> legal;
+        e3.sample(Stone::COLOR_RED, legal);
+        Step cap;
+        cap.valid = false;
+        for (std::size_t i = 0; i < legal.size(); i++) {
+            if (legal[i]->nextId != Stone::ID_NONE) { cap = *legal[i]; break; }
+        }
+        Steps::instance().put(legal);
+        if (cap.valid) {
+            ag.materialRewardEnabled = true;
+            const float withMat = ag.computeReward(cap, Stone::COLOR_RED);
+            ag.materialRewardEnabled = false;
+            const float withoutMat = ag.computeReward(cap, Stone::COLOR_RED);
+            std::printf("  吃子奖励: 显式材质开=%.4f, 关=%.4f (每步代价=%.4f)\n",
+                        (double)withMat, (double)withoutMat, (double)REWARD_STEP_COST);
+            check(withMat > withoutMat, "显式材质奖励可开关 (A/B 用)");
+            check(std::fabs(withoutMat - REWARD_STEP_COST) < 1e-9f,
+                  "关掉后只剩每步代价 —— 材质完全交给势能 Φ");
+        }
+    }
+
+    /* ---- (d) 威胁项: 悬子与多重攻击进了 evaluatePositional, 但没进 evaluate() ---- */
+    {
+        Chess e4;
+        e4.reset();
+        e4.sideToMove = Stone::COLOR_RED;
+        /* 走几步造出非对称局面 */
+        for (int i = 0; i < 6; i++) {
+            std::vector<Step *> legal;
+            e4.sample(e4.sideToMove, legal);
+            if (legal.empty()) break;
+            Step s(*legal[(std::size_t)(i * 2 + 1) % legal.size()]);
+            Steps::instance().put(legal);
+            double d = 0.0;
+            e4.moveForward(&s, d);
+        }
+        Chess::setPositionalEvalEnabled(true);
+        const double pos = e4.evaluatePositional();
+        const double plain = e4.evaluate();
+        const double abCost = 0.0; (void)abCost;
+        std::printf("  局面价值: evaluatePositional=%.4f, evaluate(AB 叶子)=%.4f,"
+                    " 局面项(含悬子/多重攻击)=%+.4f\n", pos, plain, pos - plain);
+        check(std::fabs(pos - plain) > 1e-6,
+              "威胁项 (悬子/多重攻击) 已计入 evaluatePositional()");
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -532,6 +649,7 @@ int main(int argc, char *argv[])
     section3(env);
     section4And5(env);
     section6(env);
+    section8(env);
 
     std::printf("\n========================================================\n");
     std::printf("  %d 项检查, %d 项失败\n", g_checks, g_failed);

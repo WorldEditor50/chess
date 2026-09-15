@@ -88,11 +88,24 @@ int rolloutFromCurrent(Agent &agent, Chess &chess, int color, int steps,
         RL::Tensor nextState(STATE_DIM, 1);
         agent.encodeState(nextState);
 
-        const int gameResult = chess.isGameOver();
-        const bool done = (gameResult != Stone::COLOR_NONE);
+        /*
+           终局判定统一走 Chess::getResult() (Phase 6): 它一次覆盖 将杀 / 困毙 /
+           吃将 / 三次重复 / 60 回合无吃子判和。原来这里用的是 isGameOver() ——
+           而它**只认"将不在了"**, 于是：
+             * rollout 里"被将死"不终止, 会继续往下走 (走到无合法走法时才由调用方
+               的另一条分支兜底);
+             * 三次重复 / 判和 完全不是终局;
+           两条合起来造成"截断处一律给 0" ⇒ 价值目标没有信号 (诊断实测 |target|>0.1
+           的样本占比一度是 0.0%)。
+           调用点在 moveForward 之后, 所以 getResult 的参数是 chess.sideToMove
+           (刚被翻转成对手, 也就是"可能已被将死"的那一方)。
+        */
+        const int gameResult = chess.getResult(chess.sideToMove);
+        const bool done = (gameResult != Chess::RESULT_ONGOING);
         float r = reward;
         if (done) {
-            r = (gameResult == turn) ? 1.0f : -1.0f;
+            /* 走子方视角的终局值 (胜 + / 负 - / 和 0), 与 stone.h 的 REWARD_TERMINAL 同源 */
+            r = outcomeForMover(gameResult, turn);
         }
         onTrans(recorded, selectedAction, state, nextState, r, done);
         collected++;

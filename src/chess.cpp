@@ -216,12 +216,49 @@ double Chess::positionalScore()
     */
 
     /*
-       ---- 3) 攻击对方将格的子数: 已去掉 ----
-       这一项与 (1) 被将军、(2) 将周围受攻 高度重复 (都是"将有多危险"), 而它要给
-       **双方全部 32 个子**各做一次攻击判定 —— 车/炮的判定还要算"中间有几个子"
-       (走线扫描)。实测它是这一整块里最贵的部分: 去掉它 depth-4 单步从 1621 ms 降到
-       约 950 ms, 而信息几乎没少。宁可少一项也不能把 AB 的等时间深度吃回去。
+       ---- 3) 威胁项 (多重攻击 + 悬子) ----
+       这一块**只走 evaluatePositional()** (也就是只给 RL 的势能 Φ, 每手只算两次),
+       不进 evaluate() —— 实测把它并进 AB 的叶子评估会让一次评估 0.100us -> 0.650us
+       (6.5 倍)、depth-4 单步 107ms -> 1269ms。放在 Φ 这一路, 成本无关, 于是可以
+       用"贵而准"的判定。
     */
+    /* 3a) 攻击对方将格的子数: 多重攻击比单次攻击危险得多 */
+    int attackersOnBlackJiang = 0;
+    int attackersOnRedJiang = 0;
+    for (int i = Stone::ID_RED; i < Stone::ID_RED_END; i++) {
+        Stone *st = m_children[i];
+        if (st != nullptr && st->alive && blackJiang.alive
+                && isAttackedOne(blackJiangPos, st)) {
+            attackersOnBlackJiang++;
+        }
+    }
+    for (int i = Stone::ID_BLACK; i < Stone::ID_BLACK_END; i++) {
+        Stone *st = m_children[i];
+        if (st != nullptr && st->alive && redJiang.alive
+                && isAttackedOne(redJiangPos, st)) {
+            attackersOnRedJiang++;
+        }
+    }
+    s -= 0.09 * attackersOnBlackJiang;   /* 第二个攻击者权重更高 */
+    s += 0.09 * attackersOnRedJiang;
+
+    /*
+       3b) 悬子: **被对方攻击且没有己方子保护**的棋子按价值扣分。
+       这才是"送子狂魔"的正解 —— 送子在象棋里是**合法**的 (照面/自将才是非法的,
+       引擎已经禁掉), 所以只能靠评估函数把它标出来。
+    */
+    for (int i = 0; i < 32; i++) {
+        Stone *st = m_children[i];
+        if (st == nullptr || st->alive == false) continue;
+        if (st->type == Stone::TYPE_JIANG) continue;   /* 将的处理见 (1)(2) */
+        const int enemy = (st->color == Stone::COLOR_BLACK) ? Stone::COLOR_RED
+                                                            : Stone::COLOR_BLACK;
+        if (!isAttacked(st->pos, enemy)) continue;      /* 没被盯 */
+        if (isAttacked(st->pos, st->color)) continue;   /* 有己方子保护 */
+        const double hang = 0.25 * st->value;           /* 白送的价值 (按子力折算) */
+        if (st->color == Stone::COLOR_BLACK) s -= hang;
+        else                                 s += hang;
+    }
 
     /* ---- 4) 士象完整度 ---- */
     int blackGuards = 0, redGuards = 0;

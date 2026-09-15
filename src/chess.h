@@ -158,4 +158,33 @@ private:
     void undoMove(const Step *s);
 };
 
+/* ====================================================================
+ *  终局口径统一 (Phase 6, 2026-09)
+ * ====================================================================
+ *
+ *  把 Chess::getResult() 的结果换算成"**某一步走子方**视角"的终局值。
+ *
+ *  为什么需要它: 工程里曾经并存**三套**终局定义 ——
+ *    * isGameOver()  只看将帅是否存活 (便宜), 于是"被将死""判和"都不是终局;
+ *    * getResult()   完整 (将杀/困毙/吃将/三次重复/60 回合无吃子判和);
+ *    * trainSelfPlay 里还有一条"没有合法走法"的分支自己算赢家。
+ *  各处按各自的口径取 ±1, 于是同一个终局事件在不同路径上含义不同, 而且
+ *  **rollout 里的"被将死"根本不终止** —— 截断处一律给 0, 价值目标因此没有信号。
+ *
+ *  现在统一走 getResult() + 这个换算函数。调用点都在 moveForward **之后**,
+ *  所以 getResult 的参数应当是 chess.sideToMove (刚被落子翻转成对手)。
+ * ==================================================================== */
+inline float outcomeForMover(int chessResult, int moverColor)
+{
+    if (chessResult == Chess::RESULT_DRAW) {
+        return 0.0f;
+    }
+    if (chessResult == Chess::RESULT_ONGOING) {
+        return 0.0f;   /* 未终局; 调用方应当先判 isOngoing */
+    }
+    const bool redWon = (chessResult == Chess::RESULT_RED_WIN);
+    const bool moverIsRed = (moverColor == Stone::COLOR_RED);
+    return (redWon == moverIsRed) ? REWARD_TERMINAL : -REWARD_TERMINAL;
+}
+
 #endif // CHESS_H
