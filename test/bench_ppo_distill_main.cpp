@@ -55,6 +55,21 @@ int    g_batch = 64;
 float  g_lr = 0.002f;
 unsigned g_seed = 20240901u;
 std::string g_savePrefix;
+/*
+ *  Step 3: **行为克隆预训练 actor**（--actor=1）。
+ *
+ *  为什么需要它: Step 2 实测出"价值头蒸馏成功（留出 MSE 降 4.2 倍）但选点几乎没动"，
+ *  因为**先验（actor）还是随机的** —— 中局约 40 个合法着法、80~200 次模拟，搜索树主要
+ *  靠（随机）先验铺开，好价值头无从发挥。佐证：未训练网络把模拟从 80 提到 200，探针数字
+ *  一动不动。所以这一步先把 actor 从"随机噪声"拉到"像 AB 一样选点"，让搜索有东西可聚焦。
+ *
+ *  边界（必须记住）：这是**模仿**，上限就是被模仿者的水平（AB 深度 g_depth）；它是课程，
+ *  不是终点。而且用它之后，"与 AB 的一致率"再上升就不再是独立的棋力证据了 —— 那时参照
+ *  要换成更深的 AB。
+ */
+bool   g_actor = false;
+int    g_actorEpochs = 6;
+float  g_actorLr = 0.002f;
 
 double nowSec()
 {
@@ -65,7 +80,8 @@ double nowSec()
 
 struct Sample {
     RL::Tensor state;
-    float target;   /* 规范视角 (轮到走棋的一方), 已 tanh 归一 */
+    float target;   /* critic 目标: 规范视角 (轮到走棋的一方), 已 tanh 归一 */
+    int actionIdx;  /* actor 目标: AB 选的着法在该局面规范视角下的动作下标 */
 };
 
 /* 走 `openings` 手随机棋得到一个局面 (与权重无关, 可复现) */
@@ -98,6 +114,33 @@ double mseOn(RL::PPO &ppo, const std::vector<Sample> &set)
     return sum / (double)set.size();
 }
 
+/*
+ *  [Step 3] actor 的三个信号层指标:
+ *    * priorTop1: 策略头**单独**（不看搜索）的 argmax 是否等于 AB 选的着法 —— 这就是
+ *      行为克隆的训练目标本身, 用来确认"克隆成功了";
+ *    * probOnAb : 策略头在 AB 那个着法上的平均概率 (从 1/8100 涨到多少);
+ *    * ce       : 交叉熵 (批平均), 与训练时同一口径。
+ */
+void actorMetrics(RL::PPO &ppo, const std::vector<Sample> &set,
+                  double &top1Pct, double &probOnAb, double &ce)
+{
+    top1Pct = probOnAb = ce = 0.0;
+    if (set.empty()) return;
+    int hit = 0;
+    for (std::size_t i = 0; i < set.size(); i++) {
+        RL::Tensor &p = ppo.actorP.forward(set[i].state);
+        const int a = set[i].actionIdx;
+        if (a >= 0 && (std::size_t)a < p.size()) {
+            if (p.argmax() == a) hit++;
+            probOnAb += (double)p[(std::size_t)a];
+            ce -= std::log((double)p[(std::size_t)a] + 1e-8);
+        }
+    }
+    top1Pct = 100.0 * (double)hit / (double)set.size();
+    probOnAb /= (double)set.size();
+    ce /= (double)set.size();
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -116,6 +159,9 @@ int main(int argc, char *argv[])
         else if (k == "--lr")       { g_lr = (float)atof(v.c_str()); }
         else if (k == "--seed")     { g_seed = (unsigned)strtoul(v.c_str(), nullptr, 10); }
         else if (k == "--save")     { g_savePrefix = v; }
+        else if (k == "--actor")    { g_actor = (std::atoi(v.c_str()) != 0); }
+        else if (k == "--actor-epochs") { g_actorEpochs = std::atoi(v.c_str()); }
+        else if (k == "--actor-lr") { g_actorLr = (float)atof(v.c_str()); }
         else { std::fprintf(stderr, "未知参数: %s\n", a.c_str()); return 2; }
     }
 
@@ -152,7 +198,8 @@ int main(int argc, char *argv[])
         const int color = pos.sideToMove;
 
         envAb = pos;
-        (void)ab.getBestMove(color, g_depth);
+        /* 一次搜索同时拿到"根分值"(critic 目标) 与"选点"(actor 目标) —— 不要搜两遍 */
+        const Step abMove = ab.getBestMove(color, g_depth);
         if (!ab.getScoreValid()) { skipped++; continue; }
 
         const double score = ab.getLastScore();                 /* 黑方视角 */
@@ -166,6 +213,11 @@ int main(int argc, char *argv[])
         ppo.chess = pos;
         ppo.encodeStateFor(color, s.state);
         s.target = (float)target;
+        /*
+           Step 3: actor 的监督目标 = AB 选的那一步, 换算成**同一规范视角**下的动作下标
+           (stepToActionIdx 必须用与状态编码同一个 color, 否则先验会串帧)。
+        */
+        s.actionIdx = ppo.stepToActionIdx(abMove, color);
         all.push_back(s);
 
         /* 顺带算与手工局面评估的相关系数 (两者都是黑方视角), 用来验证符号没搞反 */
@@ -231,12 +283,57 @@ int main(int argc, char *argv[])
     std::printf("    蒸馏后 MSE: 训练 %.6f, 留出 %.6f (耗时 %.1f s)\n",
                 mseOn(ppo.ppo, trainSet), mseOn(ppo.ppo, holdout), trainSec);
 
-    /* ---- 4. 保存 ---- */
+    /* ---- 4. [Step 3] 行为克隆: 只训练 actor ---- */
+    if (g_actor) {
+        double t1p, p1, c1, t2p, p2, c2;
+        actorMetrics(ppo.ppo, trainSet, t1p, p1, c1);
+        actorMetrics(ppo.ppo, holdout, t2p, p2, c2);
+        std::printf("\n[4] 行为克隆预训练 actor (目标 = AB 深度 %d 的选点)\n", g_depth);
+        std::printf("    克隆前: prior top-1 训练 %.1f%% / 留出 %.1f%%;"
+                    " P(AB 着法) 训练 %.5f / 留出 %.5f; CE 训练 %.3f / 留出 %.3f\n",
+                    t1p, t2p, p1, p2, c1, c2);
+        std::fflush(stdout);
+
+        const double t2 = nowSec();
+        RL::Tensor oneHot(PPOMCTSAgent::ACTION_DIM, 1);
+        for (int ep = 0; ep < g_actorEpochs; ep++) {
+            std::shuffle(trainSet.begin(), trainSet.end(), rng);
+            int steps = 0;
+            for (std::size_t i = 0; i + (std::size_t)g_batch <= trainSet.size();
+                 i += (std::size_t)g_batch) {
+                for (int b = 0; b < g_batch; b++) {
+                    const Sample &s = trainSet[i + (std::size_t)b];
+                    oneHot.zero();
+                    if (s.actionIdx >= 0 && (std::size_t)s.actionIdx < oneHot.size()) {
+                        oneHot[(std::size_t)s.actionIdx] = 1.0f;
+                    }
+                    RL::Tensor &p = ppo.ppo.actorP.forward(s.state);
+                    RL::Tensor ceLoss = RL::Loss::CrossEntropy::df(p, oneHot);
+                    ppo.ppo.actorP.backward(s.state, ceLoss);
+                }
+                ppo.ppo.actorP.RMSProp(g_actorLr);
+                steps++;
+            }
+            actorMetrics(ppo.ppo, trainSet, t1p, p1, c1);
+            actorMetrics(ppo.ppo, holdout, t2p, p2, c2);
+            std::printf("    epoch %d/%d: %d 次更新, prior top-1 训练 %.1f%% / 留出 %.1f%%,"
+                        " P(AB) 训练 %.4f / 留出 %.4f, CE 留出 %.3f\n",
+                        ep + 1, g_actorEpochs, steps, t1p, t2p, p1, p2, c2);
+            std::fflush(stdout);
+        }
+        std::printf("    克隆后: prior top-1 训练 %.1f%% / 留出 %.1f%%;"
+                    " P(AB 着法) 训练 %.4f / 留出 %.4f; CE 训练 %.3f / 留出 %.3f"
+                    " (耗时 %.1f s)\n", t1p, t2p, p1, p2, c1, c2, nowSec() - t2);
+        std::printf("    注: prior top-1 是**克隆的训练目标本身**, 它高只说明「克隆成功」;\n"
+                    "        这个数上升之后, 「与 AB 的一致率」就不再是独立的棋力证据了"
+                    " (参照要换成更深的 AB)。\n");
+    }
+
+    /* ---- 5. 保存 ---- */
     if (!g_savePrefix.empty()) {
         const bool ok = ppo.saveModel(g_savePrefix);
-        std::printf("\n[3] 权重已保存: %s_actor / %s_critic -> %s\n"
-                    "    (actor 未被蒸馏改动; 用 bench_policy_agreement --load 量"
-                    "\"只换价值头\"对选点的影响)\n",
+        std::printf("\n[5] 权重已保存: %s_actor / %s_critic -> %s\n"
+                    "    (用 bench_policy_agreement --load 量效果)\n",
                     g_savePrefix.c_str(), g_savePrefix.c_str(), ok ? "成功" : "**失败**");
         if (!ok) { return 1; }
     }
