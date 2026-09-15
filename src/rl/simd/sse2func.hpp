@@ -1233,17 +1233,21 @@ struct SSE2 {
                                 const float* __restrict y, std::size_t yRow, std::size_t yCol)
         {
             /*
-                z = x * y^T : z(i, j) = sum_k x(i, k) * y(j, k), k in [0, xCol)
+                z = x * y^T : z(i, j) += sum_k x(i, k) * y(j, k), k in [0, xCol)
 
                 x2(k, j) is not contiguous in j, so a vector over j cannot be
                 formed from y.  Both operands are however row contiguous in k,
                 therefore every element is a vectorized dot product of two rows.
+
+                ACCUMULATES (+=), like ikkj/kikj and like the scalar fallback in
+                Tensor::MM (it used to assign — see the AVX2 kernel's comment
+                and test_grad part C).
             */
             (void)xRow;
             (void)yRow;
             for (std::size_t i = 0; i < zRow; i++) {
                 for (std::size_t j = 0; j < zCol; j++) {
-                    z[i*zCol + j] = dot(x + i*xCol, y + j*yCol, xCol);
+                    z[i*zCol + j] += dot(x + i*xCol, y + j*yCol, xCol);
                 }
             }
             return;
@@ -1253,10 +1257,10 @@ struct SSE2 {
                                 const float* __restrict y, std::size_t yRow, std::size_t yCol)
         {
             /*
-                z = x^T * y^T : z(i, j) = sum_k x(k, i) * y(j, k), k in [0, xRow)
+                z = x^T * y^T : z(i, j) += sum_k x(k, i) * y(j, k), k in [0, xRow)
 
                 y row j is contiguous, x is not: column i is gathered once and
-                reused by every j.
+                reused by every j.  ACCUMULATES (+=) — see ikjk above.
             */
             (void)yRow;
             std::vector<float> col(xRow, 0.0f);
@@ -1265,7 +1269,7 @@ struct SSE2 {
                     col[k] = x[k*xCol + i];
                 }
                 for (std::size_t j = 0; j < zCol; j++) {
-                    z[i*zCol + j] = dot(col.data(), y + j*yCol, xRow);
+                    z[i*zCol + j] += dot(col.data(), y + j*yCol, xRow);
                 }
             }
             return;

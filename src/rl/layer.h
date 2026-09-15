@@ -50,6 +50,9 @@ public:
         return (long long)w.size() + (long long)b.size();
     }
 
+    /* R1: 全连接层的输出是逐行独立的, 所以"只算 idx 那几行"永远可行 */
+    bool supportsSparseLogits() const override { return true; }
+
     iFcLayer(){}
     iFcLayer(std::size_t inputDim_, std::size_t outputDim_, bool bias_, bool withGrad)
         :inputDim(inputDim_), outputDim(outputDim_), bias(bias_)
@@ -97,6 +100,72 @@ public:
             o += b;
         }
         return o;
+    }
+
+    /*
+        R1: 稀疏输出前向 —— 只对 idx 里的输出下标做 Σ_k w[a][k]·x[k] + b[a]。
+
+        这是 R1 的**全部收益来源**: 策略头 w 是 (8100, 64) 的 2.07 MB, 而全量 forward
+        每个模拟都要把它整块读一遍 (访存带宽是 P7 实测的瓶颈); 这里只读 idx 那几行
+        (中局 ~40 个合法着法 = 10 KB), 其余 8060 行**一个字节都不碰**。
+
+        **不加激活函数**: 激活要按"整向量口径"来定, 由调用方负责 (见 iLayer 的说明)。
+
+        关于数值: 全量路径走的是 SIMD 内核 `gemv_ikkj` (k 升序累加), 这里是标量
+        k 升序累加, 只有加法结合顺序的舍入差别 (同样的乘积加到同一个元素上)。
+        等价的逐元素断言见 test_ppomcts 的 R1 一节 (容差 1e-6)。
+
+        返回 false = 这次调用走不了稀疏路径, 调用方**必须**回退全量 forward。
+        目前的判据是"x 是单样本列向量 + idx 全部落在输出范围内" ——
+        推理路径 (搜索展开/叶子估值) 全是这个形态。
+    */
+    virtual bool sparseLogits(const Tensor &x, const std::vector<int> &idx,
+                              std::vector<float> &out) const override
+    {
+        if (x.shape.size() != 2 || x.shape[1] != 1) {
+            return false;                       /* 只支持单样本列向量 */
+        }
+        if ((std::size_t)x.shape[0] != inputDim || x.sizes[0] != 1) {
+            return false;                       /* 输入维数对不上 / 非连续视图 */
+        }
+        if (w.shape.size() != 2 || (std::size_t)w.shape[1] != inputDim ||
+            (std::size_t)w.shape[0] != outputDim) {
+            return false;
+        }
+        for (std::size_t t = 0; t < idx.size(); t++) {
+            if (idx[t] < 0 || (std::size_t)idx[t] >= outputDim) {
+                return false;                   /* 越界下标: 交给全量路径去定义行为 */
+            }
+        }
+
+        out.resize(idx.size());
+        if (idx.empty()) {
+            return true;
+        }
+
+        const float *xd = x.val.data();
+        const float *wd = w.val.data();
+        const float *bd = b.val.data();
+        const std::size_t wRowStride = (std::size_t)w.sizes[0];
+        const std::size_t wColStride = (std::size_t)w.sizes[1];
+        const std::size_t kdim = inputDim;
+        const bool denseRow = (wColStride == 1) && (x.sizes[0] == 1);
+        for (std::size_t t = 0; t < idx.size(); t++) {
+            const std::size_t a = (std::size_t)idx[t];
+            const float *wrow = wd + a * wRowStride;
+            float s = (bias && a < b.val.size()) ? bd[a] : 0.0f;
+            if (denseRow) {
+                for (std::size_t k = 0; k < kdim; k++) {
+                    s += wrow[k] * xd[k];
+                }
+            } else {
+                for (std::size_t k = 0; k < kdim; k++) {
+                    s += wrow[k * wColStride] * xd[k * (std::size_t)x.sizes[0]];
+                }
+            }
+            out[t] = s;
+        }
+        return true;
     }
 
     virtual void backward(const Tensor& x, Tensor &ei) override
@@ -277,6 +346,16 @@ public:
         }
         return softmax(o);
     }
+
+    /*
+        R1: 策略头就是这一层。softmax 是"整向量"激活, 但它的输出在**子集上重新
+        归一化**之后与"全量 softmax 后取子集"逐元素相等:
+            exp(z_a - m) / Σ_all exp(z_j - m)  再除以 Σ_legal p
+              = exp(z_a) / Σ_legal exp(z_j)     (公共因子 exp(-m) 约掉)
+        所以 sparseLogits + 子集 softmax 的推理语义与全量前向完全一致 (这条是
+        "R1 不需要重训、不动权重格式"的全部依据; 逐元素断言见 test_ppomcts)。
+    */
+    bool subsetSoftmax() const override { return true; }
 
     void backward(const Tensor& x, Tensor &ei) override
     {

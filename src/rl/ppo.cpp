@@ -95,6 +95,91 @@ RL::Tensor &RL::PPO::action(const Tensor &state)
     return actorP.forward(state);
 }
 
+/* ------------------------------------------------------------------
+ *  actionMasked (R1): 只算 idx 里那些动作的策略概率
+ *
+ *  等价性: 全量 softmax 的输出在子集上重新归一化之后 == 在子集上直接 softmax
+ *  (公共因子 exp(-m) 被归一化约掉)。所以这条路径**只改速度不改语义** ——
+ *  这是"R1 不需要重训"的全部依据。
+ *
+ *  回退: 头不支持稀疏 (非 softmax 头 / 非全连接) 或 sparseLogits 拒绝了这次的形状
+ *  时, 老老实实跑一次全量前向再取子集 —— 数值一致, 只是慢。
+ * ------------------------------------------------------------------ */
+bool RL::PPO::actionMasked(const Tensor &state,
+                           const std::vector<int> &idx,
+                           std::vector<float> &probs)
+{
+    probs.clear();
+    if (idx.empty()) {
+        return false;
+    }
+
+    /* ---- 回退路径: 全量前向 + 子集归一 ---- */
+    auto denseFallback = [&]() {
+        Tensor &full = actorP.forward(state);
+        probs.assign(idx.size(), 0.0f);
+        double sum = 0.0;
+        for (std::size_t i = 0; i < idx.size(); i++) {
+            const int a = idx[i];
+            const float p = (a >= 0 && a < actionDim) ? full[(std::size_t)a] : 0.0f;
+            probs[i] = p;
+            sum += (double)p;
+        }
+        if (sum > 1e-12) {
+            const float inv = (float)(1.0 / sum);
+            for (std::size_t i = 0; i < probs.size(); i++) {
+                probs[i] *= inv;
+            }
+        } else {
+            /* 全都被压到 0 的退化情形: 给合法集上的均匀分布, 而不是全 0 */
+            const float u = 1.0f / (float)probs.size();
+            for (std::size_t i = 0; i < probs.size(); i++) {
+                probs[i] = u;
+            }
+        }
+        return true;
+    };
+
+    if (!actorP.sparseOutputSupported()) {
+        return denseFallback();
+    }
+
+    /* ---- 稀疏路径: 骨干只跑到倒数第二层, 头只算 idx 那几行 ---- */
+    Tensor &h = actorP.forwardTrunk(state);
+    std::vector<float> logits;
+    if (!actorP.sparseLogits(h, idx, logits) || logits.size() != idx.size()) {
+        return denseFallback();
+    }
+
+    /* 在 idx 上做数值稳定的 softmax (减最大值, 与 Softmax::f 同一口径) */
+    float m = logits[0];
+    for (std::size_t i = 1; i < logits.size(); i++) {
+        if (logits[i] > m) {
+            m = logits[i];
+        }
+    }
+    double sum = 0.0;
+    probs.resize(logits.size());
+    for (std::size_t i = 0; i < logits.size(); i++) {
+        const float e = std::exp(logits[i] - m);
+        probs[i] = e;
+        sum += (double)e;
+    }
+    if (!(sum > 1e-12) || !std::isfinite(sum)) {
+        /* 极端情形 (logits 全 NaN/inf): 退化成合法集上的均匀分布 */
+        const float u = 1.0f / (float)probs.size();
+        for (std::size_t i = 0; i < probs.size(); i++) {
+            probs[i] = u;
+        }
+        return true;
+    }
+    const float inv = (float)(1.0 / sum);
+    for (std::size_t i = 0; i < probs.size(); i++) {
+        probs[i] *= inv;
+    }
+    return true;
+}
+
 float RL::PPO::value(const Tensor &state)
 {
     RL::Tensor &v = critic.forward(state);
@@ -220,7 +305,8 @@ void RL::PPO::trainStep(const Tensor &state,
 void RL::PPO::addReplay(const Tensor &state,
                         const std::vector<int> &actionIdx,
                         const std::vector<float> &actionProb,
-                        float valueTarget)
+                        float valueTarget,
+                        const std::vector<int> &legalIdx)
 {
     if (actionIdx.empty()) {
         return;
@@ -229,12 +315,158 @@ void RL::PPO::addReplay(const Tensor &state,
     s.state = state;              /* Tensor 赋值 = 深拷贝 (调用方的 state 每步会被重写) */
     s.actionIdx = actionIdx;
     s.actionProb = actionProb;
+    s.legalIdx = legalIdx;
     s.valueTarget = valueTarget;
     replay.push_back(std::move(s));
     /* FIFO: 满了丢最老的一条 (deque 的 pop_front 是 O(1)) */
     while (replay.size() > replayCapacity) {
         replay.pop_front();
     }
+}
+
+/* ------------------------------------------------------------------
+ *  accumulateGradSparse (R2): 训练侧只算合法列
+ *
+ *  与 accumulateGrad 的差别只有 Actor 那一路 (critic 一字未改):
+ *    前向: forwardTrunk -> 头只算 legalIdx 那几行的 logit -> **在合法集上** softmax
+ *    损失: CE = -Σ_{合法} t_a·ln p_a
+ *    梯度: softmax + CE 的解析梯度就是 `dL/dlogit_a = p_a - t_a`
+ *    反向: 头的权重梯度只落在合法行; 往下传的梯度也只由合法行构成 (ei = W_legalᵀ·d),
+ *          之后交给 Net::backwardFrom 走骨干 (头那一层不再走通用 backward)
+ *
+ *  这样每条样本省掉的是: 8100 行前向 + 8100 行反向 + 一次 8100 维 softmax/Jacobian,
+ *  换成 ~40 行。语义上换掉了归一化口径 (Z ≡ 1)。
+ * ------------------------------------------------------------------ */
+void RL::PPO::accumulateGradSparse(const Tensor &state,
+                                   const std::vector<int> &legalIdx,
+                                   const std::vector<int> &targetIdx,
+                                   const std::vector<float> &targetProb,
+                                   float valueTarget)
+{
+    const std::size_t headIndex = actorP.size() - 1;
+    RL::iFcLayer *head = (actorP.size() >= 2)
+                             ? dynamic_cast<RL::iFcLayer *>(actorP[headIndex])
+                             : nullptr;
+
+    /* ---- 回退: 缺任何前提就回到全量口径 (慢, 但语义是旧的, 不会算错) ---- */
+    if (head == nullptr || legalIdx.empty() || !actorP.sparseOutputSupported() ||
+        head->g.w.size() < head->w.size()) {
+        Tensor dense((std::size_t)actionDim, 1);
+        dense.zero();
+        for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
+            const int a = targetIdx[k];
+            if (a >= 0 && a < actionDim) {
+                dense[(std::size_t)a] = targetProb[k];
+            }
+        }
+        accumulateGrad(state, dense, valueTarget);
+        return;
+    }
+
+    /* ---- 1) 前向: 骨干到 h, 头只算合法列 ---- */
+    Tensor &h = actorP.forwardTrunk(state);
+    std::vector<float> logits;
+    if (!actorP.sparseLogits(h, legalIdx, logits) || logits.size() != legalIdx.size()) {
+        Tensor dense((std::size_t)actionDim, 1);
+        dense.zero();
+        for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
+            const int a = targetIdx[k];
+            if (a >= 0 && a < actionDim) {
+                dense[(std::size_t)a] = targetProb[k];
+            }
+        }
+        accumulateGrad(state, dense, valueTarget);
+        return;
+    }
+
+    const std::size_t n = logits.size();
+    /* 合法集上的数值稳定 softmax (与 R1 的推理路径同一口径) */
+    float m = logits[0];
+    for (std::size_t i = 1; i < n; i++) {
+        if (logits[i] > m) { m = logits[i]; }
+    }
+    std::vector<float> probs(n, 0.0f);
+    double sum = 0.0;
+    for (std::size_t i = 0; i < n; i++) {
+        const float e = std::exp(logits[i] - m);
+        probs[i] = e;
+        sum += (double)e;
+    }
+    const bool degenerate = !(sum > 1e-12) || !std::isfinite(sum);
+    if (!degenerate) {
+        const float inv = (float)(1.0 / sum);
+        for (std::size_t i = 0; i < n; i++) { probs[i] *= inv; }
+    }
+
+    /* ---- 2) 目标对齐到合法集的顺序 (线性查找: n ~ 40, 可忽略) ---- */
+    std::vector<float> tgt(n, 0.0f);
+    for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
+        const int a = targetIdx[k];
+        for (std::size_t i = 0; i < n; i++) {
+            if (legalIdx[i] == a) { tgt[i] += targetProb[k]; break; }
+        }
+    }
+
+    /* ---- 3) CE 与解析梯度 ---- */
+    double ce = 0.0;
+    for (std::size_t i = 0; i < n; i++) {
+        if (tgt[i] > 0.0f) {
+            ce -= (double)tgt[i] * std::log((double)probs[i] + 1e-8);
+        }
+    }
+    std::vector<float> dlogit(n, 0.0f);
+    if (!degenerate) {
+        for (std::size_t i = 0; i < n; i++) {
+            dlogit[i] = probs[i] - tgt[i];
+        }
+    }
+
+    /* ---- 4) 头的权重/偏置梯度 (只落合法行) + 往下传的梯度 ei ---- */
+    const std::size_t in = head->inputDim;
+    const std::size_t wRow = (std::size_t)head->w.sizes[0];     /* == in (行主序) */
+    const float *hd = h.val.data();
+    const float *wd = head->w.val.data();
+    float *gwd = head->g.w.val.data();
+    float *gbd = head->g.b.val.data();
+    std::vector<float> ei(in, 0.0f);
+    for (std::size_t i = 0; i < n; i++) {
+        const float d = dlogit[i];
+        if (d == 0.0f) {
+            continue;       /* 梯度恰好为 0: 这一行不用动 (常见于 p == t 的槽位) */
+        }
+        const std::size_t a = (std::size_t)legalIdx[i];
+        const float *wrow = wd + a * wRow;
+        float *grow = gwd + a * wRow;
+        for (std::size_t k = 0; k < in; k++) {
+            grow[k] += d * hd[k];
+            ei[k] += wrow[k] * d;
+        }
+        if (head->bias && a < head->g.b.size()) {
+            gbd[a] += d;
+        }
+    }
+
+    /* ---- 5) 骨干反向: 从头的前一层开始 (头那一层的 backward 已经手工做完) ---- */
+    if (headIndex >= 1) {
+        Tensor &eiTensor = actorP[headIndex - 1]->e;
+        eiTensor = Tensor(in, 1);
+        for (std::size_t k = 0; k < in; k++) {
+            eiTensor[k] = ei[k];
+        }
+        actorP.backwardFrom(headIndex - 1, state);
+    }
+
+    /* ---- Critic: 与全量路径完全一致 ---- */
+    Tensor &v = critic.forward(state);
+    const double err = (double)v[0] - (double)valueTarget;
+    Tensor valueTargetTensor(1, 1);
+    valueTargetTensor[0] = valueTarget;
+    Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);
+    critic.backward(state, mseLoss);
+
+    batchLossSum += err * err;
+    batchActorLossSum += ce;
+    batchLossCount++;
 }
 
 bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)
@@ -253,6 +485,15 @@ bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)
         for (std::size_t b = 0; b < batchSize; b++) {
             const ReplaySample &s = replay[pick(Random::engine)];
             state = s.state;
+            /*
+               R2: 样本带完整合法集时走稀疏口径 (不建 8100 维稠密目标, 也不做全量
+               softmax)。maskedTrainHead=false 就是"旧学习问题"的对照组。
+            */
+            if (maskedTrainHead && !s.legalIdx.empty()) {
+                accumulateGradSparse(state, s.legalIdx, s.actionIdx, s.actionProb,
+                                     s.valueTarget);
+                continue;
+            }
             /* 稀疏目标 -> 稠密: 只填非零项, 其余清零 */
             target.zero();
             for (std::size_t k = 0; k < s.actionIdx.size(); k++) {

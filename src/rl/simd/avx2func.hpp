@@ -1710,17 +1710,24 @@ struct AVX2 {
                          const float* __restrict y, std::size_t yRow, std::size_t yCol)
         {
             /*
-                z = x * y^T : z(i, j) = sum_k x(i, k) * y(j, k), k in [0, xCol)
+                z = x * y^T : z(i, j) += sum_k x(i, k) * y(j, k), k in [0, xCol)
 
                 y is not contiguous in j, so no vector over j can be loaded from
                 it.  Both operands are contiguous in k though, so every element
                 is a vectorized dot product of two rows.
+
+                ACCUMULATES (+=), exactly like ikkj/kikj and like the scalar
+                fallback in Tensor::MM.  It used to assign, which silently threw
+                away everything already in z; unreachable while every call site
+                had xCol == 1 (the SIMD dispatch needs every dimension >= one
+                vector), but a correctness bug the moment anyone feeds a
+                multi-column batch.  See test_grad part C.
             */
             (void)xRow;
             (void)yRow;
             for (std::size_t i = 0; i < zRow; i++) {
                 for (std::size_t j = 0; j < zCol; j++) {
-                    z[i*zCol + j] = dot(x + i*xCol, y + j*yCol, xCol);
+                    z[i*zCol + j] += dot(x + i*xCol, y + j*yCol, xCol);
                 }
             }
             return;
@@ -1730,10 +1737,10 @@ struct AVX2 {
                          const float* __restrict y, std::size_t yRow, std::size_t yCol)
         {
             /*
-                z = x^T * y^T : z(i, j) = sum_k x(k, i) * y(j, k), k in [0, xRow)
+                z = x^T * y^T : z(i, j) += sum_k x(k, i) * y(j, k), k in [0, xRow)
 
                 y row j is contiguous, x is not: column i is gathered once and
-                reused by every j.
+                reused by every j.  ACCUMULATES (+=) — see ikjk above.
             */
             (void)yRow;
             std::vector<float> col(xRow, 0.0f);
@@ -1742,7 +1749,7 @@ struct AVX2 {
                     col[k] = x[k*xCol + i];
                 }
                 for (std::size_t j = 0; j < zCol; j++) {
-                    z[i*zCol + j] = dot(col.data(), y + j*yCol, xRow);
+                    z[i*zCol + j] += dot(col.data(), y + j*yCol, xRow);
                 }
             }
             return;

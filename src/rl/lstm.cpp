@@ -140,12 +140,23 @@ void RL::LSTM::backwardAtTime(int t,
     for (std::size_t i = 0; i < outputError.size(); i++) {
         outputError[i] = E[i] * Tanh::df(states[t].y[i]);
     }
-    Tensor::MM::kijk(delta.h, w, outputError);
+    /*
+       δh(此处) += Wᵀ·δy 与 += Uᵀ·δ{i,f,g,o} —— 形状是"矩阵ᵀ × 列向量", 也就是 **kikj**。
 
-    Tensor::MM::kijk(delta.h, ui, delta_.i);
-    Tensor::MM::kijk(delta.h, uf, delta_.f);
-    Tensor::MM::kijk(delta.h, ug, delta_.g);
-    Tensor::MM::kijk(delta.h, uo, delta_.o);
+       这里原来写的是 `kijk` (z += x1ᵀ·x2ᵀ, 收缩维是 x1.shape[0], 第二操作数按 (j,k)
+       取址)。它对**列向量**输入恰好退化成同一个式子 (x2 只有一列时 x2(j,k) 与 x2(k,j)
+       都落到 x2[k]), 所以结果一直是对的 —— 但那其实是**越约**用法: kijk 自己的形状
+       契约 (x1.shape[0] == x2.shape[1]) 在这里不成立 (tensor.hpp 的 Debug 断言会直接
+       拒绝这次调用), 而且一旦把输入改成多列 (批量化), kijk 那条会把 x2 当成扁平数组、
+       索引越界。改成 kikj 后: 列向量下结果逐位相同 (同一个下标代数), 多列下也是对的;
+       顺带走上新加的反向 GEMV 分支 (见 tensor.hpp), 实测这一处比原来快一个量级。
+    */
+    Tensor::MM::kikj(delta.h, w, outputError);
+
+    Tensor::MM::kikj(delta.h, ui, delta_.i);
+    Tensor::MM::kikj(delta.h, uf, delta_.f);
+    Tensor::MM::kikj(delta.h, ug, delta_.g);
+    Tensor::MM::kikj(delta.h, uo, delta_.o);
 
     /*
         δht = E + δht+1

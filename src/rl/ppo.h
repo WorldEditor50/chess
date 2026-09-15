@@ -65,6 +65,27 @@ public:
     /* Forward - returns policy (Softmax) probabilities */
     Tensor &action(const Tensor &state);
 
+    /*
+        ================================================================
+         R1 (2026-09): 只算合法列的策略前向
+        ================================================================
+        `action(state)` 每次都要把策略头 (64x8100) 整块 2.07 MB 读一遍, 而搜索里
+        每个模拟只需要**那几十个合法着法**的概率 —— 而搜索是访存带宽受限的 (P7:
+        聚合吞吐在 ~15 GB/s 到顶)。这里改成:
+            forwardTrunk (跑到 Tanh(h) 为止) + 只算 idx 那几行的 logits + 在 idx 上 softmax
+
+        语义:**与"action(state) 之后只在 idx 上取子集再归一化"逐元素相等**
+        (推导见 rl/layer.h 的 Layer<Softmax>)。所以不需要重训、不动权重格式,
+        下游的选点口径也不变。逐元素断言 (容差 1e-6) 在 test_ppomcts 的 R1 一节。
+
+        probs 与 idx 一一对应 (probs[i] = P(idx[i])), 和 ≈ 1。
+        返回 false 只表示"idx 为空" (没有任何可算的动作); 头不支持稀疏输出时
+        内部自动回退全量前向 (只影响速度, 不影响数值)。
+    */
+    bool actionMasked(const Tensor &state,
+                      const std::vector<int> &idx,
+                      std::vector<float> &probs);
+
     /* Forward - returns scalar value V(s) */
     float value(const Tensor &state);
 
@@ -132,6 +153,15 @@ public:
         Tensor state;
         std::vector<int>   actionIdx;   /* 访问分布的非零动作下标 */
         std::vector<float> actionProb;  /* 与 actionIdx 等长, 和 ≈ 1 */
+        /*
+           R2: 该局面的**完整合法着法**下标。
+
+           注意它与 actionIdx 是两件事: actionIdx 只是"访问分布落在哪几个动作上"
+           (搜索展开过的那些), 而训练侧的 softmax 分母要覆盖的是**全部合法着法** ——
+           用 actionIdx 当分母等于把没被搜索访问到的合法着法从策略里抹掉, 那是另一种
+           (更糟的) 学习问题。空 = 不知道 -> 退回全量 8100 维口径 (旧行为)。
+        */
+        std::vector<int>   legalIdx;
         float valueTarget;
     };
 
@@ -145,13 +175,47 @@ public:
     void resetMoeBatchStats();
     /* 只累积梯度 (前向 + 反向), 不碰优化器 */
     void accumulateGrad(const Tensor &state, const Tensor &actionTarget, float valueTarget);
+
+    /*
+        ================================================================
+         R2 (2026-09): 训练侧也只算合法列
+        ================================================================
+        `accumulateGrad` 那条路每条样本都要: 把 8100 维策略头整个算一遍 (前向 + 反向),
+        再对**全部** 8100 个槽位做 softmax, 交叉熵的分母因此把概率质量也分给了非法槽位
+        (于是合法集上的质量 Z < 1, R1 测到的 Z 均值 0.51–0.59 就是这件事).
+
+        这里换成: 骨干跑到 h -> 头只算 legalIdx 那几行 -> **只在合法集上 softmax** ->
+        CE 对合法 logits 的解析梯度正好是 `p - t` -> 只更新合法行的权重、只从合法行
+        反传梯度 (再往下走 `Net::backwardFrom`)。
+
+        这是**换学习问题**, 不是等价优化 (见 docs/issues_review.md 的 R2 一节):
+        合法集上的概率和为 1 (Z ≡ 1), 非法槽位不再被训练也不再参与归一化。
+
+        legalIdx 必须与该局面的全部合法着法一致; target (targetIdx/targetProb) 是它
+        的子集 (访问分布)。目标没覆盖到的合法着法目标值为 0 = "不该走", 这正是我们
+        想要的信号。legalIdx 为空、头不支持稀疏、或没有梯度缓冲时**自动回退**到
+        `accumulateGrad` 的全量口径。
+    */
+    void accumulateGradSparse(const Tensor &state,
+                              const std::vector<int> &legalIdx,
+                              const std::vector<int> &targetIdx,
+                              const std::vector<float> &targetProb,
+                              float valueTarget);
+
+    /*
+       R2 总开关 (默认开)。关掉就退回"全量 8100 维 softmax + 全量目标"的旧学习问题 ——
+        留给 A/B 用, 也是"两种口径下同一批数据怎么学"的对照。
+    */
+    bool maskedTrainHead = true;
     /* 把累积的梯度一次性应用 (注入 MoE 辅助损失 -> RMSProp), 然后清零 */
     void applyGradients(float lr);
 
     void addReplay(const Tensor &state,
                    const std::vector<int> &actionIdx,
                    const std::vector<float> &actionProb,
-                   float valueTarget);
+                   float valueTarget,
+                   /* R2: 该局面的完整合法着法 (可省; 省了就是旧的全量口径) */
+                   const std::vector<int> &legalIdx = std::vector<int>());
     /*
        从回放池随机采样 batchSize 条、过 epochs 遍, 累积梯度后做**一次**优化器更新。
        返回 false 表示池子不够大或 epochs<=0 (什么都没做)。

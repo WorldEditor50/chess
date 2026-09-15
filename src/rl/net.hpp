@@ -71,11 +71,101 @@ public:
         return layers.back()->o;
     }
 
+    /* 层 i 的输出喂给层 i+1 时需不需要先压平 (conv/pool -> FC 才需要) */
+    bool needsFlatten(std::size_t preIndex) const
+    {
+        if (preIndex + 1 >= layers.size()) {
+            return false;
+        }
+        const int pre = layers[preIndex]->type;
+        return (pre == iLayer::LAYER_CONV2D ||
+                pre == iLayer::LAYER_MAXPOOLING ||
+                pre == iLayer::LAYER_AVGPOOLING) &&
+               layers[preIndex + 1]->type == iLayer::LAYER_FC;
+    }
+
+    /*
+        ============================================================
+         R1 (2026-09): 部分前向 + 稀疏输出头
+        ============================================================
+        forwardTrunk 跑到**倒数第二层为止**并返回它的输出 —— 也就是"输出头将要吃到的
+        那个张量" (actor 里就是 Tanh(h) 那 64 维)。配合 sparseLogits 就得到
+        "只算合法列"的推理路径 (语义等价的推导见 iLayer::sparseLogits)。
+
+        注意: 它**不写**最后一层的输出, 所以调用之后 output()/layers.back()->o 里
+        是上一次全量前向的残留值 —— 不要读它。
+    */
+    Tensor &forwardTrunk(const Tensor &x, bool inference=false)
+    {
+        layers[0]->forward(x, inference);
+        for (std::size_t i = 1; i + 1 < layers.size(); i++) {
+            Tensor &out = layers[i - 1]->o;
+            if (needsFlatten(i - 1)) {
+                layers[i]->forward(out.flatten(), inference);
+            } else {
+                layers[i]->forward(out, inference);
+            }
+        }
+        return (layers.size() >= 2) ? layers[layers.size() - 2]->o
+                                    : layers.back()->o;
+    }
+
+    /*
+        R1: 只算最后一层在 idx 上的 logits (激活前)。
+
+        `h` 必须是 forwardTrunk() 的返回值 (倒数第二层的输出); conv/pool -> FC 的
+        压平规则与 forward() 里一致, 所以两种写法喂给输出头的张量相同。
+        返回 false 表示"这个网络/这次调用走不了稀疏路径"。
+    */
+    bool sparseLogits(const Tensor &h, const std::vector<int> &idx,
+                      std::vector<float> &out) const
+    {
+        if (layers.empty()) {
+            return false;
+        }
+        if (layers.size() >= 2 && needsFlatten(layers.size() - 2)) {
+            Tensor flat = h.flatten();
+            return layers.back()->sparseLogits(flat, idx, out);
+        }
+        return layers.back()->sparseLogits(h, idx, out);
+    }
+
+    /*
+        输出头能不能走"稀疏列 + 子集重新归一"这条捷径。
+        两个条件缺一不可: 头支持 sparseLogits, 且它的激活是整向量 softmax 型
+        (只有 softmax 才有"子集归一 = 全量后归一"这条性质)。
+    */
+    bool sparseOutputSupported() const
+    {
+        if (layers.empty()) {
+            return false;
+        }
+        return layers.back()->supportsSparseLogits() &&
+               layers.back()->subsetSoftmax();
+    }
+
     void backward(const Tensor &x, const Tensor &loss)
     {
-        std::size_t outputIndex = layers.size() - 1;
-        layers[outputIndex]->e = loss;
-        for (int i = layers.size() - 1; i > 0; i--) {
+        layers[layers.size() - 1]->e = loss;
+        backwardFrom(layers.size() - 1, x);
+        return;
+    }
+
+    /*
+       ============================================================
+        从第 startIndex 层往回传到第 0 层 (R2, 2026-09)
+       ============================================================
+       `startIndex` 那一层的 `e` 必须由调用方先设好 —— 用途是"输出头自己用稀疏路径算完
+       了梯度"的情形: R2 里训练前向只在**合法列**上做 softmax, 头的权重梯度与往下传的
+       梯度都是稀疏算出来的 (见 PPO::accumulateGradSparse), 于是反向从**倒数第二层**
+       开始, 头那一层不再走通用的 backward。
+
+       语义与 backward() 完全一致 (backward 现在就是它的薄封装), 所以非稀疏路径一行
+       都没变。
+    */
+    void backwardFrom(std::size_t startIndex, const Tensor &x)
+    {
+        for (int i = (int)startIndex; i > 0; i--) {
             iLayer::sptr layer = layers[i];
             iLayer::sptr preLayer = layers[i - 1];
             if ((preLayer->type == iLayer::LAYER_CONV2D ||

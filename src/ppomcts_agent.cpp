@@ -289,25 +289,69 @@ void PPOMCTSAgent::applyPotentialShaping(std::vector<RL::Step> &trajectory) cons
 }
 
 /* ------------------------------------------------------------------
- *  pickUntriedByPrior: 按先验挑未展开着法 (Phase 4.1, 见头文件)
+ *  pickUntriedByPrior: 按先验挑未展开着法 (Phase 4.1 + R1)
  *
- *  线性扫一遍未展开列表 (中局约 40 项, 代价可忽略), 取 pi(s_parent)[a] 最大的那个。
- *  返回下标而不是动作, 因为调用方还要从 untriedSteps 里取同步的那一项。
+ *  先验现在是**稀疏策略前向**的结果 (ppo.actionMasked): 只算这个节点完整合法着法
+ *  集合那几十列, 而不是把策略头 (64x8100 = 2.07 MB) 整块读一遍。R1 的收益全部
+ *  来自这里 —— 而且语义等价 (子集重新归一 == 全量 softmax 后取子集), 合法动作之间
+ *  的相对大小完全不变, 所以**展开顺序与全量写法逐次相同**。
+ *
+ *  合法集为什么是"untried + 已展开孩子的 parentAction":
+ *    节点的合法着法集在它被创建时就是完整的 (untried = 全量合法集), 之后每展开一个
+ *    就把它从 untried 移走、变成一个孩子。所以两者的并集恒等于该节点的完整合法集。
+ *    **必须用完整合法集, 不能用"当前还剩的 untried"**: 稀疏概率是在这个集合上归一化
+ *    的, 如果每次只用剩下的未展开项, 那么最后一个孩子的先验会变成 1.0 (集合只剩它
+ *    一个), 兄弟之间的先验尺度会随展开顺序漂移 —— 那是 PUCT 的分数被污染。
+ *
+ *  线性扫一遍未展开列表 (中局约 40 项, 代价可忽略), 取概率最大的那个。
  * ------------------------------------------------------------------ */
-int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentPolicy) const
+int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
+                                     std::vector<int> &legalIdx,
+                                     std::vector<float> &probs,
+                                     float &priorOut)
 {
     const AZNode &node = nodes[nodeID];
+
+    legalIdx.clear();
+    legalIdx.reserve(node.untriedActionIndices.size() + node.childIDs.size());
+    for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
+        legalIdx.push_back(node.untriedActionIndices[i]);
+    }
+    for (std::size_t i = 0; i < node.childIDs.size(); i++) {
+        legalIdx.push_back(nodes[(std::size_t)node.childIDs[i]].parentAction);
+    }
+
+    if (sparsePolicyHead) {
+        ppo.actionMasked(parentState, legalIdx, probs);
+    } else {
+        /*
+           R1 之前的对照口径 (A/B 用, 见头文件 sparsePolicyHead): 全量策略前向, 先验
+           直接取 p_full(a) —— 合法集上的质量 Z 没有被除掉。这是**逐字复现**改动前的
+           搜索行为, 所以 "sparsePolicyHead=true/false" 的配对差就是 R1 的全部影响。
+        */
+        RL::Tensor &full = ppo.action(parentState);
+        probs.resize(legalIdx.size());
+        for (std::size_t i = 0; i < legalIdx.size(); i++) {
+            const int a = legalIdx[i];
+            probs[i] = (a >= 0 && a < ppo.actionDim) ? full[(std::size_t)a] : 0.0f;
+        }
+    }
+
+    /*
+        probs 与 legalIdx 一一对应, 而 legalIdx 的**前 untried.size() 项**就是
+        untriedActionIndices 本身 (上面按这个顺序填的) —— 于是"挑最大"和"查选中动作
+        的概率"都是直接下标访问, 不需要再查表。
+    */
     int best = 0;
     float bestP = -1.0f;
     for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
-        const int a = node.untriedActionIndices[i];
-        const float p = (a >= 0 && (std::size_t)a < parentPolicy.size())
-                            ? parentPolicy[(std::size_t)a] : 0.0f;
+        const float p = (i < probs.size()) ? probs[i] : 0.0f;
         if (p > bestP) {
             bestP = p;
             best = (int)i;
         }
     }
+    priorOut = (bestP > 0.0f) ? bestP : 0.0f;
     return best;
 }
 
@@ -407,8 +451,38 @@ bool PPOMCTSAgent::visitDistribution(int rootID, RL::Tensor &pi) const
  *  见下面 shaped[] 那一段与 stone.h 的推导。没有它, 截断 rollout 的价值目标全是
  *  0.005~0.01 量级 (诊断 [4] 实测 |target|>0.1 的样本占 0%), critic 只能学成常数。
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+ *  legalIndicesOf (R2): 节点的**完整合法着法集**
+ *
+ *  与 pickUntriedByPrior 里那套构造同源: 节点创建时 untried = 全量合法集, 之后每展开
+ *  一个就从 untried 移走、变成一个孩子 —— 所以"未展开 ∪ 已展开孩子的 parentAction"
+ *  恒等于该节点的完整合法集。
+ * ------------------------------------------------------------------ */
+void PPOMCTSAgent::legalIndicesOf(int nodeID, std::vector<int> &out) const
+{
+    out.clear();
+    if (nodeID < 0 || (std::size_t)nodeID >= nodes.size()) {
+        return;
+    }
+    const AZNode &node = nodes[(std::size_t)nodeID];
+    out.reserve(node.untriedActionIndices.size() + node.childIDs.size());
+    for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
+        out.push_back(node.untriedActionIndices[i]);
+    }
+    for (std::size_t i = 0; i < node.childIDs.size(); i++) {
+        const int c = node.childIDs[i];
+        if (c >= 0 && (std::size_t)c < nodes.size()) {
+            out.push_back(nodes[(std::size_t)c].parentAction);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
+ *  commitEpisode (P3 + P4 + R2)
+ * ------------------------------------------------------------------ */
 void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
-                                 float finalOutcome)
+                                 float finalOutcome,
+                                 const std::vector<std::vector<int>> *legalPerStep)
 {
     if (trajectory.empty()) {
         return;
@@ -436,7 +510,9 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
 
     std::vector<int> idx;
     std::vector<float> prob;
+    std::vector<int> legal;
     std::vector<int> mirrorIdx;
+    std::vector<int> mirrorLegal;
     RL::Tensor mirrorState;
     for (std::size_t t = 0; t < trajectory.size(); t++) {
         const RL::Tensor &a = trajectory[t].action;
@@ -453,15 +529,28 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
         if (idx.empty()) {
             continue;   /* 没有目标的样本不推进去 (addReplay 也会挡掉) */
         }
-        ppo.addReplay(trajectory[t].state, idx, prob, returns[t]);
+        /*
+           R2: 这一手局面的完整合法集 (调用方按 ply 收集)。没有就给空 -> 旧口径。
+        */
+        if (legalPerStep != nullptr && t < legalPerStep->size() &&
+            !(*legalPerStep)[t].empty()) {
+            legal = (*legalPerStep)[t];
+        } else {
+            legal.clear();
+        }
+        ppo.addReplay(trajectory[t].state, idx, prob, returns[t], legal);
 
         if (mirrorAugment) {
             mirrorIdx.resize(idx.size());
             for (std::size_t i = 0; i < idx.size(); i++) {
                 mirrorIdx[i] = mirrorActionIdx(idx[i]);
             }
+            mirrorLegal.resize(legal.size());
+            for (std::size_t i = 0; i < legal.size(); i++) {
+                mirrorLegal[i] = mirrorActionIdx(legal[i]);
+            }
             mirrorPlanes(trajectory[t].state, mirrorState);
-            ppo.addReplay(mirrorState, mirrorIdx, prob, returns[t]);
+            ppo.addReplay(mirrorState, mirrorIdx, prob, returns[t], mirrorLegal);
         }
     }
 
@@ -469,6 +558,149 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
     if (replayBatchSize > 0 && ppo.replaySize() >= (std::size_t)replayBatchSize) {
         ppo.learnFromReplay((std::size_t)replayBatchSize, replayEpochs, learningRate);
     }
+}
+
+/* ------------------------------------------------------------------
+ *  B-5: 置换表 + 子树复用 (见头文件里那一大段说明)
+ *
+ *  acquireRoot 是三个搜索入口唯一的"取根"入口。它做三件事:
+ *    1. 算当前局面的 Zobrist 键, 查置换表;
+ *    2. 命中且**从上一棵树的根 ≤ 2 步可达** -> 复用那个节点 (连带子树与统计);
+ *       否则新建一个根 (并把键登记进表);
+ *    3. 节点数超过 treeNodeCap 时先把整棵树丢掉 (内存兜底)。
+ * ------------------------------------------------------------------ */
+void PPOMCTSAgent::resetSearchTree()
+{
+    nodes.clear();
+    m_tt.clear();
+    m_rootID = -1;
+    m_reuseHits = 0;
+    m_nodesCreated = 0;
+}
+
+bool PPOMCTSAgent::reachableWithin(int fromID, int targetID, int maxDepth) const
+{
+    if (fromID < 0 || targetID < 0) {
+        return false;
+    }
+    if (fromID == targetID) {
+        return true;
+    }
+    if (maxDepth <= 0 || (std::size_t)fromID >= nodes.size()) {
+        return false;
+    }
+    /* 逐层向下 BFS (只看 childIDs; 两层在 80 次模拟的树上最多几千个节点, 可忽略) */
+    std::vector<int> frontier;
+    frontier.push_back(fromID);
+    for (int d = 0; d < maxDepth; d++) {
+        std::vector<int> next;
+        for (std::size_t k = 0; k < frontier.size(); k++) {
+            const int id = frontier[k];
+            if ((std::size_t)id >= nodes.size()) {
+                continue;
+            }
+            const std::vector<int>& kids = nodes[(std::size_t)id].childIDs;
+            for (std::size_t c = 0; c < kids.size(); c++) {
+                if (kids[c] == targetID) {
+                    return true;
+                }
+                next.push_back(kids[c]);
+            }
+        }
+        if (next.empty()) {
+            return false;
+        }
+        frontier.swap(next);
+    }
+    return false;
+}
+
+int PPOMCTSAgent::acquireRoot(int color)
+{
+    /*
+       treeReuse = false 时**逐字复现改动前**的行为: 每 ply 一棵新树 (原来是 nodes.clear())。
+       注意只清树、不清计数器 —— m_nodesCreated / m_reuseHits 是整局的累计量, 两条路都要能比。
+    */
+    if (!treeReuse) {
+        nodes.clear();
+        m_rootID = -1;
+    }
+
+    /*
+       键必须按"轮到 color 走"算: Chess::computeHash() 把 sideToMove 也算进去, 而调用方
+       棋盘上的 sideToMove 不一定等于 color (测试里就是 reset() 之后直接走 BLACK)。
+       这里临时对齐再还原, 保证同一个局面在任何调用路径下算出的键都一样。
+    */
+    const int savedSide = chess.sideToMove;
+    chess.sideToMove = color;
+    const unsigned long long key = chess.computeHash();
+    chess.sideToMove = savedSide;
+
+    int reused = -1;
+    if (treeReuse) {
+        std::unordered_map<unsigned long long, int>::const_iterator it = m_tt.find(key);
+        if (it != m_tt.end()) {
+            const int idx = it->second;
+            if (idx >= 0 && (std::size_t)idx < nodes.size() &&
+                nodes[(std::size_t)idx].hash == key) {
+                /*
+                   只在"从上一棵树的根往下 ≤ 2 步可达"时接受 —— 上一局的节点 (以及每个
+                   新对局都会遇到的初始局面) 必然不可达, 于是自动退化成新开一棵树,
+                   不会把上一局的访问计数/陈旧先验带进新一局。理由见头文件。
+                */
+                if (m_rootID < 0 || reachableWithin(m_rootID, idx, 2)) {
+                    reused = idx;
+                }
+            }
+        }
+    }
+
+    if (reused < 0 && nodes.size() >= treeNodeCap) {
+        /* 内存兜底: 整棵重来 (置换表与计数器一并清掉) */
+        resetSearchTree();
+    }
+
+    if (reused >= 0) {
+        m_reuseHits++;
+        m_rootID = reused;
+        nodes[(std::size_t)reused].parentID = -1;
+        nodes[(std::size_t)reused].parentAction = -1;
+        return reused;
+    }
+
+    /* ---- 新建一个根 ---- */
+    std::vector<Step*> rootSteps;
+    std::vector<int> rootActionIndices;
+    RL::Tensor rootActionMask(ACTION_DIM, 1);
+    rootActionMask.zero();
+    getLegalActions(color, rootSteps, rootActionIndices, rootActionMask);
+
+    if (rootActionIndices.empty()) {
+        /*
+            这个局面没有合法走法 (被将死/困毙/无棋可走) —— 不建节点, 返回 -1 让调用方
+            走"当前走子方输了"的分支 (三个入口原来各自用 rootSteps.empty() 判这一条,
+            B-5 把它收进这里, 移动生成只做一次)。
+        */
+        Steps::instance().put(rootSteps);
+        m_rootID = -1;
+        return -1;
+    }
+
+    AZNode rootNode(-1, -1, ::Step(), 0.0f, color, key, 0);
+    for (std::size_t i = 0; i < rootActionIndices.size(); i++) {
+        rootNode.untriedActionIndices.push_back(rootActionIndices[i]);
+        rootNode.untriedSteps.push_back(*rootSteps[i]);
+    }
+    Steps::instance().put(rootSteps);
+
+    nodes.push_back(rootNode);
+    const int id = (int)nodes.size() - 1;
+    m_nodesCreated++;
+    if (treeReuse && ttMaxDepth >= 0) {
+        m_tt[key] = id;
+    }
+    m_rootID = id;
+    return id;
 }
 
 /* ------------------------------------------------------------------
@@ -485,34 +717,23 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
  * ------------------------------------------------------------------ */
 Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
 {
-    nodes.clear();
+    /*
+       B-5: 这里原来是无条件 `nodes.clear()` —— 每一步都从零重搜。现在改成向置换表
+       要根 (见 acquireRoot): 同一局里"对手刚走的那个局面"如果在我们上一棵树的
+       两步以内, 那棵子树连同统计一起接着用。
 
-    /* ---- Create root node ----
-       根节点的策略不再在这里预先求: 它的子节点先验会在第一次展开根节点时算出来
-       (那时根节点就是"父节点"), 而原来那次 rootValue / rootPolicy 从头到尾没被用过 ——
-       纯浪费一次 actor + 一次 critic 前向。 */
-    std::vector<Step*> rootSteps;
-    std::vector<int> rootActionIndices;
-    RL::Tensor rootActionMask(ACTION_DIM, 1);
-    rootActionMask.zero();
-    getLegalActions(color, rootSteps, rootActionIndices, rootActionMask);
+       注意: 局面来自**另一局**时 (bench/测试里每次都是独立局面) 命中不可达 ⇒ 新开
+       一棵树, 行为与改动前逐位相同 —— 这也是"改动不影响独立局面选点"那条断言的依据。
+    */
+    const int rootID = acquireRoot(color);
 
-    /* Create root AZNode */
-    AZNode rootNode;
-    rootNode.currentColor = color;
-    rootNode.parentID = -1;
-    rootNode.parentAction = -1;
-
-    /* Store untried actions (filtered by legal mask) */
-    for (std::size_t i = 0; i < rootActionIndices.size(); i++) {
-        int aidx = rootActionIndices[i];
-        rootNode.untriedActionIndices.push_back(aidx);
-        rootNode.untriedSteps.push_back(*rootSteps[i]);
+    /* 这个局面没有合法走法 (被将死/困毙): 返回"无效走法"让调用方自己判负。
+       acquireRoot 已经把棋盘恢复原样 (它只临时对齐 sideToMove 算哈希)。 */
+    if (rootID < 0) {
+        return Step();
     }
-    Steps::instance().put(rootSteps);
 
-    nodes.push_back(rootNode);
-    int rootID = 0;
+    /* 这一步的真棋盘视角对齐在下面 (搜索期间 encodeState 依赖 chess.sideToMove) */
 
     /*
        搜索期间 encodeState 要靠 chess.sideToMove 决定规范视角, 而 moveForward /
@@ -526,6 +747,10 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
     /* 每模拟复用同一对缓存, 避免在循环里反复分配 (STATE_DIM 已经上千维) */
     RL::Tensor parentState(STATE_DIM, 1);
     RL::Tensor leafState(STATE_DIM, 1);
+    /* R1: 稀疏先验的三个复用缓冲 (合法动作集 / 概率 / 选中动作的先验) */
+    std::vector<int> legalIdxScratch;
+    std::vector<float> probsScratch;
+    float priorScratch = 0.0f;
 
     /* ---- Main MCTS loop ---- */
     for (int sim = 0; sim < simulations; sim++) {
@@ -579,7 +804,8 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
         /* ====== Phase 2: EXPANSION ====== */
         if (!nodes[nodeID].untriedActionIndices.empty()) {
             /*
-               Phase 4.1: 先求**父节点**的策略, 再按先验挑未展开着法。
+               Phase 4.1 + R1: 先求**父节点**的策略 (稀疏: 只算合法列), 再按先验挑
+               未展开着法。
 
                边 (parent -> child) 的先验是 P(s_parent, a) = pi_theta(s_parent)[a],
                必须用父节点的网络输出, 而且必须与动作下标处在同一个规范视角。原来的
@@ -591,13 +817,18 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
                挑法也从 `std::rand() % size` (随机) 改成**按先验最大**: 随机挑等于让
                先验完全不参与"展开哪个孩子", 而中局约 40 个合法着法、一次决策只有 80
                次模拟, 于是前 ~40 次模拟全花在随机铺开 40 个孩子上。
+
+               R1 (2026-09): `ppo.action(parentState)` (全量 8100 列, 2.07 MB 权重流量)
+               换成 `ppo.actionMasked` (只算合法列, ~10 KB) —— 两者在合法集上的相对
+               大小完全一致, 所以展开顺序不变 (见 pickUntriedByPrior 的说明)。
             */
             encodeState(parentState);
-            RL::Tensor &parentPolicy = ppo.action(parentState);
-            const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
+            const int moveIdx = pickUntriedByPrior(nodeID, parentState,
+                                                   legalIdxScratch, probsScratch,
+                                                   priorScratch);
             int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
             Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
-            float prior = parentPolicy[chosenAction];
+            float prior = priorScratch;
             if (prior < 1e-9f) prior = 1e-9f; /* avoid zero prior */
 
             /* Remove from untried list */
@@ -615,6 +846,19 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
                                 : Stone::COLOR_RED;
 
             AZNode newNode(nodeID, chosenAction, chosenStep, prior, nextColor);
+
+            /*
+               B-5: 记下这个子局面 (棋子位置 + 走棋方) 的置换表键并登记进去 ——
+               下一步真的落子走到这里时, 整棵子树连同访问计数/Q 会被直接复用
+               (自对弈里必然命中: 那边两边都是同一个 agent)。键必须现在算: 棋盘刚走完
+               chosenStep, 正停在这个子局面上。
+            */
+            newNode.hash = chess.computeHash();
+            newNode.depth = nodes[nodeID].depth + 1;
+            if (treeReuse && newNode.depth <= ttMaxDepth) {
+                m_tt[newNode.hash] = (int)nodes.size();   /* push_back 之后就是它的下标 */
+            }
+            m_nodesCreated++;
 
             /* Pre-compute legal moves for the child */
             std::vector<Step*> childSteps;
@@ -710,9 +954,18 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
     for (int ep = 0; ep < episodes; ep++) {
         chess.reset();
         int currentColor = Stone::COLOR_BLACK;
+        /*
+           B-5: **每局**清一次树 (而不是每 ply 清一次)。一局之内子树跨 ply 复用,
+           跨局必须失效 —— 否则每个新对局都会在初始局面上命中上一局的根。
+           (acquireRoot 的"≤2 步可达"判据也会挡住跨局命中, 这里是显式的双保险。)
+        */
+        resetSearchTree();
 
         /* Store trajectories for training */
         std::vector<RL::Step> trajectory;
+        /* R2: 每一手局面的完整合法着法集 (与 trajectory 同步, 供训练侧稀疏口径用) */
+        std::vector<std::vector<int>> legalPerStep;
+        std::vector<int> legalScratch;
 
         for (int moveNum = 0; moveNum < maxMoves; moveNum++) {
             /* Compute temperature: linearly annealed */
@@ -734,20 +987,15 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
             RL::Tensor state(STATE_DIM, 1);
             encodeState(state);
 
-            /* Run MCTS to get improved policy */
-            nodes.clear();
+            /*
+               Run MCTS to get improved policy.
+               B-5: 不再 `nodes.clear()` —— 向置换表要根: 上一步我们落子到达的那个局面
+               就在上一棵树里, 它的子树/先验/访问计数直接接着用 (见 acquireRoot)。
+            */
+            const int rootID = acquireRoot(currentColor);
 
-            /* 根节点的策略不在这里预先求 —— 它的子节点先验会在第一次展开根节点时
-               算出来。原来这里的 rootPolicy / rootValue 从头到尾没被使用过。 */
-            std::vector<Step*> rootSteps;
-            std::vector<int> rootActionIndices;
-            RL::Tensor rootActionMask(ACTION_DIM, 1);
-            rootActionMask.zero();
-            getLegalActions(currentColor, rootSteps,
-                            rootActionIndices, rootActionMask);
-
-            if (rootSteps.empty()) {
-                /* Current player loses */
+            if (rootID < 0) {
+                /* 没有合法走法: 当前走子方输 (acquireRoot 返回 -1, 见那里的说明) */
                 int winner = (currentColor == Stone::COLOR_RED)
                                  ? Stone::COLOR_BLACK
                                  : Stone::COLOR_RED;
@@ -761,7 +1009,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
 
                 /* Train PPO on trajectory with terminal outcome */
                 if (!trajectory.empty()) {
-                    commitEpisode(trajectory, outcomeForLastMover);
+                    commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                 }
 
                 totalEpisodes++;
@@ -774,25 +1022,23 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                            (winner == Stone::COLOR_BLACK) ? "Black(AI)" : "Red",
                            moveNum, getWinRate(Stone::COLOR_BLACK));
                 }
-                Steps::instance().put(rootSteps);
                 break;
             }
 
-            /* Build root AZNode */
-            AZNode rootNode;
-            rootNode.currentColor = currentColor;
-            rootNode.parentID = -1;
-            rootNode.parentAction = -1;
-            for (std::size_t i = 0; i < rootActionIndices.size(); i++) {
-                rootNode.untriedActionIndices.push_back(rootActionIndices[i]);
-                rootNode.untriedSteps.push_back(*rootSteps[i]);
-            }
-            nodes.push_back(rootNode);
-            int rootID = 0;
+            /*
+               R2: 记下这一手局面的**完整合法集**, 与这一手进轨迹的样本一一对应
+               (展开只是把着法从 untried 挪进 childIDs, 并集不变, 所以什么时候取都一样)。
+            */
+            legalIndicesOf(rootID, legalScratch);
+            legalPerStep.push_back(legalScratch);
 
             /* 每个模拟复用同一对缓存, 避免在循环里反复分配 (STATE_DIM 已经上千维) */
             RL::Tensor parentState(STATE_DIM, 1);
             RL::Tensor leafState(STATE_DIM, 1);
+            /* R1: 稀疏先验的三个复用缓冲 (合法动作集 / 概率 / 选中动作的先验) */
+            std::vector<int> legalIdxScratch;
+            std::vector<float> probsScratch;
+            float priorScratch = 0.0f;
 
             /* MCTS simulations */
             for (int sim = 0; sim < simulations; sim++) {
@@ -830,14 +1076,15 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 }
 
                 if (!nodes[nodeID].untriedActionIndices.empty()) {
-                    /* Phase 4.1: 先求父节点策略, 再**按先验**挑未展开着法
-                       (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
+                    /* Phase 4.1 + R1: 先求父节点策略 (稀疏: 只算合法列), 再**按先验**
+                       挑未展开着法 (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
                     encodeState(parentState);
-                    RL::Tensor &parentPolicy = ppo.action(parentState);
-                    const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
+                    const int moveIdx = pickUntriedByPrior(nodeID, parentState,
+                                                           legalIdxScratch, probsScratch,
+                                                           priorScratch);
                     int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
                     Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
-                    float prior = parentPolicy[chosenAction];
+                    float prior = priorScratch;
                     if (prior < 1e-9f) prior = 1e-9f;
 
                     nodes[nodeID].untriedActionIndices.erase(
@@ -855,6 +1102,19 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                                         : Stone::COLOR_RED;
 
                     AZNode newNode(nodeID, chosenAction, chosenStep, prior, nextColor);
+
+            /*
+               B-5: 记下这个子局面 (棋子位置 + 走棋方) 的置换表键并登记进去 ——
+               下一步真的落子走到这里时, 整棵子树连同访问计数/Q 会被直接复用
+               (自对弈里必然命中: 那边两边都是同一个 agent)。键必须现在算: 棋盘刚走完
+               chosenStep, 正停在这个子局面上。
+            */
+            newNode.hash = chess.computeHash();
+            newNode.depth = nodes[nodeID].depth + 1;
+            if (treeReuse && newNode.depth <= ttMaxDepth) {
+                m_tt[newNode.hash] = (int)nodes.size();   /* push_back 之后就是它的下标 */
+            }
+            m_nodesCreated++;
 
                     std::vector<Step*> childSteps;
                     std::vector<int> childActionIndices;
@@ -977,7 +1237,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
 
                     /* Train PPO on complete trajectory */
                     if (!trajectory.empty()) {
-                        commitEpisode(trajectory, outcomeForLastMover);
+                        commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                     }
 
                     totalEpisodes++;
@@ -990,7 +1250,6 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                                (gameResult == Stone::COLOR_BLACK) ? "Black(AI)" : "Red",
                                moveNum + 1, getWinRate(Stone::COLOR_BLACK));
                     }
-                    Steps::instance().put(rootSteps);
                     break;
                 }
 
@@ -1022,7 +1281,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 const float outcomeForLastMover = 1.0f;
 
                 if (!trajectory.empty()) {
-                    commitEpisode(trajectory, outcomeForLastMover);
+                    commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                 }
                 totalEpisodes++;
                 if (winner == Stone::COLOR_BLACK) totalWins[1]++;
@@ -1033,11 +1292,8 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                            (winner == Stone::COLOR_BLACK) ? "Black(AI)" : "Red",
                            moveNum, getWinRate(Stone::COLOR_BLACK));
                 }
-                Steps::instance().put(rootSteps);
                 break;
             }
-
-            Steps::instance().put(rootSteps);
         }
 
         /* Draw if maxMoves reached */
@@ -1050,7 +1306,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
         const int finalResult = chess.getResult(chess.sideToMove);
         if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
-                commitEpisode(trajectory, 0.0f);
+                commitEpisode(trajectory, 0.0f, &legalPerStep);
             }
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
@@ -1092,10 +1348,15 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
             if (s && s->alive) chess.m_map[s->pos] = s;
         }
         chess.history.clear();
+        /* B-5: 每局清一次树 (一局之内 subtree 跨 ply 复用), 同 trainSelfPlay */
+        resetSearchTree();
 
         /* ---- Play one episode with MCTS-guided PPO ---- */
         int currentColor = Stone::COLOR_BLACK;
         std::vector<RL::Step> trajectory;
+        /* R2: 每一手局面的完整合法着法集 (与 trajectory 同步) */
+        std::vector<std::vector<int>> legalPerStep;
+        std::vector<int> legalScratch;
 
         for (int moveNum = 0; moveNum < maxMoves; moveNum++) {
             /* 规范视角靠 chess.sideToMove, 而 Chess::reset() 把它置成 RED、本函数却
@@ -1107,47 +1368,37 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
             RL::Tensor state(STATE_DIM, 1);
             encodeState(state);
 
-            /* ---- MCTS: Selection + Expansion + Backprop ---- */
-            nodes.clear();
+            /* ---- MCTS: Selection + Expansion + Backprop ----
+               B-5: 不再每 ply `nodes.clear()`, 改成向置换表要根 (见 acquireRoot);
+               本局的树在每局开头由 resetSearchTree() 清过一次。 */
+            const int rootID = acquireRoot(currentColor);
 
-            /* 根节点的策略在展开根节点时才算 (原来这里的 rootPolicy/rootValue 未被使用) */
-            std::vector<Step*> rootSteps;
-            std::vector<int> rootActionIndices;
-            RL::Tensor rootActionMask(ACTION_DIM, 1);
-            rootActionMask.zero();
-            getLegalActions(currentColor, rootSteps,
-                            rootActionIndices, rootActionMask);
-
-            if (rootSteps.empty()) {
+            if (rootID < 0) {
                 int winner = (currentColor == Stone::COLOR_RED)
                                  ? Stone::COLOR_BLACK : Stone::COLOR_RED;
                 /* 最后一手是赢家走的 -> 最后一步走子方 = 赢家 -> 终局值 +1
                    (同 trainSelfPlay 那两处修正, 原来这里是黑方视角) */
                 const float outcomeForLastMover = 1.0f;
                 if (!trajectory.empty()) {
-                    commitEpisode(trajectory, outcomeForLastMover);
+                    commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                 }
                 totalEpisodes++;
                 if (winner == Stone::COLOR_BLACK) totalWins[1]++;
                 if (winner == Stone::COLOR_RED) totalWins[0]++;
-                Steps::instance().put(rootSteps);
                 break;
             }
 
-            AZNode rootNode;
-            rootNode.currentColor = currentColor;
-            rootNode.parentID = -1;
-            rootNode.parentAction = -1;
-            for (std::size_t i = 0; i < rootActionIndices.size(); i++) {
-                rootNode.untriedActionIndices.push_back(rootActionIndices[i]);
-                rootNode.untriedSteps.push_back(*rootSteps[i]);
-            }
-            nodes.push_back(rootNode);
-            int rootID = 0;
+            /* R2: 这一手局面的完整合法集 (与 trajectory 一一对应) */
+            legalIndicesOf(rootID, legalScratch);
+            legalPerStep.push_back(legalScratch);
 
             /* 每个模拟复用同一对缓存, 避免在循环里反复分配 (STATE_DIM 已经上千维) */
             RL::Tensor parentState(STATE_DIM, 1);
             RL::Tensor leafState(STATE_DIM, 1);
+            /* R1: 稀疏先验的三个复用缓冲 (合法动作集 / 概率 / 选中动作的先验) */
+            std::vector<int> legalIdxScratch;
+            std::vector<float> probsScratch;
+            float priorScratch = 0.0f;
 
             /* MCTS simulations */
             for (int sim = 0; sim < simulations; sim++) {
@@ -1180,14 +1431,15 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                 }
 
                 if (!nodes[nodeID].untriedActionIndices.empty()) {
-                    /* Phase 4.1: 先求父节点策略, 再**按先验**挑未展开着法
-                       (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
+                    /* Phase 4.1 + R1: 先求父节点策略 (稀疏: 只算合法列), 再**按先验**
+                       挑未展开着法 (原来这里是 std::rand() 随机挑, 先验没参与展开)。 */
                     encodeState(parentState);
-                    RL::Tensor &parentPolicy = ppo.action(parentState);
-                    const int moveIdx = pickUntriedByPrior(nodeID, parentPolicy);
+                    const int moveIdx = pickUntriedByPrior(nodeID, parentState,
+                                                           legalIdxScratch, probsScratch,
+                                                           priorScratch);
                     int chosenAction = nodes[nodeID].untriedActionIndices[moveIdx];
                     Step chosenStep = nodes[nodeID].untriedSteps[moveIdx];
-                    float prior = parentPolicy[chosenAction];
+                    float prior = priorScratch;
                     if (prior < 1e-9f) prior = 1e-9f;
 
                     nodes[nodeID].untriedActionIndices.erase(
@@ -1203,6 +1455,19 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                                         ? Stone::COLOR_BLACK : Stone::COLOR_RED;
 
                     AZNode newNode(nodeID, chosenAction, chosenStep, prior, nextColor);
+
+            /*
+               B-5: 记下这个子局面 (棋子位置 + 走棋方) 的置换表键并登记进去 ——
+               下一步真的落子走到这里时, 整棵子树连同访问计数/Q 会被直接复用
+               (自对弈里必然命中: 那边两边都是同一个 agent)。键必须现在算: 棋盘刚走完
+               chosenStep, 正停在这个子局面上。
+            */
+            newNode.hash = chess.computeHash();
+            newNode.depth = nodes[nodeID].depth + 1;
+            if (treeReuse && newNode.depth <= ttMaxDepth) {
+                m_tt[newNode.hash] = (int)nodes.size();   /* push_back 之后就是它的下标 */
+            }
+            m_nodesCreated++;
 
                     std::vector<Step*> childSteps;
                     std::vector<int> childActionIndices;
@@ -1279,12 +1544,11 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                     /* 势能塑形 (Phase 2): 记下落子**之后**局面的势能 Φ(s_{i+1}) */
                     trajectory.back().potential = potentialOf(chess.sideToMove);
                     if (!trajectory.empty()) {
-                        commitEpisode(trajectory, outcomeForLastMover);
+                        commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                     }
                     totalEpisodes++;
                     if (gameResult == Stone::COLOR_BLACK) totalWins[1]++;
                     if (gameResult == Stone::COLOR_RED) totalWins[0]++;
-                    Steps::instance().put(rootSteps);
                     break;
                 }
 
@@ -1307,16 +1571,13 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                    (同 trainSelfPlay 那处修正) */
                 const float outcomeForLastMover = 1.0f;
                 if (!trajectory.empty()) {
-                    commitEpisode(trajectory, outcomeForLastMover);
+                    commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                 }
                 totalEpisodes++;
                 if (winner == Stone::COLOR_BLACK) totalWins[1]++;
                 if (winner == Stone::COLOR_RED) totalWins[0]++;
-                Steps::instance().put(rootSteps);
                 break;
             }
-
-            Steps::instance().put(rootSteps);
         }
 
         /*
@@ -1328,7 +1589,7 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
         const int finalResult = chess.getResult(chess.sideToMove);
         if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
-                commitEpisode(trajectory, 0.0f);
+                commitEpisode(trajectory, 0.0f, &legalPerStep);
             }
             totalEpisodes++;
         }
@@ -1367,6 +1628,11 @@ bool PPOMCTSAgent::loadModel(const std::string &actorPath,
         return false;
     }
     ppo.load(actorPath, criticPath);
+    /*
+       B-5: 换了权重就把树丢掉 —— 树里的先验与 Q 全是旧网络算出来的, 复用它们等于
+       拿旧策略继续搜。这里与"新一局"是同一类失效条件。
+    */
+    resetSearchTree();
     return true;
 }
 
@@ -1386,6 +1652,8 @@ bool PPOMCTSAgent::loadModel(const std::string &filepath)
 void PPOMCTSAgent::beginOnline()
 {
     m_onlineTrajectory.clear();
+    /* B-5: 新的一局 (人机) —— 上一局的搜索树作废, 否则同一个初始局面会命中旧树 */
+    resetSearchTree();
     /* 势能塑形 (Phase 2): 线上路径同样需要首手之前的势能 */
     m_phiInit = potentialOf(chess.sideToMove);
 }
@@ -1440,41 +1708,56 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
        查不到就退化成"走第一个合法走法"。不掩码地采样, 命中合法走法的概率只有百分之
        几, 探索实际会变成恒定走 legal[0] —— 策略永远得不到按自己意愿走子的机会, 也就
        学不到东西。(旧的 128 槽哈希编码下, 碰撞让这个漏洞大部分时候看不出来。)
+
+       R1 (2026-09): 这里本来就是"全量策略 -> 只在合法集上归一 -> 采样", 与
+       `ppo.actionMasked` 是**同一件事** (它内部就是子集 softmax), 所以直接换成稀疏
+       路径: 每步省掉策略头 2.07 MB 的权重读取 (在线路径一次 rollout 有几十步)。
+       采样只在合法集上做 (紧凑向量), 数学上与原写法一致 (原写法在 8100 维上采样,
+       非法槽位已被置 0)。
     */
     auto pick = [this](const RL::Tensor &state, int turn) -> int {
-        /* 拷贝一份再改: ppo.action() 返回的是网络内部的输出张量, 不能就地清零 */
-        RL::Tensor policy = ppo.action(state);
-
-        RL::Tensor mask(ACTION_DIM, 1);
-        mask.zero();
         std::vector<Step*> legal;
         std::vector<int> actionIndices;
+        RL::Tensor mask(ACTION_DIM, 1);
         getLegalActions(turn, legal, actionIndices, mask);
         Steps::instance().put(legal);
-
-        float sum = 0.0f;
-        for (std::size_t i = 0; i < policy.size(); i++) {
-            if (mask[i] > 0.0f) {
-                sum += policy[i];
-            } else {
-                policy[i] = 0.0f;
-            }
+        if (actionIndices.empty()) {
+            return -1;   /* 没有合法走法: rolloutFromCurrent 会用第一个合法走法兜底 */
         }
-        if (sum <= 1e-12f) {
-            /* 策略把全部合法走法都压到了 0 (未归一化的 logits 极端情形):
-               退化成"合法走法上的均匀分布", 而不是把全 0 分布交给采样器 */
-            for (std::size_t i = 0; i < policy.size(); i++) {
-                if (mask[i] > 0.0f) {
-                    policy[i] = 1.0f;
-                }
+
+        std::vector<float> probs;
+        if (sparsePolicyHead) {
+            if (!ppo.actionMasked(state, actionIndices, probs) || probs.empty()) {
+                return -1;
             }
         } else {
-            for (std::size_t i = 0; i < policy.size(); i++) {
-                policy[i] /= sum;
+            /* R1 之前的对照口径 (A/B 用): 全量策略 -> 只在合法集上归一 */
+            RL::Tensor policy = ppo.action(state);
+            probs.resize(actionIndices.size());
+            double sum = 0.0;
+            for (std::size_t k = 0; k < actionIndices.size(); k++) {
+                const float p = policy[(std::size_t)actionIndices[k]];
+                probs[k] = p;
+                sum += (double)p;
+            }
+            if (sum > 1e-12) {
+                for (std::size_t k = 0; k < probs.size(); k++) {
+                    probs[k] = (float)((double)probs[k] / sum);
+                }
             }
         }
-
-        return RL::Random::categorical(policy);
+        if (probs.empty()) {
+            return -1;
+        }
+        RL::Tensor compact(probs.size(), 1);
+        for (std::size_t k = 0; k < probs.size(); k++) {
+            compact[k] = probs[k];
+        }
+        const int pos = RL::Random::categorical(compact);
+        if (pos < 0 || (std::size_t)pos >= actionIndices.size()) {
+            return actionIndices[0];
+        }
+        return actionIndices[(std::size_t)pos];
     };
 
     std::vector<RL::Step> traj;

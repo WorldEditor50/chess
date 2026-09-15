@@ -56,6 +56,16 @@ namespace {
 int g_games = 1;
 int g_sims = 8;
 int g_moves = 20;
+/*
+   R1 A/B: `--no-sparse` 让本文件里用的 agent 退回"全量策略 + 原始 p_full 先验"的改动前
+   口径 (见 ppomcts_agent.h 的 sparsePolicyHead)。
+
+   为什么这个诊断需要它: 第 [4] 节那条"有信号样本占比 > 30%"是**自对弈跑出来的**统计量,
+   而自对弈的着法序列对先验的浮点排序极敏感 —— 未训练权重下 logit 几乎并列, 稀疏路径的
+   标量点积与全量路径的 SIMD 内积之间的舍入差就足以让 argmax 换一个孩子, 之后整局分叉。
+   所以"这条检查过不过"必须能在**同一份代码、只换先验口径**下对照, 否则功过说不清。
+*/
+bool g_sparse = true;
 
 /*
  * [2]/[3] 用的即时奖励 —— Phase 1 起**与 agent 共用同一处实现** (stone.h 的
@@ -223,6 +233,7 @@ void section4And5(Chess &env)
     std::printf("\n[4] PPO 的价值目标分布 (真实 trainSelfPlay -> 回放池)\n");
 
     PPOMCTSAgent agent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true);
+    agent.sparsePolicyHead = g_sparse;   /* R1 A/B, 见 g_sparse 的说明 */
     /* 只收集、不学习, 免得学习把 lastLoss 覆盖成别的东西 */
     agent.replayBatchSize = 0;
     RL::Random::setSeed(20240914u);
@@ -313,6 +324,7 @@ void section4And5(Chess &env)
     {
         Chess env2;
         PPOMCTSAgent online(env2, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true);
+        online.sparsePolicyHead = g_sparse;   /* R1 A/B, 见 g_sparse 的说明 */
         online.replayBatchSize = 0;
         RL::Random::setSeed(20240914u);
         const bool trained = online.exploreAndTrain(Stone::COLOR_RED, 16);
@@ -637,6 +649,7 @@ int main(int argc, char *argv[])
         if (k == "--games")      { g_games = std::atoi(v.c_str()); }
         else if (k == "--sims")  { g_sims = std::atoi(v.c_str()); }
         else if (k == "--moves") { g_moves = std::atoi(v.c_str()); }
+        else if (k == "--no-sparse") { g_sparse = false; }
         else { std::fprintf(stderr, "未知参数: %s\n", a.c_str()); return 2; }
     }
 

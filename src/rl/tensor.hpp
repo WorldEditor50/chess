@@ -11,6 +11,19 @@
 #include <assert.h>
 #include "simd_ops.hpp"
 
+/*
+   别名提示 (给编译器, 不影响语义): 只用在"逐元素的两条独立内存"这类循环上 ——
+   裸指针默认要按可能别名处理, 编译器会因此放弃向量化。调用方本来就要求输出与输入
+   不是同一块内存 (MM 的语义), 所以这是安全的。
+*/
+#if defined(_MSC_VER)
+#  define RL_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RL_RESTRICT __restrict__
+#else
+#  define RL_RESTRICT
+#endif
+
 namespace RL {
 
 template<typename T, template<typename Ti> class Alloc=std::allocator>
@@ -966,8 +979,47 @@ public:
                    t.sizes[0] == t.shape[1] && t.sizes[1] == 1;
         }
 
+        /*
+           ============================================================
+            形状契约检查 (R1.5, 2026-09) —— 只在 Debug / ASAN 构建里生效
+           ============================================================
+           下面四个内核的一切都从 z/x1/x2 的 shape 推导: z 的形状决定输出, x1 行主序
+           [r,k]、x2 行主序 [k,c]。形状不匹配时既不是编译错误也不会运行时报错 ——
+           要么按错位的 sizes **越界读写**, 要么算出看起来合理的数字。实测代价:
+           写微基准时用错维度直接崩 (issues_review 的附注)。
+           所以把每条内核的形状关系写成断言; **Release (NDEBUG) 下整块被编译掉,
+           一个字节都不变**, 想验证就在编译那一个 TU 时加 /UNDEBUG 跑一遍。
+        */
+        static void requireShape2d(const Tensor_ &t)
+        {
+            (void)t;
+#ifndef NDEBUG
+            assert(t.shape.size() == 2);
+            assert(t.sizes.size() == t.shape.size());
+            assert(t.val.size() >= t.totalSize);
+#endif
+        }
+
+        /*
+           ============================================================
+            四个内核的**累加**语义 (2026-09 修)
+           ============================================================
+           ikkj / kikj / ikjk / kijk 一律是 `z += ...`, 不是 `z = ...`:
+           `MM::ikjk(g.w, e, x)` 这种"梯度累加"的用法 (以及 lstm.cpp:143-148 连写
+           五次累加到同一个 delta.h) 都依赖它。SIMD 内核里的 ikjk/kijk 曾经写成赋值,
+           与标量回落**语义不一致** —— 当时所有调用点的 kdim=1 都走标量, 所以没暴露;
+           一旦有人喂多列输入就会**静默丢掉 z 里已有的值** (梯度丢失, 不报错)。
+           现在两条路径都是累加, test_grad 的 C 节把这条钉成了断言。
+        */
+
         inline static void ikkj(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
+#ifndef NDEBUG
+            requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            assert(x.shape[0] == x1.shape[0]);
+            assert(x1.shape[1] == x2.shape[0]);
+            assert(x.shape[1] == x2.shape[1]);
+#endif
             /*
                SIMD 快速路径 (内核来自 N-spirits 的 simd/avx2func.hpp, 经
                rl/simd_ops.hpp 分派)。内核是**累加**到目标里的, 与本函数语义一致 ——
@@ -1052,6 +1104,12 @@ public:
 
         inline static void kikj(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
+#ifndef NDEBUG
+            requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            assert(x1.shape[0] == x2.shape[0]);
+            assert(x.shape[0] == x1.shape[1]);
+            assert(x.shape[1] == x2.shape[1]);
+#endif
             /* SIMD 快速路径, 见 ikkj 的说明 */
             if (contiguous2d(x) && contiguous2d(x1) && contiguous2d(x2) &&
                 x1.shape[0] == x2.shape[0] &&
@@ -1072,6 +1130,60 @@ public:
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[0];
             const std::size_t cols = (std::size_t)x.shape[1];
+            /*
+               ============================================================
+                反向 GEMV: ei += wᵀ·e  (R1.5, 2026-09)
+               ============================================================
+               这是训练步里最慢的一步 —— 实测 0.991 vs 前向 0.102 ns/MAC (9.7×),
+               见 test_grad 的 D 节。原因不是"没写 SIMD", 而是**循环方向选错了**:
+               下面那条 `xc == 1 && x2c == 1` 的分支按 (i, k) 遍历, 而 w 是行主序的
+               `[out][in]`, 于是 w[k][i] 的步长是 in —— 跨步 gather, 向量化不了。
+               `x1c == 1` 时把它反过来: **外层 k (广播 e[k]), 内层 i 整行累加** ——
+               两条内存都是单位步长, 而且每个输出元素的累加顺序仍是 k 升序 (与标量
+               分支一致, 只差 4 路展开的加法结合顺序, 与 ikkj 同一约定)。
+
+               形状要求: x / x2 是列向量 (行步长 1), x1 行内连续 (x1c == 1),
+               且 x1 是 [out, in]、x 是 [in, 1]、x2 是 [out, 1]。
+            */
+            if (xc == 1 && x2c == 1 && x1c == 1 && xr == 1 && x2r == 1 &&
+                x.shape[0] == x1.shape[1] && x2.shape[0] == x1.shape[0]) {
+                const std::size_t out = x1.shape[0];
+                const std::size_t in = x.shape[0];
+                /*
+                   这里可以直接写 eid[i] / wk[i] (不带步长乘子): 上面的判据已经把
+                   xr == 1、x1c == 1、x2r == 1 都验过了。带上步长乘子写的话 MSVC 认不出
+                   这是单位步长循环, 就不向量化 —— 实测两者差 ~2 倍 (0.24 vs 0.13 ns/MAC)。
+
+                   局部 __restrict 同理: 内层是"两条互不重叠的行"上的逐元素 FMA, 但
+                   编译器从裸指针看不出来, 默认要按可能别名处理。调用方本来就要求
+                   输出与输入不是同一块内存 (MM 的语义)。
+                */
+                const T *RL_RESTRICT wd = x1d;
+                const T *RL_RESTRICT ed = x2d;
+                T *RL_RESTRICT eid = xd;
+                std::size_t k = 0;
+                for (; k + 4 <= out; k += 4) {
+                    const T e0 = ed[k + 0];
+                    const T e1 = ed[k + 1];
+                    const T e2 = ed[k + 2];
+                    const T e3 = ed[k + 3];
+                    const T *RL_RESTRICT w0 = wd + (k + 0)*x1r;
+                    const T *RL_RESTRICT w1 = wd + (k + 1)*x1r;
+                    const T *RL_RESTRICT w2 = wd + (k + 2)*x1r;
+                    const T *RL_RESTRICT w3 = wd + (k + 3)*x1r;
+                    for (std::size_t i = 0; i < in; i++) {
+                        eid[i] += w0[i]*e0 + w1[i]*e1 + w2[i]*e2 + w3[i]*e3;
+                    }
+                }
+                for (; k < out; k++) {
+                    const T ek = ed[k];
+                    const T *RL_RESTRICT wk = wd + k*x1r;
+                    for (std::size_t i = 0; i < in; i++) {
+                        eid[i] += wk[i]*ek;
+                    }
+                }
+                return;
+            }
             if (xc == 1 && x2c == 1) {
                 /* as in ikkj: unit-stride row update, 4 k-values fused.
                  * Before: (360x90)^T*(360x90) = 18.34 ns/MAC (0.11 GFLOP/s),
@@ -1120,6 +1232,12 @@ public:
 
         inline static void ikjk(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
+#ifndef NDEBUG
+            requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            assert(x1.shape[1] == x2.shape[1]);
+            assert(x.shape[0] == x1.shape[0]);
+            assert(x.shape[1] == x2.shape[0]);
+#endif
             /* SIMD 快速路径, 见 ikkj 的说明 */
             if (contiguous2d(x) && contiguous2d(x1) && contiguous2d(x2) &&
                 x1.shape[1] == x2.shape[1] &&
@@ -1193,6 +1311,12 @@ public:
 
         inline static void kijk(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
+#ifndef NDEBUG
+            requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            assert(x1.shape[0] == x2.shape[1]);
+            assert(x.shape[0] == x1.shape[1]);
+            assert(x.shape[1] == x2.shape[0]);
+#endif
             /* SIMD 快速路径, 见 ikkj 的说明 */
             if (contiguous2d(x) && contiguous2d(x1) && contiguous2d(x2) &&
                 x1.shape[0] == x2.shape[1] &&

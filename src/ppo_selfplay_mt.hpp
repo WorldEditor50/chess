@@ -80,6 +80,13 @@ public:
         bool   mirrorAugment = true;
         /* 势能塑形 (Phase 2)。关掉它就是 A/B 消融的对照组。 */
         bool   shaping       = true;
+        /*
+           R1 A/B: false 让所有 agent (master + worker) 回到"全量策略 + 原始 p_full
+           先验"的改动前口径 (见 ppomcts_agent.h 的 sparsePolicyHead)。用于在同一台机器、
+           同一份配置下量 R1 对**聚合吞吐**的影响 —— 这是 P7 测出的访存带宽瓶颈的直接
+           对照, 靠"改动前后各跑一次"是不够的 (两次运行的机器状态会漂)。
+        */
+        bool   sparsePolicyHead = true;
     };
 
     struct Stats {
@@ -104,6 +111,7 @@ public:
         m_masterAgent.replayEpochs    = cfg.learnEpochs;
         m_masterAgent.mirrorAugment   = cfg.mirrorAugment;
         m_masterAgent.potentialShaping = cfg.shaping;
+        m_masterAgent.sparsePolicyHead = cfg.sparsePolicyHead;
 
         /* 主线程 (learner) 也要有确定的随机流 */
         RL::Random::seedCurrentThread(0u);
@@ -200,6 +208,7 @@ private:
             agent.replayBatchSize = 0;
             agent.mirrorAugment   = cfg.mirrorAugment;
             agent.potentialShaping = cfg.shaping;
+            agent.sparsePolicyHead = cfg.sparsePolicyHead;
             agent.ppo.clearReplay();
         }
     };
@@ -292,7 +301,10 @@ private:
             }
             for (std::size_t i = 0; i < batch.size(); i++) {
                 RL::PPO::ReplaySample &s = batch[i];
-                m_masterAgent.ppo.addReplay(s.state, s.actionIdx, s.actionProb, s.valueTarget);
+                /* R2: legalIdx 必须一起搬 —— 丢了它, learner 就会退回全量 8100 维口径,
+                   于是"worker 采的样本"和"master 学的口径"不是同一个学习问题。 */
+                m_masterAgent.ppo.addReplay(s.state, s.actionIdx, s.actionProb,
+                                            s.valueTarget, s.legalIdx);
             }
 
             /*

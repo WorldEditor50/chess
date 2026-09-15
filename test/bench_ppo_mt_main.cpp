@@ -25,7 +25,7 @@
  * 用法:
  *   bench_ppo_mt.exe [--games=8] [--sweep=1,2,4,6,8] [--sims=80] [--moves=120]
  *                    [--batch=64] [--epochs=2] [--lr=0.001] [--publish=1]
- *                    [--repeat=1] [--no-serial] [--seed=N]
+ *                    [--repeat=1] [--no-serial] [--no-sparse] [--seed=N]
  */
 #include <algorithm>
 #include <chrono>
@@ -64,6 +64,12 @@ struct Cfg {
     bool serial        = true;     /* 是否跑串行基线 (加速比的分母) */
     bool mirror        = true;     /* 左右镜像数据增广 (P6) */
     bool shaping       = true;     /* 势能塑形 (Phase 2); --no-shaping 做消融 */
+    /*
+       R1 A/B: --no-sparse 让 master/worker 都退回"全量策略 + 原始 p_full 先验"的
+       改动前口径。同一个进程里跑两次 (--no-sparse / 默认) 才是在同一机器状态下
+       量 R1 对聚合吞吐的影响 —— 前后各跑一次会被机器负载的漂移污染。
+    */
+    bool sparse        = true;
     std::string savePrefix;        /* 非空: 训练结束保存权重 (供对局验证) */
     unsigned seed      = 20240914;
 };
@@ -125,6 +131,7 @@ Throughput runSerialBaseline()
     agent.replayBatchSize = g_cfg.batch;
     agent.replayEpochs    = g_cfg.epochs;
     agent.mirrorAugment   = g_cfg.mirror;
+    agent.sparsePolicyHead = g_cfg.sparse;
     agent.ppo.clearReplay();
 
     const long long samplesBefore = 0;
@@ -203,6 +210,7 @@ MtPoint runMtOnce(int workers, const RL::Tensor &probe)
     cfg.seed          = g_cfg.seed;
     cfg.mirrorAugment = g_cfg.mirror;
     cfg.shaping       = g_cfg.shaping;
+    cfg.sparsePolicyHead = g_cfg.sparse;
 
     /* 构造本身也要计时之外的开销: 网络初始化 (~4 M 参数) 不便宜, 但不属于自对弈,
        所以放在计时区间之外。 */
@@ -272,6 +280,7 @@ int trainAndSave(int workers, const RL::Tensor &probe)
     cfg.seed          = g_cfg.seed;
     cfg.mirrorAugment = g_cfg.mirror;
     cfg.shaping       = g_cfg.shaping;
+    cfg.sparsePolicyHead = g_cfg.sparse;
 
     PpoSelfPlayMT mt(env, cfg);
 
@@ -314,6 +323,7 @@ int main(int argc, char *argv[])
         else if (k == "--no-serial") { g_cfg.serial = false; }
         else if (k == "--no-mirror") { g_cfg.mirror = false; }
         else if (k == "--no-shaping") { g_cfg.shaping = false; }
+        else if (k == "--no-sparse") { g_cfg.sparse = false; }
         else if (k == "--save") { g_cfg.savePrefix = v; }
         else if (k == "--workers") { g_cfg.workerList.push_back(atoi(v.c_str())); }
         else if (k == "--sweep") {
@@ -361,6 +371,8 @@ int main(int argc, char *argv[])
     std::printf("学习      : batch=%d, epochs=%d, lr=%.4f, 每 %d 轮学习发布一次权重\n",
                 g_cfg.batch, g_cfg.epochs, (double)g_cfg.lr, g_cfg.publishEvery);
     std::printf("数据增广  : 左右镜像 %s (P6)\n", g_cfg.mirror ? "开" : "关");
+    std::printf("策略前向  : %s (R1: 稀疏=只算合法列, 全量=改动前口径)\n",
+                g_cfg.sparse ? "稀疏" : "全量");
     std::printf("硬件      : hardware_concurrency=%u (本机 i7-12650H = 10 核 / 16 逻辑)\n", hw);
     std::printf("重复      : 每个配置 %d 次, 报吞吐均值\n\n", g_cfg.repeat);
 

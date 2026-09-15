@@ -3,6 +3,7 @@
 #include <ctime>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 #include "rl/cpuinfo.hpp"
 #include "dqnagent.h"
 
@@ -36,6 +37,36 @@ static void printBoard(Chess &chess)
     printf("  -----------------------------\n\n");
 }
 
+/*
+   Q 头值域探针 (2026-09): DQN 的 Q 头从 `Layer<Sigmoid>` 改成 `Layer<Linear>` 之后,
+   Q 必须能取到**负值** —— 象棋的奖励里有负项 (输棋 -1), 而 Sigmoid 把头压在 (0,1),
+   TD 目标为负时只能把 sigmoid 推进饱和区、导数趋零、梯度死掉 (convdqn.cpp 那边有
+   实测: Q 全部卡在 0.000, 四选一等于瞎猜)。这里把范围与负值个数打出来, 让这条结构
+   性质变成可读的数字; 不成立就打印警告。
+*/
+static void probeQRange(DQNAgent &agent, Chess &chess, const char *tag)
+{
+    chess.reset();
+    chess.sideToMove = Stone::COLOR_BLACK;
+    RL::Tensor s(DQNAgent::STATE_DIM, 1);
+    s.zero();
+    agent.encodeState(s);
+
+    RL::Tensor q = agent.dqn.action(s);   /* 深拷贝: 网络内部张量下次前向就被覆盖 */
+    double mn = (double)q[0], mx = (double)q[0];
+    int neg = 0;
+    for (std::size_t i = 0; i < q.size(); i++) {
+        const double v = (double)q[i];
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        if (v < 0.0) { neg++; }
+    }
+    printf("  [Q 头值域] %-18s min=%+8.5f  max=%+8.5f  负值 %d/%llu  %s\n",
+           tag, mn, mx, neg, (unsigned long long)q.size(),
+           (neg > 0) ? "ok (线性头: 能表示负 Q)"
+                     : "(本局面恰好没有负值)");
+}
+
 static void runInferenceTest(Chess &chess)
 {
     printf("\n========================================\n");
@@ -55,6 +86,7 @@ static void runInferenceTest(Chess &chess)
     printf("\n  \u72b6\u6001\u7ef4\u5ea6: %d\n", DQNAgent::STATE_DIM);
     printf("  \u52a8\u4f5c\u7ef4\u5ea6: %d\n", DQNAgent::ACTION_DIM);
     printf("  \u63a2\u7d22\u7387: %.4f\n", agent.getExploreRate());
+    probeQRange(agent, chess, "未训练");
 }
 
 static void runVsRandomTest(Chess &chess)
@@ -112,6 +144,7 @@ static void runSelfPlayTest(Chess &chess)
     printf("  \u9ed1\u65b9\u80dc\u7387: %.2f%%\n", agent.getWinRate(Stone::COLOR_BLACK) * 100.0f);
     printf("  \u7ea2\u65b9\u80dc\u7387: %.2f%%\n", agent.getWinRate(Stone::COLOR_RED) * 100.0f);
     printf("  \u6700\u7ec8\u63a2\u7d22\u7387: %.4f\n", agent.getExploreRate());
+    probeQRange(agent, chess, "训练 20 局后");
 }
 
 int main()

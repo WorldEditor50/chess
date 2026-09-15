@@ -8,6 +8,7 @@
 #include <ctime>
 #include <limits>
 #include <algorithm>
+#include <unordered_map>
 #include "chess.h"
 #include "aiagent.h"
 #include "rl/ppo.h"
@@ -119,6 +120,18 @@ public:
         int parentAction;            /* action index that led to this node */
         Step step;                   /* the move that led to this node */
 
+        /* ----------------------------------------------------------------
+         *  B-5: 置换表的键与深度
+         * ----------------------------------------------------------------
+         *  hash  : 这个节点对应局面的 Zobrist 键 (`Chess::computeHash()`, 已含走棋方)。
+         *          创建子节点时算一次 (32 次 XOR, 便宜), 用它把节点登记进置换表,
+         *          下一次搜索同一个局面时就能**直接复用这棵子树**。
+         *  depth : 相对**当前根**的深度 (根 = 0)。只用来决定"哪些节点进置换表"
+         *          (浅层节点的统计更可信、复用价值也更高)。
+         * ---------------------------------------------------------------- */
+        unsigned long long hash;
+        int depth;
+
         /* Tree statistics */
         int visitCount;
         double totalValue;           /* sum of value estimates */
@@ -133,11 +146,12 @@ public:
         int currentColor;
 
         AZNode()
-            : parentID(-1), parentAction(-1),
+            : parentID(-1), parentAction(-1), hash(0), depth(0),
               visitCount(0), totalValue(0.0), prior(0.0),
               currentColor(Stone::COLOR_NONE) {}
-        AZNode(int pid, int pa, const Step &st, float p, int color)
-            : parentID(pid), parentAction(pa), step(st),
+        AZNode(int pid, int pa, const Step &st, float p, int color,
+               unsigned long long h = 0, int d = 0)
+            : parentID(pid), parentAction(pa), step(st), hash(h), depth(d),
               visitCount(0), totalValue(0.0), prior(p),
               currentColor(color) {}
 
@@ -147,6 +161,66 @@ public:
     };
 
     std::vector<AZNode> nodes;
+
+    /* ================================================================
+     *  B-5: 置换表 + 子树复用 (2026-09)
+     * ================================================================
+     *  在这之前每 ply 都是 `nodes.clear()` —— 每一步都从零重搜。而搜索的绝大部分
+     *  结果本来就是**可以留给下一步**的: 走子之后, 我们落子到达的那个局面正是上一棵
+     *  树里的一个子节点 (自对弈里 100% 命中), 它的子节点、先验、访问计数、Q 估计
+     *  全都还在。把它们丢掉等于每一步都白扔一次搜索。
+     *
+     *  这里做两件事:
+     *   1. **置换表**: `hash -> 节点下标` 的映射 (键是 `Chess::computeHash()`, 已含
+     *      走棋方)。子节点创建时登记, 下次搜索同一局面直接命中。
+     *   2. **子树复用**: 命中之后把那个节点**当作新的根**, 它的子树与统计全部继续用
+     *      (PUCT 从继承来的访问计数/Q 上继续, 而不是从 0 开始)。
+     *
+     *  为什么安全 (以及哪些地方是刻意的取舍):
+     *   * **同一局内**复用: 网络权重在一局里不变, 先验仍然有效。
+     *   * **跨局必须失效**: 命中只有在"从上一棵树的根往下 ≤ 2 步可达"时才接受
+     *     (自对弈里"我们的着法子节点"= 1 步、"对手的应着"= 2 步)。于是上一局的节点
+     *     ——包括每个新对局都会遇到的初始局面——**必然不可达 ⇒ 新开一棵树**,
+     *     不会把上一局的访问计数带进新一局。另外 `trainSelfPlay` / `warmupFromCurrent`
+     *     在每局开头显式 `resetSearchTree()`, `loadModel()` 也会重置 (换了权重就作废)。
+     *   * **重复局面/60 回合**: Zobrist 键只看棋子位置与走棋方, 不含 halfMoveClock 与
+     *     历史。树内本来就不做终局判定 (叶子用 critic 估值), 所以这与既有口径一致;
+     *     真正判和仍由 `Chess::getResult()` 在 rollout/自对弈那一层负责。
+     *   * **策略目标会变** (这是一处**行为变化**, 不是等价优化): 自对弈的策略目标
+     *     π ∝ 根节点访问计数, 而复用之后这些计数**跨 ply 累积** (AlphaZero 的标准做法,
+     *     如 ELF/Leela)。所以等模拟数下的目标分布更尖。要关掉整个机制就用
+     *     `treeReuse = false` 做 A/B。
+     *   * 内存: 复用让同一局里的树**越滚越大** (这正是收益来源), 所以有 `treeNodeCap`
+     *     兜底 —— 超了就把整棵树和置换表一起丢掉重来。
+     * ================================================================ */
+    bool treeReuse = true;
+    std::size_t treeNodeCap = 50000;   /* 节点数上限 (超过就整棵重来) */
+    int ttMaxDepth = 12;               /* 只把深度 ≤ 它的节点登记进置换表 */
+
+    /* 新一局 / 换权重: 清空树与置换表 (计数器一并归零, 便于诊断) */
+    void resetSearchTree();
+    /* 当前根在 `nodes` 里的下标 (-1 = 还没有树) */
+    int currentRoot() const { return m_rootID; }
+    /* 只读诊断: 置换表命中次数 / 共创建过多少节点 / 置换表条目数 */
+    long long ttReuseHits() const { return m_reuseHits; }
+    long long ttNodesCreated() const { return m_nodesCreated; }
+    std::size_t ttSize() const { return m_tt.size(); }
+
+    /*
+     *  取"当前局面的根": 置换表命中且**从上一棵树的根 ≤ maxDepth 步可达**时复用那个
+     *  节点 (连同它的子树与统计), 否则新建一个根。三个搜索入口统一走它。
+     *  `color` 必须等于棋盘当前的走棋方 (规范视角与哈希都依赖它)。
+     */
+    int acquireRoot(int color);
+
+    /* targetID 是否在 fromID 的子树里、且在 maxDepth 层以内 (只向下走 childIDs) */
+    bool reachableWithin(int fromID, int targetID, int maxDepth) const;
+
+    /* 置换表本体与计数器 (全部是搜索状态, 不参与任何对外语义) */
+    std::unordered_map<unsigned long long, int> m_tt;   /* 局面键 -> 节点下标 */
+    int m_rootID = -1;                                  /* 当前根 (-1 = 无树) */
+    long long m_reuseHits = 0;                          /* 复用命中次数 */
+    long long m_nodesCreated = 0;                       /* 本轮共创建多少节点 */
 
     /* ----------------------------------------------------------------
      *  Encoding / Action Helpers
@@ -274,23 +348,35 @@ public:
     double getPUCT(int childID, int parentVisits) const;
 
     /*
-     *  Phase 4.1: 按**先验**挑一个未展开着法 (AlphaZero 的做法), 返回它在
-     *  untriedActionIndices 里的下标。三个搜索入口 (selectMove / trainSelfPlay /
-     *  warmupFromCurrent) 共用它。
+     *  Phase 4.1 + R1: 用**稀疏策略前向**求父节点先验, 并按先验挑一个未展开着法。
+     *  三个搜索入口 (selectMove / trainSelfPlay / warmupFromCurrent) 共用它。
      *
-     *  为什么必须改: 原来三处都是 `std::rand() % size` **随机**挑 —— 先验完全没参与
-     *  "展开哪个孩子"。中局约 40 个合法着法, 而一次决策只有 80 次模拟, 于是前 ~40 次
-     *  模拟全花在随机铺开 40 个孩子上 (每次还都要跑一遍 actor + critic 前向), PUCT 根本
-     *  没机会起作用。按先验挑之后, 最初几次模拟就集中在最有希望的候选上 —— 这正是
-     *  "把有效搜索空间压小"的机制本身 (见 docs/agents_design.md 的搜索一节)。
+     *  为什么必须改 (Phase 4.1): 原来三处都是 `std::rand() % size` **随机**挑 ——
+     *  先验完全没参与"展开哪个孩子"。中局约 40 个合法着法, 而一次决策只有 80 次模拟,
+     *  于是前 ~40 次模拟全花在随机铺开 40 个孩子上 (每次还都要跑一遍 actor + critic
+     *  前向), PUCT 根本没机会起作用。按先验挑之后, 最初几次模拟就集中在最有希望的
+     *  候选上 —— 这正是"把有效搜索空间压小"的机制本身 (见 docs/agents_design.md 的
+     *  搜索一节)。
      *
      *  顺带: 搜索里不再用 std::rand(), 于是 RL::Random::setSeed() 能真正控制整条搜索的
      *  可复现性 (多线程分身训练也受影响)。
      *
-     *  parentPolicy 必须是**父节点**的策略输出 pi(s_parent)[a], 且与 untriedActionIndices
-     *  处在同一个规范视角 (理由见 selectMove 里那段长注释)。
+     *  R1 之后, 先验不再来自"全量 8100 维策略", 而是来自 ppo.actionMasked ——
+     *  **只算这个节点完整合法着法集合那几列** (策略头 2.07 MB -> ~10 KB 权重流量,
+     *  见 docs/training_optimization.md §9.4)。数值上等价于"全量 softmax 后取合法集
+     *  再归一化", 所以**合法动作之间的相对大小完全不变 ⇒ 展开顺序不变**。
+     *
+     *  返回 untriedActionIndices 里的下标 (调用方还要从 untriedSteps 里取同步的那一项);
+     *  priorOut = 选中动作的先验 P(s_parent, a)。
+     *  legalIdx / probs 是复用的出参 (节点的完整合法动作集与其稀疏概率, 一一对应) ——
+     *  调用方在模拟循环外各留一份, 免得每次都重新分配。
+     *
+     *  **不是 const**: 稀疏路径要在网络上跑一次部分前向。
      */
-    int pickUntriedByPrior(int nodeID, const RL::Tensor &parentPolicy) const;
+    int pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
+                           std::vector<int> &legalIdx,
+                           std::vector<float> &probs,
+                           float &priorOut);
 
     /*
        把根节点的**访问计数**归一化成策略目标分布 (π ∝ N, τ=1), 与
@@ -339,14 +425,41 @@ public:
     bool mirrorAugment = true;
 
     /*
+        R1 A/B 开关 (2026-09, 默认 true = 稀疏路径: 策略头只算合法列)。
+
+        false 复现 **R1 之前**的口径: 全量策略前向, 而且先验**直接用原始概率**
+        (`p_full(a)`, 合法集上的质量 Z 没有被除掉)。
+
+        为什么要留这个开关: R1 的两条路径在"合法动作之间的相对大小"上完全一致
+        (所以展开顺序不变), 但**先验的绝对尺度**不同 —— 稀疏路径给的是"在合法集上
+        归一化"的概率, 比原始 p_full 大了 1/Z 倍, 而 PUCT 的探索项 `c_puct·P·√N/(1+n)`
+        对 P 是线性的, 于是等于把 c_puct 乘了 1/Z。同权重、同局面、只改这一处的配对
+        A/B (bench_policy_agreement --ab=1) 才能把"选点变了多少"量出来, 而不是靠
+        "两次运行的聚合一致率差不多"这种弱证据。
+    */
+    bool sparsePolicyHead = true;
+
+    /*
        一局结束: 按折现回报把这条轨迹推进回放池, 池子够大时触发一次批量学习。
        轨迹里的策略目标是稠密的 (RL::Step 只放得下一个 Tensor), 但**进池时立刻转成
        稀疏** —— 长期占内存的是回放池, 不是这条临时轨迹。
 
        参数是**非 const** 引用: 函数会先把势能塑形原地写进每一手的 reward
        (见 applyPotentialShaping)。轨迹是调用方的局部变量, 用完即弃。
+
+       `legalPerStep` (R2, 可选): 与 trajectory **同步**的"每一手局面的完整合法着法下标"。
+       训练侧的稀疏口径需要它才能划出 softmax 的分母 —— 轨迹只带策略目标 (访问分布),
+       而访问分布只是合法集的一个**子集**, 拿它当分母等于把没被搜索访问到的合法着法
+       从策略里抹掉。不给 = 旧的全量 8100 维口径。
     */
-    void commitEpisode(std::vector<RL::Step> &trajectory, float finalOutcome);
+    void commitEpisode(std::vector<RL::Step> &trajectory, float finalOutcome,
+                       const std::vector<std::vector<int>> *legalPerStep = nullptr);
+
+    /*
+       R2: 取某个节点的**完整合法着法集** (未展开项 ∪ 已展开孩子的 parentAction)。
+       与 pickUntriedByPrior 里那套构造同源, 理由见那里的长注释。
+    */
+    void legalIndicesOf(int nodeID, std::vector<int> &out) const;
 
     /* ----------------------------------------------------------------
      *  稀疏 MoE 诊断 (只读, 不参与决策; 给测试与调参用)

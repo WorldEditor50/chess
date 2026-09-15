@@ -9,6 +9,17 @@
 RL::DQN::DQN(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim_)
     :stateDim(stateDim_), actionDim(actionDim_), gamma(0.99), exploringRate(1), learningSteps(0)
 {
+    /*
+       Q 头必须是**线性**(无界)的, 不能是 Sigmoid  (2026-09 补修, 与 convdqn.cpp 对齐)。
+
+       原来的 QMainNet/QTargetNet 最后一层是 `Layer<Sigmoid>`, 值域被压到 (0,1)。而象棋
+       这边的奖励里有**负值**: 终局输棋是 -1、被吃红子按 `R_STEP_*` 一类的负项进账,
+       TD 目标因此经常为负 —— 网络在结构上根本表示不出来。convdqn.cpp 早就因为同一个
+       理由 (snake 的奖励以负为主) 改成了 Linear 并在那边留了实测: 旧的 Sigmoid 配置下
+       Q 全部卡在 0.000、四选一的贪心正确率等于瞎猜, 因为负目标把 sigmoid 推进饱和区、
+       导数 ≈ 0, 梯度直接死掉。dqn.cpp 当时漏改了, 这里补齐 (四个候选骨干分支一起改,
+       避免换分支时又把 bug 换回来)。
+    */
 #if 1
     /*
        chess-side divergence from snakeAI/rl/dqn.cpp.
@@ -29,43 +40,43 @@ RL::DQN::DQN(std::size_t stateDim_, std::size_t hiddenDim, std::size_t actionDim
     QMainNet = Net(MOE<16, 16>::_(stateDim, true),
                    TransformerBlock<16>::_(stateDim, true),
                    TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, true),
-                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+                   Layer<Linear>::_(hiddenDim, actionDim, true, true));
 
     QTargetNet = Net(MOE<16, 16>::_(stateDim, false),
                      TransformerBlock<16>::_(stateDim, false),
                      TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, false),
-                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+                     Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #elif 0
     /* snakeAI variant A: 4 trainable layers, no MOE */
     QMainNet = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, true),
                    TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
                    Layer<Tanh>::_(hiddenDim, hiddenDim, true, true),
                    TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, true),
-                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+                   Layer<Linear>::_(hiddenDim, actionDim, true, true));
 
     QTargetNet = Net(Layer<Tanh>::_(stateDim, hiddenDim, true, false),
                      TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
                      Layer<Tanh>::_(hiddenDim, hiddenDim, true, false),
                      TanhNorm<Sigmoid>::_(hiddenDim, hiddenDim, true, false),
-                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+                     Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #elif 0
     /* snakeAI variant B: 16-way ScaledConcat feature extractor */
     QMainNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, true), stateDim, 4, true),
                    TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, true),
-                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+                   Layer<Linear>::_(hiddenDim, actionDim, true, true));
 
     QTargetNet = Net(ScaledConcat<Layer<Sigmoid>, 16>::_(Layer<Sigmoid>(stateDim, 4, true, false), stateDim, 4, false),
                      TanhNorm<Sigmoid>::_(16*4, hiddenDim, true, false),
-                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+                     Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #else
     /* snakeAI audited default: MOE<8,4> + TanhNorm */
     QMainNet = Net(MOE<8, 4>::_(stateDim, true),
                    TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, true),
-                   Layer<Sigmoid>::_(hiddenDim, actionDim, true, true));
+                   Layer<Linear>::_(hiddenDim, actionDim, true, true));
 
     QTargetNet = Net(MOE<8, 4>::_(stateDim, false),
                      TanhNorm<Sigmoid>::_(stateDim, hiddenDim, true, false),
-                     Layer<Sigmoid>::_(hiddenDim, actionDim, true, false));
+                     Layer<Linear>::_(hiddenDim, actionDim, true, false));
 #endif
     QMainNet.copyTo(QTargetNet);
 }

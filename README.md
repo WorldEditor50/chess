@@ -192,6 +192,39 @@ build\...\bench_ppo_mt.exe --games=6  --sweep=1,2,3,4,6,8 --batch=2000000000   #
 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十三"，
 设计与成因分析见 [`docs/agents_design.md`](docs/agents_design.md) §17.6。
 
+**2026-09 更新（R1，策略头只算合法列）**：那条带宽上限被推后了一截 —— 推理侧改成
+`PPO::actionMasked`（`forwardTrunk` + 只算合法着法那几行的 logit + 在合法集上 softmax），
+每模拟权重流量 5.81 MB → 3.75 MB。实测：单线程每步 18.3 → 11.0 ms（1.64×）、多线程每线程
+ms/模拟 1.4–2.7×、最优配置吞吐 0.87 局/s ≈ 2.0× 串行基线（原来还不到 1×）。语义等价性在
+`test_ppomcts` 的"测试11"里逐元素验到 3.7e-09；副作用是先验归一化口径变化带来约 2% 的
+选点变化（`bench_policy_agreement --ab=1` 量出来的 97.5–98% 一致率）。全部数字、纠正过的
+带宽拆账与 A/B 命令行见 [`docs/training_optimization.md`](docs/training_optimization.md) §9.4。
+
+**同一轮的 R1.5（内核收尾，四项）**：训练步最慢的反向 GEMV（`ei = wᵀ·e`）补上了对称内核
+（**1.060 → 0.070–0.098 ns/MAC ≈13×**，`learnFromReplay(64,2)` **490 → 304 ms**）；
+SIMD 的 `ikjk`/`kijk` 从"覆盖"改成与标量一致的"累加"（**正确性**：多列输入曾会静默丢梯度）；
+`MM::*` 入口加了 `NDEBUG` 下的形状契约断言（用 `/UNDEBUG` 重编测试跑通，并当场抓到 `lstm.cpp`
+一处越约调用）；DQN 的 Q 头从 `Sigmoid` 改成 `Linear`（奖励含负项，旧头结构上装不下负 Q）。
+细节与可复核命令见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十五"。
+
+**再同一轮之后（B-5，置换表 + 子树复用）**：PPO+MCTS 不再每 ply `nodes.clear()` —— 子局面按
+Zobrist 键登记进置换表，下一步落子走到同一局面就直接**换根复用**那棵子树（子树/先验/访问
+计数/Q 全接着用）。跨局靠"≤2 步可达"判据与显式 `resetSearchTree()` 失效，`treeReuse=false`
+可逐字复现旧行为（A/B 用）。**实测是"机制成立、决策中性"**：命中率 ~90%、每手白拿 ~10% 有效
+模拟，但 80/400 模拟下复用开/关的选点 **100% 相同**（1200 模拟下 97.5%），对 AB 的一致率三档
+预算完全相同 —— 因为 `getPUCT` 给未访问孩子 +∞，搜索先把 40 多个孩子全铺一遍，深挖余量只有
+`sims − 分支数`。数字、方法与"为什么中性"见 [`docs/issues_review.md`](docs/issues_review.md)
+的"零之二点十六"（`test_ppomcts` 测试12 + `bench_policy_agreement --reuse-ab=1`）。
+
+**R2（训练侧也只算合法列）**：R1 只改了推理；R2 换的是**学习问题** —— 训练时的 softmax
+分母也只覆盖该局面的合法着法（Z ≡ 1）。`PPO::accumulateGradSparse` + `Net::backwardFrom`
+把"头只算合法列 + 只更新合法行 + 梯度只从合法行往下传"做实；解析梯度对着中心差分验到
+1.1e-3（头）/3.5e-4（骨干），且**非法行的梯度恰好为 0**（全量口径下是 1.9e-04）。副作用确认：
+R2 权重上"全量 softmax"已无意义（Z≈0.005，非法槽位从未被训练）—— 所以 `PPO::action()`、
+`sparsePolicyHead=false`、`--ab=1` 这些不要在 R2 权重上用。**c_puct 重扫的结论是"扫不出
+落点"**（80 模拟下 6 个取值选点逐位相同，400/1200 下落进 ±6% 噪声），保持 1.414。缺口：
+BC 蒸馏路径仍是旧口径。见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十七"。
+
 ### 界面自动化（PowerShell + Windows UI Automation）
 
 | 脚本 | 验证什么 |
