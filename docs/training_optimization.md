@@ -483,6 +483,51 @@ bootstrap 尖峰）里是有效的信赖域。我据此提出假设：**在平�
 而且历史上我们的价值目标确实出现过 ±100 量级的尖峰（Phase 1 之前）；
 (c) 没有可测的收益也没有可测的代价，改默认值属于没有证据支持的改动。
 
+### 9.4 R1 实施规格：推理侧只算合法列（可机械执行）
+
+**目标**：把每次模拟的策略前向从"算满 8100 个 logit"改成"只算合法着法那几十个 logit 再在
+合法集上归一"。推理路径**语义完全等价**（现在的实现也是"全量 softmax 后把非法槽位置 0 再重新
+归一"，两者数学上一致），因此不需要重训、不动权重格式。
+
+**收益（按已实测的每模拟流量拆解）**：
+```
+现在每模拟 ≈ 3.07 MB:  输入层 368 KB + MoE 135 KB + 策略头 2070 KB + critic 500 KB
+改后每模拟 ≈ 0.50 MB:  输入层 368 KB + MoE 135 KB + 稀疏输出 ~10 KB(40×64×4B) + critic 500 KB
+                       ⇒ 约 6x（策略头是唯一被消掉的大头）
+```
+推论：P7 实测的"聚合吞吐 ~5100 模拟/秒（≈15 GB/s 饱和）"应上移到 2~3 万模拟/秒；并行上限
+（现在 ~1.5×）也应随之改善，因为带宽墙被推后了。
+
+**实现步骤（按依赖顺序，每步都能单独构建+验证）**：
+
+1. **内核侧：稀疏输出前向**
+   - 位置：`src/rl/net.hpp`（`Net`）与 `src/rl/layer.h`（`iFcLayer`）。
+   - 需要的能力：(a) 跑到**倒数第二层**为止的部分前向（拿到 `Tanh(h)` 那 64 维），
+     (b) 只对给定下标集合做 `Σ_k h[k]·W[a][k] + b[a]`。
+   - 接口建议：`void Net::forwardTrunk(const Tensor &x)`（跑到 `layers.size()-1`）+
+     `void Net::sparseLogits(const Tensor &h, const std::vector<int> &idx, std::vector<float> &out)`
+     —— 后者只对 `idx` 里的列做点积，**不触碰其余 8060 列的内存**（这是全部收益的来源）。
+   - 注意：`MlpExpert`/`SparseMoE` 在中间层，部分前向要复用它们现有的 `forward`，不要重写。
+2. **PPO 侧**：`void PPO::actionMasked(const Tensor &state, const std::vector<int> &idx, std::vector<float> &probs)`
+   —— `forwardTrunk` + `sparseLogits` + 在 `idx` 上 softmax（数值稳定：减去最大值）。
+3. **agent 侧**：改三处搜索展开里的父节点先验（`selectMove` / `trainSelfPlay` /
+   `warmupFromCurrent`），把 `ppo.action(parentState)[chosenAction]` 换成"先取该节点的合法
+   动作下标集合、`actionMasked` 一次、按 `chosenAction` 在集合里的位置查概率"。
+   **注意**：先验必须在**同一个规范视角**下算（见 Phase 4.1 的长注释），且
+   `pickUntriedByPrior` 现在是对全量 policy 取 argmax，要改成在稀疏结果上取。
+4. **测试（等价性，最重要的一步）**：在 `test_ppomcts` 加一节，对 N 个随机局面断言
+   `actionMasked(state, legalIdx)` 与"`ppo.action(state)` 后只在 legalIdx 上归一"的结果
+   **逐元素一致**（容差 1e-6）。这条是"零语义风险"这一说法的唯一凭据。
+5. **量收益**：`bench_ppo_mt` 的"每线程 ms/模拟"与"模拟/秒"，以及 `bench_policy_agreement`
+   确认选点未变（同一权重、同一局面集，一致率应**完全不变**——这是最强的回归证据）。
+
+**风险与注意**：
+* `Net` 的层输出管理（`o`/`e` 张量）要读清楚再动；`backward` 对稀疏输出**不适用**，
+  所以训练侧（R2）是另一件事：那里的 CE 拿的是全量分布，改动会**改变学习问题**，必须重训
+  并用探针验证。
+* 现有 `weights/` 下的验证权重（`verify_on/off`、`distill`、`bc8k_*`、`bc20k`）在 R2 之后
+  会作废（最后一层语义变了）；R1 阶段它们仍然有效。
+
 ### 7.12 复现命令
 ```bat
 :: 训练并保存 (塑形开 / 关)
