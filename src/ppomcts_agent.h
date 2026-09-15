@@ -202,6 +202,15 @@ public:
     void applyPotentialShaping(std::vector<RL::Step> &trajectory) const;
 
     /*
+     *  势能塑形总开关 (默认开)。留它出来**只为做 A/B 消融**: 关掉之后 Φ 恒为 0,
+     *  价值目标就退回到"自举 + 材质"这条基线, 于是"塑形到底有没有用"能被量出来
+     *  (见 docs/training_optimization.md 的验证一节)。
+     *  做成**成员**而不是全局静态: 多线程分身训练的每个 worker 都要能各带一份设置,
+     *  用全局变量会变成数据竞争。
+     */
+    bool potentialShaping = true;
+
+    /*
      *  一局开始前必须先设好: 首手**之前**那个局面的势能 (它是第 0 步的 Φ_before)。
      *  之所以不在 commitEpisode 里算, 是因为那时棋盘已经停在终局局面了。
      */

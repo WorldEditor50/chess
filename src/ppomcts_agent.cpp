@@ -252,6 +252,9 @@ float PPOMCTSAgent::potentialOf(int colorToMove)
  * ------------------------------------------------------------------ */
 void PPOMCTSAgent::applyPotentialShaping(std::vector<RL::Step> &trajectory) const
 {
+    if (!potentialShaping || trajectory.empty()) {
+        return;   /* A/B 消融: 关掉之后 Φ 恒为 0, 奖励保持原样 */
+    }
     float phiBefore = m_phiInit;
     for (std::size_t t = 0; t < trajectory.size(); t++) {
         trajectory[t].reward = shapedStepReward(trajectory[t].reward,

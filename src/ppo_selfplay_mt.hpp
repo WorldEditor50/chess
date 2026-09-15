@@ -78,6 +78,8 @@ public:
         float  moeAuxCoef    = 0.1f;
         /* 左右镜像数据增广 (P6, 见 ppomcts_agent.h)。worker 与 master 用同一个设置。 */
         bool   mirrorAugment = true;
+        /* 势能塑形 (Phase 2)。关掉它就是 A/B 消融的对照组。 */
+        bool   shaping       = true;
     };
 
     struct Stats {
@@ -101,6 +103,7 @@ public:
         m_masterAgent.replayBatchSize = cfg.learnBatch;
         m_masterAgent.replayEpochs    = cfg.learnEpochs;
         m_masterAgent.mirrorAugment   = cfg.mirrorAugment;
+        m_masterAgent.potentialShaping = cfg.shaping;
 
         /* 主线程 (learner) 也要有确定的随机流 */
         RL::Random::seedCurrentThread(0u);
@@ -196,6 +199,7 @@ private:
             */
             agent.replayBatchSize = 0;
             agent.mirrorAugment   = cfg.mirrorAugment;
+            agent.potentialShaping = cfg.shaping;
             agent.ppo.clearReplay();
         }
     };

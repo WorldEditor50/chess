@@ -63,6 +63,8 @@ struct Cfg {
     int repeat         = 1;        /* 每个配置重复几次 (取吞吐均值, 抗抖动) */
     bool serial        = true;     /* 是否跑串行基线 (加速比的分母) */
     bool mirror        = true;     /* 左右镜像数据增广 (P6) */
+    bool shaping       = true;     /* 势能塑形 (Phase 2); --no-shaping 做消融 */
+    std::string savePrefix;        /* 非空: 训练结束保存权重 (供对局验证) */
     unsigned seed      = 20240914;
 };
 
@@ -200,6 +202,7 @@ MtPoint runMtOnce(int workers, const RL::Tensor &probe)
     cfg.publishEveryLearnRounds = g_cfg.publishEvery;
     cfg.seed          = g_cfg.seed;
     cfg.mirrorAugment = g_cfg.mirror;
+    cfg.shaping       = g_cfg.shaping;
 
     /* 构造本身也要计时之外的开销: 网络初始化 (~4 M 参数) 不便宜, 但不属于自对弈,
        所以放在计时区间之外。 */
@@ -247,6 +250,48 @@ MtPoint runMtOnce(int workers, const RL::Tensor &probe)
     return p;
 }
 
+/* ================================================================
+ *  只训练 -> 保存权重 (供棋力对局验证: bench_ppo_vs_ab --load=<prefix>)
+ *
+ *  与 runMtOnce 的区别只有一处: 它要**留住**训练后的 agent 好把权重写盘,
+ *  而扫描里的那些对象用完即弃。
+ * ================================================================ */
+int trainAndSave(int workers, const RL::Tensor &probe)
+{
+    RL::Random::setSeed(g_cfg.seed);
+
+    Chess env;
+    PpoSelfPlayMT::Config cfg;
+    cfg.workers       = workers;
+    cfg.simulations   = g_cfg.sims;
+    cfg.maxMoves      = g_cfg.moves;
+    cfg.learnBatch    = g_cfg.batch;
+    cfg.learnEpochs   = g_cfg.epochs;
+    cfg.lr            = g_cfg.lr;
+    cfg.publishEveryLearnRounds = g_cfg.publishEvery;
+    cfg.seed          = g_cfg.seed;
+    cfg.mirrorAugment = g_cfg.mirror;
+    cfg.shaping       = g_cfg.shaping;
+
+    PpoSelfPlayMT mt(env, cfg);
+
+    const double v0 = mt.master().ppo.value(probe);
+    const double t0 = nowSec();
+    const PpoSelfPlayMT::Stats s = mt.run(g_cfg.games);
+    const double dt = nowSec() - t0;
+    const double v1 = mt.master().ppo.value(probe);
+
+    std::printf("  训练完成: %lld 局 / %.1f s (%.3f 局/s), 样本 %lld, 学习轮数 %lld\n",
+                s.games, dt, s.gamesPerSec(), s.samples, s.learnRounds);
+    std::printf("  权重变化: V(固定局面) %.4f -> %.4f, |dpi|_1 见扫描表\n", v0, v1);
+
+    const bool ok = mt.master().saveModel(g_cfg.savePrefix);
+    std::printf("  权重已保存: %s_actor / %s_critic -> %s\n",
+                g_cfg.savePrefix.c_str(), g_cfg.savePrefix.c_str(),
+                ok ? "成功" : "**失败**");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -268,6 +313,8 @@ int main(int argc, char *argv[])
         else if (k == "--seed")    { g_cfg.seed = (unsigned)strtoul(v.c_str(), nullptr, 10); }
         else if (k == "--no-serial") { g_cfg.serial = false; }
         else if (k == "--no-mirror") { g_cfg.mirror = false; }
+        else if (k == "--no-shaping") { g_cfg.shaping = false; }
+        else if (k == "--save") { g_cfg.savePrefix = v; }
         else if (k == "--workers") { g_cfg.workerList.push_back(atoi(v.c_str())); }
         else if (k == "--sweep") {
             /* "1,2,4,6,8" -> {1,2,4,6,8} */
@@ -319,6 +366,19 @@ int main(int argc, char *argv[])
 
     /* ---- 探针 (在跑之前建, 之后不再变) ---- */
     const RL::Tensor probe = makeProbeState();
+
+    /* ---- 0. 只训练并保存 (棋力验证用): 给了 --save 就跳过扫描 ---- */
+    if (!g_cfg.savePrefix.empty()) {
+        const int w = g_cfg.workerList.empty() ? 4 : g_cfg.workerList.back();
+        std::printf("[0] 训练并保存权重: %lld 局, workers=%d, 塑形=%s, 镜像增广=%s\n",
+                    g_cfg.games, w, g_cfg.shaping ? "开" : "关",
+                    g_cfg.mirror ? "开" : "关");
+        std::fflush(stdout);
+        const RL::Tensor probe = makeProbeState();
+        const int rc = trainAndSave(w, probe);
+        std::printf("\nEXIT=%d\n", rc);
+        return rc;
+    }
 
     /* ---- 1. 串行基线 ---- */
     double baseGamesPerSec = 0.0;
@@ -453,8 +513,7 @@ int main(int argc, char *argv[])
     }
 
     /* ---- 4. 结论 ---- */
-    if (baseGamesPerSec > 0.0 && !results.empty()) {
-        const MtPoint *best = &results[0];
+    if (baseGamesPerSec > 0.0 && !results.empty()) {        const MtPoint *best = &results[0];
         for (std::size_t i = 1; i < results.size(); i++) {
             if (results[i].gamesPerSec > best->gamesPerSec) {
                 best = &results[i];

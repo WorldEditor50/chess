@@ -4,3 +4,7 @@ build
 .vscode
 .claude
 *.user
+
+# 训练权重 (运行期产物, 每个文件约 15 MB; GUI 与基准都从运行目录的 weights/ 读写)
+# 验证用的权重可用 bench_ppo_mt --save=<prefix> 重新生成, 见 docs/training_optimization.md §7
+weights/
