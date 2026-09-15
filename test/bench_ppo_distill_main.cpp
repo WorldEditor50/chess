@@ -70,6 +70,15 @@ std::string g_savePrefix;
 bool   g_actor = false;
 int    g_actorEpochs = 6;
 float  g_actorLr = 0.002f;
+/*
+ *  clipGrad 消融: Optimize::RMSProp 在 clipGrad=true 时做的是
+ *      dw /= ||dw||_2 + 1e-8      <-- **归一化成单位长度**, 不是"超阈值才缩"
+ *  于是每参数位移与梯度量级无关 (≈ lr), 整层位移 ∝ lr·sqrt(n) —— 等价于
+ *  "signSGD + RMSProp 缩放"。它在 snakeAI (稠密奖励 + bootstrap 尖峰) 里是有效的
+ *  信赖域; 但在**平稳**的监督/AlphaZero 交叉熵上, 梯度变小时步长仍是满幅 ⇒ 会来回撞。
+ *  --no-clip 把它关掉, 用来做 A/B。
+ */
+bool   g_noClip = false;
 
 double nowSec()
 {
@@ -162,6 +171,7 @@ int main(int argc, char *argv[])
         else if (k == "--actor")    { g_actor = (std::atoi(v.c_str()) != 0); }
         else if (k == "--actor-epochs") { g_actorEpochs = std::atoi(v.c_str()); }
         else if (k == "--actor-lr") { g_actorLr = (float)atof(v.c_str()); }
+        else if (k == "--no-clip")  { g_noClip = true; }
         else { std::fprintf(stderr, "未知参数: %s\n", a.c_str()); return 2; }
     }
 
@@ -271,7 +281,7 @@ int main(int argc, char *argv[])
                 RL::Tensor mseLoss = RL::Loss::MSE::df(v, targetTensor);
                 ppo.ppo.critic.backward(s.state, mseLoss);
             }
-            ppo.ppo.critic.RMSProp(g_lr);
+            ppo.ppo.critic.RMSProp(g_lr, 0.9f, 0.0f, !g_noClip);
             steps++;
         }
         std::printf("    epoch %d/%d: 该轮 %d 次更新, 训练 MSE %.6f, 留出 MSE %.6f\n",
@@ -311,7 +321,7 @@ int main(int argc, char *argv[])
                     RL::Tensor ceLoss = RL::Loss::CrossEntropy::df(p, oneHot);
                     ppo.ppo.actorP.backward(s.state, ceLoss);
                 }
-                ppo.ppo.actorP.RMSProp(g_actorLr);
+                ppo.ppo.actorP.RMSProp(g_actorLr, 0.9f, 0.0f, !g_noClip);
                 steps++;
             }
             actorMetrics(ppo.ppo, trainSet, t1p, p1, c1);
