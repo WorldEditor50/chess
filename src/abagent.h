@@ -21,6 +21,9 @@ class ABAgent : public AgentBase
 private:
     Chess &chess;
     int maxDepth;
+    /* 最近一次搜索的根分值 (黑方视角) 与"这次搜索有没有分数" */
+    double m_lastScore = 0.0;
+    bool   m_scoreValid = false;
 
     /* Alpha-beta search internals */
     double minimizeAlpha(int color, int depth, double beta, double &totalReward);
@@ -49,6 +52,17 @@ public:
     /* Get/set search depth */
     void setDepth(int depth) { maxDepth = depth; }
     int getDepth() const { return maxDepth; }
+    /*
+     * 最近一次 findBestMove() 的**根节点搜索分**（黑方视角: 正 = 黑优）。
+     * 口径来自 findBestMove 的根节点类型选择: 黑方是 MAX 节点、红方是 MIN 节点,
+     * 所以两个分支给出的 beta/alpha 都是"black-perspective 得分"。
+     *
+     * 用途: 价值头蒸馏 (Step 2) —— 把"AB 搜了 3~4 层的结论"当作 critic 的监督目标,
+     * 它比手工局面评估多了一层**搜索**的信息 (手工评估是深度 0)。
+     * getScoreValid() 为 false 表示那次搜索没有合法走法 (没有分数可言)。
+     */
+    double getLastScore() const { return m_lastScore; }
+    bool getScoreValid() const { return m_scoreValid; }
 };
 
 #endif // ABAGENT_H

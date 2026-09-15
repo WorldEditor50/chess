@@ -718,6 +718,33 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_policy_agreement)
 
+    # ------------------------------------------- 价值头蒸馏 (Step 2)
+    # **不进 ctest**: 它跑 AB 搜索打分 + 训练 critic, 分钟级。手动跑:
+    #   cmake --build <build> --target bench_ppo_distill
+    #   <build>/bench_ppo_distill --positions=1500 --depth=3 --save=weights/distill
+    # 用 ABAgent 的**根搜索分**(含三四层战术) 当监督目标, 单独预训练 critic ——
+    # 不碰奖励、不依赖外部引擎 (全仓无 FEN 接口, 接 Pikafish 还得先写局面交换桥)。
+    add_executable(bench_ppo_distill
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_distill_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_ppo_distill PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_distill PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_distill PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_distill PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_distill)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。

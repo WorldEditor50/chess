@@ -104,6 +104,11 @@ Step ABAgent::findBestMove(int color)
                 beta = r;
             }
         }
+        /*
+           记下根分值供价值头蒸馏用 (Step 2)。黑方是 MAX 节点, 所以最终的 beta 就是
+           "这个局面黑方有多好"; 红方那一支取 alpha, 两者**同一口径** (black-perspective)。
+        */
+        m_lastScore = beta;
     } else {
         /* 红方 = MIN 节点 */
         double alpha = Stone::value_infi;
@@ -116,12 +121,18 @@ Step ABAgent::findBestMove(int color)
                 alpha = r;
             }
         }
+        m_lastScore = alpha;
     }
 
     Step step;
     if (best != nullptr) {
         step = *best;
     }
+    /*
+       没有合法走法时不记分数 (getScoreValid() = false): 那种局面的"分值"是 ±value_infi
+       量级, 拿去做回归目标会把 critic 一带带偏。
+    */
+    m_scoreValid = (best != nullptr) && (std::fabs(m_lastScore) < Stone::value_infi * 0.5);
     Steps::instance().put(steps);
     return step;
 }
