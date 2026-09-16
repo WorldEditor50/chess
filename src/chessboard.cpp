@@ -25,6 +25,7 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
     case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
     case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
+    case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
     }
     return QStringLiteral("agent");
 }
@@ -40,6 +41,7 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_DQNAB:
         return true;
     default:
         return false;
@@ -122,6 +124,15 @@ static constexpr int SACAZ_MOE_SIMS = 16;
  * Switch Transformer 论文里的 0.01 要大得多才起作用。
  */
 static constexpr float SACAZ_MOE_AUX = 0.1f;
+/*
+ * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
+ * 单位是**搜索节点数** (= 网络前向次数), 不是模拟次数: TB 骨干实测 ~3 ms/节点,
+ * 所以 256 节点 ≈ 0.8 s/步、能搜到 2~3 层 (bench_dqnab_vs_ab 实测深度 2.5)。
+ * 要更深的规划就把它调大 (线性变贵), 或者把骨干换成 MLP (同一套算法便宜两个数量级,
+ * 同样预算能搜 4~6 层)。
+ */
+static constexpr int DQNAB_NODES = 256;
+static constexpr int DQNAB_HIDDEN = 64;    /* DQN+AB 的头隐层宽度 */
 /* 单局手数上限已集中到 ChessBoard::DEFAULT_MAX_PLIES (界面上可用 setMaxPliesPerGame 调) */
 
 /*
@@ -141,6 +152,7 @@ DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
+DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
 /*
@@ -193,7 +205,15 @@ void ChessBoard::startupLoad()
         */
         {AGENT_SACAZ,     "weights/sacaz_agent_actor"},
         /* 稀疏 MoE 骨干的变体: 权重不能共用 —— 层结构完全不同 */
-        {AGENT_SACAZ_MOE, "weights/sacaz_moe_agent_actor"}
+        {AGENT_SACAZ_MOE, "weights/sacaz_moe_agent_actor"},
+        /*
+           DQN+AB 是三个文件 (主干 / V 头 / A 头), 所以这里的路径是**前缀**。
+           **探测字符串必须与实际写出的文件名一致**: DQNABAgent::saveModel(prefix)
+           写的是 `<prefix>_trunk` —— 而 RL::PPO 那一支就栽在这里 (探测的是裸的
+           `ppomcts_agent.dat`, 写出的却是 `..._actor`, 于是它的权重从来没被载入过,
+           见 docs/agents_design.md §18 的更正)。这里用 actor 对应的那个文件探测。
+        */
+        {AGENT_DQNAB,  "weights/dqnab_agent_trunk"}
     };
 
     for (const auto &we : weightFiles) {
@@ -288,6 +308,23 @@ void ChessBoard::startupLoad()
         }
         m_sfSACAZMoe->loadModel(prefix);
         logLoad("SAC+AZ-MoE 读权重(3 x 146 MB)");
+    }
+    if (s_weightPaths.count(AGENT_DQNAB)) {
+        emit busyMessage(QStringLiteral("正在载入 DQN+AB 权重… (主干 146 MB + 两个头)"));
+        if (m_sfDQNAB == nullptr) {
+            m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                             DQNABAgent::Backbone::SparseMoeTb);
+        }
+        logLoad("DQN+AB 建网(主干 37.5 M 参数)");
+        /* 探测串是 `<prefix>_trunk`, 去掉后缀得到 loadModel 要的前缀 */
+        std::string prefix = s_weightPaths[AGENT_DQNAB];
+        const std::string suffix = "_trunk";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfDQNAB->loadModel(prefix);
+        logLoad("DQN+AB 读权重(主干 + V 头 + A 头)");
     }
 
     /* ---- 4. 启动后台训练 & 通知主线程加载完成 ---- */
@@ -1172,6 +1209,39 @@ Step ChessBoard::aiThink(int color)
         preTrainThenDecide(m_sfSACAZMoe, color);
         return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
     }
+    case AGENT_DQNAB: {
+        /*
+           DQN+AB: AB 当 DQN 的 planning head。
+           每步的搜索预算是 `DQNAB_NODES` (节点数, 不是模拟次数): TB 骨干实测
+           ~3 ms/节点, 512 节点 ≈ 1.5 s/步, 能搜到 2~3 层; 同样预算换成 MLP 骨干
+           只要几毫秒、能搜到 4~6 层 (同一套算法, 见 dqnabagent.h §5)。
+           这里给 256 (约 0.8 s/步) —— 与 SACAZ_MOE 的 175 ms 同一量级, 但那 175 ms
+           是"16 次 MCTS 模拟", 这里是"256 个节点的 alpha-beta", 信息量不同。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfDQNAB == nullptr) {
+            /* 正常路径下 startupLoad() 已经预加载过它; 这里只是兜底 */
+            m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                             DQNABAgent::Backbone::SparseMoeTb);
+            auto it = s_weightPaths.find(AGENT_DQNAB);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 DQN+AB: 读取主干 + 两个头的权重…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_trunk";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfDQNAB->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        m_sfDQNAB->nodeBudget = DQNAB_NODES;
+        preTrainThenDecide(m_sfDQNAB, color);
+        /* temp = 0: 取搜索值最大的那一手 (确定性) */
+        return m_sfDQNAB->selectMove(color, 0.0f);
+    }
     default: {
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
         ABAgent abAIDefault(env, AB_DEPTH);
@@ -1284,6 +1354,30 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
         }
         preTrainThenDecide(m_sfSACAZMoe, color);
         return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+    }
+    case AGENT_DQNAB: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfDQNAB == nullptr) {
+            m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                             DQNABAgent::Backbone::SparseMoeTb);
+            /* 与上面 SACAZ_MOE 同一条约定: 建了对象就把权重载上, 两条兜底路径不许分叉 */
+            auto it = s_weightPaths.find(AGENT_DQNAB);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 DQN+AB: 读取主干 + 两个头的权重…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_trunk";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfDQNAB->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        m_sfDQNAB->nodeBudget = DQNAB_NODES;
+        preTrainThenDecide(m_sfDQNAB, color);
+        return m_sfDQNAB->selectMove(color, 0.0f);
     }
     default:
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
@@ -1639,6 +1733,8 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 */
     case AGENT_SACAZ:     return "weights/sacaz_agent";
     case AGENT_SACAZ_MOE: return "weights/sacaz_moe_agent";
+    /* DQN+AB: 前缀 -> <prefix>_trunk / _v / _a */
+    case AGENT_DQNAB:  return "weights/dqnab_agent";
     default:              return std::string();
     }
 }
@@ -1653,6 +1749,7 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     case AGENT_EVAB:      return m_sfEVAB != nullptr;
     case AGENT_SACAZ:     return m_sfSACAZ != nullptr;
     case AGENT_SACAZ_MOE: return m_sfSACAZMoe != nullptr;
+    case AGENT_DQNAB:  return m_sfDQNAB != nullptr;
     default:              return false;
     }
 }
@@ -1703,6 +1800,11 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     case AGENT_SACAZ_MOE: {
         if (m_sfSACAZMoe == nullptr) return false;
         return m_sfSACAZMoe->saveModel(filepath);
+    }
+    case AGENT_DQNAB: {
+        if (m_sfDQNAB == nullptr) return false;
+        /* 一个模型三个文件: filepath 是前缀 -> filepath_trunk / _v / _a */
+        return m_sfDQNAB->saveModel(filepath);
     }
     default:
         return false;
@@ -1889,7 +1991,7 @@ void ChessBoard::shutdownSave()
         于是每次启动都从随机价值网络重新开始, 上一局学到的东西全丢。)
     */
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
-                              AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE };
+                              AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB };
     for (AgentType t : all) {
         if (hasAgentInstance(t)) {
             saveCurrentAgentModel(t, defaultWeightPath(t));

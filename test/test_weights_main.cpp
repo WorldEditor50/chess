@@ -339,6 +339,38 @@ static void part4()
         CHECK(other.load("no_such_weight_file_xyz.wgt") != 0, "文件不存在时载入失败");
     }
 
+    /*
+       (g) **层类型完全相同、只是维度不同** (本轮新增的"维度守卫")
+       这是最阴的一种失效: v2 的结构指纹只哈希层的**类型序列**, 1440 维与 1710 维的
+       同一套网络指纹**一模一样**, 载入会被放行 —— 而 `Layer::read` 是整块替换
+       (`w = Tensor::fromString(...)`), 于是网络的张量被静默换成文件里的形状, 直到
+       某次前向才崩, 或者更糟: 不崩但输出全是垃圾。
+       触发场景就是本轮做的事: 给状态编码加平面之后, 旧权重文件必须被**明确拒绝**。
+    */
+    {
+        Net dim1440(Layer<Tanh>::_(1440, 64, true, false),
+                    Layer<Tanh>::_(64, 64, true, false),
+                    Layer<Linear>::_(64, 8, true, false));
+        Net dim1710(Layer<Tanh>::_(1710, 64, true, false),
+                    Layer<Tanh>::_(64, 64, true, false),
+                    Layer<Linear>::_(64, 8, true, false));
+        CHECK(dim1440.structureFingerprint() == dim1710.structureFingerprint(),
+              "同一套层结构、不同输入维度 -> 结构指纹**相同** (所以光靠指纹拦不住)");
+        CHECK(dim1440.paramCount() != dim1710.paramCount(),
+              "但参数总量不同 (维度守卫的判据)");
+        const std::string pd = "test_weights_dim.wgt";
+        CHECK(dim1440.save(pd) == 0, "存一个 1440 维的权重文件");
+        const int rc = dim1710.load(pd);
+        std::printf("    1440 维文件载入 1710 维网络 -> load 返回 %d\n", rc);
+        CHECK(rc != 0, "维度不同必须被拒绝 (不会把张量静默换成文件里的形状)");
+        /* 正对照: 同一个文件载入**同维度**的网络必须成功 */
+        Net same(Layer<Tanh>::_(1440, 64, true, false),
+                 Layer<Tanh>::_(64, 64, true, false),
+                 Layer<Linear>::_(64, 8, true, false));
+        CHECK(same.load(pd) == 0, "正对照: 同维度的网络仍然能载入这个文件");
+        std::remove(pd.c_str());
+    }
+
     /* (f) 在**行边界**上截断 (每一行本身都是完整的, 只是行数不够) */
     {
         std::string lines;

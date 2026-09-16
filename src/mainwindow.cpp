@@ -45,6 +45,14 @@ const AgentChoice kAgents[] = {
        界面上把它单独列出来, 就是为了能直接和 MLP 骨干的版本对弈比较。
     */
     { "SAC+MCTS+AlphaZero (稀疏MoE+TB专家)", ChessBoard::AGENT_SACAZ_MOE },
+    /*
+       DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
+       网络 (稀疏 MoE + TB 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
+       反过来当 TD 目标。与上面几个 agent 的关键差别: 它的"搜索"是**对抗展开**,
+       杀棋/战术看得见 (实测一步杀局面 8/8 命中, 而纯 Q-argmax 是 0/8)。
+       每步给 256 个搜索节点 (TB 骨干约 0.8 s/步、2~3 层), 见 DQNAB_NODES。
+    */
+    { "DQN+AB (AB+DuelingDQN, 稀疏MoE+TB专家)", ChessBoard::AGENT_DQNAB },
 };
 
 void fillAgentCombo(QComboBox *combo, int defaultIndex)
@@ -69,6 +77,7 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_DQNAB:
         return true;
     default:
         return false;

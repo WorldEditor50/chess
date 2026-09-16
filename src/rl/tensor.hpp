@@ -1660,6 +1660,18 @@ public:
        是 34 MB, 每行都拷成 std::string 就白省了。 */
     static bool validateEncoded(const char *s, std::size_t sLen)
     {
+        long long unused = 0;
+        return validateEncodedCount(s, sLen, unused);
+    }
+
+    /*
+       与 validateEncoded 完全同一趟解析, 额外把"这一行有多少个元素"报出来。
+       Net::load 用它把**整个文件的元素总数**与当前网络的 `paramCount()` 对齐 ——
+       这是"同一套层结构但维度不同"的权重文件唯一的拦截点 (见 net.hpp 的说明)。
+    */
+    static bool validateEncodedCount(const char *s, std::size_t sLen, long long &elements)
+    {
+        elements = 0;
         const void *barPtr = std::memchr(s, '|', sLen);
         if (barPtr == nullptr) {
             return false;
@@ -1669,6 +1681,7 @@ public:
         if (!parseShape(std::string(s, bar), shapeProduct)) {
             return false;
         }
+        elements = shapeProduct;
         const char *p = s + bar + 1;
         std::size_t n = sLen - bar - 1;
         while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) {
@@ -1676,6 +1689,7 @@ public:
         }
         if (n >= 4 && std::strncmp(p, "b64:", 4) == 0) {
             if (n < 4 + 8 + 1 || p[12] != ':') {
+                elements = 0;
                 return false;
             }
             std::uint32_t want = 0;
@@ -1689,14 +1703,19 @@ public:
                 } else if (c >= 'A' && c <= 'F') {
                     d = c - 'A' + 10;
                 } else {
+                    elements = 0;
                     return false;
                 }
                 want = (want << 4) | (std::uint32_t)d;
             }
             /* 流式校验: 不分配任何大缓冲, 一趟算完"长度 + 合法性 + 校验和" */
-            return base64DecodeInto(p + 13, n - 13, nullptr,
-                                    (std::size_t)(shapeProduct * (long long)sizeof(T)),
-                                    want);
+            const bool ok = base64DecodeInto(p + 13, n - 13, nullptr,
+                                             (std::size_t)(shapeProduct * (long long)sizeof(T)),
+                                             want);
+            if (!ok) {
+                elements = 0;
+            }
+            return ok;
         }
         /* v1 (十进制文本): 值的个数 = 逗号数 + 1 */
         long long values = (n == 0) ? 0 : 1;
@@ -1705,7 +1724,11 @@ public:
                 values++;
             }
         }
-        return values == shapeProduct;
+        if (values != shapeProduct) {
+            elements = 0;
+            return false;
+        }
+        return true;
     }
 
     /* 解析 "1,2,3" 形式的形状, 同时给出元素总数 */

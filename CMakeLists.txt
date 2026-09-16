@@ -261,6 +261,7 @@ set(APP_SOURCES
     ${SRC_DIR}/pos.cpp
     ${SRC_DIR}/ppomcts_agent.cpp
     ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/dqnabagent.cpp
     ${SRC_DIR}/stone.cpp
     ${SRC_DIR}/thinkingindicator.cpp
     ${SRC_DIR}/metricsview.cpp
@@ -492,6 +493,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/ppomcts_agent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/dqnabagent.cpp
         # [2.9] 节要直接构造 CurveChart, 钉住"换一批线"的语义 (clearData 只清点,
         # removeAllSeries 才清线) —— 曲线控件只依赖 Qt Widgets, 不需要主窗口。
         ${SRC_DIR}/metricsview.cpp
@@ -599,6 +601,79 @@ if(CHESS_BUILD_TESTS)
     add_test(NAME test_scaledconcat COMMAND test_scaledconcat)
     set_tests_properties(test_scaledconcat PROPERTIES TIMEOUT 600)
 
+    # ------------------------------------------- RL::SAC (库里的离散 SAC)
+    # 这个类在这之前**没有任何调用方**, 也从没被跑过。2026-09 把 PPO 的训练侧优化
+    # 方法 (P3 梯度累积 / P4 回放池多 epoch / MoE 批统计与负载均衡辅助损失 /
+    # 批平均损失 / R2 只算合法列) 搬过来时顺手撞出两处静默缺陷 (critic 的
+    # [state;π] 拼接被 MM 的形状契约静默截断; learn() 的 learningRate 参数没接线),
+    # 所以必须有测试盯着。它只依赖 RL_CORE (不碰棋盘/Qt), 因此也进 ctest。
+    # 盯三件事:
+    #   * R2 的口径: 合法集 Σπ ≡ 1、非法列 π 恰好为 0、非法列的**头权重梯度恰好为 0**
+    #   * critic 真的在学 (固定经验, TD 目标恰好 0.5, 断言 Q 朝它走)
+    #   * P3/P4 的机制: 多 epoch 的梯度成比例、优化器只调一次、
+    #     resetMoeBatchStats 真的划出了批边界 (带正对照)
+    add_executable(test_sac
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sac_main.cpp)
+    target_include_directories(test_sac PRIVATE ${SRC_DIR})
+    target_link_libraries(test_sac PRIVATE RL_CORE)
+    target_compile_options(test_sac PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_sac PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_sac)
+    add_test(NAME test_sac COMMAND test_sac)
+    set_tests_properties(test_sac PROPERTIES TIMEOUT 600)
+
+    # ------------------------------------------- DQN+AB (AB 当 DQN 的 planning head)
+    # 新 agent: 稀疏 MoE + TransformerBlock 专家骨干 + Dueling 双头 (V/A), AB 用 Q 排序、
+    # 用 V 当叶子, 并把"展开若干层后的值"当 TD 目标 (planning head)。
+    # 测试盯 [3] Dueling 双头的解析梯度 vs 有限差分、[4] 一步杀命中率 (AB vs 纯 Q-argmax)、
+    # [1][2] 规范视角的镜像对称与动作双射、[5] 固定目标收敛、[6][7] 自对弈/路由/代价/棋盘复原。
+    # 只依赖 RL_CORE + 棋盘 (不碰 Qt)。
+    add_executable(test_dqnab
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_dqnab_main.cpp
+        ${SRC_DIR}/dqnabagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_include_directories(test_dqnab PRIVATE ${SRC_DIR})
+    target_link_libraries(test_dqnab PRIVATE RL_CORE)
+    target_compile_options(test_dqnab PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_dqnab PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_dqnab)
+    add_test(NAME test_dqnab COMMAND test_dqnab)
+    set_tests_properties(test_dqnab PROPERTIES TIMEOUT 900)
+
+    # ------------------------------------------- DQN+AB vs AB 静默对弈验证
+    # **不进 ctest** (与 bench_sacaz_vs_ab / bench_ppo_vs_ab 同一理由): 跑真实对局,
+    # 依赖随机开局, TB 骨干建网要 ~1 s、每步要 1~2 s。
+    # 手动跑:
+    #   cmake --build <build> --target bench_dqnab_vs_ab
+    #   <build>/bench_dqnab_vs_ab --games=4 --budget=512 --quiet
+    #   对照(关掉搜索, 只按 Q 取最大): <build>/bench_dqnab_vs_ab --pure-q
+    add_executable(bench_dqnab_vs_ab
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_dqnab_vs_ab_main.cpp
+        ${SRC_DIR}/dqnabagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_dqnab_vs_ab PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_dqnab_vs_ab PRIVATE RL_CORE)
+    target_compile_options(bench_dqnab_vs_ab PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_dqnab_vs_ab PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_dqnab_vs_ab)
+
     # ------------------------------------------- 骨干 A/B/C/D 等时对弈基准
     # **不进 ctest**: 它跑真实对局, 依赖随机开局, 而且 TB 专家骨干一步几十毫秒,
     # 放进 ctest 既慢又会偶发失败。手动跑:
@@ -649,6 +724,92 @@ if(CHESS_BUILD_TESTS)
         AUTOUIC OFF
         AUTORCC OFF)
     chess_add_header_deps(bench_ppo_vs_ab)
+
+    # ------------------------------------------- PPO+MCTS 同权重、只改模拟次数的头对头
+    # **不进 ctest**: 同 bench_ppo_vs_ab —— 跑真实对局、依赖随机开局。
+    # 它回答的是 "把模拟次数从 80 提到 800, 同一个策略会不会下得更好": 两方权重逐位
+    # 相同、温度 0、开局由局号决定, 唯一差别是 --sims-a / --sims-b。手动跑:
+    #   cmake --build <build> --target bench_ppo_sims
+    #   <build>/bench_ppo_sims --games=20 --load=weights/<prefix> --sims-a=80 --sims-b=800
+    add_executable(bench_ppo_sims
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_sims_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_ppo_sims PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_sims PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_sims PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_sims PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_sims)
+
+    # ------------------------------------------- 纯 MCTS (随机回放) 的模拟次数标度探针
+    # **不进 ctest**: 同 bench_ppo_sims —— 依赖随机回放与随机开局。
+    #   cmake --build <build> --target bench_mcts_sims
+    #   <build>/bench_mcts_sims --positions=20 --sims-a=800 --sims-b=1600
+    add_executable(bench_mcts_sims
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_mcts_sims_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp)
+    target_include_directories(bench_mcts_sims PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_mcts_sims PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_mcts_sims PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_mcts_sims PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_mcts_sims)
+
+    # ------------------------------------------- SAC+AZ(TB 专家) vs AB 静默对弈验证
+    # GUI 里的 "SAC+AZ-MoE" 那一档 (`AGENT_SACAZ_MOE`) 的无界面对应物: 骨干 =
+    # SparseMoeTb, 16 次模拟/步, AB 深度 4 —— 与本文件里 SACAZ_MOE_* 常量一致。
+    #
+    # 它验的是**机制**并把结果放进退出码: 逐手校验走法合法性、不许有无效走法、
+    # 每局必须在手数上限内结束、对局后策略与 Q 必须全有限。比分**不影响退出码**
+    # (默认是随机初始化权重, 输给固定深度的 alpha-beta 是预期内的, 不是缺陷)。
+    # --quiet 只打一行结论 (静默验证)。
+    #
+    # **不进 ctest**: 与 bench_ppo_vs_ab / bench_moe 同一理由 —— 它跑真实对局,
+    # 依赖随机开局, 一个 TB 专家 agent 还要 ~1.6 GB 内存与秒级的建网时间。
+    # 手动跑:
+    #   cmake --build <build> --target bench_sacaz_vs_ab
+    #   <build>/bench_sacaz_vs_ab --games=4 --sims=16 --quiet
+    add_executable(bench_sacaz_vs_ab
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sacaz_vs_ab_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_sacaz_vs_ab PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sacaz_vs_ab PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sacaz_vs_ab PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sacaz_vs_ab PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sacaz_vs_ab)
 
     # ------------------------------------------- PPO+MCTS 多线程分身训练吞吐
     # **不进 ctest**: 同 bench_ppo_vs_ab —— 跑真实自对弈、依赖线程调度与随机开局,

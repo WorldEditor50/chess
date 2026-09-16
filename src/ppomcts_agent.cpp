@@ -1,4 +1,6 @@
 #include "ppomcts_agent.h"
+
+#include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "rl/layer.h"
 #include "rl/loss.h"
 #include "agentrollout.hpp"
@@ -112,6 +114,17 @@ void PPOMCTSAgent::encodeStateFor(int color, RL::Tensor &state)
             state[PLANE_UNDER_ATTACK * CELLS + canonicalCell(s->pos, me)] = 1.0f;
         }
     }
+
+    /*
+       ---- 规则上下文平面 (本轮从 DQNAB 推广过来, 见 src/chessstate.h) ----
+       三个全局标量铺满 90 格: 无吃子进度 / 重复次数 / 是否被将军。
+       **必须进状态**: 同一局面的第 1 次与第 2 次出现棋盘逐位相同, 但第 3 次直接判和 ——
+       不编码它, V(s) 就不是 s 的函数, Bellman 备份的前提 (P(s'|s,a) 只依赖 s) 就破了。
+       数值口径一律取 ChessState 里那一份 (与引擎 isRepetition 同窗口同判据), 不另写。
+    */
+    ChessState::fillPlane(&state[0], PLANE_HALFMOVE, (float)ChessState::halfmovePhase(chess));
+    ChessState::fillPlane(&state[0], PLANE_REPEAT, (float)ChessState::repetitionPhase(chess));
+    ChessState::fillPlane(&state[0], PLANE_CHECK, (float)ChessState::checkPhase(chess, me));
 }
 
 void PPOMCTSAgent::encodeState(RL::Tensor &state)

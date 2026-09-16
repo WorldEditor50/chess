@@ -28,6 +28,7 @@
 #include "dqnmcts_agent.h"
 #include "evagent.h"
 #include "sacazagent.h"
+#include "dqnabagent.h"
 
 class ChessBoard : public QWidget
 {
@@ -55,7 +56,14 @@ public:
            代价实测 ~10.9 ms/模拟 (MLP 骨干 0.07 ms/模拟), 所以模拟次数要小得多
            (见 SACAZ_MOE_SIMS), 一次走子约 175 ms。
         */
-        AGENT_SACAZ_MOE
+        AGENT_SACAZ_MOE,
+        /*
+           DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
+           网络 (稀疏 MoE + TB 专家骨干 + Dueling 双头: V + A) 学 Q(s,a); AB 用它排序、
+           用它当叶子; TD 目标来自"从 s' 展开若干层后的值"。搜索与训练细节见
+           src/dqnabagent.h 顶部的长注释。
+        */
+        AGENT_DQNAB
     };
 
 public:
@@ -277,6 +285,7 @@ private:
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
     static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
+    static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */
     std::atomic<bool> m_preTrainEnabled{true};

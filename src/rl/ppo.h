@@ -14,20 +14,70 @@
 #include "rl_basic.h"
 #include "parameter.hpp"
 #include "annealing.hpp"
+#include "expert.hpp"          /* 专家类型 / ExpertFactory / scaleExpertInit */
+#include "transformer.hpp"
 
 namespace RL {
 
 /*
+ * ============================================================
+ *  PPO 的稀疏 MoE 骨干配置 —— 换专家 / 换专家数 / 换 top-k 只改这一段
+ * ============================================================
+ *
+ * 结构参数必须编译期确定 (模板参数), 所以放在 namespace 作用域而不是类成员。
+ *
+ *  TB 专家的结构:
+ *    PPO_MOE_TB_HEADS = 16 -> 1440/16 = 90 维/头 (与 SACAZAgent 的
+ *                              MOE_TB_HEADS=15 @1260 同一个"每头 ~90 维"的口径)
+ *    PPO_MOE_TB_DFF   = 360 -> = d_model/4 (压住 TB 专家里 FFN 的开销;
+ *                              注意力那 4·d_model² 才是大头, FFN 只占 1/8)
+ *
+ *  换专家只改 `PPOExpert` 这一行 (两种专家都在 ExpertFactory 里注册过):
+ *    using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;  // 现役
+ *    using PPOExpert = MlpExpert;                                          // 旧配置 (专家数要配 8/2)
+ */
+constexpr int PPO_MOE_TB_HEADS = 16;
+constexpr int PPO_MOE_TB_DFF   = 360;
+constexpr int PPO_MOE_EXPERTS  = 4;
+constexpr int PPO_MOE_TOPK     = 1;
+
+using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
+
+/*
  * Simplified PPO for AlphaZero-style Chinese Chess.
  *
- * 骨干 (2026-09 改版): 把原来的**稠密** MOE<8,4> 换成稀疏路由的
- * SparseMoE<MlpExpert, 8, 2> (见 rl/sparse_moe.hpp)。
+ * 骨干 (2026-09 第二次改版): **专家从 MlpExpert 换成 TransformerBlock**。
+ *   旧: SparseMoE<MlpExpert, 8, 2>                  (便宜的 MLP 专家, 容量小)
+ *   新: SparseMoE<TransformerBlock<16,360>, 4, 1>   (与 SAC+AZ 那条骨干同一族)
+ * 第一次改版是"稠密 MOE<8,4> -> 稀疏路由" (下面那段注释), 那件事没有回退。
  *
- *   actorP  : state -> SparseMoE(E=8, top-2) -> Tanh(h) -> Softmax(actionDim)
- *   critic  : state -> SparseMoE(E=8, top-2) -> Tanh(h) -> Linear(1)
+ *   actorP  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Softmax(actionDim)
+ *   critic  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Linear(1)
  *
- * 为什么换: 稠密的 MOE 会把**全部**专家都算一遍再做门控加权和, 于是"专家数"直接
- * 乘在算力上 —— 那是稠密混合, 不是 MoE 的卖点。稀疏版只算门控选中的 top-k 个:
+ * 为什么换: MlpExpert 的容量被它的隐层宽度锁死 (2·d·h ≈ 0.18 M MAC/专家), 而
+ * TransformerBlock 专家带完整的注意力 + FFN (4·d² + 2·d·d_ff ≈ 9.3 M MAC/专家) ——
+ * 参数量 2.15 M -> 38.0 M (**17.7×**), 这是"专家"这个词在本工程里第一次真的代表容量。
+ *
+ * 代价 (实测: 单网络, d=1440/h=64/头=8100, MSVC Release + AVX2;
+ *       复现脚本 .r1build/bench_ppo_expert.cpp):
+ *
+ *   配置                        参数量     前向       前向+反向    每层四份缓冲
+ *   MlpExpert        E=8 top-2   2.15 M   0.139 ms    1.94 ms      34 MB
+ *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms     608 MB
+ *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms    1205 MB
+ *
+ * **专家数与 top-k 一起从 8/2 降到 4/1**, 理由有两条, 都是实测而不是偏好:
+ *   1. 内存: withGrad=true 时每个全连接张量有 w/g/v/m **四份** (见 rl/layer.h 的
+ *      iFcLayer 构造函数), 于是 E=8/top-2 的 actor+critic ≈ 2.4 GB —— 训练侧直接
+ *      不可用; E=4/top-1 是 1.22 GB, 与改版前同一量级。
+ *   2. 算力: top-k 直接乘在算力上, 而一个 TB 专家比一个 MlpExpert 贵 ~50×,
+ *      所以"容量不按 k 付费"这条稀疏 MoE 的性质在这里比 MLP 专家重要得多。
+ *   这正是 SACAZAgent 那条 TB 骨干选 E=4/top-1 (MOE_TB_EXPERTS/MOE_TB_TOPK)
+ *   的同一套理由。要回到"容量优先": 改上面 PPO_MOE_EXPERTS/PPO_MOE_TOPK 两个常量。
+ *
+ * 第一次改版 (稠密 MOE -> 稀疏路由, 未回退): 稠密的 MOE 会把**全部**专家都算一遍
+ * 再做门控加权和, 于是"专家数"直接乘在算力上 —— 那是稠密混合, 不是 MoE 的卖点。
+ * 稀疏版只算门控选中的 top-k 个:
  *   参数量 ~ E×(每个专家)   算力 ~ k×(每个专家)      ← 算力与 E 无关
  * 实测 (docs/agents_design.md §11.4): 28.7 M 参数下 42.0 -> 10.4 ms/模拟 (4.1×)。
  *
@@ -49,12 +99,17 @@ namespace RL {
 class PPO
 {
 public:
-    /* 稀疏 MoE 骨干的结构。模板参数必须编译期确定, 所以做成常量而不是运行时成员。 */
-    static constexpr int MOE_EXPERTS = 8;
-    static constexpr int MOE_TOPK    = 2;
+    /* 稀疏 MoE 骨干的结构。模板参数必须编译期确定, 所以做成常量而不是运行时成员
+       (真正的取值在文件顶部: PPO_MOE_* —— 这里只是给上层留的稳定别名)。 */
+    static constexpr int MOE_EXPERTS  = PPO_MOE_EXPERTS;
+    static constexpr int MOE_TOPK     = PPO_MOE_TOPK;
+    static constexpr int MOE_TB_HEADS = PPO_MOE_TB_HEADS;
+    static constexpr int MOE_TB_DFF   = PPO_MOE_TB_DFF;
 
     PPO(){}
     explicit PPO(int stateDim, int hiddenDim, int actionDim,
+                 /* 只有 MlpExpert 专家用它; TransformerBlock 专家的 FFN 宽度由
+                    PPO_MOE_TB_DFF 决定, 这个参数被忽略 (签名保持不变, 免得改一圈调用方) */
                  int expertHidden = 64,
                  float moeAuxCoef = 0.1f,
                  /* false = 只推理 (不分配 g/v/m 梯度缓冲, 内存与构造时间约 1/4)。
@@ -135,11 +190,28 @@ public:
      *  更新" (rl/dqn.cpp 的 learn(): 循环 experienceReplay 累积, 最后只调一次
      *  RMSProp), PPO 是唯一漏掉的那个。
      *
+     *  (2026-09 附注: 那两个百分比是在 MLP 专家骨干 (3.8 M 参数) 上量的。换成
+     *  TransformerBlock 专家 (75 M 参数) 之后**这个占比更高**: 空载实测
+     *  trainStep = 305 ms、单独计时的优化器 ≈ 277 ms ⇒ **优化器占约 91%** ——
+     *  优化器成本按参数量线性涨, 而前向+反向只是其中一小部分。
+     *  同一段计时还有个坑: 它是"反复调 RMSProp 而不重新 backward"的纯访存微基准,
+     *  机器一忙就被挤 (同一次改动里量到过 439 ms > 整步 335 ms, 每样本成本成负数),
+     *  而且梯度被清零后 v = rho·v 会衰减到浮点非规格化数 (R1.5 记过这个效应)。
+     *  test_ppomcts 现在遇到这种失真会打印"不可用"而不是负数; 要拿到可信占比,
+     *  得让每次调用前梯度都非零。)
+     *
      *  但**累积本身不是净赢**: 它把优化器成本按 batchSize 摊薄, 同时把优化器**步数**
      *  也除以 batchSize —— 没有回放池时, 你只是用"更少但更便宜的更新"换了原来那批
-     *  更新。必须配回放池才能真赚到: 同一批数据可以反复过很多遍, 每遍都产生新更新。
-     *  实测成本基准 (同一台机器): 重新生成一条样本 ≈ 55 ms, 重放一条 ≈ 20 ms,
-     *  重放 + 累积 ≈ 7 ms —— 复用比重生成便宜 3~8 倍。
+     *  更新。必须配回放池才能真赚到: 回放池让"一次更新能看到 batchSize×epochs 条经验"
+     *  而样本生成成本不涨。
+     *
+     *  (2026-09 更正: 这一条原来写的是"同一批数据可以反复过很多遍, **每遍都产生新更新**"
+     *  —— 不准确。`learnFromReplay` 的优化器调用在**所有 epoch 之后只有一次**, 所以
+     *  只产生一次更新; 而且多 epoch 是**每遍重新抽样本**, 不是把同一批重复算几遍
+     *  (后者在 clipGrad 下连方向都改不了, 见 rl/sac.cpp 里那段说明)。
+     *  真正的收益是"每单位样本生成成本拿到更多梯度信号"。实测成本基准 (同一台机器):
+     *  重新生成一条样本 ≈ 55 ms, 重放一条 ≈ 20 ms, 重放 + 累积 ≈ 7 ms ——
+     *  复用比重生成便宜 3~8 倍。)
      * ================================================================ */
 
     /*
@@ -259,7 +331,7 @@ public:
 public:
     int stateDim;
     int actionDim;
-    int expertHidden;      /* MLP 专家的隐层宽度 */
+    int expertHidden;      /* MLP 专家的隐层宽度 (换回 MlpExpert 时才有意义) */
     float gamma;
     float exploringRate;
     /* 负载均衡辅助损失系数, <=0 关闭。与 SACAZAgent 的默认值一致 (0.1) */

@@ -74,10 +74,27 @@ class ISparseMoE;
 class SACAZAgent : public AgentBase
 {
 public:
-    /* ---- 状态编码 ---- */
+    /* ---- 状态编码 ----
+       17 个平面 = 14 棋子平面 + 3 规则上下文 (无吃子进度 / 重复次数 / 将军)。
+       规则上下文是本轮从 DQNAB 推广过来的 (见 src/chessstate.h): 象棋是双人零和、
+       完全信息、交替行动的 Markov Game, 而**裸棋盘 + 轮到谁不是 Markov 状态** ——
+       三次重复判和、60 回合无吃子判和都依赖历史, 而它们决定终局。
+       只喂棋子平面时「同一局面的第 2 次与第 3 次出现」编码成同一个向量, V(s) 就不是
+       s 的函数。 */
     static constexpr int CELLS = 90;                  /* 10x9 */
-    static constexpr int PLANES = 14;                 /* 7 类棋子 x {己方, 对方} */
-    static constexpr int STATE_DIM = PLANES * CELLS;  /* 1260 */
+    static constexpr int PLANES = 17;                 /* 14 棋子 + 3 规则上下文 */
+    static constexpr int PLANE_HALFMOVE = 14;
+    static constexpr int PLANE_REPEAT   = 15;
+    static constexpr int PLANE_CHECK    = 16;
+    /*
+       **为什么这里不用"整平面铺满"的写法**: 本 agent 的状态在回放池里是**稀疏格列表**
+       (cells, 见 Transition), 只有"某格上有子"这类 1 才进得去。规则上下文是全局标量,
+       "铺满 90 格"等于凭空塞进 270 个非零格。所以它们跟在 14 个平面**之后**,
+       占 3 个标量槽 (通道), 由 Transition 的 ctx[3] 随身携带 —— 语义完全一样,
+       只是布局对稀疏表示友好。
+    */
+    static constexpr int CTX_BASE = 14 * CELLS;       /* 1260 */
+    static constexpr int STATE_DIM = CTX_BASE + 3;    /* 1263 */
     /* ---- 动作编码 ---- */
     static constexpr int ACTION_DIM = 128;
 
@@ -123,6 +140,13 @@ public:
     struct Transition {
         std::vector<std::uint16_t> cells;      /* 当前局面: plane*CELLS + cell */
         std::vector<std::uint16_t> nextCells;  /* 下一局面 (同一编码) */
+        /*
+           规则上下文 (无吃子进度 / 重复次数 / 将军) —— 它们**不是**"某个格子上的 1",
+           所以进不了上面的稀疏格列表, 必须单独随身携带: 否则训练时 expandSparse()
+           重建出来的状态会丢掉规则上下文, 编码就退回成"裸棋盘" (静默失效)。
+        */
+        float ctx[3] = { 0.0f, 0.0f, 0.0f };
+        float nextCtx[3] = { 0.0f, 0.0f, 0.0f };
         float pi[ACTION_DIM];                  /* 策略目标 (MCTS 访问分布) */
         std::uint64_t curMaskLo = 0;           /* 当前局面合法走法掩码 (策略损失要用) */
         std::uint64_t curMaskHi = 0;
@@ -198,12 +222,44 @@ public:
     int replaceTargetIter;    /* 每多少次 learn 做一次 Polyak 同步 */
     std::size_t maxMemorySize;
 
+    /*
+        ================================================================
+         [P4] 回放池的**多 epoch 复用** (2026-09, 从 RL::PPO 搬过来)
+        ================================================================
+        `learnBatch()` 原来把 batchSize 条经验**每条只过一遍**。现在每个 epoch 都
+        **重新从池里抽** batchSize 条 (与 `RL::PPO::learnFromReplay` 同一做法),
+        累积梯度之后仍然只做**一次**优化器更新 (P3 的那条: 优化器占一步的 66%,
+        必须摊薄)。于是"刷一批"看到的经验从 batchSize 变成 batchSize×epochs,
+        而优化器调用次数不变。
+
+        **不是**"把同一批重复过几遍": 批内权重不变, 所以重复遍的梯度与第一遍逐位
+        相同, 而 `RL::Net::RMSProp` 默认 clipGrad=true 会把这个倍数归一掉 ——
+        那种写法对更新方向毫无影响, 只是白烧算力。
+
+        与 `PPOMCTSAgent::replayEpochs` 同名同义 (那边默认 2)。本 agent 默认取 1
+        (与改版前的更新量逐位一致): 它的学习率不是配着"批放大 2 倍"调的, 而在线
+        路径 (exploreAndTrain) 里用户在等这一步, 把它拉到 2 就是把这个等待翻倍。
+        自对弈训练路径上想开就设 2。
+    */
+    int replayEpochs = 1;
+
+    /*
+       [R2] **本 agent 的 R2 口径是结构性的, 不是一个开关**: 掩码 softmax
+       (maskedSoftmax) 决定了非法动作 π ≡ 0, 而策略梯度的 g 在非法列上恒为 0 + 掩码
+       雅可比也给出 dz ≡ 0, 于是非法列的头部权重梯度**恰好为 0** —— 与 RL::PPO 的
+       R2 (训练侧只算合法列) 同一口径。证据钉在 test_sacaz 的 R2 一节里。
+       这里不设 `maskedTrainHead` 开关: 对局面的合法性做"可关掉的掩码"等于允许
+       非法着法, 那不是 A/B, 那是另一个 (错的) 算法。
+    */
+
     /* 统计 */
     int totalEpisodes;
     int totalWins[2];
     int learnSteps;
     long long m_leafEvals;
     float m_lastLoss = std::numeric_limits<float>::quiet_NaN();  /* 见 getLastTrainLoss */
+    /* 最近一次 learnBatch 一共攒了多少条样本 (P4 诊断: 应为 batchSize×epochs) */
+    int m_lastBatchSamples = 0;
     std::vector<AZNode> nodes;
 
     /* 回放缓冲 */
@@ -230,6 +286,10 @@ public:
     void encodeSparse(int color, std::vector<std::uint16_t> &cells) const;
     static void expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state);
     static void denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells);
+    /* 规则上下文的读写 (放在平面之后的那 3 个槽; 见 STATE_DIM 的说明) */
+    static void contextOf(Chess &c, int color, float out[3]);
+    static void writeContext(RL::Tensor &state, const float ctx[3]);
+    static void readContext(const RL::Tensor &state, float out[3]);
 
     void getLegalActions(int color,
                          std::vector<Step*> &steps,
@@ -300,7 +360,22 @@ public:
     Step selectMove(int color, int simulations_, float temp = 0.0f,
                     RL::Tensor *piOut = nullptr);
     /* 从回放缓冲采一个 mini-batch 更新一次 (critic / actor / α), 返回 critic loss */
-    float learnBatch(int batchSize_);
+    /*
+       epochs <= 0 时用成员 `replayEpochs` (P4: 同一批过几遍)。
+       批大小**必须**按池里的实际条数夹一下: 池 < batchSize 时本函数故意直接返回 0。
+    */
+    float learnBatch(int batchSize_, int epochs = 0);
+    /*
+       [MoE] 只清"本批"的门控统计 (usageBatch / probSumBatch / xSum / batchForwardCount),
+       保留生命周期累计 (坍缩诊断用的 usageTotal)。
+
+       为什么必须: 辅助损失的批均值是按"自上次 addAuxGradient 以来所有 forward"算的,
+       而 forward 有两个来源 —— learnBatch 里的训练前向, 和**搜索 (MCTS 叶子估值) 的
+       推理前向**。不复位的话, 一次 learnBatch 的辅助损失会被它之前那一整局的模拟
+       (几十到几百次叶子估值) 稀释/污染。PPO 那边 (RL::PPO::resetMoeBatchStats)
+       是同一条机制。
+    */
+    void resetMoeBatchStats();
     /* 把 getResult 的返回值换算成 color 视角的 ±1/0; 未结束返回 false */
     static bool resultValue(int result, int color, float &out);
     void trainSelfPlay(int episodes, int simulations_, int maxMoves = 200,
@@ -340,6 +415,12 @@ public:
      * 界面的"训练损失曲线"用它; 还没学过时是 NaN (曲线控件会丢弃非有限值)。
      */
     float getLastTrainLoss() const override { return m_lastLoss; }
+    /*
+       [P4] 最近一次 learnBatch 攒下的样本条数 (batchSize × epochs)。把它做成公开的
+       只读数字, 是为了让"多 epoch 真的是每遍都抽新样本"这件事可以被断言
+       (test_sacaz 的 P4 一节)。
+    */
+    int getLastBatchSamples() const { return m_lastBatchSamples; }
 };
 
 #endif // SACAZ_AGENT_H

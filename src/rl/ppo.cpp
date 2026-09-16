@@ -58,17 +58,25 @@ RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
      moeAuxCoef(moeAuxCoef_), learningSteps(0)
 {
     /*
-       Actor: state -> SparseMoE(E=8, top-2) -> Tanh(hidden) -> Softmax(actionDim)
+       Actor: state -> SparseMoE(E, top-k, 专家 = PPOExpert) -> Tanh(hidden) -> Softmax(actionDim)
 
        稀疏 MoE 层是"同维进出"的 (专家的输入输出必须同维才能做门控加权和), 所以后面
        必须再接一层普通层把 stateDim 压到 hiddenDim, 再进输出头。
 
+       2026-09 第二次改版: 专家 = TransformerBlock<16,360> (原来是 MlpExpert) ——
+       容量 2.15 M -> 38.0 M 参数, 代价是前向 0.139 -> 3.59 ms/次; 结构参数与
+       理由 (含"为什么专家数同时从 8 降到 4") 见 ppo.h 顶部那一段。
+
+       expertHidden 只对 MlpExpert 有意义 (ExpertFactory 对 TransformerBlock 会忽略它),
+       签名保留是为了不动一圈调用方 (PPOMCTSAgent / 测试 / bench)。
+
        withGrad=false 时每个 iFcLayer **不分配** g/v/m 三份梯度缓冲 —— 参数量不变,
        但内存和构造时间都降到约 1/4。多线程分身训练里 worker 只做搜索、不做反向,
-       所以它的网络应该是这个形态 (N 个 worker 省下的内存很可观)。
+       所以它的网络应该是这个形态 (N 个 worker 省下的内存很可观: TB 专家下
+       worker 从 ~600 MB 降到 ~150 MB)。
     */
     Net::Layers actorLayers;
-    actorLayers.push_back(std::make_shared<SparseMoE<MlpExpert,
+    actorLayers.push_back(std::make_shared<SparseMoE<PPOExpert,
                                                      MOE_EXPERTS,
                                                      MOE_TOPK> >(
         stateDim, withGrad, expertHidden));
@@ -78,7 +86,7 @@ RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
 
     /* Critic: 同样的骨干 + Linear(1) 标量价值头 */
     Net::Layers criticLayers;
-    criticLayers.push_back(std::make_shared<SparseMoE<MlpExpert,
+    criticLayers.push_back(std::make_shared<SparseMoE<PPOExpert,
                                                       MOE_EXPERTS,
                                                       MOE_TOPK> >(
         stateDim, withGrad, expertHidden));
@@ -481,6 +489,14 @@ bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)
     std::uniform_int_distribution<std::size_t> pick(0, replay.size() - 1);
 
     resetMoeBatchStats();
+    /*
+       每个 epoch **重新抽** batchSize 条 (注意 `pick` 在内层循环里), 所以一次更新看到
+       的是 batchSize×epochs 条经验, 而优化器只在最后调一次。
+       两种写法要分清:
+         * 现在这种 (每遍抽新样本) —— 等于把批放大 epochs 倍;
+         * "把同一批重复过 N 遍" —— 批内权重不变, 第 N 遍的梯度与第 1 遍逐位相同,
+           而 clipGrad 会把这个纯倍数归一掉, 于是对更新方向**毫无影响**, 只是白烧算力。
+    */
     for (int e = 0; e < epochs; e++) {
         for (std::size_t b = 0; b < batchSize; b++) {
             const ReplaySample &s = replay[pick(Random::engine)];

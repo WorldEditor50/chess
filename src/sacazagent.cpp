@@ -1,4 +1,6 @@
 #include "sacazagent.h"
+
+#include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "agentrollout.hpp"
 #include "rl/sparse_moe.hpp"
 
@@ -226,7 +228,7 @@ std::string SACAZAgent::getName() const
 }
 
 /* ============================================================
- *  状态编码: 规范视角 14x90 (与 EVABAgent 同一约定)
+ *  状态编码: 规范视角 14x90 + 3 个规则上下文槽 (与 EVABAgent 同一约定)
  * ============================================================ */
 void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
 {
@@ -238,11 +240,41 @@ void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) cons
         if (s == nullptr || s->alive == false || s->type < 0 || s->type >= 7) {
             continue;
         }
-        /* 轮到黑方时上下镜像 (x -> 9-x): "己方"永远在 x 大的那一侧 */
-        const int x = redToMove ? s->pos.x : (9 - s->pos.x);
-        const int cell = x * 9 + s->pos.y;
-        const int plane = s->type + ((s->color == color) ? 0 : 7);
+        /* 轮到黑方时左右镜像 (x -> 9-x): "己方"永远在 x 大的那一侧。
+           镜像只有一份实现 (src/chessstate.h), 这里调它。 */
+        const int cell = ChessState::canonicalCell(s->pos.x, s->pos.y, color);
+        /* 平面下标 = type*2 + (是己方?0:1), 与棋盘状态公共约定一致 */
+        const int plane = s->type * 2 + ((s->color == color) ? 0 : 1);
         cells.push_back((std::uint16_t)(plane * CELLS + cell));
+    }
+    (void)redToMove;
+}
+
+void SACAZAgent::contextOf(Chess &c, int color, float out[3])
+{
+    /* 规则上下文: 无吃子进度 / 重复次数 / 将军 —— 数值口径取 chessstate.h 那一份 */
+    out[0] = (float)ChessState::halfmovePhase(c);
+    out[1] = (float)ChessState::repetitionPhase(c);
+    out[2] = (float)ChessState::checkPhase(c, color);
+}
+
+void SACAZAgent::writeContext(RL::Tensor &state, const float ctx[3])
+{
+    if (state.size() < (std::size_t)STATE_DIM) {
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        state[(std::size_t)(CTX_BASE + i)] = ctx[i];
+    }
+}
+
+void SACAZAgent::readContext(const RL::Tensor &state, float out[3])
+{
+    for (int i = 0; i < 3; i++) {
+        out[i] = 0.0f;
+        if (state.size() >= (std::size_t)STATE_DIM) {
+            out[i] = state[(std::size_t)(CTX_BASE + i)];
+        }
     }
 }
 
@@ -261,7 +293,10 @@ void SACAZAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_
 {
     cells.clear();
     cells.reserve(32);
-    for (std::size_t i = 0; i < state.size(); i++) {
+    /* 只取**棋子平面**里非零的格: 规则上下文那 3 个槽不是"格子", 由 ctx[] 单独带 */
+    const std::size_t boardLimit = (state.size() < (std::size_t)CTX_BASE)
+                                       ? state.size() : (std::size_t)CTX_BASE;
+    for (std::size_t i = 0; i < boardLimit; i++) {
         if (state[i] != 0.0f) {
             cells.push_back((std::uint16_t)i);
         }
@@ -270,9 +305,15 @@ void SACAZAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_
 
 void SACAZAgent::encodeStateFor(int color, RL::Tensor &state)
 {
+    if (state.size() != (std::size_t)STATE_DIM) {
+        state = RL::Tensor(STATE_DIM, 1);
+    }
     std::vector<std::uint16_t> cells;
     encodeSparse(color, cells);
     expandSparse(cells, state);
+    float ctx[3];
+    contextOf(chess, color, ctx);
+    writeContext(state, ctx);
 }
 
 void SACAZAgent::encodeState(RL::Tensor &state)
@@ -760,13 +801,40 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
     return Step();
 }
 
+void SACAZAgent::resetMoeBatchStats()
+{
+    if (auxLossCoef <= 0.0f) {
+        return;
+    }
+    /*
+       目标网 q1Target/q2Target 也要复位: 它们只前向、不训练, 门控统计永远用不到
+       (辅助损失只注入在线网), 但 xSum/probSumBatch 是 float 累加器 —— 不复位的话
+       会随一局的模拟次数一路涨上去, 精度慢慢烂掉。
+    */
+    RL::Net *nets[5] = {&actor, &q1, &q2, &q1Target, &q2Target};
+    for (int ni = 0; ni < 5; ni++) {
+        for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+            RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+            if (moe != nullptr) {
+                moe->resetBatchStats();
+            }
+        }
+    }
+}
+
 /* ============================================================
  *  learnBatch: 一次 mini-batch 的 SAC 更新 (critic / actor / α)
  * ============================================================ */
-float SACAZAgent::learnBatch(int batchSize_)
+float SACAZAgent::learnBatch(int batchSize_, int epochs)
 {
     if (batchSize_ < 1 || (int)memories.size() < batchSize_) {
         return 0.0f;
+    }
+    if (epochs <= 0) {
+        epochs = replayEpochs > 0 ? replayEpochs : 1;
+    }
+    if (epochs < 1) {
+        epochs = 1;
     }
 
     RL::Tensor state(STATE_DIM, 1);
@@ -782,17 +850,38 @@ float SACAZAgent::learnBatch(int batchSize_)
     RL::Tensor g(ACTION_DIM, 1);
     RL::Tensor dz(ACTION_DIM, 1);
 
+    /*
+       [P4] **每个 epoch 重新从池里抽** batchSize 条 (与 RL::PPO::learnFromReplay 同一
+       做法), 累积梯度后优化器只在最后调一次 (P3)。
+
+       为什么不是"把同一批复用 epochs 遍": 批内权重不变, 所以第 N 遍的梯度与第 1 遍
+       **逐位相同**; 而 `RL::Net::RMSProp` 默认 clipGrad=true (`dw /= |dw|`) 会把这个
+       纯倍数完全归一掉 —— 重复同一批对更新方向**毫无影响**, 只是白烧算力。
+       每遍抽新样本才是真东西: 一次更新看到 batchSize×epochs 条经验 (等于把批放大
+       epochs 倍, 但仍然只调一次优化器)。生成一条样本要走整棵 MCTS, 比抽一条贵得多,
+       所以这个放大基本是白拿的。
+    */
     std::uniform_int_distribution<int> pick(0, (int)memories.size() - 1);
+
+    /*
+       [MoE] 批统计的**边界**: 只反映本批的训练前向。
+       搜索期间每次模拟都会跑一次策略/价值前向, 那些是"推理前向", 不该混进负载均衡
+       辅助损失的批均值里 (见 resetMoeBatchStats 的说明)。
+    */
+    resetMoeBatchStats();
 
     float lossSum = 0.0f;
     int n = 0;
     float alphaGrad = 0.0f;
     const float a = alpha[0];
 
+    for (int ep = 0; ep < epochs; ep++) {
     for (int it = 0; it < batchSize_; it++) {
         const Transition &tr = memories[(std::size_t)pick(RL::Random::engine)];
         expandSparse(tr.cells, state);
+        writeContext(state, tr.ctx);
         expandSparse(tr.nextCells, nextState);
+        writeContext(nextState, tr.nextCtx);
         bitsToMask(tr.curMaskLo, tr.curMaskHi, mask);
         bitsToMask(tr.nextMaskLo, tr.nextMaskHi, nextMask);
 
@@ -862,13 +951,20 @@ float SACAZAgent::learnBatch(int batchSize_)
         alphaGrad += (H - Hbar);
         n++;
     }
+    }   /* ---- epochs 循环结束 (P4) ---- */
 
     if (n == 0) {
         return 0.0f;
     }
 
-    /* 本批的平均 critic 损失 (界面曲线用, 见 getLastTrainLoss) */
+    /*
+       本批的平均 critic 损失 (界面曲线用, 见 getLastTrainLoss)。
+       取**批平均**而不是最后一条: 逐样本上报会让曲线变成低占空比的脉冲
+       (重尾样本能差几个数量级), 而且与 DQN 报"平均平方 TD 误差"的口径对不上。
+       P4 之后分母是 batchSize × epochs (每个 epoch 各抽 batchSize 条)。
+    */
     m_lastLoss = lossSum / (float)n;
+    m_lastBatchSamples = n;
 
     /*
        ---- 稀疏 MoE 的负载均衡辅助损失 ----
@@ -948,6 +1044,7 @@ void SACAZAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
 
             Transition tr;
             encodeSparse(turn, tr.cells);
+            contextOf(chess, turn, tr.ctx);
             for (int i = 0; i < ACTION_DIM; i++) {
                 tr.pi[i] = piTarget[i];
             }
@@ -1064,7 +1161,9 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
             (void)chosen;
             Transition tr;
             denseToSparse(stateBefore, tr.cells);
+            readContext(stateBefore, tr.ctx);
             denseToSparse(nextState, tr.nextCells);
+            readContext(nextState, tr.nextCtx);
             tr.action = actionIdx;
             tr.legalCount = m_pendingLegalCount;
             tr.curMaskLo = m_pendingMaskLo;

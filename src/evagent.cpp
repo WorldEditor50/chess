@@ -1,4 +1,6 @@
 #include "evagent.h"
+
+#include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -104,22 +106,15 @@ void EVABAgent::resetStats()
 void EVABAgent::encodeCanonical(int color, RL::Tensor &state) const
 {
     state.zero();
-    const bool redToMove = (color == Stone::COLOR_RED);
-    for (int i = 0; i < 32; i++) {
-        Stone *s = chess.m_children[i];
-        if (s == nullptr || s->alive == false) {
-            continue;
-        }
-        if (s->type < 0 || s->type >= 7) {
-            continue;
-        }
-        /* 镜像: 轮到黑方时把棋盘上下翻转, 于是"己方"永远在 x 大的那一侧 */
-        const int x = redToMove ? s->pos.x : (9 - s->pos.x);
-        const int cell = x * 9 + s->pos.y;
-        const bool own = (s->color == color);
-        const int plane = s->type + (own ? 0 : 7);
-        state[plane * CELLS + cell] = 1.0f;
-    }
+    /*
+       14 个棋子平面 (规范视角) + **3 个**规则上下文平面 (无吃子/重复/将军), 由公共实现
+       写出 (src/chessstate.h) —— 镜像与规则口径都只有一份, 不在这里重写。
+       ⚠ 掩码必须显式给 CTX_RULES: 本 agent 的布局是 17 个平面, 而"5 个全写"的那条
+       便捷入口会写满 19 个平面 —— 第一版就是那么调的, 结果越界写 180 个 float,
+       实测直接堆损坏崩溃 (0xC0000374)。
+    */
+    ChessState::encodeWithContext(const_cast<Chess &>(chess), color, &state[0], 0,
+                                  ChessState::CTX_RULES, true, REWARD_MAX_PLIES);
 }
 
 /* ============================================================

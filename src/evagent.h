@@ -32,9 +32,13 @@ class EVABAgent : public AgentBase
 {
 public:
     /* ---- 状态编码: 7 种棋子 x 2 方 x 90 格 ---- */
-    static constexpr int PLANES = 14;
+    static constexpr int PLANES = 17;
     static constexpr int CELLS = 90;
-    static constexpr int STATE_DIM = PLANES * CELLS;   /* 1260 */
+    /* 14 个棋子平面 + 3 个规则上下文 (无吃子进度/重复次数/将军), 见 src/chessstate.h */
+    static constexpr int PLANE_HALFMOVE = 14;
+    static constexpr int PLANE_REPEAT   = 15;
+    static constexpr int PLANE_CHECK    = 16;
+    static constexpr int STATE_DIM = PLANES * CELLS;   /* 1530 */
 
     /* 终局分值: 与 (-1,1) 的正常评估拉开距离, 保证"将杀优先于一切" */
     static constexpr double MATE = 1000.0;
@@ -213,11 +217,19 @@ private:
     float m_lastLoss = std::numeric_limits<float>::quiet_NaN();  /* 见 getLastTrainLoss */
     /* 网络隐藏层宽度 (在线更新时要按同样的结构造一份备份用于回滚) */
     int m_hiddenDim;
-    /* 复用缓冲, 避免每次评估都分配 1260 维张量 */
+    /* 复用缓冲, 避免每次评估都分配 STATE_DIM 维张量 */
     RL::Tensor m_stateBuf;
 
-private:
+public:
+    /*
+       公开是为了让测试能断言"状态里确实带规则上下文" (test_evab [1]): 走 4 手可逆循环
+       回到同一个局面时, 棋子平面必须逐位相同而规则上下文必须变。
+       与 PPOMCTSAgent / DQNABAgent 的 encodeStateFor 一样是公开的 —— 编码是 agent 与
+       网络之间的**契约**, 检查它不该需要 friend。
+    */
     void encodeCanonical(int color, RL::Tensor &state) const;
+
+private:
     double negamax(int color, int depth, double alpha, double beta, int ply);
     double quiescence(int color, double alpha, double beta, int ply);
     void scoreMoves(std::vector<Step*> &steps, int ply, const Step *ttMove);

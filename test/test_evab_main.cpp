@@ -122,6 +122,23 @@ static void report(const char *label, const Score &sc)
 }
 
 /* ============================================================
+ *  0. 完备 Markov 状态 (本轮从 DQNAB 推广到 EVAB)
+ * ============================================================
+ *  这个测试原来是"打印信息型"的 (没有断言), 所以这里加一个最小的断言宏 ——
+ *  "状态里有没有规则上下文"这件事必须有判据, 不能靠读输出。
+ * ============================================================ */
+static int g_checks = 0;
+static int g_failed = 0;
+
+#define printf_check(cond, msg) do {                                  \
+        ++g_checks;                                                   \
+        if (!(cond)) {                                                \
+            ++g_failed;                                               \
+            std::printf("  [FAIL] %s\n", (msg));                      \
+        }                                                             \
+    } while (0)
+
+/* ============================================================
  *  1. 搜索自身的性能特征 (置换表 / 迭代加深 / 排序 的效果)
  * ============================================================ */
 static void testSearchProfile()
@@ -133,6 +150,66 @@ static void testSearchProfile()
     Chess chess;
     EVABAgent evab(chess, 48, 5, 0);
     evab.blend = 0.0f;                      /* 纯手工评估, 只看搜索本身 */
+
+    /*
+       ---- 完备 Markov 状态 (本轮从 DQNAB 推广) ----
+       象棋是双人零和、完全信息、交替行动的 Markov Game; **裸棋盘 + 轮到谁不是 Markov
+       状态** —— 三次重复判和 / 60 回合无吃子判和都依赖历史, 而它们决定终局。
+       价值网的输入必须携带这些规则上下文, 否则「同一局面的第 2 次与第 3 次出现」是
+       同一个输入而价值不同, V(s) 就不是 s 的函数。
+       判据: 走 4 手可逆循环回到同一个局面 —— 棋子平面逐位相同, 规则上下文必须变。
+    */
+    {
+        chess.reset();
+        RL::Tensor s0(EVABAgent::STATE_DIM, 1);
+        evab.encodeCanonical(Stone::COLOR_RED, s0);
+        const int boardPlanes = EVABAgent::PLANE_HALFMOVE;   /* 14: 前面全是棋子平面 */
+        const float rep0 = s0[(std::size_t)(EVABAgent::PLANE_REPEAT * EVABAgent::CELLS)];
+        const float hm0  = s0[(std::size_t)(EVABAgent::PLANE_HALFMOVE * EVABAgent::CELLS)];
+
+        const int from[4] = { 9 * 9 + 1, 0 * 9 + 1, 7 * 9 + 2, 2 * 9 + 2 };
+        const int to[4]   = { 7 * 9 + 2, 2 * 9 + 2, 9 * 9 + 1, 0 * 9 + 1 };
+        int played = 0;
+        for (int k = 0; k < 4; k++) {
+            const int turn = chess.sideToMove;
+            std::vector<Step*> legal;
+            chess.sample(turn, legal);
+            Step *mv = nullptr;
+            for (std::size_t i = 0; i < legal.size(); i++) {
+                if (legal[i]->pos.x == from[k] / 9 && legal[i]->pos.y == from[k] % 9 &&
+                    legal[i]->nextPos.x == to[k] / 9 && legal[i]->nextPos.y == to[k] % 9) {
+                    mv = legal[i];
+                    break;
+                }
+            }
+            if (mv == nullptr) { Steps::instance().put(legal); break; }
+            Step copy = *mv;
+            Steps::instance().put(legal);
+            double d = 0.0;
+            chess.moveForward(&copy, d);
+            played++;
+        }
+        RL::Tensor s1(EVABAgent::STATE_DIM, 1);
+        evab.encodeCanonical(chess.sideToMove, s1);
+        double boardDiff = 0.0;
+        for (int p = 0; p < boardPlanes; p++) {
+            for (int cell = 0; cell < EVABAgent::CELLS; cell++) {
+                const std::size_t k = (std::size_t)(p * EVABAgent::CELLS + cell);
+                boardDiff = std::max(boardDiff, std::fabs((double)s1[k] - (double)s0[k]));
+            }
+        }
+        const float rep1 = s1[(std::size_t)(EVABAgent::PLANE_REPEAT * EVABAgent::CELLS)];
+        const float hm1  = s1[(std::size_t)(EVABAgent::PLANE_HALFMOVE * EVABAgent::CELLS)];
+        std::printf("  完备状态: %d 维 (14 棋子平面 + 3 规则上下文); 4 手循环后 "
+                    "棋平面差 %.1e, 重复 %.3f -> %.3f, 无吃子 %.4f -> %.4f\n",
+                    EVABAgent::STATE_DIM, boardDiff, (double)rep0, (double)rep1,
+                    (double)hm0, (double)hm1);
+        printf_check(played == 4, "走完 4 手可逆循环 (回到起始局面)");
+        printf_check(boardDiff == 0.0, "循环之后棋子平面逐位相同 (确实是同一个局面)");
+        printf_check(rep1 > rep0, "**规则上下文变了** —— 状态不再是裸棋盘");
+        printf_check(hm1 > hm0, "无吃子计数进了状态 (60 回合判和的风险可见)");
+        chess.reset();
+    }
 
     const int depths[] = {2, 3, 4, 5};
     for (int d : depths) {
@@ -382,7 +459,7 @@ int main(int argc, char *argv[])
     testMatches(chess, games, depth, maxMoves);
 
     std::printf("\n========================================\n");
-    std::printf("  EVAB Agent 测试完成!\n");
+    std::printf("  EVAB Agent 测试完成! %d 项断言, %d 项失败\n", g_checks, g_failed);
     std::printf("========================================\n");
-    return 0;
+    return g_failed == 0 ? 0 : 1;
 }

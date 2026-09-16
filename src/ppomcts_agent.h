@@ -81,15 +81,25 @@ class PPOMCTSAgent : public AgentBase
 {
 public:
     /* ----------------------------------------------------------------
-     *  状态编码: 16 个平面 x 90 格
+     *  状态编码: 19 个平面 x 90 格  (14 棋子 + 2 威胁 + 3 规则上下文)
+     *
+     *  规则上下文那 3 个平面是本轮从 DQNAB 推广过来的（见 src/chessstate.h）：
+     *  象棋是双人零和、完全信息、交替行动的 Markov Game，而**裸棋盘 + 轮到谁不是
+     *  Markov 状态** —— 三次重复判和、60 回合无吃子判和、长将/循环都依赖历史，
+     *  而它们决定终局。只喂棋子平面时，「同一局面的第 2 次出现」与「第 3 次出现
+     *  （立刻判和）」会编码成**同一个向量**，那 V(s) 就不是 s 的函数。
      * ---------------------------------------------------------------- */
     static constexpr int CELLS = 90;                 /* 10 行 x 9 列 */
     static constexpr int PIECE_TYPES = 7;
     static constexpr int PIECE_PLANES = PIECE_TYPES * 2;   /* 7 类 x {己方, 对方} */
     static constexpr int PLANE_ATTACKED = PIECE_PLANES;          /* 14: 被对方攻击 */
     static constexpr int PLANE_UNDER_ATTACK = PIECE_PLANES + 1;  /* 15: 己方子被攻击 */
-    static constexpr int PLANES = PIECE_PLANES + 2;              /* 16 */
-    static constexpr int STATE_DIM = PLANES * CELLS;             /* 1440 */
+    /* 规则上下文: 无吃子进度 / 重复次数 / 将军 (顺序与 ChessState::CTX_* 一致) */
+    static constexpr int PLANE_HALFMOVE = PIECE_PLANES + 2;      /* 16 */
+    static constexpr int PLANE_REPEAT   = PIECE_PLANES + 3;      /* 17 */
+    static constexpr int PLANE_CHECK    = PIECE_PLANES + 4;      /* 18 */
+    static constexpr int PLANES = PIECE_PLANES + 5;              /* 19 */
+    static constexpr int STATE_DIM = PLANES * CELLS;             /* 1710 */
 
     /* ----------------------------------------------------------------
      *  动作编码: from*90 + to (无碰撞, 规范视角)
@@ -102,7 +112,10 @@ public:
     float gamma;
     float learningRate;
     float c_puct;                   /* PUCT exploration constant */
-    int expertHidden;               /* 稀疏 MoE 的 MLP 专家隐层宽度 */
+    int expertHidden;               /* 稀疏 MoE 的 MLP 专家隐层宽度 (只在把
+                                       PPOExpert 换回 MlpExpert 时才有效;
+                                       TransformerBlock 专家的 FFN 宽度由
+                                       PPO_MOE_TB_DFF 决定, 见 rl/ppo.h) */
     float moeAuxCoef;               /* 稀疏 MoE 负载均衡辅助损失系数 */
 
     /* Training statistics */

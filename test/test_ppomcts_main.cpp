@@ -199,7 +199,9 @@ static void testVsTraditionalMCTS()
  *  稀疏 MoE 的经典失败模式是**路由坍缩**: softmax 的反向会持续压低"没被选中"的
  *  专家的门控概率, 于是几轮更新之内少数专家就吃掉全部流量, 其余永远不训练。
  *  RL::PPO 为此注入了负载均衡辅助损失 (见 rl/ppo.h)。这里把每个专家被选中的次数
- *  打出来 —— 只要 8 个专家都还在被使用, 就说明辅助损失压住了坍缩。
+ *  打出来 —— 只要**每个**专家都还在被使用, 就说明辅助损失压住了坍缩。
+ *  (专家数与 top-k 现在来自 rl/ppo.h 的 PPO_MOE_* 常量: 2026-09 换成
+ *   TransformerBlock 专家之后是 E=4/top-1, 所以"都还在被使用"只有 4 个数要看。)
  *
  *  同时报告参数量与新编码的维度, 让"换骨干 / 换编码"这件事有可比的数字。
  * ================================================================ */
@@ -364,8 +366,31 @@ static void testComputeBudget()
     /* 梯度累积 B 条后每样本的成本 (只有优化器那一项被摊薄) */
     const int B = 64;
     const double perSampleBatched = fwdMs + restMs + optMs / (double)B;
-    printf("  per-sample cost: %.2f ms now -> %.2f ms with grad-accum B=%d (%.1fx cheaper)\n",
-           trainPerStep, perSampleBatched, B, trainPerStep / perSampleBatched);
+    /*
+       **这一行先判一次符号, 因为 `optMs` 会失真到超过一整步**。
+       2026-09 实测 (同一份二进制, 只差机器忙不忙):
+           空载: trainStep = 305.17 ms -> 每样本 32.17 ms (9.5x cheaper)  => optMs ≈ 277 ms
+           有别的测试在跑: trainStep = 334.81 ms -> **-97.46 ms** (负数!)  => optMs ≈ 439 ms
+       一个"优化器耗时"比"前向+反向+优化器"还大, 显然不是算法的问题, 是测量的问题:
+         * 这段计时把 RMSProp 单独拿出来反复调, **不重新 backward** —— 它是个纯访存
+           微基准 (每次读写 w/v/g 三份全参数), 机器一忙就被挤得很惨, 而真实的 trainStep
+           里有 GEMV 计算可以把访存延迟盖住, 受影响小得多;
+         * 顺带还有 R1.5 记过的那个效应: 梯度被 RMSProp 清零后 v = rho·v 会衰减到浮点
+           非规格化数, 每次除法代价暴涨 (当时量 clipGrad=false 时表现为"反而慢 4 倍")。
+       所以这里不再把负数当成一个"加速比 -3.4x"打出来。要拿到可信的优化器占比, 得让
+       每次调用前梯度都非零 (把 backward 出来的梯度快照下来、每轮恢复一次)。
+       (顺带一个有意义的结论: TB 专家骨干下优化器占整步的约 91% (277/305) —— 参数从
+        3.8 M 涨到 75 M, 而优化器成本是按参数量线性涨的, 于是 P3"把优化器调用摊薄到批上"
+        比在旧骨干下更值。)
+    */
+    if (perSampleBatched > 0.0) {
+        printf("  per-sample cost: %.2f ms now -> %.2f ms with grad-accum B=%d (%.1fx cheaper)\n",
+               trainPerStep, perSampleBatched, B, trainPerStep / perSampleBatched);
+    } else {
+        printf("  per-sample cost: **不可用** —— 单独计时的优化器 %.1f ms 超过整步 %.1f ms;"
+               " 这次测量本身失效了, 见源码注释\n",
+               optMs, trainPerStep);
+    }
     /*
        这是"数据利用效率"最关键的一行: 复用同一批数据的边际成本 = 一次前向+反向+优化器,
        而它相对搜索很便宜。K 轮复用只让每步的总成本涨 K*trainPerStep。
@@ -626,14 +651,27 @@ static bool testReplayPath()
     /*
        只断言**方向**, 不断言"恰好落在目标上": 软目标下交叉熵的最优点确实是 p=target,
        但 RMSProp + clipGrad 每步位移固定, 冲过头是正常的, 那不代表路径错了。
+
+       **三个概率的完整排序 (p0 > p1 > p2) 不要断言** —— 2026-09 量过:
+       循环在 p0 刚过 0.5 时就停, 而那时 p1/p2 还停在 0.01~0.05 量级 (目标是
+       0.15/0.05, 差 3~10 倍), 它们的**相对顺序在这个早停点上基本是噪声**。
+       同一个实验换 6 个种子跑 (`.r1build/dbg_ppo_rank.cpp`, 两种专家各 6 次):
+           MlpExpert E=8 top-2 : rank 通过 3/6
+           TB<16,360> E=4 top-1: rank 通过 4/6
+       两者都接近抛硬币 —— 也就是说旧骨干下这条断言本来就在**偶发假失败**
+       (种子来自 `std::srand(time)`, 所以它时红时绿)。"学到方向"的最小可靠断言是
+       "p(target0) 是三者里最大的", 下面就用它; 尾部的顺序只打印出来看。
     */
     const bool learned = ran && (pAfter[0] > 0.5f) && (pAfter[0] > pBefore[0] * 10.0f);
-    const bool ranked  = (pAfter[0] > pAfter[1]) && (pAfter[1] > pAfter[2]);
+    const bool ranked  = (pAfter[0] > pAfter[1]) && (pAfter[0] > pAfter[2]);
     const bool valued  = std::fabs(vAfter - 0.75f) < 0.5f;
     const bool finite  = std::isfinite(agent.ppo.lastLoss) &&
                          std::isfinite(agent.ppo.lastActorLoss);
-    printf("  learning ok=%d (P(target0)>0.5 且至少涨 10x), rank ok=%d, value ok=%d, finite ok=%d\n",
+    printf("  learning ok=%d (P(target0)>0.5 且至少涨 10x), rank ok=%d (P(target0) 最大),"
+           " value ok=%d, finite ok=%d\n",
            (int)learned, (int)ranked, (int)valued, (int)finite);
+    printf("  尾部顺序 (仅供观察, 不作断言): P(target1)%s P(target2)  [目标 0.15 > 0.05]\n",
+           (pAfter[1] > pAfter[2]) ? " >" : " <");
     ok = ok && learned && ranked && valued && finite;
 
     /* ---- [c] 成本: 批量路径 vs 逐样本路径 (改动前的做法) ---- */

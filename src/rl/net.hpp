@@ -452,6 +452,20 @@ public:
             const std::size_t hdrEnd = buffer.find('\n');
             scan = (hdrEnd == std::string::npos) ? buffer.size() : hdrEnd + 1;
         }
+        /*
+           **元素总数校验** (维度守卫)。
+           为什么必须有: v2 的"结构指纹"只哈希**层的类型序列**, 不含任何维度 ——
+           于是"同一套层结构、但输入维度不同"的文件指纹完全一样, 载入会被放行, 而
+           `Layer::read` 是 `w = Tensor::fromString(...)` (整块替换), 网络的张量就被
+           **静默换成文件里的形状**, 直到某次前向才崩 (或者更糟: 不崩但输出全是垃圾)。
+           这正是 CHWGT2 想防的那类失效, 只是漏掉了维度这一维。
+           这里的判据是"文件里所有张量的元素总数 == 当前网络的 paramCount()":
+           任何维度变化 (输入维、隐层宽、专家数…只要总参数变了) 都会被拦下,
+           而且**在改动网络之前** (仍守"载入失败时网络保持不变"的保证)。
+           场景来源: 给某个 agent 的状态编码加平面 (1440 -> 1710) 之后, 旧权重文件必须
+           是"被明确拒绝", 而不是"被静默读成另一个形状"。
+        */
+        long long fileElements = 0;
         while (scan < buffer.size()) {
             const std::size_t lineStart = scan;
             const std::size_t eol = buffer.find('\n', scan);
@@ -467,15 +481,25 @@ public:
                 continue;   /* 末尾多一个换行是正常的 */
             }
             lineNo++;
-            if (!Tensor::validateEncoded(buffer.data() + lineStart, len)) {
+            long long lineElements = 0;
+            if (!Tensor::validateEncodedCount(buffer.data() + lineStart, len, lineElements)) {
                 std::cerr << "[weights] " << fileName << ": 第 " << lineNo
                           << " 个张量校验失败 (文件被截断/损坏? ), "
                              "已放弃这次载入, 网络保持不变" << std::endl;
                 return -1;
             }
+            fileElements += lineElements;
         }
         if (lineNo == 0) {
             std::cerr << "[weights] " << fileName << ": 没有张量数据" << std::endl;
+            return -1;
+        }
+        if (fileElements != paramCount()) {
+            std::cerr << "[weights] " << fileName << ": 参数量不匹配 (文件 "
+                      << fileElements << " 个元素, 当前网络 " << paramCount()
+                      << " 个) —— 层类型一样但**维度不同**, 典型的来源是状态编码改了"
+                         " (例如加了规则上下文平面)。拒绝载入, 网络保持不变。"
+                      << std::endl;
             return -1;
         }
 
