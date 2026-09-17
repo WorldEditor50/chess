@@ -15,6 +15,32 @@ public:
         RESULT_DRAW
     };
 
+    /*
+     * ====================================================================
+     *  和棋原因 (P0.2, 2026-09) —— "判和"要能归因, 否则和棋率治不到点上
+     * ====================================================================
+     *
+     *  为什么需要它: 在本工程当前的台架下, "和棋"至少是三类**性质完全不同**的事件:
+     *
+     *    * DRAW_REPEAT       —— 三次重复局面。规则结果, 也是唯一"白嫖和棋"的通道
+     *                           (本工程没有长将/长捉判负, 见 docs/rl_plan_optimized.md §0.2)。
+     *    * DRAW_NO_CAPTURE60 —— 60 回合 (120 半回合) 无吃子 (自然限着)。
+     *                           **注意**: GUI 训练一局上限只有 60 ply, 所以这条在
+     *                           训练路径上根本不可达, 只有在 --moves>=120 的 bench 里才会出现。
+     *    * 截断              —— 走到手数上限。**这不是规则结果, 是台架产物**,
+     *                           但它常常是训练里和棋的大头, 所以必须有办法把它单独数出来。
+     *                           截断由调用方记录 (见 RL::Diag::END_TRUNCATED), 规则
+     *                           引擎这里只负责前两类。
+     *
+     *  只把 RESULT_DRAW 折成一个数, 就会把上面三类混成一桶, "和棋率高"因此无法判断
+     *  该改裁判、该改课程、还是该改手数上限。
+     */
+    enum DrawReason {
+        DRAW_NONE = 0,       /* 不是和棋 (未终局 / 已分胜负) */
+        DRAW_REPEAT,         /* 三次重复局面 */
+        DRAW_NO_CAPTURE60    /* 60 回合 (120 半回合) 无吃子 — 自然限着 */
+    };
+
     /* 历史记录: 用于三次重复局面判定; halfMoveClock 在同一记录里以便精确回退 */
     struct HistoryRecord {
         unsigned long long hash;
@@ -101,10 +127,16 @@ public:
     bool isLegalMoveInternal(int color, const Step *s, bool inCheck);
     /* 该方是否还有合法走法 (将杀 / 困毙判定) */
     bool hasLegalMoves(int color);
-    /* 三次重复局面 或 60 回合(120 半回合)内无吃子 -> 和棋 */
-    bool isDraw();
-    /* 完整终局判定 (含将杀/困毙/和棋); colorToMove = 轮到谁走 */
-    int getResult(int colorToMove);
+    /*
+     * 三次重复局面 或 60 回合(120 半回合)内无吃子 -> 和棋
+     * reason (可选, P0.2): 非空时写回**是哪一类**和棋; 不是和棋时一律置 DRAW_NONE。
+     */
+    bool isDraw(DrawReason *reason = nullptr);
+    /*
+     * 完整终局判定 (含将杀/困毙/和棋); colorToMove = 轮到谁走
+     * reason (可选, P0.2): 非空时写回和棋原因 (分胜负/未终局 -> DRAW_NONE)。
+     */
+    int getResult(int colorToMove, DrawReason *reason = nullptr);
     /* 优化: 增强评估函数 */
     double evaluate();
     /*

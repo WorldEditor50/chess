@@ -983,6 +983,64 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_ppo_distill)
 
+    # ------------------------------------------- P0.1: 无界面常驻训练器
+    # **不进 ctest**: 跑真实自对弈训练, 分钟级, 且打印的是"生态读数"而不是通过/失败。
+    #
+    # 为什么需要它: GUI 的训练线程是**每局** 3 趟整模型磁盘往返 (seed 写盘 -> clone
+    # 读入 -> clone 写回 -> 主 agent 读入; actor+critic 一对约 555 MB), 换 3.2 分钟
+    # 的自对弈。那个架构是为"界面上看得见进度"服务的, 不是吞吐基线。本程序对一个
+    # 常驻 agent 反复调 trainSelfPlay, 每局零磁盘 I/O。
+    # 同时是 P0.2 (和棋原因分桶) / P0.4 (一次性 CSV 报告) / P1.1 (PBRS A/B) 的落点。
+    #   cmake --build <build> --target train_ppo
+    #   <build>/train_ppo --games=20 --sims=400 --moves=60 --opening=8 --csv=run1
+    #   <build>/train_ppo --games=20 --no-shaping --csv=shaping_off   # P1.1 A/B
+    add_executable(train_ppo
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/train_ppo_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(train_ppo PRIVATE ${SRC_DIR})
+    target_link_libraries(train_ppo PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(train_ppo PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(train_ppo PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(train_ppo)
+
+    # ------------------------------------------- P0.3: 固定锚点评测
+    # **不进 ctest**: 跑真实对局, 分钟级起。它给出"棋力有没有涨"的可证伪尺子:
+    # 固定开局集 (确定性生成 + FNV 指纹) + 换先手成对计分 + 得分率/Elo 的 95% 区间。
+    #   cmake --build <build> --target bench_anchor
+    #   <build>/bench_anchor --a=weights/run_10k --b=weights/run_5k --openings=20 --plies=8
+    #   <build>/bench_anchor --a=weights/run_10k --ab-depth=4 --budget=100 --openings=20
+    add_executable(bench_anchor
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_anchor_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_anchor PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_anchor PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_anchor PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_anchor PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_anchor)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。

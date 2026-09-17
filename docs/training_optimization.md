@@ -887,6 +887,36 @@ PBRS 的不变性**只覆盖势能那一半**，显式材质项是不受保护�
 
 ---
 
+### 9.6 2026-09 追加：和棋归因与锚点评测（P0）
+
+> 动机：§7.10 已经证明**代理指标会与胜率脱钩**，而 §10 里"快照 Elo 阶梯"一直空着 ——
+> 于是"这个改动到底有没有让棋变强""和棋率这么高该治哪一头"这两个问题都**不可证伪**。
+> P0 只做基础设施、不动算法：逐条"原建议 → 优化后"见
+> [`rl_plan_optimized.md`](rl_plan_optimized.md)，实施记录在它的 Part 6。
+
+三个落地件与它们**第一次运行就报出来**的事：
+
+| 件 | 作用 | 第一次运行的结论 |
+|---|---|---|
+| `Chess::DrawReason` + `RL::Diag::GameEndKind` | 判和**分原因**：三次重复 / 60 回合自然限着 / **台架截断**；`Aggregates` 直接打印"和棋里属于台架截断的占比"并给判读 | 60 ply 手数上限下，训练里的和棋**几乎全是台架截断**（`截断 1.000`）；而自然限着要 120 半回合 ⇒ **在 GUI 的训练配置里根本不可达**。也就是说"和棋率高"在这套台架里首先是**手数上限**问题，不是规则问题、更不是"棋力到顶" |
+| `test/train_ppo_main.cpp`（目标 `train_ppo`） | 无界面**常驻**训练器：一个进程连跑 K 局，**每局零磁盘往返** —— GUI 路径是每局 3 趟 x ~555 MB 权重往返（`chessboard.cpp:1915/1991/1999/2055`） | 小骨干下 **1.3 s/局（≈2800 局/小时）**，使 P1.1 的消融扫描第一次可行；为它加的两个钩子 `gameLog` / `openingPlies` 在默认值下行为**逐位不变** |
+| `test/bench_anchor_main.cpp`（目标 `bench_anchor`） | 固定开局集（局部 `mt19937_64` + FNV 指纹，**不碰 `RL::Random`** ⇒ 换权重跑的是同一批局面）+ 换先手成对计分 + 得分率/Elo 的 95% 区间 + `--budget=MS` 等时间 | 6 局时 Elo 区间 **[−174.9, +46.0] 跨过 50%**，程序自己打印"没测出差别" —— 而旧的 4~6 局随机开局 bench 只会给一个看起来像结论的数字 |
+
+两条关于**更新器**的事实（本轮逐行核对代码得出，记在这里免得再被引错）：
+
+* **本工程的 PPO+MCTS 就是 AZ-CE 蒸馏**：`RL::PPO::accumulateGrad` 只有 `CE(π_visit, π_net) + MSE(v, target)`，
+  没有 ratio / clip / advantage（`rl/diag.h` 里 `clipFraction = -1` 的注释就是这件事）。所以
+  "PPO clip 把 logp 猛推 ⇒ 策略塌成单点"这类诊断在这条管线上**没有对应机制**；entropy 塌只可能来自
+  "π 目标本身尖 → CE 照抄 → 更尖"的正反馈（判据是先验 KL 与访问熵，`bench_diag` 已在量）。
+* **价值目标不是 z**：`learnSelfPlay` 走 negamax 折现回报（`rl/ppo.cpp:528-604`），再叠 PBRS 平移
+  `V' = V + Φ`（`src/stone.h:885`）。于是任何"V 校准"读数**必须先减 Φ**，否则量到的是手写 `evaluate()`；
+  而每步塑形项最大 ≈(1+γ)|Φ| ≈ **1.99**，压过终局 ±1 —— `train_ppo --no-shaping` 就是为这条 A/B 准备的。
+
+GUI 侧配套：对弈局数上限 **100 → 10000**（`src/mainwindow.cpp`）。理由与锚点评测同源：80 Elo ≈ 61.5%
+得分率，几十局的协议分辨不了它。
+
+---
+
 ## 10. 未做 / 未验证（明确列出，不含糊）
 
 | 项 | 状态 | 说明 |
@@ -912,8 +942,8 @@ PBRS 的不变性**只覆盖势能那一半**，显式材质项是不受保护�
 | Phase 5 "我攻击的格" 平面 | 未做 | 编码里有"被对方攻击"（plane 14）却没有"我攻击的格"；会改 STATE_DIM（当前 `weights/` 下只有验证用的三组权重，代价只是重训） |
 | 自对弈路径的截断自举 | **已做（2026-09）** | 原为 `commitEpisode(traj, 0.0f)`（走到手数上限一律当"和棋"）。现改为 `bootstrapOutcome()`：用 critic 估**最后一步之后**的局面、取负号换算到最后一步走子方的视角（口径与在线路径 `endOnline` 一致），clamp 到 ±1。`truncationBootstrap=false` 可切回旧口径做 A/B |
 | Gumbel AlphaZero | 未做 | 低模拟数下的算法正解，改动大，留到最后 |
-| **实时训练信号采集（policy CE / 策略熵 / MoE 负载 CV / EV）** | **接口已就位、采集点未接** | `src/rl/diag.h` 的 `TrainDiag` 与 `PPOMCTSAgent::moeUsage()` 都在，但 `bench_diag` 不训练 ⇒ 这几格现在没有数据源。接上之后才能看到"policy CE 是否长期 >3""策略熵是否秒归零""MoE 有没有死专家" |
-| **快照 Elo 阶梯 / 遗忘曲线 / buffer age 直方图** | 未做 | 需要常驻对手池 + 定期快照；现在每次 `bench_*` 都是新进程，没有这个基础设施。在它之前"棋力有没有涨"只能靠 `bench_policy_agreement` 的代理指标，而那条路已被证明会与胜率脱钩（§7.10） |
+| **实时训练信号采集（policy CE / 策略熵 / MoE 负载 CV / EV）** | **部分已接（2026-09）** | `train_ppo` 现在在**训练路径**上产出：逐局结果/手数/和棋原因/吃子、吞吐、value MSE、MoE 专家负载（`--csv` 落 TB 长表）。**仍缺** `TrainDiag` 的 policy CE / 策略熵 / EV —— 训练器报告里"训练 0 次"就是这件事的暴露：`Aggregates::addTrain` 需要 `PPOMCTSAgent::commitEpisode` 里接一行 |
+| **快照 Elo 阶梯 / 遗忘曲线 / buffer age 直方图** | **部分已做（2026-09）** | `bench_anchor` 给出**可证伪**的那一半：固定开局集（带 FNV 指纹）+ 换先手成对计分 + 得分率/Elo 的 95% 区间 + 和棋构成。**仍缺**常驻快照池 —— 现在每次 `bench_*` 还是新进程，权重得手动 `--a/--b` 传，所以"阶梯"与"遗忘曲线"要等快照按固定命名（如 `weights/snap_<step>`）存一排、并有一个脚本把锚点清单传进去 |
 | **Blunder delta（用 AB 标注每个局面）** | 未做 | 需要逐局面 AB 标注；AB agent 就在手边，接线成本不高，但要注意"AB 深度 D 自己就是天花板"这条老问题 |
 | **诊断指标写进 SQLite** | 未做（**选择 CSV**） | 已给逐手宽表 + TensorBoard 长表两种 CSV；GUI 侧 `GameDatabase` 加诊断表没做。刻意取舍：先用 CSV 把读数跑通，稳住口径之后再进库 |
 | **`dqnmcts_agent` 的帧不一致** | 未修（**不能简单照搬**） | 它的 `encodeState` 是固定红黑符号、**没有走棋方通道**，叶子值是绝对视角却配交替翻号的 backup。另三个 agent 修的是"消费端漏负号"，这里要先决定 DQN 的 Q 是哪个帧，再统一 backup 与选择器 |
@@ -972,6 +1002,23 @@ cmake --build <build> --target test_reward_diag
 :: 与 AB 的配对对局 (注意: 现在每步 400 模拟约 3-5 s, 局数别开大)
 <build>\bench_ppo_vs_ab.exe --games=4 --plies=80 --sims=400 --depth=4 --opening=4 ^
     --load=<工作区>\weights\ppo_bc_d4
+
+:: ---- 2026-09: P0 基础设施 (和棋归因 + 锚点评测; 见 §9.6 与 rl_plan_optimized.md Part 6) ----
+:: 规则层: 和棋原因码的判例 (进 ctest: ctest -R test_rules; 108 断言)
+<build>\test_rules.exe
+
+:: 常驻训练器: 一个进程连跑 K 局, 每局零权重往返; 报告含和棋原因分桶 + 吞吐 + CSV
+<build>\train_ppo.exe --games=20 --sims=400 --moves=60 --opening=8 --csv=run1
+
+:: P1.1 PBRS 消融: 同一批参数跑两次, 比报告里的吃子与和棋构成
+<build>\train_ppo.exe --games=40 --opening=8 --no-shaping         --csv=shaping_off
+<build>\train_ppo.exe --games=40 --opening=8 --shaping-alpha=0.25 --csv=shaping_25
+:: 先用小骨干确认链路 (秒级/局): --hidden=16 --expert=16 --moves=20
+
+:: 锚点评测: 固定开局集 + 换先手成对计分 + 95% 区间 (指纹变了即两次不可比)
+<build>\bench_anchor.exe --openings=2 --plies=4 --sims=8 --ab-depth=2 --max-plies=16   :: 冒烟
+<build>\bench_anchor.exe --a=weights/run_10k --b=weights/run_5k --openings=20 --plies=8
+<build>\bench_anchor.exe --a=weights/run_10k --ab-depth=4 --budget=100 --openings=20  :: 等时间
 ```
 
 `test_reward_diag` 目前 **22 项检查全过**（用上面的 `--moves=60`；**别用默认的

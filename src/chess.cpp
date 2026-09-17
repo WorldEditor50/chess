@@ -1043,29 +1043,41 @@ bool Chess::isRepetition()
     return count >= 3;
 }
 
-bool Chess::isDraw()
+bool Chess::isDraw(DrawReason *reason)
 {
+    if (reason != nullptr) {
+        *reason = DRAW_NONE;
+    }
     if (isGameOver() != Stone::COLOR_NONE) {
         return false;
     }
     /* 三次重复局面 */
     if (isRepetition()) {
+        if (reason != nullptr) {
+            *reason = DRAW_REPEAT;
+        }
         return true;
     }
     /* 60 回合 (120 半回合) 内双方都没有吃子 */
     if (halfMoveClock >= 120) {
+        if (reason != nullptr) {
+            *reason = DRAW_NO_CAPTURE60;
+        }
         return true;
     }
     return false;
 }
 
-int Chess::getResult(int colorToMove)
+int Chess::getResult(int colorToMove, DrawReason *reason)
 {
+    if (reason != nullptr) {
+        *reason = DRAW_NONE;   /* 分胜负 / 未终局时保持 NONE; 判和时由 isDraw 覆写 */
+    }
     int win = isGameOver();
     if (win != Stone::COLOR_NONE) {
         return (win == Stone::COLOR_RED) ? RESULT_RED_WIN : RESULT_BLACK_WIN;
     }
-    if (isDraw()) {
+    if (isDraw(reason)) {
         return RESULT_DRAW;
     }
     /*

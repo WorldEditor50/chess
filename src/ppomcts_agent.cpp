@@ -6,6 +6,8 @@
 #include "agentrollout.hpp"
 #include "rl/util.hpp"
 
+#include <random>         /* P0.1: 随机开局 (playRandomOpening) */
+
 /* ================================================================
  *  PPOMCTSAgent - PPO + MCTS (AlphaZero-style) implementation
  *
@@ -1383,6 +1385,65 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
 }
 
 /* ------------------------------------------------------------------
+ *  P0.1 (2026-09): 无界面常驻训练器用的两个小工具
+ *
+ *  为什么放在**训练路径**里而不是让训练器自己复制一份自对弈循环:
+ *  复制一份 = 两条路会各自漂移 (π 目标 / PBRS / 截断自举 / R2 的 legalPerStep
+ *  只要有一处不一致, 量出来的东西就不是训练在学的东西)。所以这里只加最小的钩子:
+ *  gameLog (按局统计) 与 openingPlies (起点随机化), 默认值下行为逐位不变。
+ * ------------------------------------------------------------------ */
+namespace {
+
+/*
+ * 从当前局面随机走 plies 手**合法**棋 (与中国象棋各 bench 的 --opening 同一做法)。
+ * 返回 false 表示中途出现了终局局面 (此时棋盘停在那个终局上, 调用方必须 reset)。
+ * 返回 true 时 chess.sideToMove 就是下一步该走的一方 —— 调用方**必须**用它,
+ * 不能再假设"总是黑先走": 硬写颜色会让 loop 第一步改掉 sideToMove 而走错一方。
+ */
+bool playRandomOpening(Chess &c, int plies, unsigned long long seed)
+{
+    std::mt19937_64 rng(seed);
+    for (int i = 0; i < plies; i++) {
+        std::vector<Step *> steps;
+        c.sample(c.sideToMove, steps);
+        if (steps.empty()) {
+            Steps::instance().put(steps);
+            return false;
+        }
+        std::uniform_int_distribution<int> pick(0, (int)steps.size() - 1);
+        const Step s = *steps[(std::size_t)pick(rng)];
+        Steps::instance().put(steps);
+        double dummy = 0.0;
+        c.moveForward(&s, dummy);
+        if (c.getResult(c.sideToMove) != Chess::RESULT_ONGOING) {
+            return false;   /* 随机开局撞上将杀/和棋: 这一局起点作废 */
+        }
+    }
+    return true;
+}
+
+/*
+ * 把一局的统计整理成 RL::Diag::GameStat。
+ * 吃子数由调用方在逐手循环里数 (与 bench_diag 的 isCaptureStep 同口径: Step::nextId),
+ * **不用**"终局盘面反推" —— 吃将也会让一个子离场, 反推会把它算成普通吃子。
+ */
+void fillGameStat(RL::Diag::GameStat &g, long long index, int plies, int result,
+                  int endKind, int drawReason, unsigned long long openingHash,
+                  int capRed, int capBlack)
+{
+    g.gameIndex = index;
+    g.result = result;
+    g.plies = plies;
+    g.openingHash = openingHash;
+    g.capturesByRed = capRed;
+    g.capturesByBlack = capBlack;
+    g.endKind = endKind;
+    g.drawReason = drawReason;
+}
+
+}  // namespace
+
+/* ------------------------------------------------------------------
  *  trainSelfPlay:  PPO+MCTS self-play training loop
  *
  *  For each episode:
@@ -1405,6 +1466,31 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
     for (int ep = 0; ep < episodes; ep++) {
         chess.reset();
         int currentColor = Stone::COLOR_BLACK;
+        /*
+           P0.1: 起点随机化 (默认 openingPlies = 0 -> 与改动前逐位相同)。
+           不随机化时, 同一个权重下**每一局都是同一盘棋**, 于是"开局多样性"会退化成
+           1 种、"和棋分桶"反复量同一盘棋 —— 量出来的是台架的缺陷, 不是模型的。
+        */
+        if (openingPlies > 0) {
+            bool opened = false;
+            for (int attempt = 0; attempt < 8 && !opened; attempt++) {
+                chess.reset();
+                opened = playRandomOpening(chess, openingPlies,
+                                           openingSeed
+                                               + (unsigned long long)ep * 0x9E3779B1ull
+                                               + (unsigned long long)attempt);
+            }
+            if (opened) {
+                currentColor = chess.sideToMove;   /* 轮到谁由棋盘决定, 不能硬写 */
+            } else {
+                /* 8 次都没造出非终局起点 (几乎不可能): 退回标准开局, 保证这一局合法 */
+                chess.reset();
+                currentColor = Stone::COLOR_BLACK;
+            }
+        }
+        /* P0.1: 本局统计的局部量 (只在 gameLog != nullptr 时才会被用到) */
+        unsigned long long openingHash = 0;
+        int capRed = 0, capBlack = 0;
         /*
            B-5: **每局**清一次树 (而不是每 ply 清一次)。一局之内子树跨 ply 复用,
            跨局必须失效 —— 否则每个新对局都会在初始局面上命中上一局的根。
@@ -1473,6 +1559,17 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 totalEpisodes++;
                 if (winner == Stone::COLOR_BLACK) totalWins[1]++;
                 if (winner == Stone::COLOR_RED) totalWins[0]++;
+
+                /* P0.1: 按局统计 (根节点就没有合法走法 = 将杀/困毙) */
+                if (gameLog != nullptr) {
+                    RL::Diag::GameStat gs;
+                    const int res = (winner == Stone::COLOR_RED) ? Chess::RESULT_RED_WIN
+                                                                 : Chess::RESULT_BLACK_WIN;
+                    fillGameStat(gs, (long long)ep + 1, moveNum, res,
+                                 RL::Diag::END_MATE, (int)Chess::DRAW_NONE,
+                                 openingHash, capRed, capBlack);
+                    gameLog->push_back(gs);
+                }
 
                 if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                     printf("  Episode %4d/%d: %s wins (no moves), %d moves, win_rate=%.2f\n",
@@ -1634,11 +1731,39 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 double dummyReward = 0.0;
                 chess.moveForward(&chosenStep, dummyReward);
 
+                /* P0.1: 逐手数吃子 (口径同 bench_diag 的 isCaptureStep: Step::nextId) */
+                if (chosenStep.nextId != Stone::ID_NONE) {
+                    if (currentColor == Stone::COLOR_RED) { capRed++; } else { capBlack++; }
+                }
+                /* 开局多样性: 第 8 手局面的哈希 (与 bench_diag 同一口径) */
+                if (moveNum + 1 == 8) {
+                    openingHash = chess.computeHash();
+                }
+
                 /* Check game over —— Phase 6: 统一走 getResult()
                    (一次覆盖 将杀/困毙/吃将/三次重复/60 回合判和; 原来 isGameOver()
                    只认"将不在了", 于是将杀与判和都不会让这一局结束)。 */
-                int gameResult = chess.getResult(chess.sideToMove);
+                Chess::DrawReason drawReason = Chess::DRAW_NONE;
+                int gameResult = chess.getResult(chess.sideToMove, &drawReason);
                 if (gameResult != Chess::RESULT_ONGOING) {
+                    /*
+                       P0.1: 按局统计 (只在调用方要的时候记)。和棋**分原因** ——
+                       把三次重复与自然限着混成一桶, "和棋率高"就没法归因
+                       (口径见 rl/diag.h 的 GameEndKind)。
+                    */
+                    if (gameLog != nullptr) {
+                        RL::Diag::GameStat gs;
+                        int kind = RL::Diag::END_MATE;
+                        if (gameResult == Chess::RESULT_DRAW) {
+                            kind = (drawReason == Chess::DRAW_NO_CAPTURE60)
+                                       ? RL::Diag::END_DRAW_NO_CAPTURE60
+                                       : RL::Diag::END_DRAW_REPEAT;
+                        }
+                        fillGameStat(gs, (long long)ep + 1, moveNum + 1, gameResult,
+                                     kind, (int)drawReason, openingHash,
+                                     capRed, capBlack);
+                        gameLog->push_back(gs);
+                    }
                     /*
                        终局值必须按**最后一步走子方**的视角给 —— 此刻走子方就是
                        currentColor (还没翻转)。原先各处按黑方视角算, 与走子方视角的
@@ -1720,6 +1845,16 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 totalEpisodes++;
                 if (winner == Stone::COLOR_BLACK) totalWins[1]++;
                 if (winner == Stone::COLOR_RED) totalWins[0]++;
+                /* P0.1: 按局统计 (无合法走法 = 将杀/困毙, 终局值 +1 给对手) */
+                if (gameLog != nullptr) {
+                    RL::Diag::GameStat gs;
+                    const int res = (winner == Stone::COLOR_RED) ? Chess::RESULT_RED_WIN
+                                                                 : Chess::RESULT_BLACK_WIN;
+                    fillGameStat(gs, (long long)ep + 1, moveNum, res,
+                                 RL::Diag::END_MATE, (int)Chess::DRAW_NONE,
+                                 openingHash, capRed, capBlack);
+                    gameLog->push_back(gs);
+                }
                 if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                     printf("  Episode %4d/%d: %s wins, %d moves, win_rate=%.2f\n",
                            ep + 1, episodes,
@@ -1753,6 +1888,30 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 commitEpisode(trajectory, bootOutcome, &legalPerStep);
             }
             totalEpisodes++;
+            /*
+               P0.1: 按局统计 —— 截断局必须与"规则判和"分开记 (END_TRUNCATED)。
+               这是本工程最容易被误读的一个数: 一局上限 60 ply 时,"和棋多"里的大头
+               往往是**台架截断**, 不是规则和棋, 更不是"棋力到顶"
+               (见 docs/rl_plan_optimized.md §0.2)。
+            */
+            if (gameLog != nullptr) {
+                RL::Diag::GameStat gs;
+                int kind = RL::Diag::END_TRUNCATED;
+                int reason = (int)Chess::DRAW_NONE;
+                int res = Chess::RESULT_DRAW;
+                if (finalResult == Chess::RESULT_DRAW) {
+                    /* 防御性分支: 这一手就判和 (上面那条路径已经会 break, 这里兜底) */
+                    Chess::DrawReason dr = Chess::DRAW_NONE;
+                    res = chess.getResult(chess.sideToMove, &dr);
+                    reason = (int)dr;
+                    kind = (dr == Chess::DRAW_NO_CAPTURE60)
+                               ? RL::Diag::END_DRAW_NO_CAPTURE60
+                               : RL::Diag::END_DRAW_REPEAT;
+                }
+                fillGameStat(gs, (long long)ep + 1, maxMoves, res, kind, reason,
+                             openingHash, capRed, capBlack);
+                gameLog->push_back(gs);
+            }
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                 printf("  Episode %4d/%d: Draw (%d moves)\n",
                        ep + 1, episodes, maxMoves);

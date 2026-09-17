@@ -140,10 +140,19 @@ MainWindow::MainWindow(QWidget *parent)
        对弈参数: 局数与每手探索(预训练)步数。把这两个数字放到界面上是为了让
        "对弈结果"可解释 —— 局数太少结论会被单局偶然性翻转, 探索步数直接决定
        每一步的思考成本。
+
+       上限 10000: 原来卡在 100。而 80 Elo ≈ 61.5% 得分率, 用 4~100 局去分辨它
+       是在噪声里读结论 (与 bench_anchor 同一件事: 100 局时得分率的 95% 区间仍有
+       ±10 个百分点)。需要"这个改动到底有没有变强"这种可证伪的结论时, 就把局数
+       拉到几百以上; 对局过程中按钮会变成"停止对弈", 随时可以中止, 不会锁死界面。
+       逐局明细会一局一行写进右侧列表 —— 上千局时那个列表会很长 (数据本身没问题,
+       MatchStats 只累加计数 + 一行文本), 只是别指望一眼扫完。
     */
-    ui->gamesSpin->setRange(1, 100);
+    ui->gamesSpin->setRange(1, 10000);
     ui->gamesSpin->setValue(4);
     ui->gamesSpin->setSuffix(QStringLiteral(" 局"));
+    /* 上千局时按 1 递增太慢: 步进给 10 (仍然可以敲键盘直接输入精确值) */
+    ui->gamesSpin->setSingleStep(10);
     ui->preTrainStepsSpin->setRange(0, 2000);
     ui->preTrainStepsSpin->setSingleStep(16);
     ui->preTrainStepsSpin->setValue(ui->gameWidget->getPreTrainSteps());

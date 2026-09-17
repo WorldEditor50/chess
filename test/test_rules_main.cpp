@@ -336,6 +336,18 @@ static void testCheckmateAndStalemate()
     CHECK(!c.hasLegalMoves(Stone::COLOR_RED), "红方无合法走法 -> 将杀");
     CHECK_EQ(c.getResult(Stone::COLOR_RED), Chess::RESULT_BLACK_WIN,
              "getResult 判定黑胜");
+    /*
+       P0.2: 带原因的重载在**分胜负**时必须把原因清成 DRAW_NONE。
+       故意传一个非 NONE 的初值: 如果输出参数只在判和时被写, 这个断言就会红 ——
+       而那种"残留上一条读数的原因"是典型静默错误 (调用方会把上一局的和棋原因
+       记到这一局头上)。
+    */
+    {
+        Chess::DrawReason w = Chess::DRAW_REPEAT;
+        CHECK_EQ(c.getResult(Stone::COLOR_RED, &w), Chess::RESULT_BLACK_WIN,
+                 "getResult(color, &reason) 判定黑胜");
+        CHECK_EQ((int)w, (int)Chess::DRAW_NONE, "分胜负时和棋原因被清成 DRAW_NONE");
+    }
     /* isGameOver() 保持"便宜"的语义: 只看将帅是否存活 */
     CHECK(c.isGameOver() == Stone::COLOR_NONE,
           "isGameOver() 不负责将杀, 仍返回 COLOR_NONE");
@@ -402,6 +414,19 @@ static void testRepetitionDraw()
     CHECK(c.isDraw(), "isDraw() 判定为和棋");
     CHECK_EQ(c.getResult(Stone::COLOR_RED), Chess::RESULT_DRAW,
              "getResult 判定和棋");
+    /*
+       P0.2: 和棋要**分原因**。三次重复与 60 回合自然限着是两类完全不同的和棋,
+       混成一桶之后"和棋率高"就无法归因 (该改裁判还是该改台架)。
+    */
+    {
+        Chess::DrawReason reason = Chess::DRAW_NONE;
+        CHECK(c.isDraw(&reason), "isDraw(&reason) 也判和");
+        CHECK_EQ((int)reason, (int)Chess::DRAW_REPEAT, "和棋原因 = 三次重复");
+        reason = Chess::DRAW_NONE;
+        CHECK_EQ(c.getResult(Stone::COLOR_RED, &reason), Chess::RESULT_DRAW,
+                 "getResult(color, &reason) 也判和");
+        CHECK_EQ((int)reason, (int)Chess::DRAW_REPEAT, "getResult 的原因 = 三次重复");
+    }
 }
 
 /* ============================================================
@@ -452,10 +477,23 @@ static void testSixtyMoveRule()
     place(c3, Stone::ID_RED_JIANG, 9, 5);
     place(c3, Stone::ID_BLACK_JIANG, 0, 3);
     c3.halfMoveClock = 119;
-    CHECK(!c3.isDraw(), "119 半回合还不是和棋");
+    /* 同样故意给个非 NONE 初值: 不是和棋时输出参数也必须被写 */
+    {
+        Chess::DrawReason none = Chess::DRAW_REPEAT;
+        CHECK(!c3.isDraw(&none), "119 半回合还不是和棋");
+        CHECK_EQ((int)none, (int)Chess::DRAW_NONE, "不是和棋时原因被清成 DRAW_NONE");
+    }
     c3.halfMoveClock = 120;
     CHECK(c3.isDraw(), "120 半回合判和");
     CHECK_EQ(c3.getResult(Stone::COLOR_RED), Chess::RESULT_DRAW, "getResult 判和");
+    /* P0.2: 这一条与"三次重复"必须能区分开 —— 否则分桶没有意义 */
+    {
+        Chess::DrawReason r60 = Chess::DRAW_NONE;
+        CHECK_EQ(c3.getResult(Stone::COLOR_RED, &r60), Chess::RESULT_DRAW,
+                 "getResult(color, &reason) 判和");
+        CHECK_EQ((int)r60, (int)Chess::DRAW_NO_CAPTURE60,
+                 "和棋原因 = 60 回合自然限着 (不是三次重复)");
+    }
 }
 
 /* ============================================================

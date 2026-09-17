@@ -337,6 +337,29 @@ struct TrainDiag {
  *  5. 对局级诊断 (自对弈生态)
  * ------------------------------------------------------------------------- */
 
+/*
+ * 一局棋是**怎么结束的** (P0.2/P0.4, 2026-09)。
+ *
+ * 为什么必须分类: "和棋率 70%" 这一句话里至少混了三件性质完全不同的事 ——
+ *   * END_MATE            : 真的分出了胜负 (唯一能产出无偏 z=±1 的终局)
+ *   * END_DRAW_REPEAT     : 三次重复。规则结果, 且是本工程唯一"白嫖和棋"的通道
+ *   * END_DRAW_NO_CAPTURE60: 60 回合自然限着。**训练路径上不可达**
+ *                            (GUI 一局上限 60 ply, 规则要 120 半回合)
+ *   * END_TRUNCATED       : 走到手数上限。**不是规则结果, 是台架产物**, 但在低棋力
+ *                            阶段它常常是"和棋"的大头, 而且它走的是 critic 自举
+ *                            而不是 z (见 PPOMCTSAgent::truncationBootstrap)。
+ * 不分开数, 就会把"台架的限制"当成"规则的问题"或"模型的问题"去治。
+ *
+ * 取值顺序与 Chess::DrawReason 无关, 这里是**训练侧**的口径, 由调用方填充。
+ */
+enum GameEndKind {
+    END_UNKNOWN = 0,
+    END_MATE,                 /* 将杀 / 困毙 / 吃将 */
+    END_DRAW_REPEAT,          /* 三次重复局面 */
+    END_DRAW_NO_CAPTURE60,    /* 60 回合无吃子 (自然限着) */
+    END_TRUNCATED             /* 手数上限 (台架截断, 走 critic 自举) */
+};
+
 struct GameStat {
     long long gameIndex = 0;
     int result = 0;                 /* Chess::RESULT_* (1=红胜 2=黑胜 3=和) */
@@ -344,6 +367,10 @@ struct GameStat {
     unsigned long long openingHash = 0;   /* 第 8 手局面的哈希 (开局多样性去重) */
     int capturesByRed = 0;
     int capturesByBlack = 0;
+    /* P0.4: 结束方式 (GameEndKind)。默认 END_UNKNOWN = 旧调用方不填, 不进分桶。 */
+    int endKind = END_UNKNOWN;
+    /* P0.4: 被判和时的原因 (Chess::DrawReason); 不是和棋为 0。 */
+    int drawReason = 0;
 };
 
 /* ---------------------------------------------------------------------------
@@ -412,7 +439,20 @@ public:
         else if (g.result == 2) { m_blackWins++; }
         else if (g.result == 3) { m_draws++; }
         m_plies += (double)g.plies;
+        if ((double)g.plies > m_pliesMax) { m_pliesMax = (double)g.plies; }
         m_openingHashes.push_back(g.openingHash);
+        /*
+           P0.4: 结束方式分桶。旧调用方不填 endKind (保持 END_UNKNOWN), 于是
+           m_endKnown 不增加 —— "分桶率"因此能自己暴露"谁还没接上", 而不是把
+           未分类的局偷偷算进 END_MATE。
+        */
+        switch (g.endKind) {
+        case END_MATE:              m_endMate++;      m_endKnown++; break;
+        case END_DRAW_REPEAT:       m_endRep++;       m_endKnown++; break;
+        case END_DRAW_NO_CAPTURE60: m_endNoCap60++;   m_endKnown++; break;
+        case END_TRUNCATED:         m_endTruncated++; m_endKnown++; break;
+        default: break;
+        }
     }
 
     long long rootSamples() const { return m_rootN; }
@@ -478,6 +518,23 @@ public:
     double redWinRate() const { return div((double)m_redWins, (double)m_games); }
     double blackWinRate() const { return div((double)m_blackWins, (double)m_games); }
     double meanPlies() const { return div(m_plies, (double)m_games); }
+    double maxPlies() const { return m_pliesMax; }
+    /*
+       ---- P0.4: 结束方式分桶 ----
+       分母用**已分类的局数** (gamesClassified), 未分类的局不进任何一桶 ——
+       否则"没人填 endKind"会被读成"全部是将杀终局", 那正是最坏的一种说谎。
+    */
+    long long gamesClassified() const { return m_endKnown; }
+    double endMateRate() const { return div((double)m_endMate, (double)m_endKnown); }
+    double drawRepeatRate() const { return div((double)m_endRep, (double)m_endKnown); }
+    double drawNoCapture60Rate() const { return div((double)m_endNoCap60, (double)m_endKnown); }
+    double truncatedRate() const { return div((double)m_endTruncated, (double)m_endKnown); }
+    /*
+       和棋里其实属于台架截断的占比。**这是最先要看的一个数**:
+         ≈1  -> "和棋多"是手数上限造成的, 该动课程/手数, 不该动裁判;
+         ≈0  -> 才是真的规则和棋 (三次重复 / 自然限着), 那才轮到裁判与奖励。
+    */
+    double truncationShareOfDraws() const { return div((double)m_endTruncated, (double)m_draws); }
     long long distinctOpenings() const
     {
         if (m_openingHashes.empty()) { return 0; }
@@ -534,8 +591,28 @@ public:
         }
         if (m_games > 0) {
             std::printf("  -- 自对弈生态 --\n");
-            std::printf("    红胜 %.3f | 黑胜 %.3f | 和 %.3f | 平均手数 %.1f\n",
-                        redWinRate(), blackWinRate(), drawRate(), meanPlies());
+            std::printf("    红胜 %.3f | 黑胜 %.3f | 和 %.3f | 平均手数 %.1f (最长 %.0f)\n",
+                        redWinRate(), blackWinRate(), drawRate(), meanPlies(), maxPlies());
+            /*
+               P0.4: 和棋**为什么**和。这一行是"该治裁判还是该治台架"的唯一判据:
+               截断占比高 = 手数上限/课程问题; 重复占比高 = 裁判(长将长捉)问题;
+               自然限着占比高 = 需要 --moves>=120 才可能出现。
+            */
+            if (m_endKnown > 0) {
+                std::printf("    结束方式 (已分类 %lld/%lld 局): 将杀 %.3f | 三次重复 %.3f"
+                            " | 自然限着 %.3f | 截断 %.3f\n",
+                            m_endKnown, m_games, endMateRate(), drawRepeatRate(),
+                            drawNoCapture60Rate(), truncatedRate());
+                if (m_draws > 0) {
+                    std::printf("    和棋里属于台架截断的占比 %.3f %s\n",
+                                truncationShareOfDraws(),
+                                (truncationShareOfDraws() > 0.5)
+                                    ? "<- 大头是手数上限, 先动课程/台架, 不是动裁判"
+                                    : "");
+                }
+            } else {
+                std::printf("    结束方式: 未分类 (调用方没填 GameStat::endKind)\n");
+            }
             std::printf("    开局种类 %lld / %lld 局 %s\n",
                         distinctOpenings(), m_games,
                         (m_games >= 10 && distinctOpenings() * 4 < m_games)
@@ -559,6 +636,10 @@ private:
     double m_valueMse = 0.0, m_valueEv = 0.0, m_moeLoadCv = 0.0;
     long long m_redWins = 0, m_blackWins = 0, m_draws = 0;
     double m_plies = 0.0;
+    double m_pliesMax = 0.0;
+    /* P0.4: 结束方式分桶 (m_endKnown = 已分类局数, 未填 endKind 的局不进任何桶) */
+    long long m_endMate = 0, m_endRep = 0, m_endNoCap60 = 0, m_endTruncated = 0;
+    long long m_endKnown = 0;
     std::vector<unsigned long long> m_openingHashes;
 };
 

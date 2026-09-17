@@ -26,6 +26,7 @@
 | 零之二点十七 | **R2**：训练侧也只算合法列（换学习问题，Z ≡ 1）+ **c_puct 重扫（扫不出落点）** |
 | **零之二点十九** | **PPO+MCTS 正确性审计（2026-09）**：PUCT 的 Q 符号反了（选择器在最大化**对手**价值）、`loadModel` 静默成功（检查点全部失效却报"载入成功"，**连本轮自己的测量都被污染**）、`Result`/`Color` 枚举混比（胜率记账错位）、`BG_TRAIN_SIMS=20` 结构性退化（**零深挖**）、搜索从不判终局叶子（**一步杀 0/20**）；外加根 Dirichlet 噪声 / `selectMove` 温度 / 截断局自举三项补齐 |
 | **零之二点二十** | **诊断指标矩阵（2026-09）**：`src/rl/diag.h`（无 Qt 依赖的指标核心）+ `rootDiag()` + `bench_diag`（自动战术题库 / Dirichlet 有效性 A/B）+ `test_diag`（68 断言，进 ctest）；**上线当天就抓出"搜索看不见将杀"**（0/20 → 20/20）；并量出三条会**让诊断说谎**的坑 |
+| **零之二点二十一** | **P0 基础设施（2026-09）**：和棋**分原因**（三次重复 / 自然限着 / **台架截断**）+ 无界面**常驻**训练器 `train_ppo`（每局零磁盘往返）+ 固定开局集锚点评测 `bench_anchor`（成对计分 / Elo 置信区间 / `--budget` 等时间）；**第一次运行就报出"训练里的和棋几乎全是 60 ply 台架截断、自然限着根本不可达"**；并逐条核清两条易被引错的事实（本管线的 actor 是纯 CE 蒸馏、没有 clip；价值目标是 negamax 塑形回报、`V'=V+Φ` 使校准读数必须先减 Φ） |
 | **零之二点十八** | **各会话（轮次）× 问题 × 优化方法 汇总 + 方法论沉淀**（本文的总索引） |
 | 零之三 | 修复前的实测结果（作为对照基线） |
 | **零之四** | **优化方法汇总（含实测数字）** —— 按手法组织，回答"哪个优化值得做、做完还剩什么瓶颈"<br>4.1 计算内核 / 4.2 构建与工具链 / 4.3 算法与交互 / 4.4 验证手法的沉淀 |
@@ -1904,13 +1905,75 @@ R1 让先验的实际尺度变成 `p_full/Z`（Z 均 0.51–0.59），等于把�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `TrainDiag` 的实时采集（policy CE / 策略熵 / MoE 负载 CV / clip fraction） | 接口就位、**未接线** | `bench_diag` 不训练，所以这几格现在只能由训练路径填。`PPOMCTSAgent::moeUsage()` 已有，接线是下一步 |
-| 快照 Elo 阶梯 / forgetting curve / buffer age 直方图 | 未做 | 需要长训练基础设施（`bench` 每次都是新进程、没有常驻对手池） |
+| `TrainDiag` 的实时采集（policy CE / 策略熵 / MoE 负载 CV / clip fraction） | **部分已接（零之二点二十一）** | `train_ppo` 在训练路径上产出逐局生态（和棋原因/手数/吃子/开局多样性）+ 吞吐 + value MSE + MoE 专家负载，并写 TB 长表 CSV；**仍缺** policy CE / 策略熵 / EV（`Aggregates::addTrain` 要在 `commitEpisode` 里接一行）。`clipFraction` 对本管线不适用（见本表末行） |
+| 快照 Elo 阶梯 / forgetting curve / buffer age 直方图 | **部分已做（零之二点二十一）** | `bench_anchor` 给出固定开局集（带 FNV 指纹）+ 换先手成对计分 + 得分率/Elo 的 95% 区间 + `--budget` 等时间 —— "棋力有没有涨"第一次可证伪。**仍缺**常驻快照池：现在每次 `bench_*` 仍是新进程，锚点要手动传 |
 | Blunder delta | 未做 | 需要逐局面 AB 标注；AB agent 就在手边，接线成本不高 |
 | SQLite 表 | 未做（**选择 CSV**） | 给了逐手宽表 + TB 长表两种 CSV；GUI 侧 `GameDatabase` 加诊断表没做 —— 这是刻意的取舍，先记在这里 |
 | virtual loss contention | N/A | 各 worker 拥有**独立**搜索树，不存在多线程踩同一棵树（见"零之二点十三"） |
 | 长将/长捉裁定 | 未做 | 规则层问题：重复局面目前**只判和**，WXF 下长将方应判负（C 组既有条目，仍开放） |
 | `clip fraction / ratio` | **对本管线不适用** | actor 损失是纯交叉熵（AlphaZero 蒸馏口径），没有 importance ratio。`TrainDiag::clipFraction` 显式标成 **−1** 而不是填 0，免得看曲线的人以为"clip 永远 0 = 更新停滞" |
+
+---
+
+## 零之二点二十一、P0 基础设施：和棋归因 / 常驻训练器 / 锚点评测（2026-09）
+
+> 背景：外部提出的三轮建议（过强对手打崩信心、和棋率、更新器选型与回放容量）先被逐条
+> 对着代码核对了一遍，收敛成 [`rl_plan_optimized.md`](rl_plan_optimized.md)（含"不做清单"），
+> 然后**只做 P0**：不动算法，先把"能量出来 + 跑得动"建起来。本节记事实与证据。
+
+### 21.1 三条先被定性的判断（对着代码核对，不是推理）
+
+1. **"被过强对手打崩信心"在当前仓库里没有通道。** PPO+MCTS 的学习入口只有
+   `chessboard.cpp:1996` 的 `clone.trainSelfPlay(...)`；对局/评测路径里没有任何
+   `commitEpisode` / `learnFromReplay` / `beginOnline` / `endOnline` 调用（`chessboard.cpp:1149`
+   的注释自己写着在线路径"GUI 从不调用"），与 AB 的对弈全在评测路径且明确不写权重
+   （`bench_ppo_vs_ab_main.cpp:5-11`）。全仓也无对手池/league（§20.6 一直列着）。
+   ⇒ 观察到的"只走一两手、不敢吃子"必须先去查另外三个嫌疑人：**PBRS 的边界双计**、
+   **低模拟数下 π 目标本身尖**、**截断自举**（见第 3 条）。
+2. **和棋的大头是台架截断，不是规则纵容。** GUI 训练一局上限 `BG_TRAIN_MAX_MOVES = 60`
+   （`chessboard.cpp:167`，循环一次迭代 = 1 ply），而"60 回合自然限着"要
+   `halfMoveClock >= 120`（`chess.cpp:1056`）⇒ **这条规则在训练路径上不可达**。
+   再加上判和只有"三次重复"与"截断"两类，于是"和棋率 70%"里混着性质完全不同的东西。
+   长将/长捉**确实没有判罚**（`chess.h` 里"长将/循环走法检测"那行注释名不副实：
+   `isRepetition()` 只数重复次数），这是唯一"白嫖和棋"的真通道 —— 仍未做（见 21.4）。
+3. **本管线里不存在 PPO clip，且价值目标不是 z。** `RL::PPO::accumulateGrad`（`rl/ppo.cpp:212-264`）
+   只有 `CE(π_visit, π_net) + MSE(v, target)`，没有 ratio / clip / advantage —— `TrainDiag::clipFraction = -1`
+   的注释就是这件事（§20.6 最后一行）。价值目标走 negamax 折现回报（`rl/ppo.cpp:528-604`）
+   再叠 PBRS 平移 `V' = V + Φ`（`stone.h:885`），于是任何"V 校准"读数**必须先减 Φ**，
+   否则量到的是手写 `evaluate()`；而每步塑形项最大 ≈(1+γ)|Φ| ≈ **1.99**，压过终局 ±1。
+
+### 21.2 落地件
+
+| 件 | 作用 | 第一次运行报出来的事 |
+|---|---|---|
+| `Chess::DrawReason`（`chess.h`/`chess.cpp`） | 判和**分原因**：`DRAW_REPEAT` / `DRAW_NO_CAPTURE60`；用**默认参数**重载 `isDraw(DrawReason*)` / `getResult(int, DrawReason*)`，旧调用点零改动。不是和棋时也显式写 `DRAW_NONE`（防"上一局的原因残留到这一局"） | 判例进了 `test_rules`（108 断言），把"三次重复"与"自然限着"钉成两类 |
+| `RL::Diag::GameEndKind` + `Aggregates` 分桶（`rl/diag.h`） | 结束方式四分：将杀 / 三次重复 / 自然限着 / **台架截断**；新增 `endMateRate()`/`drawRepeatRate()`/`drawNoCapture60Rate()`/`truncatedRate()`/`truncationShareOfDraws()`/`maxPlies()`，仪表盘直接打印判读 | 60 ply 配置下 `截断 1.000`、"和棋里属于台架截断的占比 1.000" ⇒ **"和棋率高"首先是手数上限问题**。未填 `endKind` 的旧调用方不进任何桶（`gamesClassified()` 会暴露"谁还没接上"） |
+| `test/train_ppo_main.cpp`（目标 `train_ppo`） | 无界面**常驻**训练器：一个进程连跑 K 局，每局**零磁盘往返**（GUI 路径是每局 3 趟 x ~555 MB 权重往返，`chessboard.cpp:1915/1991/1999/2055`）。agent 上只加两个默认无害的钩子：`gameLog`（三个终局出口都接上）与 `openingPlies/openingSeed`（起点随机化；顺带修掉"随机开局后 `currentColor` 必须跟着棋盘走"的错帧隐患） | 小骨干 `--hidden=16 --expert=16` 下 **1.3 s/局（≈2800 局/小时）**，"一次 A/B 要跑很多局面"第一次变得可行 |
+| `test/bench_anchor_main.cpp`（目标 `bench_anchor`） | 固定开局集（局部 `mt19937_64` + FNV 指纹，**不碰 `RL::Random`** ⇒ 换权重跑的是同一批局面）+ 换先手成对计分 + 得分率/Elo 的 **95% 区间** + `--budget=MS` 等时间标定 + 和棋构成 | 6 局时 Elo 区间 **[−174.9, +46.0] 跨过 50%**，程序自己打印"没测出差别"；旧的 4~6 局随机开局 bench 只会给一个看起来像结论的数字 |
+| P1.1 的 A/B 开关（`train_ppo`） | `--no-shaping` / `--shaping-alpha=F` / `--no-material-reward` / `--no-bootstrap` / `--no-root-noise` + `--hidden/--expert` | 配置行确认 `塑形: 关 (alpha=0.25)` —— 第 1 条里"PBRS 边界双计"这个嫌疑人现在**可以量**了 |
+| GUI 对局上限 | `mainwindow.cpp`：`gamesSpin` 100 → **10000**（步进 10） | `matchAgents` 只有下界钳制（`chessboard.cpp:1625`），放开上限只需改界面；80 Elo ≈ 61.5% 得分率，几十局的协议分辨不了 |
+
+### 21.3 验证
+
+* `test_rules`：**108 断言 / 0 失败**（新增 7 条：三次重复→`DRAW_REPEAT`、120 半回合→`DRAW_NO_CAPTURE60`、
+  分胜负与未判和时原因被清成 `DRAW_NONE`）。
+* `test_diag`：**68 断言 / 0 失败**（改过 `diag.h`，CSV 表头一致性那条断言仍绿）。两条都过 `ctest`。
+* **全项目重建**（30+ 目标，含 `chess.exe`）退出码 0 —— `chess.h`/`diag.h` 是横切头文件，这一条是必需的。
+* `train_ppo --games=2 --sims=12 --moves=60 --opening=6`：跑通并产出 `game_end_*` 逐局行 + `sum_*` 汇总行；
+  `bench_anchor --openings=3 --plies=4 --sims=8 --ab-depth=2`：跑通并产出区间与和棋构成。
+* 新代码 **0 编译警告**（仅剩 `rl/util.hpp:65`、`rl/tensor.hpp:558` 两条既有警告）。
+
+### 21.4 仍未做
+
+* **长将判负**（唯一规则改动）：必须与**新增状态平面**同批做（"是否被将军"这项特征告诉不了网络
+  *是谁*在连续将军，而判负对象正是那一方），因此 `STATE_DIM` 1710 → 1800、**所有已存权重作废**。
+* **P1.2** critic 的独立稠密监督（AB 根分值 `tanh(score/2)` 当辅助损失，`bench_ppo_distill` 已证明只训 critic 可行）；
+  **P1.3** PCR + 目标不确定性加权（只让深挖充分的 ply 进 policy 目标）；**P1.5** 残局课程 + conversion rate
+  （`trainSelfPlay` 的起点参数已由 `openingPlies` 打开一半，还缺"从给定局面起手"的入口）。
+* **`TrainDiag` 的接线**：`train_ppo` 报告里"根/行为/训练"三行仍是 0（那是 `bench_diag` 的职责），
+  但 `Aggregates::addTrain` 在训练路径上确实还没接。
+* **快照池**：`bench_anchor` 只是"可证伪的那一半"，锚点还要手动 `--a/--b` 传；要成"阶梯/遗忘曲线"
+  还得按固定命名存一排快照并脚本化。
 
 ---
 

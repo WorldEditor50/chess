@@ -4,7 +4,9 @@
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
 自带稀疏 MoE），以及一整套**可复现的验证手段**（13 个 ctest 套件 + 5 个界面自动化脚本 +
 一批手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement` /
-`bench_ppo_sims` / **`bench_diag`（诊断仪表盘：搜索健康度 / 战术题库 / value 校准）** 等）。
+`bench_ppo_sims` / **`bench_diag`（诊断仪表盘：搜索健康度 / 战术题库 / value 校准）** /
+**`bench_anchor`（固定开局集 + 换先手成对计分 + Elo 置信区间）** / **`train_ppo`（无界面
+常驻训练器）** 等）。
 
 > 这个工程的写法偏"工程审计"风格：每个非显然的决定都写成注释，每个结论都有实测数字，
 > 发现的问题（包括自己引入的）都记在 `docs/issues_review.md` 里，包括还没修好的。
@@ -264,6 +266,36 @@ build\...\bench_diag.exe --games=6 --plies=80 --sims=80 --tactics=20 --tactic-si
 **结论：下一轮的杠杆在 value，不在搜索参数。** 全部数字与三条"会让诊断说谎"的坑见
 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点二十"。
 
+### 无界面训练器 `train_ppo` 与锚点评测 `bench_anchor`（P0，2026-09）
+
+这两个工具补的是同一件事的两半：**"这一轮自对弈到底在下什么样的棋"** 与 **"棋力到底涨没涨"**。
+方案与优先级见 [`docs/rl_plan_optimized.md`](docs/rl_plan_optimized.md)（Part 6 是实施记录）。
+
+```bat
+:: 常驻训练（一个进程连跑 K 局, 每局零磁盘往返 —— GUI 路径是每局 3 趟 x ~555 MB 权重往返）
+build\...\train_ppo.exe --games=20 --sims=400 --moves=60 --opening=8 --csv=run1
+
+:: P1.1 的 PBRS 消融: 同一批参数跑两次, 比报告里的吃子与和棋构成
+build\...\train_ppo.exe --games=40 --opening=8 --no-shaping            --csv=shaping_off
+build\...\train_ppo.exe --games=40 --opening=8 --shaping-alpha=0.25    --csv=shaping_25
+
+:: 锚点对局（固定开局集 + 换先手成对计分 + 95% 区间; 对 AB 可等时间）
+build\...\bench_anchor.exe --a=weights/run_10k --b=weights/run_5k --openings=20 --plies=8
+build\...\bench_anchor.exe --a=weights/run_10k --ab-depth=4 --budget=100 --openings=20
+```
+
+| 工具 | 量什么 |
+|---|---|
+| `train_ppo` | 和棋**分原因**（三次重复 / 60 回合自然限着 / **台架截断**）/ 手数 / 吃子 / 开局多样性 / 吞吐（局/小时）/ value MSE / MoE 专家负载；逐局 + 汇总写进 TB 长表 CSV |
+| `bench_anchor` | 固定开局集（确定性生成 + FNV 指纹，**指纹不同即不可比**）→ 每个开局换先手下两局 → 得分率、**Elo 差与其 95% 区间**、和棋构成、双方 ms/步；`--budget=MS` 把 PPO 的模拟次数按 AB 实测耗时标定成等时间 |
+
+**它们第一次运行就报出了最重要的一件事**：60 ply 手数上限下，训练里的"和棋"几乎全是
+**台架截断**（`截断 1.000`），而规则里的 60 回合自然限着需要 120 半回合 —— 在 GUI 的训练
+配置下**根本不可达**。也就是说"和棋率高"在这套台架里首先是**手数上限**问题，不是规则问题、
+更不是"棋力到顶"；`Aggregates` 现在会直接打印这个判读。另外 `bench_anchor` 会明确说出
+"6 局分辨不了 Elo，区间跨过 50% —— 没测出差别"，而旧的 4~6 局随机开局 bench 只会给一个
+看起来像结论的数字。
+
 ### 界面自动化（PowerShell + Windows UI Automation）
 
 | 脚本 | 验证什么 |
@@ -300,11 +332,12 @@ chess/
 │       ├── tensor.hpp net.hpp layer.h ...          # 张量/网络/层
 │       ├── simd_ops.hpp simd/ cpuinfo.hpp          # SIMD 分派与内核
 │       ├── moe.hpp sparse_moe.hpp                  # 稠密 / 稀疏 MoE
-│       ├── diag.h                                  # 诊断指标核心 (熵/CE/KL/EV/校准 + CSV)
+│       ├── diag.h                                  # 诊断指标核心 (熵/CE/KL/EV/校准 + 和棋原因分桶 + CSV)
 │       └── dqn.cpp dpg.cpp ppo.cpp sac.cpp ...     # RL 算法
 ├── test/                   # 13 个 ctest 套件 + 多个手动基准（含 bench_diag 诊断仪表盘）
 │                           #   (bench_moe / bench_ppo_vs_ab / bench_ppo_mt /
-│                           #    bench_policy_agreement / bench_ppo_sims / bench_diag)
+│                           #    bench_policy_agreement / bench_ppo_sims / bench_diag /
+│                           #    train_ppo / bench_anchor)
 ├── tools/                  # 界面验证脚本 + 图标生成
 └── docs/                   # 设计/审查/同步/理论分析 (见下)
 ```
@@ -323,6 +356,7 @@ chess/
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |
+| [`docs/rl_plan_optimized.md`](docs/rl_plan_optimized.md) | **三轮讨论收敛出的可执行方案**（过强对手/信心崩塌、和棋率、更新器与回放容量）：逐条"原建议 → 优化后"、数字按本机吞吐重算、明确不做清单、验收标准；**Part 6 是 P0 实施记录**（改了什么 / 怎么跑 / 实测数字 / 下一步） |
 | [`docs/agent_evab_design.md`](docs/agent_evab_design.md) | EVAB 专篇 |
 
 ---
