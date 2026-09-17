@@ -12,6 +12,7 @@
 #include "chess.h"
 #include "aiagent.h"
 #include "rl/ppo.h"
+#include "rl/diag.h"
 
 /*
  * PPOMCTSAgent - AlphaZero-style PPO+MCTS Chess Agent
@@ -210,6 +211,41 @@ public:
     std::size_t treeNodeCap = 50000;   /* 节点数上限 (超过就整棵重来) */
     int ttMaxDepth = 12;               /* 只把深度 ≤ 它的节点登记进置换表 */
 
+    /* ================================================================
+     *  根节点 Dirichlet 噪声 (AlphaZero 的探索机制, 2026-09 补)
+     * ================================================================
+     *  为什么必须有它: 这套搜索的"扩展开关"是**确定性**的 (按先验挑最大的未展开着法),
+     *  而象棋终局判罚又让和棋极多。没有根噪声时, 自对弈的多样性只剩"按访问分布采样"
+     *  这一条 —— 而访问分布本身还是被同一份先验决定的。于是低先验的着法 (典型是吃子)
+     *  可能**整局都不会被模拟一次**, 搜索永远拿不到它的 Q, 网络也就永远学不到它
+     *  (这正是"越训越窄 / 开局塌成一条线"的直接机制之一)。
+     *
+     *  做法 (标准 AlphaZero): 只在**自对弈取数据**时把根先验改成
+     *      P' = (1-eps)·P + eps·Dir(alpha)
+     *  并按手数把 eps 线性退火到 0 (开局探索、残局收敛)。
+     *  **评测 / 对局一律不开** (selectMove 走 withRootNoise=false) —— 否则量出来的棋力
+     *  会被探索噪声污染, 而且改动前后不可比。
+     *
+     *  取值: alpha 与合法着法数有关, 象棋中局约 40 个候选, 取 0.4 (既不至于退化成
+     *  均匀分布、也不会全压在一两个着法上); eps=0.25 是 AlphaZero 的常用值;
+     *  只在前 rootNoiseMoves 手加 (之后 eps 退到 0 自动关闭)。
+     * ================================================================ */
+    bool rootNoise = true;
+    float rootNoiseAlpha = 0.4f;
+    float rootNoiseEps = 0.25f;
+    int rootNoiseMoves = 30;           /* 只在前 N 手加噪声 (之后自动关闭) */
+    /*
+       评测路径 (selectMove) 是否也加根噪声。**默认 false**, 打开只为做诊断 A/B:
+       诊断矩阵里的"Dirichlet 有效性"就是"关掉 η 重跑同一个根, 比较吃子着的访问数变化"
+       —— 加了噪声吃子 N 从 0 涨起来 = 噪声在救命; 加了也没用 = leaf Q 把吃子压得太死,
+       回去修 value。生产路径 (对局/评测) 必须保持 false, 否则量出来的棋力掺了探索噪声。
+    */
+    bool evalRootNoise = false;
+    /* 根先验的"加噪后"版本 (按动作下标索引); 只在 m_rootNoiseActive 时被采用 */
+    std::vector<float> m_rootPriorNoised;
+    bool m_rootNoiseActive = false;
+    int m_plyInGame = 0;               /* 本局已搜索过的手数 (噪声退火用; resetSearchTree 归零) */
+
     /* 新一局 / 换权重: 清空树与置换表 (计数器一并归零, 便于诊断) */
     void resetSearchTree();
     /* 当前根在 `nodes` 里的下标 (-1 = 还没有树) */
@@ -223,8 +259,19 @@ public:
      *  取"当前局面的根": 置换表命中且**从上一棵树的根 ≤ maxDepth 步可达**时复用那个
      *  节点 (连同它的子树与统计), 否则新建一个根。三个搜索入口统一走它。
      *  `color` 必须等于棋盘当前的走棋方 (规范视角与哈希都依赖它)。
+     *
+     *  withRootNoise (2026-09): 是否给本局的根先验加 Dirichlet 噪声。**只有自对弈取
+     *  数据那条路传 true**; 评测与对局保持默认 false (见上面 rootNoise 的说明)。
+     *  为 true 时每次取根都会把 m_plyInGame +1, 作为噪声退火的手数。
      */
-    int acquireRoot(int color);
+    int acquireRoot(int color, bool withRootNoise = false);
+
+    /*
+     *  给根节点的先验加 Dirichlet 噪声 (只在 withRootNoise=true 的取根路径里调用)。
+     *  把"加噪后的完整合法集先验"写进 m_rootPriorNoised 并置 m_rootNoiseActive,
+     *  pickUntriedByPrior 在根节点上改用它 (于是 U 项与存进孩子的 prior 都是加噪的)。
+     */
+    void applyRootNoise(int rootID, int color, int ply);
 
     /* targetID 是否在 fromID 的子树里、且在 maxDepth 层以内 (只向下走 childIDs) */
     bool reachableWithin(int fromID, int targetID, int maxDepth) const;
@@ -413,6 +460,66 @@ public:
                                  std::vector<int> &actionIdx,
                                  std::vector<float> &actionProb) const;
 
+    /*
+     *  ---- 从根的访问计数里"出招" (2026-09: 唯一口径) ----
+     *
+     *  temp > 0.1 : 按 N^(1/temp) 归一化后**采样** (AlphaZero 的出招口径, 探索靠它);
+     *  temp <= 0.1: 取访问数最多的孩子 (argmax, 确定性)。
+     *
+     *  为什么要抽成一个函数: 原来这段逻辑在 trainSelfPlay 里内联了一份, 而
+     *  `selectMove(color, simulations, temp)` 的 temp 参数**根本没被读取** —— 它
+     *  永远走 argmax, 与文档注释 (\"or sample from visit distribution if temp > 0\")
+     *  不符, 任何传 temp>0 想拿到探索采样的调用方都静默地拿到了确定性结果。
+     *  现在两处共用同一实现, 口径不可能再漂移。
+     *
+     *  返回 -1 表示"没有任何访问计数"(sum(visits)==0), 调用方按无效着法处理 ——
+     *  这与改动前 trainSelfPlay 的分支条件完全一致。
+     */
+    int pickRootChildByVisits(int rootID, float temp);
+
+    /* ----------------------------------------------------------------
+     *  ---- 叶子估值 (三个搜索入口的唯一口径) ----
+     *
+     *  **终局叶子必须给真实胜负, 不能交给 critic。** 走到评估段时棋盘正停在叶子局面
+     *  (moveForward 已把 sideToMove 翻成叶子的走棋方)。若这个局面已经终局
+     *  (将杀/困毙/吃将/三次重复/60 回合), 它的价值是**确定的**, 让一个只学过"评估"
+     *  的网络去猜, 搜索就永远看不见"一步杀" —— 诊断仪表盘实测过: 一步杀命中率
+     *  **0/20 = 0%**, 白吃子 16.7% (见 bench_diag)。SACAZAgent 一直有 terminalValue(),
+     *  这条路径一直没有, 两个 agent 的搜索口径本来就不一致。
+     *
+     *  返回**叶子走棋方**视角的价值 (与 backup 的视角约定一致):
+     *  判和 -> 0, 叶子走棋方被将死/困毙 -> -1, 对方被将死 -> +1。
+     *  非终局才走 encodeState + ppo.value。
+     * ---------------------------------------------------------------- */
+    double evaluateLeaf(RL::Tensor &leafStateScratch);
+
+    /* ----------------------------------------------------------------
+     *  ---- 搜索诊断 (健康度观测, 2026-09) ----
+     *
+     *  棋力是滞后指标; 能回答"搜索这一层设计对不对"的是根上的这几个量。本函数把它们
+     *  整理成 RL::Diag::RootDiag (纯只读, 不改任何搜索状态, 不影响可复现性)。
+     *
+     *  **必须在一次搜索刚结束时调用** (selectMove / trainSelfPlay 的一手之后):
+     *  那时棋盘已回退到根局面, 节点统计也还是那一手的。
+     *
+     *  它做三件别处做不到的事:
+     *   1. **吃子 vs 退让 的 Q 分组** —— "搜索是不是怕吃子"只有这里能回答。
+     *      注意 Q 要取负号换算到根走棋方视角 (见 rl/diag.h 的 qForParent)。
+     *   2. **KL(访问分布 || 先验)** —— 搜索到底有没有给出网络先验之外的信息。
+     *      ≈0 就说明搜索白跑 (目标只是在复现先验), 这正是本工程量过的"地板"问题。
+     *   3. **展开覆盖率 children/legal** —— 20 次模拟对 38.7 个分支时它是 0.5,
+     *      意味着**一次深挖都没有** (见 chessboard.cpp 里 BG_TRAIN_SIMS 的长注释)。
+     *
+     *  返回 false 表示"没有可诊断的根" (无树 / 零访问)。
+     * ---------------------------------------------------------------- */
+    bool rootDiag(RL::Diag::RootDiag &out) const;
+
+    /*
+     *  调试钩子: 把根的已展开着法按访问数排序打印 (P/Q/N 三列 + 是否吃子)。
+     *  用来人工核对"吃子着排第几" —— 这是最省事的单局面定位手段。
+     */
+    void printSortedRoot(int limit = 10) const;
+
     /* ----------------------------------------------------------------
      *  自对弈 -> 回放池 -> 多 epoch 批量学习 (P3 + P4, 2026-09)
      *
@@ -467,6 +574,20 @@ public:
     */
     void commitEpisode(std::vector<RL::Step> &trajectory, float finalOutcome,
                        const std::vector<std::vector<int>> *legalPerStep = nullptr);
+
+    /*
+       ---- 截断局的自举 (2026-09) ----
+       自对弈走到手数上限仍未分胜负时, 原来一律 `commitEpisode(traj, 0.0f)` —— 也就是
+       告诉 critic "这些局面的回报是 0"。而象棋和棋极多、手数上限又低 (GUI 训练只给
+       60 手), 于是**大部分轨迹的价值目标都是 0**, critic 只学得到"和棋"。
+       正确的做法是用 bootstrapping: 把最后一步之后的局面交给 critic 估值, 取负号
+       换算到最后一步走子方的视角 (此刻轮到对手走, 所以 V 是对手视角的)。
+       口径与在线路径 endOnline 完全一致 (那边一直是这么做的), 所以两条路的学习问题
+       不再不同。用 truncationBootstrap=false 可回到旧口径做 A/B。
+    */
+    bool truncationBootstrap = true;
+    /* 估值最后一步之后的局面, 返回"最后一步走子方视角"的自举终局值 (clamp 到 ±1) */
+    float bootstrapOutcome();
 
     /*
        R2: 取某个节点的**完整合法着法集** (未展开项 ∪ 已展开孩子的 parentAction)。

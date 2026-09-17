@@ -21,15 +21,22 @@ MCTSNode::MCTSNode(int parentID_, const Step &step_, int color_)
 
 double MCTSNode::getUCB1(double totalParentVisits, double C) const
 {
-    /* UCB1 = W/N + C * sqrt(ln(N_parent) / N)
+    /* UCB1 = -W/N + C * sqrt(ln(N_parent) / N)
      *
      * If visitCount is 0, return infinity to encourage exploring
      * unvisited nodes first.
+     *
+     * 符号 (2026-09 修正): `totalReward` 由 backpropagate 沿父链**逐层翻号**写入,
+     * 所以它记的是**本节点走棋方**视角的回报 (simulateRandomPlay 也是按
+     * nodes[nodeID].currentColor 返回的)。子节点的走棋方是父节点的对手, 因此父节点
+     * 比较时必须取**负号**。漏掉它, UCB1 会在最大化对手的收益 —— 表现是搜索专挑
+     * 对自己最差的着法, 而 rollout/估值越准错得越狠。
+     * 与 PPOMCTSAgent::getPUCT / SACAZAgent::getPUCT 是同一处口径。
      */
     if (visitCount == 0) {
         return std::numeric_limits<double>::max();
     }
-    double exploitation = totalReward / (double)visitCount;
+    double exploitation = -totalReward / (double)visitCount;
     double exploration = C * std::sqrt(std::log(totalParentVisits) / (double)visitCount);
     return exploitation + exploration;
 }

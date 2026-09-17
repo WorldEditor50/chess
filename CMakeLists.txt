@@ -355,6 +355,61 @@ if(CHESS_BUILD_TESTS)
     add_test(NAME test_rules COMMAND test_rules)
     set_tests_properties(test_rules PROPERTIES TIMEOUT 120)
 
+    # ------------------------------------------------------- diagnostics matrix
+    # 诊断指标矩阵 (rl/diag.h): 棋力是滞后指标, 这一层量的是"信号健康度"。
+    # 它做两件事:
+    #   1. test_diag   —— **解析验证**每个指标公式 (熵/CE/KL/EV/CV/校准/qForParent),
+    #      外加一个端到端接线检查 (rootDiag 的不变量 + evalRootNoise 开关真的接上了)。
+    #      指标算错比没有指标更贵, 所以这一层必须进 ctest。
+    #   2. bench_diag  —— **不进 ctest** (跑真实对局/战术题, 依赖随机开局)。
+    #   test_diag 用小网络 (hidden=16), 所以只链 RL_CORE, 秒级完成。
+    add_executable(test_diag
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_diag_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    chess_add_header_deps(test_diag)
+    target_include_directories(test_diag PRIVATE ${SRC_DIR})
+    target_link_libraries(test_diag PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_diag PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_diag PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    add_test(NAME test_diag COMMAND test_diag)
+    set_tests_properties(test_diag PROPERTIES TIMEOUT 300)
+
+    # ------------------------------------------- 诊断仪表盘 (自对弈 + 自动战术题库)
+    # **不进 ctest**: 跑真实自对弈与战术题, 依赖随机开局, 分钟级。
+    #   cmake --build <build> --target bench_diag
+    #   <build>/bench_diag --games=2 --plies=40 --sims=40 --hidden=16 --expert=16 --tactics=20
+    #   <build>/bench_diag --sims=400 --tactics=60 --load=D:\...\weights\ppo_bc_d4 --csv=diag
+    add_executable(bench_diag
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_diag_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    chess_add_header_deps(bench_diag)
+    target_include_directories(bench_diag PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_diag PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_diag PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_diag PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+
     # The four RL-agent tests. These are plain C++ programs that only include
     # src/ + src/rl/ headers, so they link RL_CORE and skip Qt's code
     # generators; Qt::Core/Qt::Sql are still needed by gamedb.cpp.

@@ -514,7 +514,15 @@ double SACAZAgent::getPUCT(int childID, int parentVisits) const
         /* 未访问过的子节点优先 (AlphaZero 的 PUCT 里 U 项在 N=0 时最大) */
         return std::numeric_limits<double>::max();
     }
-    const double q = child.getQ();
+    /*
+       符号 (2026-09 修正): `totalValue` 按**当前走棋方视角**累计 (见 sacazagent.h 的
+       字段注释与 backup 的逐层翻号), 而子节点的走棋方就是父节点的对手 ——
+       所以父节点比较时必须取负号。漏掉它等于最大化对手的价值:
+       搜索专挑对自己最差的着法, 且评估越准越糟 (症状是"loss 降、棋力不涨",
+       以及不敢吃子 —— 吃子后对手少大子, 子节点 Q 对对手为负, 被算成亏着)。
+       与 PPOMCTSAgent::getPUCT 的修正同一处口径, 两个 agent 必须一致。
+    */
+    const double q = -child.getQ();
     const double u = c_puct * child.prior
                      * std::sqrt((double)parentVisits)
                      / (1.0 + (double)child.visitCount);
@@ -1223,9 +1231,21 @@ bool SACAZAgent::loadModel(const std::string &filepath)
         || !weightFileReadable(filepath + "_q2")) {
         return false;
     }
-    actor.load(filepath + "_actor");
-    q1.load(filepath + "_q1");
-    q2.load(filepath + "_q2");
+    /*
+       三个网络都**必须**检查载入结果 (见 ppomcts_agent.cpp 同一处修正的说明):
+       原来只按"文件可读"就返回 true, 于是结构/CRC 不匹配的检查点会被静默忽略,
+       训练循环表现成"每轮从随机权重重来却报告成功"。
+       任何一个失败都直接返回 false —— 此时不碰 q1Target/q2Target, 避免把目标网
+       拷成"载入失败后的混合状态"。
+    */
+    const int ra = actor.load(filepath + "_actor");
+    const int r1 = q1.load(filepath + "_q1");
+    const int r2 = q2.load(filepath + "_q2");
+    if (ra != 0 || r1 != 0 || r2 != 0) {
+        std::cerr << "[weights] SACAZAgent::loadModel 失败 (actor=" << ra
+                  << ", q1=" << r1 << ", q2=" << r2 << "), 未同步目标网" << std::endl;
+        return false;
+    }
     q1.copyTo(q1Target);
     q2.copyTo(q2Target);
     return true;

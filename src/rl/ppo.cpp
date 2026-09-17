@@ -603,16 +603,36 @@ std::vector<float> RL::PPO::discountedReturnsFromRewards(const std::vector<float
     return returns;
 }
 
-void RL::PPO::save(const std::string &actorPara, const std::string &criticPara)
+bool RL::PPO::save(const std::string &actorPara, const std::string &criticPara)
 {
-    actorP.save(actorPara);
-    critic.save(criticPara);
+    /*
+       两次调用都要**无条件执行**, 所以先各自存结果再与 —— 写成
+       `a.save(x) == 0 && b.save(y) == 0` 会在第一个失败时短路掉第二个,
+       于是 actor 写失败时 critic 文件不会被刷新 (留下新旧不一致的一对)。
+    */
+    const int a = actorP.save(actorPara);
+    const int c = critic.save(criticPara);
+    return (a == 0) && (c == 0);
 }
 
-void RL::PPO::load(const std::string &actorPara, const std::string &criticPara)
+bool RL::PPO::load(const std::string &actorPara, const std::string &criticPara)
 {
-    actorP.load(actorPara);
-    critic.load(criticPara);
+    /* 同上: 不短路, 两个都尝试 */
+    const int a = actorP.load(actorPara);
+    const int c = critic.load(criticPara);
+    if (a != 0 || c != 0) {
+        /*
+           注意: 单个 Net::load 是"整文件预校验通过才改动网络"的 (见 net.hpp), 所以
+           失败的那个网络本身没有被改坏; 但**两个之间**可能出现"actor 换了、critic
+           没换"的混合状态。调用方必须把它当成失败处理并停止继续训练, 而不是接着用。
+        */
+        std::cerr << "[weights] PPO::load 失败: actor="
+                  << (a == 0 ? "ok" : "拒绝") << ", critic="
+                  << (c == 0 ? "ok" : "拒绝")
+                  << " —— 权重可能处于 actor/critic 不一致的混合状态" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 /* ============================================================

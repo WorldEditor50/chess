@@ -6,6 +6,7 @@
 #include <cmath>
 #include <random>
 #include <vector>
+#include <limits>
 #include "rl/cpuinfo.hpp"
 #include "rl/layer.h"
 #include "ppomcts_agent.h"
@@ -540,6 +541,421 @@ static bool testVisitDistributionTarget()
     ok = ok && (std::fabs(sum - 1.0f) <= 1e-4f);
     printf("  -> %s\n", ok ? "target is a proper distribution"
                            : "**TARGET BUG**");
+    return ok;
+}
+
+/* ================================================================
+ *  测试8b: PUCT 的 Q 项符号 (父节点必须偏好"存储值为负"的孩子)
+ *
+ *  这是一个**不报错但致命**的口径 bug: 节点里存的 Q 是**该节点走棋方**视角的价值
+ *  (backup 沿父链逐层翻号, 而价值头也是按走子方训练的 —— 见测试7), 而子节点的
+ *  走棋方恰好就是父节点的对手, 所以父节点比较时必须取**负号**。漏掉它, 搜索会去
+ *  最大化**对手**的价值, 也就是专挑对自己最差的着法, 而且评估越准错得越狠。
+ *
+ *  为什么必须专门钉住: 它的症状是"loss 一路降、棋力不涨甚至越训越臭", 以及
+ *  "不敢吃子" (吃子后轮到对手、对手少一个大子 ⇒ 该子节点 Q 对对手为负 ⇒
+ *  吃子被根节点算成亏着, 而"平推不交换"的子节点 Q ≈ 0 反而更大)。
+ *  而现有测试全都会通过: testVsRandom 只打印不断言, 且网络未训练时 Q≈0,
+ *  探索项会盖住符号错误。
+ *
+ *  判据本身: 两个孩子**先验与访问次数完全相同** ⇒ U 项相等, argmax 只可能由 Q 的
+ *  符号决定。两个方向都查 (免得"永远选第一个"这种假通过)。
+ * ================================================================ */
+static bool testPuctSign()
+{
+    printf("\n========================================\n");
+    printf("  PPO+MCTS: PUCT sign (parent prefers NEGATIVE child Q)\n");
+    printf("========================================\n");
+
+    Chess chess;
+    PPOMCTSAgent agent(chess, 16, 0.99f, 0.001f, 1.414f);
+    chess.reset();
+
+    bool ok = true;
+
+    const int actA = 100;
+    const int actB = 200;
+    const int visits = 4;
+    const int parentVisits = 8;
+
+    /* 手搭 root + A + B: 先验/访问数一致, 只有累计价值 W 不同 */
+    auto buildTree = [&](double wA, double wB) {
+        agent.nodes.clear();
+        PPOMCTSAgent::AZNode root;
+        root.currentColor = Stone::COLOR_RED;
+        root.visitCount = parentVisits;
+        agent.nodes.push_back(root);
+        const int acts[2] = { actA, actB };
+        const double ws[2] = { wA, wB };
+        for (int k = 0; k < 2; k++) {
+            PPOMCTSAgent::AZNode c(0, acts[k], ::Step(), 0.3f, Stone::COLOR_BLACK);
+            c.visitCount = visits;
+            c.totalValue = ws[k];
+            agent.nodes.push_back(c);
+            agent.nodes[0].childIDs.push_back(1 + k);
+        }
+    };
+
+    /* 与搜索里完全相同的选择规则: argmax over getPUCT */
+    auto pickBest = [&]() {
+        int best = -1;
+        double bestScore = -std::numeric_limits<double>::max();
+        for (int childID : agent.nodes[0].childIDs) {
+            const double s = agent.getPUCT(childID, agent.nodes[0].visitCount);
+            if (s > bestScore) { bestScore = s; best = childID; }
+        }
+        return best;
+    };
+    auto nameOf = [](int id) { return (id == 1) ? "A" : (id == 2 ? "B" : "?"); };
+
+    /* 情形1: A 的局面轮到黑方且黑方输 (Q(A) = -1) —— 对红方是**好**棋, 该选 A */
+    buildTree(-1.0 * visits, +1.0 * visits);
+    int best = pickBest();
+    const bool case1 = (best == 1);
+    printf("  case1: Q(A)=-1.0, Q(B)=+1.0 -> picked %s  (want A)  %s\n",
+           nameOf(best), case1 ? "ok" : "**FAIL**");
+    ok = ok && case1;
+
+    /* 情形2: 符号整体反过来 -> 该选 B */
+    buildTree(+1.0 * visits, -1.0 * visits);
+    best = pickBest();
+    const bool case2 = (best == 2);
+    printf("  case2: Q(A)=+1.0, Q(B)=-1.0 -> picked %s  (want B)  %s\n",
+           nameOf(best), case2 ? "ok" : "**FAIL**");
+    ok = ok && case2;
+
+    /* 情形3: 未访问的孩子仍然优先 (U 项为 +inf 的既有约定不能被动到) */
+    buildTree(0.0, 0.0);
+    agent.nodes[1].visitCount = 0;
+    const double unvisited = agent.getPUCT(1, parentVisits);
+    const double visited = agent.getPUCT(2, parentVisits);
+    const bool case3 = (unvisited > visited);
+    printf("  case3: unvisited %.3f > visited %.3f  %s\n",
+           unvisited, visited, case3 ? "ok" : "**FAIL**");
+    ok = ok && case3;
+
+    printf("  -> %s\n", ok ? "PUCT sign convention pinned"
+                           : "**PUCT SIGN BUG**");
+    return ok;
+}
+
+/* ================================================================
+ *  测试8c: loadModel 必须报告**真实**结果 (不能"文件在就算成功")
+ *
+ *  背景 (2026-09 抓到的一个"不报错但能让训练整轮白跑"的 bug): 内核 Net::load 在
+ *  "层数 / 结构指纹 / CRC 不匹配"时会**拒绝载入并保持网络不变**, 但 RL::PPO::load
+ *  当时是 void —— 把结果吞掉了。于是 PPOMCTSAgent::loadModel 只按"文件可读"返回
+ *  true。DQN / DQN+MCTS / SACAZ 是同一个写法 (EVAB / DQNAB 是对的)。
+ *
+ *  为什么这条最贵: 训练循环是"保存 -> 载入 -> 训练 -> 保存" (见 chessboard.cpp 的
+ *  后台训练)。载入若静默失败, 那一轮就是从**随机权重**重来并把存档覆盖掉, 表现是
+ *  "跑了很多轮完全没有效果", 而且一句报错都没有。
+ *  现场证据 (实测): bench_ppo_sims 打印 "A 成功 / B 成功", 而 stderr 同时在喊
+ *  "参数量不匹配 ... 拒绝载入" —— 也就是说那次基准测量其实是在**随机权重**下做的,
+ *  结论无效。修好之前, 任何"载入成功"的字样都不可信。
+ *
+ *  三条判据:
+ *    [a] 正常往返: 载入成功, 且网络输出与该存档的网络**逐元素相同**
+ *        (先用"两个独立初始化必须不同"做反向对照, 否则"变一致"不能说明载入发生了)
+ *    [b] 结构不匹配 (hiddenDim 16 存出的文件载进 24 的网络): 必须 false
+ *    [c] 不存在的路径: 必须 false
+ * ================================================================ */
+static bool testLoadModelReportsFailure()
+{
+    printf("\n========================================\n");
+    printf("  PPO+MCTS: loadModel reports the REAL result\n");
+    printf("========================================\n");
+
+    bool ok = true;
+    const std::string prefix = "test_ppomcts_lm";
+
+    Chess envA, envB, envC;
+    envA.reset();
+    envB.reset();
+    envC.reset();
+
+    RL::Tensor st(PPOMCTSAgent::STATE_DIM, 1);
+    st.zero();
+
+    /*
+       刻意用**小网络** (hiddenDim 16, withGrad=false): 当前默认构造的 actor 有
+       5.2e7 个参数 (约 200 MB/网络), 一个测试里建好几个会把内存和耗时都吃光。
+       本测试量的是"载入结果的诚实性", 与网络大小无关。
+    */
+    PPOMCTSAgent a(envA, 16, 0.99f, 0.001f, 1.414f, 16, 0.1f, false);
+    a.encodeState(st);
+    RL::Tensor pA = a.ppo.action(st);            /* 深拷贝 */
+
+    const bool saved = a.saveModel(prefix);
+    printf("  [a] saveModel -> %s  (want true)  %s\n", saved ? "true" : "false",
+           saved ? "ok" : "**FAIL**");
+    ok = ok && saved;
+
+    PPOMCTSAgent b(envB, 16, 0.99f, 0.001f, 1.414f, 16, 0.1f, false);
+    b.encodeState(st);
+    RL::Tensor pB = b.ppo.action(st);
+
+    float diffInit = 0.0f;
+    const std::size_t nOut = std::min(pA.size(), pB.size());
+    for (std::size_t i = 0; i < nOut; i++) {
+        diffInit = std::max(diffInit, std::fabs(pA[i] - pB[i]));
+    }
+    /*
+       阈值必须按**相对**尺度定: 策略头是 8100 维 softmax, 而小网络的 logits 接近 0,
+       所以每个概率都只有 ~1/8100 = 1.2e-4 量级, 两个不同网络之间的绝对差自然只有
+       1e-5~1e-4。用绝对阈值 (第一版用的 1e-4) 会把"确实不同"判成"相同"。
+       这里改成"与均匀分布相比的相对差异"。
+    */
+    const float meanP = 1.0f / (float)PPOMCTSAgent::ACTION_DIM;
+    const float relInit = diffInit / meanP;
+    const bool distinctInit = (relInit > 0.10f);
+    printf("  [a] 反向对照: 独立初始化的最大输出差 = %.3e (均匀值 %.3e, 相对 %.1f%%)  %s\n",
+           diffInit, meanP, 100.0f * relInit, distinctInit ? "ok" : "**FAIL**");
+    ok = ok && distinctInit;
+
+    const bool loaded = b.loadModel(prefix);
+    printf("  [a] loadModel -> %s  (want true)  %s\n", loaded ? "true" : "false",
+           loaded ? "ok" : "**FAIL**");
+    ok = ok && loaded;
+
+    b.encodeState(st);
+    RL::Tensor pB2 = b.ppo.action(st);
+    float diffAfter = 0.0f;
+    for (std::size_t i = 0; i < nOut; i++) {
+        diffAfter = std::max(diffAfter, std::fabs(pA[i] - pB2[i]));
+    }
+    const bool sameAfter = (diffAfter <= 1e-6f);
+    printf("  [a] 载入后与存档网络的最大输出差 = %.3e  (须 ~0)  %s\n",
+           diffAfter, sameAfter ? "ok" : "**FAIL**");
+    ok = ok && sameAfter;
+
+    /* ---- [b] 结构不匹配必须报失败 ---- */
+    {
+        Chess envS;
+        envS.reset();
+        PPOMCTSAgent other(envS, 24, 0.99f, 0.001f, 1.414f, 24, 0.1f, false);
+        const std::string badPrefix = prefix + "_bad";
+        other.saveModel(badPrefix);
+
+        const bool bad = b.loadModel(badPrefix);
+        const bool pass = !bad;
+        printf("  [b] 结构不匹配(hidden 24 存 -> 16 载) -> loadModel %s  (want false)  %s\n",
+               bad ? "true" : "false", pass ? "ok" : "**FAIL**");
+        ok = ok && pass;
+
+        std::remove((badPrefix + "_actor").c_str());
+        std::remove((badPrefix + "_critic").c_str());
+    }
+
+    /* ---- [c] 不存在的路径 ---- */
+    {
+        PPOMCTSAgent d(envC, 16, 0.99f, 0.001f, 1.414f, 16, 0.1f, false);
+        const bool missing = d.loadModel("no_such_prefix_xyz_ppomcts");
+        const bool pass = !missing;
+        printf("  [c] 不存在的路径 -> loadModel %s  (want false)  %s\n",
+               missing ? "true" : "false", pass ? "ok" : "**FAIL**");
+        ok = ok && pass;
+    }
+
+    std::remove((prefix + "_actor").c_str());
+    std::remove((prefix + "_critic").c_str());
+
+    printf("  -> %s\n", ok ? "loadModel result is honest"
+                           : "**SILENT LOAD FAILURE**");
+    return ok;
+}
+
+/* ================================================================
+ *  测试8d: 根节点 Dirichlet 噪声 + 出招温度 (2026-09 新增的两项)
+ *
+ *  [1] Dirichlet 采样器 (RL::Random::dirichlet) 的性质。它是内核里**新加**的东西 ——
+ *      之前全仓没有任何 Gamma/Dirichlet 采样器, 这正是两个 MCTS agent 都没有根噪声的
+ *      直接原因 (不是不想要, 是没工具)。查: 和为 1、非负、对称性 (均值 = 1/K)、
+ *      alpha 越小分布越"尖"。
+ *  [2] 出招温度: temp<=0.1 必须等价于 argmax; temp=1 时经验频率应等于 N/ΣN。
+ *      这条同时钉住"selectMove 的 temp 参数真的被读取了" —— 改动前它是个死参数,
+ *      无论传什么都走 argmax, 与函数注释承诺的行为不符。
+ *  [3] 根噪声的接线: 评测路径 (withRootNoise=false) 绝不开; 自对弈取根时开, 且加噪
+ *      先验在合法集上仍然归一; 走满 rootNoiseMoves 手后自动关闭 (退火到 0)。
+ * ================================================================ */
+static bool testRootNoiseAndTemperature()
+{
+    printf("\n========================================\n");
+    printf("  PPO+MCTS: root Dirichlet noise + move temperature\n");
+    printf("========================================\n");
+
+    bool ok = true;
+
+    /* ---------- [1] Dirichlet 采样器 ---------- */
+    {
+        const int K = 44;          /* 中局典型合法着法数 */
+        const int N = 4000;
+        std::vector<float> x((std::size_t)K, 0.0f);
+
+        /* alpha = 0.4: 对称 Dirichlet 的每个分量均值应为 1/K */
+        RL::Random::setSeed(20240914u);
+        std::vector<double> acc((std::size_t)K, 0.0);
+        double worstSumErr = 0.0;
+        double maxShareSum = 0.0;
+        bool allNonNeg = true;
+        for (int n = 0; n < N; n++) {
+            std::fill(x.begin(), x.end(), 0.0f);
+            RL::Random::dirichlet(x, 0.4f);
+            double s = 0.0;
+            double mx = 0.0;
+            for (int k = 0; k < K; k++) {
+                if (!(x[k] >= 0.0f)) { allNonNeg = false; }
+                s += (double)x[k];
+                if ((double)x[k] > mx) { mx = (double)x[k]; }
+                acc[(std::size_t)k] += (double)x[k];
+            }
+            if (std::fabs(s - 1.0) > worstSumErr) { worstSumErr = std::fabs(s - 1.0); }
+            maxShareSum += mx;
+        }
+        double worstMeanErr = 0.0;
+        for (int k = 0; k < K; k++) {
+            const double m = acc[(std::size_t)k] / (double)N;
+            worstMeanErr = std::max(worstMeanErr, std::fabs(m - 1.0 / (double)K));
+        }
+        const bool p1 = allNonNeg && (worstSumErr < 1e-5) && (worstMeanErr < 0.01);
+        printf("  [1] alpha=0.4: 非负=%d, 和的偏差<=%.2e, 分量均值偏差<=%.4f  %s\n",
+               allNonNeg ? 1 : 0, worstSumErr, worstMeanErr, p1 ? "ok" : "**FAIL**");
+        ok = ok && p1;
+
+        /* alpha 越小 -> 分布越尖 (最大分量更大) */
+        auto meanMaxShare = [&](float alpha) {
+            std::vector<float> y((std::size_t)K, 0.0f);
+            double sum = 0.0;
+            for (int n = 0; n < 500; n++) {
+                std::fill(y.begin(), y.end(), 0.0f);
+                RL::Random::dirichlet(y, alpha);
+                double mx = 0.0;
+                for (int k = 0; k < K; k++) { mx = std::max(mx, (double)y[k]); }
+                sum += mx;
+            }
+            return sum / 500.0;
+        };
+        const double shareSmall = meanMaxShare(0.1f);
+        const double shareBig   = meanMaxShare(4.0f);
+        const bool p2 = (shareSmall > shareBig * 1.5);   /* 小 alpha 明显更尖 */
+        printf("  [1] 最大分量均值: alpha=0.1 -> %.4f, alpha=4 -> %.4f  (小 alpha 须更尖)  %s\n",
+               shareSmall, shareBig, p2 ? "ok" : "**FAIL**");
+        ok = ok && p2;
+    }
+
+    /* ---------- [2] 出招温度 ---------- */
+    {
+        Chess env;
+        env.reset();
+        PPOMCTSAgent ag(env, 16, 0.99f, 0.001f, 1.414f, 16, 0.1f, false);
+
+        /* 手搭一棵最小树: 根 + 3 个孩子, 访问数 8/2/1 */
+        ag.nodes.clear();
+        PPOMCTSAgent::AZNode root;
+        root.currentColor = Stone::COLOR_RED;
+        ag.nodes.push_back(root);
+        const int actIdx[3] = { 11, 22, 33 };
+        const int vis[3] = { 8, 2, 1 };
+        for (int k = 0; k < 3; k++) {
+            PPOMCTSAgent::AZNode c(0, actIdx[k], ::Step(), 0.3f, Stone::COLOR_BLACK);
+            c.visitCount = vis[k];
+            ag.nodes.push_back(c);
+            ag.nodes[0].childIDs.push_back(1 + k);
+        }
+
+        /* temp = 0 -> 永远取访问最多的 (下标 1) */
+        int argmaxHits = 0;
+        for (int i = 0; i < 200; i++) {
+            if (ag.pickRootChildByVisits(0, 0.0f) == 1) { argmaxHits++; }
+        }
+        const bool p3 = (argmaxHits == 200);
+        printf("  [2] temp=0: 取到访问数最多的孩子 %d/200  %s\n",
+               argmaxHits, p3 ? "ok" : "**FAIL**");
+        ok = ok && p3;
+
+        /* temp = 1 -> 频率应约等于 N/ΣN = 8/11, 2/11, 1/11 */
+        RL::Random::setSeed(314159u);
+        const int draws = 3000;
+        int hit[3] = { 0, 0, 0 };
+        for (int i = 0; i < draws; i++) {
+            const int cid = ag.pickRootChildByVisits(0, 1.0f);
+            if (cid >= 1 && cid <= 3) { hit[cid - 1]++; }
+        }
+        const double want[3] = { 8.0 / 11.0, 2.0 / 11.0, 1.0 / 11.0 };
+        bool p4 = true;
+        for (int k = 0; k < 3; k++) {
+            const double got = (double)hit[k] / (double)draws;
+            if (std::fabs(got - want[k]) > 0.05) { p4 = false; }
+            printf("  [2] temp=1: 孩子%d 频率 %.3f  期望 %.3f\n", k, got, want[k]);
+        }
+        printf("  [2] temp=1 采样分布匹配 N/ΣN  %s\n", p4 ? "ok" : "**FAIL**");
+        ok = ok && p4;
+
+        /* temp 大 -> 更平: 最大孩子的频率下降 */
+        int topHigh = 0;
+        for (int i = 0; i < draws; i++) {
+            if (ag.pickRootChildByVisits(0, 4.0f) == 1) { topHigh++; }
+        }
+        const double flat = (double)topHigh / (double)draws;
+        const bool p5 = (flat < 0.55);
+        printf("  [2] temp=4: 最大孩子频率 %.3f (< 0.55 说明变平)  %s\n",
+               flat, p5 ? "ok" : "**FAIL**");
+        ok = ok && p5;
+    }
+
+    /* ---------- [3] 根噪声接线 ---------- */
+    {
+        Chess env;
+        env.reset();
+        PPOMCTSAgent ag(env, 16, 0.99f, 0.001f, 1.414f, 16, 0.1f, false);
+
+        /* 评测路径: 绝不开噪声 */
+        const int rOff = ag.acquireRoot(Stone::COLOR_RED, /*withRootNoise=*/false);
+        const bool offOk = (rOff >= 0) && (!ag.m_rootNoiseActive);
+        printf("  [3] 评测取根: active=%d (须 0)  %s\n",
+               ag.m_rootNoiseActive ? 1 : 0, offOk ? "ok" : "**FAIL**");
+        ok = ok && offOk;
+
+        /* 自对弈取根: 开, 且加噪先验在合法集上仍然归一 */
+        RL::Random::setSeed(777u);
+        const int rOn = ag.acquireRoot(Stone::COLOR_RED, /*withRootNoise=*/true);
+        std::vector<int> idx;
+        ag.legalIndicesOf(rOn, idx);
+        double sum = 0.0;
+        for (std::size_t i = 0; i < idx.size(); i++) {
+            sum += (double)ag.m_rootPriorNoised[(std::size_t)idx[i]];
+        }
+        const bool onOk = (rOn >= 0) && ag.m_rootNoiseActive
+                          && !idx.empty() && (std::fabs(sum - 1.0) < 1e-3);
+        printf("  [3] 自对弈取根: active=%d, 合法集 %d 项, 加噪先验和=%.6f (须 1)  %s\n",
+               ag.m_rootNoiseActive ? 1 : 0, (int)idx.size(), sum, onOk ? "ok" : "**FAIL**");
+        ok = ok && onOk;
+
+        /* 噪声确实是随机的: 换种子后同一局面的加噪先验应当不同 */
+        std::vector<float> first = ag.m_rootPriorNoised;
+        RL::Random::setSeed(888u);
+        ag.acquireRoot(Stone::COLOR_RED, true);
+        float diff = 0.0f;
+        for (std::size_t i = 0; i < first.size(); i++) {
+            diff = std::max(diff, std::fabs(first[i] - ag.m_rootPriorNoised[i]));
+        }
+        const bool randOk = (diff > 1e-4f);
+        printf("  [3] 换随机种子后先验最大差 = %.5f (> 0 说明噪声真的在起作用)  %s\n",
+               diff, randOk ? "ok" : "**FAIL**");
+        ok = ok && randOk;
+
+        /* 走满 rootNoiseMoves 手后自动关闭 */
+        for (int i = 0; i < ag.rootNoiseMoves + 2; i++) {
+            ag.acquireRoot(Stone::COLOR_RED, true);
+        }
+        const bool autoOff = (!ag.m_rootNoiseActive);
+        printf("  [3] 超过 %d 手后 active=%d (须 0, 噪声退火到 0)  %s\n",
+               ag.rootNoiseMoves, ag.m_rootNoiseActive ? 1 : 0, autoOff ? "ok" : "**FAIL**");
+        ok = ok && autoOff;
+    }
+
+    printf("  -> %s\n", ok ? "root noise + temperature verified"
+                           : "**ROOT NOISE / TEMPERATURE BUG**");
     return ok;
 }
 
@@ -1716,6 +2132,9 @@ int main()
     testComputeBudget();
     const bool signOk = testValueTargetSign();
     const bool targetOk = testVisitDistributionTarget();
+    const bool puctOk = testPuctSign();
+    const bool loadOk = testLoadModelReportsFailure();
+    const bool noiseOk = testRootNoiseAndTemperature();
     const bool replayOk = testReplayPath();
     const bool mirrorOk = testMirrorAugmentation();
     const bool sparseOk = testSparsePolicyHead();
@@ -1727,5 +2146,5 @@ int main()
     printf("========================================\n");
 
     /* 符号约定/目标分布这类"不会自己报错"的问题要能反映到退出码上 */
-    return (signOk && targetOk && replayOk && mirrorOk && sparseOk && reuseOk && maskedOk) ? 0 : 1;
+    return (signOk && targetOk && puctOk && loadOk && noiseOk && replayOk && mirrorOk && sparseOk && reuseOk && maskedOk) ? 0 : 1;
 }

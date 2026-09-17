@@ -82,7 +82,14 @@ QString shortElapsed(long long ms)
  */
 static constexpr int AB_DEPTH = 4;            /* Alpha-Beta 搜索深度 */
 static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
-static constexpr int PPO_SIMS = 80;           /* PPO+MCTS 每次决策的模拟次数 */
+/*
+ * PPO+MCTS 每次决策的模拟次数。**必须远大于中局分支数 (~38.7)**, 理由见下面
+ * BG_TRAIN_SIMS 的长注释: 少于分支数时搜索一次深挖都没有, 出招与策略目标都退化成
+ * "先验前 N 名的均匀分布"。80 次时实测仍有约 48% 的访问落在"每个孩子一次"的
+ * 地板里 (bench_ppo_sims 的根节点诊断), 400 次降到约 10%。
+ * 代价: 当前骨干约 8 ms/模拟 ⇒ 一步决策从 ~0.65 s 变成 ~3.2 s。
+ */
+static constexpr int PPO_SIMS = 400;          /* PPO+MCTS 每次决策的模拟次数 */
 static constexpr int DQNMCTS_ITERATIONS = 200;/* DQN+MCTS 每次决策的迭代次数 */
 /*
  * SAC+AZ 每次决策的 MCTS 模拟次数。实测 (test_sacaz, 本机 AVX2): 64 次模拟约 3 ms,
@@ -139,10 +146,26 @@ static constexpr int DQNAB_HIDDEN = 64;    /* DQN+AB 的头隐层宽度 */
  * 后台训练的单轮规模。训练线程只在每轮开始时检查停止标志, 所以这几个数字直接
  * 决定"关窗要等多久"。原来是 4 局 x 200 步 x 50 次 MCTS 模拟 —— 每步都要跑网络
  * 前向, 一轮可能几分钟, 关窗时 GUI 线程会冻在 join() 上。
+ *
+ * ---- BG_TRAIN_SIMS 为什么从 20 提到 400 (2026-09) ----
+ * 20 次模拟在象棋中局是**结构性退化**: 实测根节点平均有 38.7 个合法着法
+ * (bench_ppo_sims --probe-positions), 而选择阶段只在"未展开列表为空"时才向下深挖
+ * (见 ppomcts_agent.cpp 的 SELECTION)。于是
+ *     前 #legal 次模拟 = 把先验最高的那些孩子各展开一次 (每人恰好 1 次访问),
+ *     max(0, sims − #legal) 次才是真正的深挖。
+ * 20 < 38.7 ⇒ **一次深挖都没有**, 搜索只铺开了先验最高的 20 个孩子。于是
+ *     π_target = "我自己前 20 名上各 1/20 的均匀分布",
+ *     出招      = 从这个均匀分布里采样 (温度 1.0)。
+ * 也就是说搜索提供的信息量是**零**: 目标只教网络"对你自己的先验前 20 名保持均匀",
+ * 是一个把先验抹平的算子 —— 这直接解释了"跑很多轮棋力不动"。
+ * 提到 400 后深挖余量约 361 次 (90%), 目标才真正携带搜索结果。
+ * 代价: 每步约 8 ms/模拟 (当前 5.2e7 参数的骨干) ⇒ 单步从 ~0.16 s 涨到 ~3.2 s;
+ * 一轮 (1 局 x 60 手上限) 从秒级变成分钟级, 所以 BG_TRAIN_EPISODES 保持 1,
+ * 关窗等待时间仍由单轮决定。
  */
 static constexpr int BG_TRAIN_EPISODES = 1;   /* 每轮训练局数 */
 static constexpr int BG_TRAIN_MAX_MOVES = 60; /* 每局步数上限 */
-static constexpr int BG_TRAIN_SIMS = 20;      /* MCTS 类 agent 每步的模拟次数 */
+static constexpr int BG_TRAIN_SIMS = 400;     /* MCTS 类 agent 每步的模拟次数 (须远大于分支数) */
 
 /* Static member initialization */
 PGEagent *ChessBoard::m_sfPG = nullptr;
@@ -1878,26 +1901,45 @@ void ChessBoard::backgroundTrainLoop()
         }
 
         /* ---- 克隆主agent权重到临时文件 ---- */
+        bool seeded = false;
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
             switch (type) {
             case AGENT_PG:
-                if (m_sfPG) m_sfPG->savePolicy(TMP_WEIGHTS);
+                if (m_sfPG) seeded = m_sfPG->savePolicy(TMP_WEIGHTS);
                 break;
             case AGENT_DQN:
-                if (m_sfDQN) m_sfDQN->saveModel(TMP_WEIGHTS);
+                if (m_sfDQN) seeded = m_sfDQN->saveModel(TMP_WEIGHTS);
                 break;
             case AGENT_PPOMCTS:
-                if (m_sfPPOMCTS) m_sfPPOMCTS->saveModel(TMP_WEIGHTS);
+                if (m_sfPPOMCTS) seeded = m_sfPPOMCTS->saveModel(TMP_WEIGHTS);
                 break;
             case AGENT_DQNMCTS:
-                if (m_sfDQNMCTS) m_sfDQNMCTS->saveModel(TMP_WEIGHTS);
+                if (m_sfDQNMCTS) seeded = m_sfDQNMCTS->saveModel(TMP_WEIGHTS);
                 break;
             default: break;
             }
         }
 
+        /*
+           ---- 种子权重写不出去就**不要训这一轮** (2026-09) ----
+           一轮训练是个往返: 主agent --写--> 临时文件 --读--> clone(训练) --写-->
+           临时文件 --读--> 主agent。这些 save/load 原来**全部忽略返回值**, 于是第一步
+           写失败时: clone 拿不到种子 ⇒ 从**它自己的随机初始化**开始训 ⇒ 把随机权重写回
+           临时文件 ⇒ 再同步回主 agent。结果是"每轮把模型重置一次, 却一句报错都没有",
+           表现就是"跑了很多轮完全没有效果"。
+           所以这里把写失败当成硬失败: 报出来、睡 2 秒重试 (与上面"没有可训练权重"那条
+           同样的节奏, 避免忙等), 绝不带着"随机权重"继续。
+        */
+        if (!seeded) {
+            qWarning() << "[train] 种子权重写入失败, 跳过本轮训练: agent"
+                       << agentDisplayName(type) << "路径" << TMP_WEIGHTS;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
         /* ---- 在独立棋盘上创建克隆agent并训练4轮 ---- */
+        bool roundApplied = false;   /* 本轮成果是否真的写回并同步 (见下面各 case) */
         {
             Chess trainChess;  /* 独立训练棋盘: 从初始局面开始 */
             /*
@@ -1906,39 +1948,75 @@ void ChessBoard::backgroundTrainLoop()
             */
             float roundLoss = std::numeric_limits<float>::quiet_NaN();
 
+            /*
+               ---- 每个 case 都必须检查载入与写回的返回值 (2026-09) ----
+               种子文件刚由上面写好, 所以 clone 的 loadModel **应该**成功; 若失败,
+               说明架构/版本对不上 (例如改了状态编码而临时文件是旧的), 那么这一轮
+               训练的就是一个"随机初始化的 clone", 它的成果绝不能写回主 agent。
+               同理, 写回失败表示本轮成果没落盘, 也不该拿去同步主 agent。
+            */
             switch (type) {
             case AGENT_PG: {
                 PGEagent clone(trainChess, 64, 0.9f, 0.01f, 1.0f);
-                clone.loadPolicy(TMP_WEIGHTS);
+                if (!clone.loadPolicy(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PG clone 载入种子权重失败, 本轮丢弃";
+                    break;
+                }
                 clone.train(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, true, false);
                 roundLoss = clone.getLastTrainLoss();
-                clone.savePolicy(TMP_WEIGHTS);
+                if (!clone.savePolicy(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PG 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
                 break;
             }
             case AGENT_DQN: {
                 DQNAgent clone(trainChess, 64, 0.99f, 0.001f, 1.0f);
-                clone.loadModel(TMP_WEIGHTS);
+                if (!clone.loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN clone 载入种子权重失败, 本轮丢弃";
+                    break;
+                }
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, false);
                 roundLoss = clone.getLastTrainLoss();
-                clone.saveModel(TMP_WEIGHTS);
+                if (!clone.saveModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
                 break;
             }
             case AGENT_PPOMCTS: {
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f);
-                clone.loadModel(TMP_WEIGHTS);
+                if (!clone.loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PPO+MCTS clone 载入种子权重失败, 本轮丢弃"
+                               << "(临时文件与当前网络架构不匹配? 路径" << TMP_WEIGHTS << ")";
+                    break;
+                }
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
                                     BG_TRAIN_MAX_MOVES, false);
                 roundLoss = clone.getLastTrainLoss();
-                clone.saveModel(TMP_WEIGHTS);
+                if (!clone.saveModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PPO+MCTS 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
                 break;
             }
             case AGENT_DQNMCTS: {
                 DQNMCTSAgent clone(trainChess, 128, 0.99f, 0.001f, 1.0f, 1.414f);
-                clone.loadModel(TMP_WEIGHTS);
+                if (!clone.loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN+MCTS clone 载入种子权重失败, 本轮丢弃";
+                    break;
+                }
                 clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
                                     BG_TRAIN_MAX_MOVES, false);
                 roundLoss = clone.getLastTrainLoss();
-                clone.saveModel(TMP_WEIGHTS);
+                if (!clone.saveModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN+MCTS 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
                 break;
             }
             default: break;
@@ -1950,21 +2028,38 @@ void ChessBoard::backgroundTrainLoop()
             }
         }
 
-        /* ---- 4轮完成后, 将训练好的权重同步回主agent ---- */
+        /*
+           ---- 训练好的权重同步回主agent ----
+           只有 roundApplied (载入成功 && 写回成功) 才同步。否则主 agent 会去读一个
+           没被更新过、甚至可能不存在的临时文件 —— 而它的 loadModel 一旦静默失败,
+           主 agent 就还是旧权重, 界面上却看不出任何异常。
+        */
+        if (!roundApplied) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
             switch (type) {
             case AGENT_PG:
-                if (m_sfPG) m_sfPG->loadPolicy(TMP_WEIGHTS);
+                if (m_sfPG && !m_sfPG->loadPolicy(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PG 权重同步回主 agent 失败";
+                }
                 break;
             case AGENT_DQN:
-                if (m_sfDQN) m_sfDQN->loadModel(TMP_WEIGHTS);
+                if (m_sfDQN && !m_sfDQN->loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN 权重同步回主 agent 失败";
+                }
                 break;
             case AGENT_PPOMCTS:
-                if (m_sfPPOMCTS) m_sfPPOMCTS->loadModel(TMP_WEIGHTS);
+                if (m_sfPPOMCTS && !m_sfPPOMCTS->loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] PPO+MCTS 权重同步回主 agent 失败";
+                }
                 break;
             case AGENT_DQNMCTS:
-                if (m_sfDQNMCTS) m_sfDQNMCTS->loadModel(TMP_WEIGHTS);
+                if (m_sfDQNMCTS && !m_sfDQNMCTS->loadModel(TMP_WEIGHTS)) {
+                    qWarning() << "[train] DQN+MCTS 权重同步回主 agent 失败";
+                }
                 break;
             default: break;
             }

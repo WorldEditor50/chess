@@ -4,6 +4,8 @@
 #include <vector>
 #include <random>
 #include <ctime>
+#include <cmath>
+#include <cstddef>
 #include "tensor.hpp"
 
 namespace RL {
@@ -71,6 +73,90 @@ struct Random {
             x[i] = distribution(Random::generator);
         }
         return;
+    }
+
+    /*
+       ---- Gamma(alpha, 1) 采样 (Marsaglia-Tsang) ----
+
+       存在的理由: AlphaZero 的根节点探索噪声是 Dirichlet, 而 Dirichlet(alpha) 的标准
+       构造就是"K 个独立 Gamma(alpha,1) 归一化"。内核里原来只有 uniform / normal /
+       categorical, **没有任何 Gamma 采样器** —— 这正是全仓两个 MCTS agent
+       (PPOMCTSAgent / SACAZAgent) 都没有根噪声的直接原因: 不是不想要, 是没工具。
+
+       算法: alpha >= 1 用 Marsaglia-Tsang 的 squeeze + 对数接受/拒绝; alpha < 1 借
+       恒等式 G(alpha) = G(alpha+1)·U^(1/alpha) 提升 (标准做法, 避免小 alpha 时拒绝率
+       爆炸)。期望迭代数约 1.03 (squeeze 命中率 ~97%), 与 alpha 无关。
+    */
+    inline static float gamma(float alpha)
+    {
+        if (!(alpha > 0.0f)) {
+            return 0.0f;
+        }
+        const bool boost = (alpha < 1.0f);
+        const float a = boost ? (alpha + 1.0f) : alpha;
+        const float d = a - 1.0f / 3.0f;
+        const float c = 1.0f / std::sqrt(9.0f * d);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+        float x = 0.0f;
+        float v = 0.0f;
+        for (;;) {
+            do {
+                x = nd(Random::generator);
+                v = 1.0f + c * x;
+            } while (v <= 0.0f);
+            v = v * v * v;
+            const float u = ud(Random::generator);
+            if (u < 1.0f - 0.0331f * x * x * x * x) {
+                break;                      /* squeeze: 直接接受 */
+            }
+            if (std::log(u) < 0.5f * x * x + d * (1.0f - v + std::log(v))) {
+                break;                      /* 精确的对数接受判据 */
+            }
+        }
+        float g = d * v;
+        if (boost) {
+            g *= std::pow(ud(Random::generator), 1.0f / alpha);
+        }
+        return g;
+    }
+
+    /*
+       ---- Dirichlet(alpha) 采样, 写进 out 并归一化 ----
+
+       用 float 累加足够: K 最多 ~50 (中局合法着法数), 结果随后要与 float 先验做凸组合。
+
+       **零样本兜底**: Gamma(alpha) 在 alpha 很小或 U 取到 0 时可能返回 0/非规格化数。
+       个别分量为 0 本身无害 (混完噪声那条着法的先验就是 (1-eps)P); 但若**全部**为 0,
+       归一化会除以 0 产生 NaN, 而 NaN 会顺着 PUCT 污染整棵树的 Q。所以显式兜底成均匀
+       分布 —— 绝不产生 NaN。
+    */
+    inline static void dirichlet(std::vector<float> &out, float alpha)
+    {
+        const std::size_t n = out.size();
+        if (n == 0) {
+            return;
+        }
+        double sum = 0.0;
+        for (std::size_t i = 0; i < n; i++) {
+            float g = gamma(alpha);
+            if (!(g > 0.0f)) {
+                g = 1e-8f;                  /* 0 / 非规格化 / NaN 一律兜底 */
+            }
+            out[i] = g;
+            sum += (double)g;
+        }
+        if (!(sum > 0.0)) {
+            const float u = 1.0f / (float)n;
+            for (std::size_t i = 0; i < n; i++) {
+                out[i] = u;
+            }
+            return;
+        }
+        const float inv = (float)(1.0 / sum);
+        for (std::size_t i = 0; i < n; i++) {
+            out[i] *= inv;
+        }
     }
 };
 

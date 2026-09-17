@@ -310,9 +310,16 @@ public:
         return out;
     }
 
-    /* Save / Load weights */
-    void save(const std::string &actorPara, const std::string &criticPara);
-    void load(const std::string &actorPara, const std::string &criticPara);
+    /*
+       Save / Load weights
+
+       返回**真实结果** (两个网络都成功才 true)。原来是 void, 把内核 Net::save/load
+       的 int 结果吞掉了 —— 于是"文件在但结构/CRC 不匹配而被拒载"这件事到不了调用方,
+       各 agent 的 loadModel() 只好按"文件可读"返回 true, 表现为**静默从随机权重重来**
+       却报告成功。签名从 void 改成 bool 对所有既有调用方源码兼容 (可以忽略返回值)。
+    */
+    bool save(const std::string &actorPara, const std::string &criticPara);
+    bool load(const std::string &actorPara, const std::string &criticPara);
 
     /* ----------------------------------------------------------------
      *  稀疏 MoE 诊断 (只读, 不参与任何计算; 给测试与调参用)

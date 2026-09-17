@@ -187,4 +187,27 @@ inline float outcomeForMover(int chessResult, int moverColor)
     return (redWon == moverIsRed) ? REWARD_TERMINAL : -REWARD_TERMINAL;
 }
 
+/* ====================================================================
+ *  winnerOfResult: Chess::Result -> 赢家颜色 (和棋 / 未终局 = COLOR_NONE)
+ *
+ *  为什么需要它: 统计胜负的地方屡次把 **Chess::Result 直接和 Stone::Color 比较**,
+ *  而这两个枚举的数值是错位的 ——
+ *      RESULT_ONGOING=0, RESULT_RED_WIN=1, RESULT_BLACK_WIN=2, RESULT_DRAW=3
+ *      COLOR_RED=0,      COLOR_BLACK=1,   COLOR_NONE=2
+ *  于是 `gameResult == Stone::COLOR_BLACK` 实际匹配的是 **RESULT_RED_WIN**
+ *  (1 == 1), 红胜被记成黑胜; 而 `== Stone::COLOR_RED` 匹配 RESULT_ONGOING (0),
+ *  黑胜(2) 谁都匹配不上 —— 胜率面板因此是错的, 而且不会报任何错。
+ *  统计口径一律走这个函数, 不要再手写比较。
+ * ==================================================================== */
+inline int winnerOfResult(int chessResult)
+{
+    if (chessResult == Chess::RESULT_RED_WIN) {
+        return Stone::COLOR_RED;
+    }
+    if (chessResult == Chess::RESULT_BLACK_WIN) {
+        return Stone::COLOR_BLACK;
+    }
+    return Stone::COLOR_NONE;   /* 和棋 / 未终局 */
+}
+
 #endif // CHESS_H

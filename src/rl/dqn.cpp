@@ -230,9 +230,19 @@ void RL::DQN::save(const std::string &fileName)
     return;
 }
 
-void RL::DQN::load(const std::string &fileName)
+bool RL::DQN::load(const std::string &fileName)
 {
-    QMainNet.load(fileName);
+    const int r = QMainNet.load(fileName);
+    if (r != 0) {
+        /*
+           载入被拒 (结构指纹 / CRC 不匹配等) ⇒ 网络**没有被改动**。此时**不能**把它
+           拷到目标网: 那会把"上次成功载入的权重"覆盖成"当前主网", 而两者此刻未必
+           一致。直接返回失败, 让调用方(各 agent 的 loadModel)把失败传到上层。
+        */
+        std::cerr << "[weights] DQN::load 失败, 网络保持不变 (文件: "
+                  << fileName << ")" << std::endl;
+        return false;
+    }
     QMainNet.copyTo(QTargetNet);
-    return;
+    return true;
 }

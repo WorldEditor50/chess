@@ -601,6 +601,39 @@ static void testHashIncludesSideToMove()
     CHECK(!c2.isRepetition(), "reset() 后不构成重复局面");
 }
 
+/* ================================================================
+ *  [11] Chess::Result -> 赢家颜色 的换算 (winnerOfResult)
+ *
+ *  为什么值得一条测试: 统计胜负的地方屡次把 Chess::Result **直接**和 Stone::Color
+ *  比较, 而两个枚举数值错位 ——
+ *      RESULT_ONGOING=0, RESULT_RED_WIN=1, RESULT_BLACK_WIN=2, RESULT_DRAW=3
+ *      COLOR_RED=0,      COLOR_BLACK=1,   COLOR_NONE=2
+ *  于是 `gameResult == Stone::COLOR_BLACK` 实际匹配的是 RESULT_RED_WIN (1==1),
+ *  红胜被记成黑胜; `== Stone::COLOR_RED` 匹配 RESULT_ONGOING, 黑胜谁都匹配不上。
+ *  胜率面板因此是错的, 而程序不会报任何错 —— 这类错误只能靠断言钉住。
+ * ================================================================ */
+static void testResultToWinnerColor()
+{
+    std::printf("\n[11] Chess::Result 与 Stone::Color 不能直接比较\n");
+
+    CHECK_EQ(winnerOfResult(Chess::RESULT_RED_WIN), Stone::COLOR_RED,
+             "RESULT_RED_WIN -> 红方");
+    CHECK_EQ(winnerOfResult(Chess::RESULT_BLACK_WIN), Stone::COLOR_BLACK,
+             "RESULT_BLACK_WIN -> 黑方");
+    CHECK_EQ(winnerOfResult(Chess::RESULT_DRAW), Stone::COLOR_NONE,
+             "RESULT_DRAW -> 无赢家");
+    CHECK_EQ(winnerOfResult(Chess::RESULT_ONGOING), Stone::COLOR_NONE,
+             "RESULT_ONGOING -> 无赢家");
+
+    /* 把"为什么需要这个函数"钉成断言: 两个枚举的数值确实是错位的 */
+    CHECK(Chess::RESULT_RED_WIN == Stone::COLOR_BLACK,
+          "陷阱: RESULT_RED_WIN(1) 与 COLOR_BLACK(1) 撞号 (所以直接比较会把红胜记成黑胜)");
+    CHECK(Chess::RESULT_ONGOING == Stone::COLOR_RED,
+          "陷阱: RESULT_ONGOING(0) 与 COLOR_RED(0) 撞号");
+    CHECK(Chess::RESULT_BLACK_WIN != Stone::COLOR_BLACK,
+          "陷阱: RESULT_BLACK_WIN(2) 谁都匹配不上");
+}
+
 int main()
 {
     std::printf("========================================\n");
@@ -618,6 +651,7 @@ int main()
     testMakeUnmakeRoundTrip();
     testStepValueSemantics();
     testHashIncludesSideToMove();
+    testResultToWinnerColor();
 
     std::printf("\n========================================\n");
     std::printf("  断言 %d 条, 失败 %d 条\n", g_checks, g_failed);

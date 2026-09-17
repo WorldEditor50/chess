@@ -31,7 +31,8 @@ public:
                std::size_t batchSize = 32,
                float learningRate = 0.001);
     void save(const std::string& fileName);
-    void load(const std::string& fileName);
+    /* 返回真实结果 (见 rl/ppo.h 里同一处的说明: 原来是 void, 把内核的失败吞掉了) */
+    bool load(const std::string& fileName);
     /*
        chess-side divergence from snakeAI/rl/dqn.h:
        upstream made these members `protected`, but the chess agents

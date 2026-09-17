@@ -2,8 +2,9 @@
 
 一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**9 个可选 AI Agent**（从
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
-自带稀疏 MoE），以及一整套**可复现的验证手段**（10 个 ctest 套件 + 5 个界面自动化脚本 +
-4 个手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement`）。
+自带稀疏 MoE），以及一整套**可复现的验证手段**（13 个 ctest 套件 + 5 个界面自动化脚本 +
+一批手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement` /
+`bench_ppo_sims` / **`bench_diag`（诊断仪表盘：搜索健康度 / 战术题库 / value 校准）** 等）。
 
 > 这个工程的写法偏"工程审计"风格：每个非显然的决定都写成注释，每个结论都有实测数字，
 > 发现的问题（包括自己引入的）都记在 `docs/issues_review.md` 里，包括还没修好的。
@@ -108,7 +109,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
 | **Policy Gradient** | REINFORCE + baseline，走子前在线训练 | 预训 64 步 |
 | **Deep Q-Network** | 双网 + 经验回放 + ε-greedy | 预训 64 步 |
-| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor | 80 次模拟 |
+| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor | 400 次模拟 |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
 | **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节 | 256 次模拟，约 12 ms |
@@ -140,7 +141,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 ## 测试与验证
 
-### `ctest`（10 个套件，全过）
+### `ctest`（13 个套件，全过）
 
 ```bat
 ctest --output-on-failure
@@ -150,7 +151,8 @@ ctest --output-on-failure
 |------|--------|
 | `test_ab` | Alpha-Beta 搜索正确性与基准 |
 | `test_mcts` | MCTS 四阶段 + 树规模（较慢，约 4 分钟） |
-| `test_rules` | 棋规回归：走法数 / 应将 / 自杀 / 照面 / 将杀 / 重复 / 限着 |
+| `test_rules` | 棋规回归：走法数 / 应将 / 自杀 / 照面 / 将杀 / 重复 / 限着 + **`Chess::Result` 与 `Stone::Color` 的枚举换算**（两者数值撞号，手写比较会把红胜记成黑胜） |
+| `test_diag` | **诊断指标的解析验证**（68 断言，秒级）：熵 / CE / KL / explained variance / 变异系数 / 校准分桶 / `qForParent` 的符号 / CSV 列数与表头一致 / `rootDiag` 的不变量（**根访问数之和 == 模拟次数**）/ **搜索能不能看见一步杀** |
 | `test_pretrain` | **探索不得改动真棋局**（逐字段比对） |
 | `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** |
 | `test_grad` | **有限差分核对 SIMD 之后的解析梯度** + MM 内核"累加 vs 覆盖"语义探针 |
@@ -158,6 +160,9 @@ ctest --output-on-failure
 | `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
+
+`test_ppomcts` 也在这 13 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
+置换表 / **PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）。
 
 另外有 **`bench_moe`**（骨干 A/B/C/D 等时间对弈基准）**故意不进 ctest** —— 它跑真实对局、
 依赖随机开局，放进去只是偶发失败：
@@ -226,6 +231,39 @@ R2 权重上"全量 softmax"已无意义（Z≈0.005，非法槽位从未被训�
 落点"**（80 模拟下 6 个取值选点逐位相同，400/1200 下落进 ±6% 噪声），保持 1.414。缺口：
 BC 蒸馏路径仍是旧口径。见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十七"。
 
+### 诊断仪表盘 `bench_diag`（2026-09）
+
+棋力是**滞后指标** —— 本轮实测过：4 局对 AB 的得分率三次都压在 **0%** 地板上，这个协议
+什么也答不了。`bench_diag` 量的是**中间量**，让"哪一层设计错了"当场可读：
+
+```bat
+:: 小网络冒烟（几十秒）
+build\...\bench_diag.exe --games=2 --plies=40 --sims=40 --hidden=16 --expert=16 --tactics=20
+
+:: 真实权重 + CSV（逐手宽表 + TensorBoard 长表）
+build\...\bench_diag.exe --games=6 --plies=80 --sims=80 --tactics=20 --tactic-sims=80 ^
+    --dirichlet-ab=10 --print-root=1 --csv=diag --load=<工作区>\weights\ppo_bc_d4
+```
+
+| 区块 | 量什么 |
+|---|---|
+| 搜索（老师） | 分支数 / 展开覆盖率 / top-1 访问份额 / 访问熵 / 先验熵 / **KL(访问‖先验)** / **吃子 vs 退让的 Q 分组** |
+| 行为 | 每手材质变化 / 选到吃子的比例 / 叫将率 / 被将率 / **每手 V 增益**（附 `std(V)` 与 `corr(V_before,V_after)`，否则常数偏置会被读成"越走越差"） |
+| value 校准 | **EV（explained variance）** + 分桶表（预测区间 → 实际胜率）。全和棋时显式提示"**EV 无定义**"而不是报 0 |
+| 战术题库 | **自动生成**一步杀 / 白吃子题（随机造局面 + 扫描合法着法自校验，不需要手工摆局面）；命中率是硬指标 |
+| Dirichlet 有效性 | 同一局面开/关根噪声，比较吃子着访问份额 —— 判断"噪声救不救得了" |
+| 自对弈生态 | 红/黑/和比例 / 平均手数 / 开局种类数（第 8 手局面哈希去重） |
+
+**它上线当天就抓到一个真缺陷**：一步杀命中 **0/20 = 0%** —— 根因是三个搜索入口都无条件
+用 critic 估叶子、**从不判终局**（`SACAZAgent` 有 `terminalValue()`，PPO 这条没有）。
+修 `evaluateLeaf()` 后 **20/20 = 100%**，而自对弈读数**一点没变**（外科式修复的回归证据）。
+
+同一份仪表盘给出的**当前瓶颈定位**：KL(访问‖先验)=1.32（搜索不是白跑），但 **EV = −0.0293 < 0、
+283 个样本里 281 个落在同一个校准桶** ⇒ V 是常数偏置 ⇒ **Q(吃子)−Q(退让) = −0.098** ⇒
+白吃子命中率 10%。而噪声实测**救不了**（开/关差 −0.0037）。
+**结论：下一轮的杠杆在 value，不在搜索参数。** 全部数字与三条"会让诊断说谎"的坑见
+[`docs/issues_review.md`](docs/issues_review.md) 的"零之二点二十"。
+
 ### 界面自动化（PowerShell + Windows UI Automation）
 
 | 脚本 | 验证什么 |
@@ -262,8 +300,11 @@ chess/
 │       ├── tensor.hpp net.hpp layer.h ...          # 张量/网络/层
 │       ├── simd_ops.hpp simd/ cpuinfo.hpp          # SIMD 分派与内核
 │       ├── moe.hpp sparse_moe.hpp                  # 稠密 / 稀疏 MoE
+│       ├── diag.h                                  # 诊断指标核心 (熵/CE/KL/EV/校准 + CSV)
 │       └── dqn.cpp dpg.cpp ppo.cpp sac.cpp ...     # RL 算法
-├── test/                   # ctest 套件 + 3 个手动基准 (bench_moe / bench_ppo_vs_ab / bench_ppo_mt)
+├── test/                   # 13 个 ctest 套件 + 多个手动基准（含 bench_diag 诊断仪表盘）
+│                           #   (bench_moe / bench_ppo_vs_ab / bench_ppo_mt /
+│                           #    bench_policy_agreement / bench_ppo_sims / bench_diag)
 ├── tools/                  # 界面验证脚本 + 图标生成
 └── docs/                   # 设计/审查/同步/理论分析 (见下)
 ```
@@ -277,8 +318,8 @@ chess/
 | 文档 | 内容 |
 |------|------|
 | [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈） |
-| [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办 |
-| [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项 |
+| [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办。**零之二点十九**：PPO+MCTS 正确性审计（PUCT 的 Q 符号反了 / `loadModel` 静默成功 / 枚举混比 / 模拟数退化 / 搜索看不见将杀）；**零之二点二十**：诊断指标矩阵与当前瓶颈定位（EV<0 ⇒ 该修 value 而不是搜索参数） |
+| [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项。**§9.5** 是 2026-09 的诊断矩阵与负面结果 |
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |

@@ -831,8 +831,8 @@ bool DQNMCTSAgent::loadModel(const std::string &filepath)
     if (!weightFileReadable(filepath)) {
         return false;
     }
-    dqn.load(filepath);
-    return true;
+    /* 传播内核的真实结果, 理由同 ppomcts_agent.cpp / dqnagent.cpp 的同一处修正 */
+    return dqn.load(filepath);
 }
 
 /* ------------------------------------------------------------------ */

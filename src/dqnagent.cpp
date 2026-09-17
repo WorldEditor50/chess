@@ -678,8 +678,11 @@ bool DQNAgent::loadModel(const std::string &filepath)
     if (!weightFileReadable(filepath)) {
         return false;
     }
-    dqn.load(filepath);
-    return true;
+    /*
+       传播内核的真实结果 (见 ppomcts_agent.cpp 里同一处修正的说明): 载入被拒时
+       必须让调用方知道, 而不是按"文件可读"报成功。
+    */
+    return dqn.load(filepath);
 }
 
 /* ------------------------------------------------------------------ */

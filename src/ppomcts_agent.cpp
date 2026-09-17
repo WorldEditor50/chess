@@ -351,6 +351,23 @@ int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
     }
 
     /*
+       ---- 根节点的 Dirichlet 噪声 (2026-09) ----
+       根上开着噪声时, 改用 applyRootNoise 预先算好的"加噪先验" (按动作下标索引)。
+       覆盖发生在**算完网络先验之后**, 因为噪声的定义就是"在网络先验上做凸组合";
+       这个覆盖同时作用于下面两个出口 —— "挑哪个未展开着法"和返回给调用方的 prior
+       (它会存进孩子、进 PUCT 的 U 项)。只改前者等于噪声没接上探索强度。
+    */
+    if (m_rootNoiseActive && nodeID == m_rootID && !m_rootPriorNoised.empty()) {
+        probs.resize(legalIdx.size());
+        for (std::size_t i = 0; i < legalIdx.size(); i++) {
+            const int a = legalIdx[i];
+            probs[i] = (a >= 0 && a < ACTION_DIM)
+                           ? m_rootPriorNoised[(std::size_t)a]
+                           : 0.0f;
+        }
+    }
+
+    /*
         probs 与 legalIdx 一一对应, 而 legalIdx 的**前 untried.size() 项**就是
         untriedActionIndices 本身 (上面按这个顺序填的) —— 于是"挑最大"和"查选中动作
         的概率"都是直接下标访问, 不需要再查表。
@@ -372,10 +389,30 @@ int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
  *  getPUCT:  PUCT score for a child node
  *
  *  Formula:
- *    U(s,a) = Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N_child)
+ *    U(s,a) = -Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N_child)
  *
  *  Unvisited children return a very large score to ensure they
  *  are explored first.
+ *
+ *  ---- 符号约定 (2026-09 修正, 这是一个"不报错但致命"的 bug) ----
+ *
+ *  子节点里存的 Q 是**子节点走棋方**的价值: backup 沿父链逐层翻号 (见 selectMove
+ *  的 Phase 4 与 trainSelfPlay 里同一段), 而价值头的训练口径也正是"走子方视角"
+ *  (RL::PPO::discountedReturns 的 r = reward - gamma*r; test_ppomcts 的
+ *  "discounted-return sign convention" 一节把这条钉成断言)。
+ *
+ *  子节点的走棋方**恰好就是父节点走棋方的对手** (父走一手, 轮到对手), 所以父节点
+ *  要挑"对自己好"的着法, 必须取**负号**再比大小。漏掉它不会报任何错, 只会让搜索
+ *  去最大化**对手**的价值 —— 即专挑对自己最差的着法, 而且**评估越准错得越狠**。
+ *
+ *  症状 (与本次排查的两条报告完全吻合):
+ *   * "loss 一路降、棋力不涨甚至越训越臭" —— 策略被蒸馏向搜索选出的坏着法;
+ *   * "胆小不吃子" —— 吃子后轮到对手、对手少一个大子, 该子节点 Q 对对手为负,
+ *     于是吃子在根上被算成亏着, 而"平推不交换"的子节点 Q ≈ 0 反而更大。
+ *
+ *  最小验算 (可直接手算): 根为红方, A 走后红将死黑 ⇒ A 的 Q = -1;
+ *  B 走后黑将死红 ⇒ B 的 Q = +1。红方该选 A, 而漏负号会选 B。
+ *  单测: test_ppomcts 的 "PUCT sign" 一节用一棵手搭的两孩子树把这条钉住。
  * ------------------------------------------------------------------ */
 double PPOMCTSAgent::getPUCT(int childID, int parentVisits) const
 {
@@ -386,10 +423,11 @@ double PPOMCTSAgent::getPUCT(int childID, int parentVisits) const
         return std::numeric_limits<double>::max();
     }
 
-    double q = child.getQ();                /* Q(s,a) = W/N */
-    double puct = c_puct * child.prior
-                  * std::sqrt((double)parentVisits)
-                  / (1.0 + (double)child.visitCount);
+    /* 取负号的理由见上面的符号约定: 子节点的 Q 是对手视角的 */
+    const double q = -child.getQ();         /* -Q(s,a) = -W/N */
+    const double puct = c_puct * child.prior
+                        * std::sqrt((double)parentVisits)
+                        / (1.0 + (double)child.visitCount);
 
     return q + puct;
 }
@@ -450,6 +488,279 @@ bool PPOMCTSAgent::visitDistribution(int rootID, RL::Tensor &pi) const
 }
 
 /* ------------------------------------------------------------------
+ *  pickRootChildByVisits: 从根的访问计数里出招 (唯一口径, 2026-09)
+ *
+ *  temp > 0.1  : 按 N^(1/temp) 采样 —— 探索就靠它 (训练/自对弈取数据)
+ *  temp <= 0.1 : 取访问最多的孩子 (argmax) —— 评测/对局要确定性
+ *
+ *  这段逻辑原来内联在 trainSelfPlay 里, 而 `selectMove(color, sims, temp)` 的 temp
+ *  **从头到尾没被读过**: 它永远走 argmax。也就是说公开 API 承诺的"temp > 0 时按访问
+ * 分布采样"根本没实现 —— 任何传 temp>0 的调用方 (例如想给自对弈或基准加探索的)
+ *  都会静默地拿到确定性结果。现在两处共用这一个实现, 口径不可能再漂移。
+ *
+ *  返回 -1 表示"根的访问计数总和为 0"。这与改动前 trainSelfPlay 的分支条件一致
+ *  (`bestChildID >= 0 && totalVisits > 0`), 所以对既有行为是保守的。
+ * ------------------------------------------------------------------ */
+int PPOMCTSAgent::pickRootChildByVisits(int rootID, float temp)
+{
+    if (rootID < 0 || (std::size_t)rootID >= nodes.size()) {
+        return -1;
+    }
+    const AZNode &root = nodes[(std::size_t)rootID];
+
+    int bestChildID = -1;
+    int maxVisits = -1;
+    int totalVisits = 0;
+    for (std::size_t k = 0; k < root.childIDs.size(); k++) {
+        const int childID = root.childIDs[k];
+        const int v = nodes[(std::size_t)childID].visitCount;
+        totalVisits += v;
+        if (v > maxVisits) {
+            maxVisits = v;
+            bestChildID = childID;
+        }
+    }
+    if (bestChildID < 0 || totalVisits <= 0) {
+        return -1;
+    }
+
+    if (temp <= 0.1f) {
+        return bestChildID;                 /* 低温柔性: 确定性 argmax */
+    }
+
+    /*
+       温度采样。注意**保持与原实现逐位相同**的写法 (同一个稠密 ACTION_DIM 张量、
+       同样的填充顺序、同一次 categorical 调用): RL::Random::categorical 内部是
+       std::discrete_distribution, 输入相同才给出同一条随机序列, 否则自对弈的可复现性
+       (RL::Random::setSeed) 会变。
+    */
+    RL::Tensor visitProbs(ACTION_DIM, 1);
+    visitProbs.zero();
+    for (std::size_t k = 0; k < root.childIDs.size(); k++) {
+        const AZNode &child = nodes[(std::size_t)root.childIDs[k]];
+        if (child.parentAction < 0 || child.parentAction >= ACTION_DIM) {
+            continue;
+        }
+        const double prob = std::pow((double)child.visitCount,
+                                     1.0 / (double)temp);
+        visitProbs[(std::size_t)child.parentAction] = (float)prob;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < ACTION_DIM; i++) {
+        sum += visitProbs[(std::size_t)i];
+    }
+    if (sum > 1e-9f) {
+        for (int i = 0; i < ACTION_DIM; i++) {
+            visitProbs[(std::size_t)i] /= sum;
+        }
+    }
+    const int chosenAction = RL::Random::categorical(visitProbs);
+
+    for (std::size_t k = 0; k < root.childIDs.size(); k++) {
+        const int childID = root.childIDs[k];
+        if (nodes[(std::size_t)childID].parentAction == chosenAction) {
+            return childID;
+        }
+    }
+    /* 采样到了一个没有对应孩子的下标 (理论上不会发生): 退回 argmax 而不是给无效着法 */
+    return bestChildID;
+}
+
+/* ------------------------------------------------------------------
+ *  evaluateLeaf: 叶子估值 (三个搜索入口的唯一口径, 2026-09)
+ *
+ *  这是诊断仪表盘直接抓出来的一个缺陷: 原来三处都是无条件
+ *      encodeState(leafState); reward = ppo.value(leafState);
+ *  于是"一步杀"那步落子后, 叶子被交给一个只会**评估**的 critic 去猜 (它甚至不知道
+ *  这个局面已经终局), 搜索因此看不见任何战术终点。bench_diag 实测: 一步杀命中率
+ *  **0/20**, 而白吃子(非终局, 靠 V 比较)有 16.7% —— 这个 0% 与 16.7% 的对比就是
+ *  "终局没做特殊处理"的直接证据。
+ *
+ *  成本: 每个模拟多一次 getResult (以将/困毙/判和/60 回合的判定), 相对一次网络前向
+ *  (当前骨干约 8 ms/模拟) 可以忽略; 小网络下它是可观的一小块, 但正确性优先 ——
+ *  "搜索看不见将杀"是不可接受的。
+ * ------------------------------------------------------------------ */
+double PPOMCTSAgent::evaluateLeaf(RL::Tensor &leafStateScratch)
+{
+    const int leafResult = chess.getResult(chess.sideToMove);
+    if (leafResult != Chess::RESULT_ONGOING) {
+        const int winner = winnerOfResult(leafResult);
+        if (winner == Stone::COLOR_NONE) {
+            return 0.0;                                   /* 判和 */
+        }
+        /* 必须按**叶子走棋方**视角给: 此刻 chess.sideToMove 就是叶子的走棋方 */
+        return (winner == chess.sideToMove) ? 1.0 : -1.0;
+    }
+    encodeState(leafStateScratch);
+    return (double)ppo.value(leafStateScratch);
+}
+
+/* ------------------------------------------------------------------
+ *  rootDiag: 把根的访问/Q/先验整理成诊断量 (只读, 2026-09)
+ *
+ *  为什么这些量值得单独抽出来: 棋力是滞后指标, 而"搜索这一层设计对不对"当场就能看。
+ *  尤其是**吃子 vs 退让的 Q 分组** —— 报告里那句"胆小不吃子"在代码层只有这一个
+ *  地方能被直接量化。判读口径写进 rl/diag.h 的 Aggregates::print。
+ *
+ *  三个必须注意的口径:
+ *   1. Q 取**负号**换算到根走棋方视角 (子节点存的是它自己走棋方的价值)。
+ *   2. 先验在**已展开集合**上重归一后再算熵/KL —— 否则未展开着的概率质量会把
+ *      KL 压低, 看起来像"搜索没纠正网络", 而实际原因是"那些着法还没被展开"。
+ *   3. `legalCount` 用 legalIndicesOf (未展开 ∪ 已展开), 它等于该节点的**完整**合法集;
+ *      用它做分母才是真正的"展开覆盖率"。
+ * ------------------------------------------------------------------ */
+bool PPOMCTSAgent::rootDiag(RL::Diag::RootDiag &out) const
+{
+    out = RL::Diag::RootDiag();
+    if (m_rootID < 0 || (std::size_t)m_rootID >= nodes.size()) {
+        return false;
+    }
+    const AZNode &root = nodes[(std::size_t)m_rootID];
+
+    /* 完整合法集 (未展开 ∪ 已展开) —— 展开覆盖率的分母 */
+    std::vector<int> legal;
+    legalIndicesOf(m_rootID, legal);
+    out.legalCount = (int)legal.size();
+
+    const std::size_t nc = root.childIDs.size();
+    if (nc == 0) {
+        return false;                      /* 一次模拟都没跑过: 没有可诊断的东西 */
+    }
+
+    std::vector<double> visits(nc, 0.0);
+    std::vector<double> priors(nc, 0.0);
+    double sumPrior = 0.0;
+    for (std::size_t k = 0; k < nc; k++) {
+        const int cid = root.childIDs[k];
+        if (cid < 0 || (std::size_t)cid >= nodes.size()) {
+            continue;
+        }
+        const AZNode &c = nodes[(std::size_t)cid];
+        visits[k] = (double)c.visitCount;
+        priors[k] = (double)c.prior;
+        sumPrior += (double)c.prior;
+        out.totalVisits += c.visitCount;
+    }
+    if (out.totalVisits <= 0) {
+        return false;                      /* 零访问: 分布无意义 */
+    }
+
+    std::vector<double> pv(nc, 0.0);
+    for (std::size_t k = 0; k < nc; k++) {
+        pv[k] = visits[k] / (double)out.totalVisits;
+    }
+    std::vector<double> pp(nc, 0.0);
+    if (sumPrior > 1e-12) {
+        for (std::size_t k = 0; k < nc; k++) {
+            pp[k] = priors[k] / sumPrior;
+        }
+    }
+
+    out.children = (int)nc;
+    out.expandCoverage = (out.legalCount > 0)
+                             ? (double)nc / (double)out.legalCount : 0.0;
+    out.topShare = 0.0;
+    for (std::size_t k = 0; k < nc; k++) {
+        if (pv[k] > out.topShare) { out.topShare = pv[k]; }
+    }
+    out.visitEntropy = RL::Diag::entropy(pv);
+    out.priorEntropy = RL::Diag::entropy(pp);
+    out.priorKl = RL::Diag::klDivergence(pv, pp);
+
+    /* ---- 吃子 / 退让 分组 (核心: "搜索是不是怕吃子") ---- */
+    const double kNegInf = -std::numeric_limits<double>::infinity();
+    double qCapMax = kNegInf;
+    double qQuietMax = kNegInf;
+    int bestVisits = -1;
+    for (std::size_t k = 0; k < nc; k++) {
+        const int cid = root.childIDs[k];
+        if (cid < 0 || (std::size_t)cid >= nodes.size()) {
+            continue;
+        }
+        const AZNode &c = nodes[(std::size_t)cid];
+        /* Q 换算到**根走棋方**视角 (子节点是对手视角 ⇒ 取负) */
+        const double q = RL::Diag::qForParent(c.totalValue, c.visitCount);
+        /* nextId != ID_NONE 就是吃子 (见 stone.h 的 Step 说明) */
+        const bool isCap = (c.step.nextId != Stone::ID_NONE);
+        if (isCap) {
+            out.captureCount++;
+            out.captureVisits += c.visitCount;
+            if (q > qCapMax) { qCapMax = q; }
+        } else if (q > qQuietMax) {
+            qQuietMax = q;
+        }
+        /* 访问最多的着法是否为吃子: 用严格大于, 与 pickRootChildByVisits 的 argmax 同规则 */
+        if (c.visitCount > bestVisits) {
+            bestVisits = c.visitCount;
+            out.bestIsCapture = isCap ? 1 : 0;
+        }
+    }
+    out.captureVisitShare = (double)out.captureVisits / (double)out.totalVisits;
+    out.qCaptureMax = (out.captureCount > 0) ? RL::Diag::safe(qCapMax) : 0.0;
+    out.qQuietMax = (qQuietMax != kNegInf) ? RL::Diag::safe(qQuietMax) : 0.0;
+    out.valid = true;
+    return true;
+}
+
+/* ------------------------------------------------------------------
+ *  printSortedRoot: 把根的已展开着法按访问数排序打印 (P/Q/N + 是否吃子)
+ *
+ *  这是最省事的单局面定位手段: 挑一个"明显该吃"的局面跑一次搜索, 看吃子着排第几、
+ *  它的 Q 是正还是负 —— 一眼就能分开"网络不给吃子先验"与"搜索把吃子算成亏着"。
+ * ------------------------------------------------------------------ */
+void PPOMCTSAgent::printSortedRoot(int limit) const
+{
+    if (m_rootID < 0 || (std::size_t)m_rootID >= nodes.size()) {
+        std::printf("[root] 没有树 (先跑一次 selectMove)\n");
+        return;
+    }
+    const AZNode &root = nodes[(std::size_t)m_rootID];
+
+    struct Row {
+        int visits = 0;
+        double q = 0.0;
+        double prior = 0.0;
+        int isCap = 0;
+        int fx = 0, fy = 0, tx = 0, ty = 0;
+    };
+    std::vector<Row> rows;
+    rows.reserve(root.childIDs.size());
+    for (std::size_t k = 0; k < root.childIDs.size(); k++) {
+        const int cid = root.childIDs[k];
+        if (cid < 0 || (std::size_t)cid >= nodes.size()) {
+            continue;
+        }
+        const AZNode &c = nodes[(std::size_t)cid];
+        Row r;
+        r.visits = c.visitCount;
+        r.q = RL::Diag::qForParent(c.totalValue, c.visitCount);
+        r.prior = c.prior;
+        r.isCap = (c.step.nextId != Stone::ID_NONE) ? 1 : 0;
+        r.fx = c.step.pos.x; r.fy = c.step.pos.y;
+        r.tx = c.step.nextPos.x; r.ty = c.step.nextPos.y;
+        rows.push_back(r);
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row &a, const Row &b) { return a.visits > b.visits; });
+
+    std::printf("[root] 走棋方=%s, 已展开 %d 个孩子 (按访问数排序)\n",
+                (root.currentColor == Stone::COLOR_RED) ? "RED" : "BLACK",
+                (int)rows.size());
+    std::printf("   %-16s %6s %8s %9s %s\n", "move", "N", "Q(parent)", "prior", "吃子");
+    const int n = (limit > 0 && (int)rows.size() > limit) ? limit : (int)rows.size();
+    for (int i = 0; i < n; i++) {
+        char mv[32];
+        std::snprintf(mv, sizeof(mv), "(%d,%d)->(%d,%d)",
+                      rows[(std::size_t)i].fx, rows[(std::size_t)i].fy,
+                      rows[(std::size_t)i].tx, rows[(std::size_t)i].ty);
+        std::printf("   %-16s %6d %8.4f %9.4f %s\n",
+                    mv, rows[(std::size_t)i].visits, rows[(std::size_t)i].q,
+                    rows[(std::size_t)i].prior,
+                    rows[(std::size_t)i].isCap ? "吃" : "");
+    }
+}
+
+/* ------------------------------------------------------------------
  *  commitEpisode: 一局 -> 回放池 -> 批量学习 (P3 + P4, 见 ppomcts_agent.h)
  *
  *  为什么要"进池时转稀疏": 回放池是长期占内存的那个 (20000 条 x 1440 状态 ≈ 115 MB),
@@ -493,6 +804,38 @@ void PPOMCTSAgent::legalIndicesOf(int nodeID, std::vector<int> &out) const
 /* ------------------------------------------------------------------
  *  commitEpisode (P3 + P4 + R2)
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+ *  bootstrapOutcome: 截断局的"终局值"用 critic 自举 (2026-09)
+ *
+ *  调用时机: 自对弈跑到手数上限仍未分胜负时, 棋盘停在**最后一步落子之后**的局面,
+ *  此时 chess.sideToMove 是**对手** (moveForward 会翻转走棋方)。
+ *
+ *  口径: `encodeState` 按 chess.sideToMove 编码 ⇒ ppo.value(...) 是**对手视角**的
+ *  价值; 取负号才是"最后一步走子方"视角 —— 这正是 commitEpisode 的 finalOutcome
+ *  所需的口径 (终局值按最后一步走子方给)。
+ *
+ *  为什么是"取代 0"而不是"加到 0 上": finalOutcome 是回报递推的起点
+ *  (returns[i] = reward_i - gamma*returns[i+1], 起点是 -finalOutcome)。传 0 等于断言
+ *  "这局是均势和棋", 传 ±V 才是"按当前估值继续下下去会怎样"。
+ *
+ *  量纲: 与在线路径 endOnline 一致 (同样 clamp 到 ±1, 与 REWARD_TERMINAL 同量级)。
+ *  势能塑形的边界项由 commitEpisode 自己扣 (它减掉 Φ(s_end+1)), 这里不必管 ——
+ *  这正是"塑形不改最优策略"那条不变性所要求的。
+ * ------------------------------------------------------------------ */
+float PPOMCTSAgent::bootstrapOutcome()
+{
+    RL::Tensor lastState(STATE_DIM, 1);
+    encodeState(lastState);                 /* 按 chess.sideToMove = 对手 编码 */
+    float v = -(float)ppo.value(lastState);
+    if (!(v > -1.0f)) {
+        v = -1.0f;                          /* 同时挡住 NaN */
+    }
+    if (v > 1.0f) {
+        v = 1.0f;
+    }
+    return v;
+}
+
 void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
                                  float finalOutcome,
                                  const std::vector<std::vector<int>> *legalPerStep)
@@ -589,6 +932,10 @@ void PPOMCTSAgent::resetSearchTree()
     m_rootID = -1;
     m_reuseHits = 0;
     m_nodesCreated = 0;
+    /* 新一局: 根噪声的手数计数与"加噪后先验"一并失效 (见 rootNoise 的说明) */
+    m_plyInGame = 0;
+    m_rootNoiseActive = false;
+    m_rootPriorNoised.clear();
 }
 
 bool PPOMCTSAgent::reachableWithin(int fromID, int targetID, int maxDepth) const
@@ -628,8 +975,20 @@ bool PPOMCTSAgent::reachableWithin(int fromID, int targetID, int maxDepth) const
     return false;
 }
 
-int PPOMCTSAgent::acquireRoot(int color)
+int PPOMCTSAgent::acquireRoot(int color, bool withRootNoise)
 {
+    /*
+       根噪声的手数: `ply` 是**本手**的编号 (0 起), 只在自对弈取数据时递增 ——
+       评测/对局路径不计数, 于是噪声退火不会被"下过多少盘"污染。
+       每次取根都要先把上一手的 m_rootNoiseActive 清掉, 否则关掉噪声后根上还会
+       残留上一手的加噪先验。
+    */
+    const int ply = m_plyInGame;
+    if (withRootNoise) {
+        m_plyInGame++;
+    }
+    m_rootNoiseActive = false;
+
     /*
        treeReuse = false 时**逐字复现改动前**的行为: 每 ply 一棵新树 (原来是 nodes.clear())。
        注意只清树、不清计数器 —— m_nodesCreated / m_reuseHits 是整局的累计量, 两条路都要能比。
@@ -678,6 +1037,9 @@ int PPOMCTSAgent::acquireRoot(int color)
         m_rootID = reused;
         nodes[(std::size_t)reused].parentID = -1;
         nodes[(std::size_t)reused].parentAction = -1;
+        if (withRootNoise) {
+            applyRootNoise(reused, color, ply);
+        }
         return reused;
     }
 
@@ -713,7 +1075,77 @@ int PPOMCTSAgent::acquireRoot(int color)
         m_tt[key] = id;
     }
     m_rootID = id;
+    if (withRootNoise) {
+        applyRootNoise(id, color, ply);
+    }
     return id;
+}
+
+/* ------------------------------------------------------------------
+ *  applyRootNoise: 把根节点的先验换成 (1-eps)P + eps·Dir(alpha)
+ *
+ *  为什么在"取根"这里做, 而不是等第一个孩子被展开时: 根的先验要同时影响两件事 ——
+ *  (a) 未展开着法的**展开顺序** (pickUntriedByPrior 按先验挑最大的),
+ *  (b) 已展开孩子存下来的 `prior`, 也就是 PUCT 的 U 项。
+ *  两者都必须用加噪后的先验, 否则噪声只改了顺序、没改探索强度, 等于白加。
+ *
+ *  口径: 稀疏前向 `ppo.actionMasked`, 与 pickUntriedByPrior 完全一致 (合法集上归一),
+ *  所以"加噪前的 P"和搜索实际用的 P 是同一个东西。
+ *
+ *  eps 按手数线性退火: 第 0 手 eps = rootNoiseEps, 到 rootNoiseMoves 手降到 0
+ *  (之后整个函数直接返回, 不再有任何开销)。
+ * ------------------------------------------------------------------ */
+void PPOMCTSAgent::applyRootNoise(int rootID, int color, int ply)
+{
+    if (!rootNoise || rootNoiseEps <= 0.0f) {
+        return;
+    }
+    if (ply >= rootNoiseMoves) {
+        return;                     /* 开局阶段已过: 残局要收敛, 不加噪声 */
+    }
+    if (rootID < 0 || (std::size_t)rootID >= nodes.size()) {
+        return;
+    }
+
+    /* 根的**完整合法着法集** (未展开 ∪ 已展开孩子的 parentAction) —— 与先验同一口径 */
+    std::vector<int> legalIdx;
+    legalIndicesOf(rootID, legalIdx);
+    if (legalIdx.empty()) {
+        return;
+    }
+
+    /* 网络先验: 显式按 color 编码 (此刻 chess.sideToMove 未必等于 color) */
+    const int savedSide = chess.sideToMove;
+    chess.sideToMove = color;
+    RL::Tensor rootState(STATE_DIM, 1);
+    encodeState(rootState);
+    chess.sideToMove = savedSide;
+
+    std::vector<float> probs;
+    ppo.actionMasked(rootState, legalIdx, probs);
+
+    /* Dirichlet(alpha) 噪声与线性退火 */
+    std::vector<float> noise(legalIdx.size());
+    RL::Random::dirichlet(noise, rootNoiseAlpha);
+
+    const float t = (rootNoiseMoves > 1)
+                        ? (float)ply / (float)(rootNoiseMoves - 1)
+                        : 0.0f;
+    float eps = rootNoiseEps * (1.0f - (t > 1.0f ? 1.0f : t));
+    if (eps <= 0.0f) {
+        return;
+    }
+
+    m_rootPriorNoised.assign((std::size_t)ACTION_DIM, 0.0f);
+    for (std::size_t i = 0; i < legalIdx.size(); i++) {
+        const int a = legalIdx[i];
+        if (a < 0 || a >= ACTION_DIM) {
+            continue;
+        }
+        const float p = (i < probs.size()) ? probs[i] : 0.0f;
+        m_rootPriorNoised[(std::size_t)a] = (1.0f - eps) * p + eps * noise[i];
+    }
+    m_rootNoiseActive = true;
 }
 
 /* ------------------------------------------------------------------
@@ -738,7 +1170,11 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
        注意: 局面来自**另一局**时 (bench/测试里每次都是独立局面) 命中不可达 ⇒ 新开
        一棵树, 行为与改动前逐位相同 —— 这也是"改动不影响独立局面选点"那条断言的依据。
     */
-    const int rootID = acquireRoot(color);
+    /*
+       评测路径默认**不加**根噪声 (evalRootNoise=false) —— 量棋力时不能掺探索噪声。
+       打开它只为诊断 A/B ("Dirichlet 有效性": 同一局面开/关噪声, 看吃子着拿到多少访问)。
+    */
+    const int rootID = acquireRoot(color, evalRootNoise);
 
     /* 这个局面没有合法走法 (被将死/困毙): 返回"无效走法"让调用方自己判负。
        acquireRoot 已经把棋盘恢复原样 (它只临时对齐 sideToMove 算哈希)。 */
@@ -905,8 +1341,12 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
          * 扮演的是"父节点"), 所以不必现在再算一遍。原来的代码每个模拟把同一个局面
          * 算了两遍 (子节点策略 + 叶子估值), 其中策略那一次还是被用错帧的。
          */
-        encodeState(leafState);
-        double reward = (double)ppo.value(leafState);
+        /*
+           叶子估值统一走 evaluateLeaf(): **终局叶子给真实 ±1** (而不是交给 critic 猜),
+           非终局才用 ppo.value。这一步是诊断仪表盘抓出来的 —— 不做它, 搜索看不见
+           一步杀 (bench_diag 实测命中率 0/20)。详见 evaluateLeaf 的注释。
+        */
+        double reward = evaluateLeaf(leafState);
 
         /* ====== Phase 4: BACKPROPAGATION ====== */
         for (int i = (int)path.size() - 1; i >= 0; i--) {
@@ -924,21 +1364,19 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
     }
 
     /* ---- Select the best move ---- */
-    int bestChildID = -1;
-    int maxVisits = -1;
+    /*
+       出招现在走唯一的那个函数 (pickRootChildByVisits):
+         temp <= 0.1 -> argmax over visits (评测/对局, 确定性)
+         temp >  0.1 -> 按 N^(1/temp) 采样 (探索)
+       在本次改动之前, 这里的 `temp` 参数**从未被读取**, 所以无论调用方传什么都是
+       argmax —— 与函数注释承诺的行为不符。修复后调用方传 0.0f 的结果与改动前**逐位
+       相同** (走同一个 argmax 分支), 所以评测基线与既有基准都不受影响。
+    */
+    chess.sideToMove = savedSideToMove;   /* 恢复调用方的棋盘视角 (见本函数开头的说明) */
 
-    for (int childID : nodes[rootID].childIDs) {
-        if (nodes[childID].visitCount > maxVisits) {
-            maxVisits = nodes[childID].visitCount;
-            bestChildID = childID;
-        }
-    }
-
-    /* 恢复调用方的棋盘视角 (见本函数开头保存 savedSideToMove 处的说明) */
-    chess.sideToMove = savedSideToMove;
-
-    if (bestChildID >= 0) {
-        return nodes[bestChildID].step;
+    const int chosenID = pickRootChildByVisits(rootID, temp);
+    if (chosenID >= 0) {
+        return nodes[chosenID].step;
     }
 
     return Step();
@@ -1004,8 +1442,15 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                Run MCTS to get improved policy.
                B-5: 不再 `nodes.clear()` —— 向置换表要根: 上一步我们落子到达的那个局面
                就在上一棵树里, 它的子树/先验/访问计数直接接着用 (见 acquireRoot)。
+
+               ---- 自对弈取数据: 这里开根节点 Dirichlet 噪声 (2026-09) ----
+               这是**唯一**开噪声的入口 (理由见头文件 rootNoise 一节): 这套搜索的展开是
+               确定性的 (按先验挑最大), 若再没有根噪声, 低先验着法 (典型是吃子) 可能
+               整局都不会被模拟到, 搜索拿不到它的 Q, 网络就永远学不到它。
+               selectMove (评测/对局) 与 warmupFromCurrent 都保持不开 —— 量棋力时不能
+               掺探索噪声, 而且必须与改动前可比。
             */
-            const int rootID = acquireRoot(currentColor);
+            const int rootID = acquireRoot(currentColor, /*withRootNoise=*/true);
 
             if (rootID < 0) {
                 /* 没有合法走法: 当前走子方输 (acquireRoot 返回 -1, 见那里的说明) */
@@ -1152,8 +1597,8 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 /* 这里只要**价值**: 叶子自己的策略先验会在它被展开的那次模拟里用到
                    (那时它扮演"父节点"), 所以不必现在再算一遍 —— 原来的代码把同一个
                    局面算了两遍, 其中策略那一次还是被用错帧的。 */
-                encodeState(leafState);
-                double reward = (double)ppo.value(leafState);
+                /* 叶子估值统一走 evaluateLeaf (终局给真实 ±1, 见那个函数的注释) */
+                double reward = evaluateLeaf(leafState);
 
                 /* Backpropagation */
                 for (int i = (int)path.size() - 1; i >= 0; i--) {
@@ -1170,52 +1615,20 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
             }
 
             /* --- Select move from MCTS visit distribution --- */
-            int bestChildID = -1;
-            int maxVisits = -1;
-            int totalVisits = 0;
-
-            for (int childID : nodes[rootID].childIDs) {
-                totalVisits += nodes[childID].visitCount;
-                if (nodes[childID].visitCount > maxVisits) {
-                    maxVisits = nodes[childID].visitCount;
-                    bestChildID = childID;
-                }
-            }
-
+            /*
+               出招统一走 pickRootChildByVisits (2026-09)。原来这里内联了一整份
+               "temp>0.1 就按 N^(1/temp) 采样、否则 argmax" 的实现 —— 而
+               selectMove() 的 temp 参数从未被读取, 于是同一个语义在两条路径上行为不同。
+               抽出去之后两边不可能再漂移; 采样的数学与随机数调用顺序**逐位保持不变**
+               (同一个稠密张量、同一次 categorical), 所以自对弈的可复现性不受影响。
+            */
             Step chosenStep;
             int chosenAction = -1;
 
-            if (bestChildID >= 0 && totalVisits > 0) {
-                if (temp > 0.1f) {
-                    /* Sample from visit distribution with temperature */
-                    RL::Tensor visitProbs(ACTION_DIM, 1);
-                    visitProbs.zero();
-                    for (int childID : nodes[rootID].childIDs) {
-                        const AZNode &child = nodes[childID];
-                        double prob = std::pow((double)child.visitCount,
-                                               1.0 / (double)temp);
-                        visitProbs[child.parentAction] = (float)prob;
-                    }
-                    /* Normalize */
-                    float sum = 0.0f;
-                    for (int i = 0; i < ACTION_DIM; i++) sum += visitProbs[i];
-                    if (sum > 1e-9f) {
-                        for (int i = 0; i < ACTION_DIM; i++) visitProbs[i] /= sum;
-                    }
-                    chosenAction = RL::Random::categorical(visitProbs);
-
-                    /* Find the Step for this action */
-                    for (int childID : nodes[rootID].childIDs) {
-                        if (nodes[childID].parentAction == chosenAction) {
-                            chosenStep = nodes[childID].step;
-                            break;
-                        }
-                    }
-                } else {
-                    /* Argmax: pick the child with most visits */
-                    chosenStep = nodes[bestChildID].step;
-                    chosenAction = nodes[bestChildID].parentAction;
-                }
+            const int chosenID = pickRootChildByVisits(rootID, temp);
+            if (chosenID >= 0) {
+                chosenStep = nodes[(std::size_t)chosenID].step;
+                chosenAction = nodes[(std::size_t)chosenID].parentAction;
 
                 /* Execute move on the board */
                 double dummyReward = 0.0;
@@ -1254,13 +1667,21 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                     }
 
                     totalEpisodes++;
-                    if (gameResult == Stone::COLOR_BLACK) totalWins[1]++;
-                    if (gameResult == Stone::COLOR_RED) totalWins[0]++;
+                    /*
+                       统计必须走 winnerOfResult(): `gameResult` 是 Chess::Result, 而
+                       RESULT_RED_WIN(1) 与 COLOR_BLACK(1) 数值撞号 —— 直接比较会把红胜
+                       记成黑胜, 黑胜则谁都匹配不上 (胜率面板一直是错的, 且不报错)。
+                    */
+                    const int winnerColor = winnerOfResult(gameResult);
+                    if (winnerColor == Stone::COLOR_BLACK) totalWins[1]++;
+                    if (winnerColor == Stone::COLOR_RED) totalWins[0]++;
 
                     if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
-                        printf("  Episode %4d/%d: %s wins, %d moves, win_rate=%.2f\n",
+                        printf("  Episode %4d/%d: %s, %d moves, win_rate=%.2f\n",
                                ep + 1, episodes,
-                               (gameResult == Stone::COLOR_BLACK) ? "Black(AI)" : "Red",
+                               (winnerColor == Stone::COLOR_BLACK) ? "Black(AI) wins"
+                             : (winnerColor == Stone::COLOR_RED)   ? "Red wins"
+                                                                   : "Draw",
                                moveNum + 1, getWinRate(Stone::COLOR_BLACK));
                     }
                     break;
@@ -1319,7 +1740,17 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
         const int finalResult = chess.getResult(chess.sideToMove);
         if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
-                commitEpisode(trajectory, 0.0f, &legalPerStep);
+                /*
+                   ---- 截断局的自举 (2026-09) ----
+                   原来一律传 0.0f, 等于告诉 critic "这些局面的回报就是 0"。而象棋和棋
+                   极多、手数上限又低 (GUI 训练只给 60 手), 于是大部分轨迹的价值目标都是
+                   0, critic 只学得到"和棋", 搜索的叶子估值也就没有区分度。
+                   现在用 critic 对"最后一步之后局面"的估值自举 —— 口径与在线路径
+                   endOnline 完全一致 (那边一直这么做), 两条路的学习问题不再不同。
+                   truncationBootstrap=false 可切回旧口径做 A/B。
+                */
+                const float bootOutcome = truncationBootstrap ? bootstrapOutcome() : 0.0f;
+                commitEpisode(trajectory, bootOutcome, &legalPerStep);
             }
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
@@ -1502,8 +1933,8 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                 }
 
                 /* 只要价值: 叶子的策略先验在它被展开那次模拟里才用到 (同 trainSelfPlay) */
-                encodeState(leafState);
-                double reward = (double)ppo.value(leafState);
+                /* 叶子估值统一走 evaluateLeaf (终局给真实 ±1, 见那个函数的注释) */
+                double reward = evaluateLeaf(leafState);
 
                 for (int i = (int)path.size() - 1; i >= 0; i--) {
                     nodes[path[i]].visitCount++;
@@ -1560,8 +1991,11 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
                         commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
                     }
                     totalEpisodes++;
-                    if (gameResult == Stone::COLOR_BLACK) totalWins[1]++;
-                    if (gameResult == Stone::COLOR_RED) totalWins[0]++;
+                    /* 同 trainSelfPlay: 必须用 winnerOfResult 换算 (Chess::Result 与
+                       Stone::Color 数值错位, 直接比较会把红胜记成黑胜) */
+                    const int winnerColor = winnerOfResult(gameResult);
+                    if (winnerColor == Stone::COLOR_BLACK) totalWins[1]++;
+                    if (winnerColor == Stone::COLOR_RED) totalWins[0]++;
                     break;
                 }
 
@@ -1602,7 +2036,17 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
         const int finalResult = chess.getResult(chess.sideToMove);
         if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
             if (!trajectory.empty()) {
-                commitEpisode(trajectory, 0.0f, &legalPerStep);
+                /*
+                   ---- 截断局的自举 (2026-09) ----
+                   原来一律传 0.0f, 等于告诉 critic "这些局面的回报就是 0"。而象棋和棋
+                   极多、手数上限又低 (GUI 训练只给 60 手), 于是大部分轨迹的价值目标都是
+                   0, critic 只学得到"和棋", 搜索的叶子估值也就没有区分度。
+                   现在用 critic 对"最后一步之后局面"的估值自举 —— 口径与在线路径
+                   endOnline 完全一致 (那边一直这么做), 两条路的学习问题不再不同。
+                   truncationBootstrap=false 可切回旧口径做 A/B。
+                */
+                const float bootOutcome = truncationBootstrap ? bootstrapOutcome() : 0.0f;
+                commitEpisode(trajectory, bootOutcome, &legalPerStep);
             }
             totalEpisodes++;
         }
@@ -1629,9 +2073,12 @@ void PPOMCTSAgent::warmupFromCurrent(int episodes, int simulations,
 bool PPOMCTSAgent::saveModel(const std::string &actorPath,
                              const std::string &criticPath)
 {
-    ppo.save(actorPath, criticPath);
-    /* 不无条件返回 true: 两个文件都写成功才算成功 */
-    return weightFileWritten(actorPath) && weightFileWritten(criticPath);
+    /*
+       内核的 save 自己做了原子写 + 落盘检查, 现在也会返回真实结果 (见 rl/ppo.cpp)。
+       两个判据都用上: 内核结果为主, "文件是否真的在且非空"作为兜底。
+    */
+    const bool ok = ppo.save(actorPath, criticPath);
+    return ok && weightFileWritten(actorPath) && weightFileWritten(criticPath);
 }
 
 bool PPOMCTSAgent::loadModel(const std::string &actorPath,
@@ -1640,7 +2087,19 @@ bool PPOMCTSAgent::loadModel(const std::string &actorPath,
     if (!weightFileReadable(actorPath) || !weightFileReadable(criticPath)) {
         return false;
     }
-    ppo.load(actorPath, criticPath);
+    /*
+       ---- 必须传播内核的真实结果 (2026-09 修) ----
+       内核的 load 在"层数 / 结构指纹 / CRC 不匹配"时会**拒绝载入并保持网络不变**, 但
+       原来这里丢弃了它的返回值, 只按"文件可读"就返回 true —— 于是**过期或损坏的检查点
+       被静默忽略, 同时报告成功**。对"每轮保存 -> 载入 -> 继续训"的循环这是最坏的失败
+       形态: 静默退化成每次从随机权重重来, 表现就是"跑了很多轮完全没有效果", 而且
+       一句报错都没有 (实测: bench_ppo_sims 打印 "A 成功 / B 成功", 而 stderr 同时
+       在喊"参数量不匹配 ... 拒绝载入")。
+    */
+    if (!ppo.load(actorPath, criticPath)) {
+        /* 载入失败 ⇒ 网络没变 ⇒ 树仍然有效, 不 resetSearchTree() */
+        return false;
+    }
     /*
        B-5: 换了权重就把树丢掉 —— 树里的先验与 Q 全是旧网络算出来的, 复用它们等于
        拿旧策略继续搜。这里与"新一局"是同一类失效条件。
