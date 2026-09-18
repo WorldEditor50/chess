@@ -335,6 +335,14 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QString &info) {
             ui->exploreLabel->setText(QString("探索+预训练: %1").arg(info));
         });
+    /*
+       ---- 模型自检面板 ----
+       时机刻意选在这里: 预训练做完 = 棋盘上又走了一步、训练又更新过一轮权重,
+       于是"对局累计"那一类读数会跟着走。报告本身是只读的, 随时可以再刷 (见
+       updateSelfCheckPanel 的说明)。
+    */
+    connect(ui->gameWidget, &ChessBoard::aiExploreInfo, this,
+        [this](const QString &) { updateSelfCheckPanel(); });
 
     /* 棋盘回放状态信号 */
     connect(ui->gameWidget, &ChessBoard::replayIndexChanged,
@@ -358,6 +366,8 @@ MainWindow::MainWindow(QWidget *parent)
             ui->matchResultLabel->setText("对弈结果: -");
             ui->thinkIndicator->resetToIdle();
             ui->gameWidget->setEnabled(true);
+            /* 启动加载完成: 现在才有 agent 可以自检 (之前都是 nullptr) */
+            updateSelfCheckPanel();
             refreshGameList();
         });
 
@@ -568,6 +578,9 @@ void MainWindow::onAgentSelected(int index)
 
     QString name = ui->agentComboBox->currentText();
     qDebug("AI Agent switched to: %s", qPrintable(name));
+
+    /* 换了 agent 就换一份自检报告 (不支持的 agent 显示"没有自检项") */
+    updateSelfCheckPanel();
 }
 
 /* ================================================================
@@ -765,6 +778,45 @@ void MainWindow::updateMetricsLabels()
     */
     ui->rewardValueLabel->setText(
         ui->rewardChart->readoutText(QStringLiteral("奖励(局内累计)")));
+}
+
+/*
+ * updateSelfCheckPanel - 把当前 agent 的自检报告写进右侧面板
+ *
+ * 为什么要有这个面板 (这一节的全部理由):
+ *   面板上原来只有两条曲线 + 一个"逐局明细"列表。而**这两样都不能判断"这个模型
+ *   值不值得继续训"**:
+ *     * 损失只说明网络与自己的目标一致 —— 一个把 Q 学成常数、或者用自举把材质
+ *       当终局的网络, 损失一样可以很低 (实测 DQN+MCTS 是 22, PPO 是 0.003,
+ *       两个数**量纲不同、都不可比**, 也都与棋力无关);
+ *     * 自对弈的"胜负"里赢家和输家是同一份权重 —— "50 胜 50 和"里没有任何一条
+ *       信息是关于棋力的 (实测同一份 PPO 权重对 AB 深度 4 是 0 胜 1 和 23 负)。
+ *   真正的前置判据是**结构/口径**类事实: 动作编码有没有别名、状态能不能观测到
+ *   规则历史、终局信号有没有真的进过目标。这些原来只能靠命令行探针
+ *   (probe_dqnmcts_aliasing) 看, 现在接到界面上。
+ *
+ * 线程与时机:
+ *   * 数据源是 `ChessBoard::getAgentSelfCheck()`, 它转发到 agent 的
+ *     `selfCheckReport()`; 那个函数被约定为**只读且不动棋盘**, 所以可以在 GUI
+ *     线程调 (见 aiagent.h 的契约)。
+ *   * 调用时机: 选中 agent 时、每一手"探索+预训练"之后、以及启动加载完成时。
+ *     这些都是"棋盘状态刚变过"的点, 于是对局累计读数会跟着走。
+ *   * 报告里那些**对局累计**的计数来自主 agent, 而后台训练跑在 clone 上 ——
+ *     面板里写明了这一点, 否则显示 0 会被读成"没训练过"。
+ */
+void MainWindow::updateSelfCheckPanel()
+{
+    const QString report = QString::fromStdString(
+        ui->gameWidget->getAgentSelfCheck());
+    if (report.isEmpty()) {
+        ui->selfCheckView->setPlainText(QStringLiteral(
+            "当前 agent 没有可报告的自检项。\n"
+            "(已实现自检的: DQN+MCTS —— 表示健康度 + 终局通道计数)\n"
+            "注意: 自检报告的是**结构与口径**, 不是棋力。\n"
+            "要判断棋力用 bench_anchor 的锚点对局 (带 95% 区间的 Elo 差)。"));
+        return;
+    }
+    ui->selfCheckView->setPlainText(report);
 }
 
 /*

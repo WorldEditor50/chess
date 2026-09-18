@@ -174,6 +174,57 @@ public:
     float getExploreRate() const { return dqn.exploringRate; }
     /* 最近一次 learn 的平均平方 TD 误差 (界面"训练损失曲线"用, 见 rl/dqn.h) */
     float getLastTrainLoss() const override { return (float)dqn.lastLoss; }
+
+    /* ----------------------------------------------------------------
+     *  自检 (界面"模型自检"面板) —— 口径说明见 aiagent.h 的 selfCheckReport
+     *
+     *  报告两类事实:
+     *   1. **表示健康度**: 状态里有哪些规则上下文通道 (本 agent 是 0 个),
+     *      以及**动作别名** —— 同一个局面里有多少互不相同的合法着法被迫共用
+     *      一个 Q 槽位 (`stepToActionIdx` 是 128 槽位的哈希, 真实走法空间 8100)。
+     *      前一项用"标准开局"这一份确定性样本算一次 (与棋盘状态无关); 后一项用
+     *      搜索过程累计的增量统计 (所以对局中会变)。
+     *   2. **终局通道计数**: 每局结束时记下 `getResult()` 判出的结束方式,
+     *      以及 `isGameOver()` 能不能看见它。两者的差就是"终局信号漏掉了多少局"
+     *      —— 漏掉的那些局的 Q 目标只有 r(材质) + gamma*maxQ, 没有胜负。
+     *
+     *  **只读**: 全部走 `chess` 的副本与局部解码, 不改任何成员、不动棋盘。
+     * ---------------------------------------------------------------- */
+    std::string selfCheckReport() const override;
+
+    /*
+     * 一局的结束方式 (训练循环收尾时累加)。口径与 chess.h 的 Chess::Result 一致,
+     * 另加 END_CAP = 撞手数上限、根本没走到终局 (台架截断)。
+     */
+    enum EndCode {
+        END_CAP = 0,        /* 跑到 maxMoves 上限, 未终局 */
+        END_RED_WIN = 1,    /* Chess::RESULT_RED_WIN */
+        END_BLACK_WIN = 2,  /* Chess::RESULT_BLACK_WIN */
+        END_DRAW = 3        /* Chess::RESULT_DRAW (三次重复 / 60 回合自然限着) */
+    };
+    long long endCount[4] = {0, 0, 0, 0};
+    /* 其中被 `isGameOver()` 看见的次数 (它只认将/帅是否还在场) */
+    long long endSeenByGameOver = 0;
+
+    /*
+     * 动作别名的增量统计 (每次自对弈取着法时累加)。
+     * 为什么要增量而不是只看标准开局: 开局 44 个合法着法只落进 39 个槽位, 而中局
+     * 的合法集会更大、碰撞也不同 —— 只有把对局里真实遇到的那些局面统计进来,
+     * 面板上的数才代表"训练时实际发生了什么"。
+     */
+    long long aliasMoves = 0;         /* 累计取过的合法着法数 */
+    long long aliasIndexed = 0;       /* 其中拿到独立 Q 槽位的着法数 (碰撞后剩余) */
+    long long aliasWorstSlot = 0;     /* 单局面内最挤槽位背了几个不同走法 */
+    long long aliasClearedMoves = 0;  /* 累计被挤掉的走法数 (合法数 - 用到的槽位数) */
+
+private:
+    /*
+     * 记一局的结束方式 (三个训练收尾点共用)。
+     *   result         : `chess.getResult(chess.sideToMove)` 的返回值;
+     *                    RESULT_ONGOING 表示"撞手数上限", 归到 END_CAP。
+     *   seenByGameOver : 旧口径 `isGameOver()` 是否看见了这一局的终局。
+     */
+    void noteEnd(int result, bool seenByGameOver);
 };
 
 #endif // DQNMCTS_AGENT_H

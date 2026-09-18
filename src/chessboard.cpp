@@ -1056,6 +1056,41 @@ std::string ChessBoard::getLastExploreInfo() const
     return m_lastExploreInfo;
 }
 
+/*
+ * 当前 agent 的自检报告 (界面"模型自检"面板)。
+ *
+ * 按**当前选中的 agent 类型**取对应的那一份实例 (s_ 系列的静态指针, 与
+ * preTrainThenDecide 用的是同一批对象) —— 不能"遍历所有 agent 返回第一个非空的",
+ * 那会在切到别的 agent 之后继续显示上一个的自检结果。
+ *
+ * 刻意**不**加锁: 报告函数被约定为只读且不动棋盘 (见 aiagent.h 的契约), 所以可以
+ * 在 GUI 线程安全调用。指针可能为 nullptr (该 agent 的权重文件没找到 ⇒ 没建过网),
+ * 此时返回空串, 由 GUI 显示"没有自检项"。
+ *
+ * 注意 (界面上也写明了, 否则 0 会被误读): 那些**对局累计**的计数来自主 agent,
+ * 而 GUI 的后台训练跑在 clone 上、每轮才把权重同步回来 —— 训练期间这里的计数
+ * 不会增长。所以面板同时给出"标准开局"那一份**确定性**读数 (与训练进度无关,
+ * 一打开就能看)。
+ */
+std::string ChessBoard::getAgentSelfCheck() const
+{
+    switch (m_agentType) {
+    case AGENT_DQNMCTS:
+        if (m_sfDQNMCTS != nullptr) {
+            return m_sfDQNMCTS->selfCheckReport();
+        }
+        break;
+    /*
+       其它 agent 的 selfCheckReport() 目前是默认实现 (返回空串)。以后要把 PPO 的
+       "和棋分桶 / priorKl"或 DQNAB 的"手工锚 gap/corr"接进来, 就在这里加一个分支,
+       再在对应 agent 里重写 —— 接口已经留在 AgentBase 上 (aiagent.h)。
+    */
+    default:
+        break;
+    }
+    return std::string();
+}
+
 QString ChessBoard::stagePrefix() const
 {
     if (m_matchRunning.load()) {

@@ -4,6 +4,10 @@
 #include "agentrollout.hpp"
 #include "rl/util.hpp"
 
+#include <cstdio>   /* selfCheckReport 的 snprintf */
+#include <map>      /* aliasOfPosition 的槽位分组 */
+#include <set>      /* aliasOfPosition 的"互不相同的走法"去重 */
+
 /* ================================================================
  *  DQNMCTSAgent - DQN + MCTS implementation
  *
@@ -12,6 +16,101 @@
  *  MCTS uses UCB1 (no prior — unlike PUCT in PPOMCTSAgent).
  *  Training uses standard DQN experience replay.
  * ================================================================ */
+
+namespace {
+
+/*
+ * 一手的终局判定, 统一走 `getResult()` (Phase 6 的"终局口径统一")。
+ *
+ * 为什么必须有这个函数: 本文件原先在三处收尾都写
+ *     int gameResult = chess.isGameOver();
+ *     bool done = (gameResult != Stone::COLOR_NONE);
+ * 而 `Chess::isGameOver()` 只认"将/帅还在不在场上" —— 它**不认**将杀、困毙、
+ * 三次重复、60 回合自然限着。于是:
+ *
+ *   * 正常对局几乎永远不 done: 双方走到手数上限被截断, 那一手照常写成
+ *     (s,a,r,s',done=false), Q 目标 = r(材质) + gamma*maxQ 一路自举。
+ *     实测 (probe_dqnmcts_aliasing [3]): 6 局全部撞在 200 手上限, 终局信号 0 条。
+ *     也就是说 Q 学到的是"舍不得丢子", 不是"怎么赢"—— 终局 ±1 从来没进过目标。
+ *   * `trainVsRandom` 更糟: 它没有"非终局就用即时奖励"那一支, 于是**每一手**
+ *     都按 done 写入、奖励取 `(gameResult==BLACK)?1:-1` = **-1**。等于告诉网络
+ *     "你走的每一步都是输棋"。这解释了那个"最低 22"的损失量级。
+ *
+ * `outcomeForMover()` (chess.h) 把 Chess::Result 换算成**走子方视角**的 ±1/0,
+ * 三处即时奖励 (`computeReward`) 也都是走子方视角 —— 口径一致后再按各调用点的
+ * 需要换算到黑方/白方视角。
+ *
+ *   result : 必须是 chess.getResult(chess.sideToMove) 的结果 (落子之后)
+ * 返回 true 表示**这一手之后已终局** (outcome 已写好)。
+ */
+bool terminalOutcomeOf(const Chess &c, float &outcome)
+{
+    const int res = const_cast<Chess &>(c).getResult(c.sideToMove);
+    if (res == Chess::RESULT_ONGOING) {
+        return false;
+    }
+    /* mover = 刚走完的那一方 = 走子方的对手 (getResult 的参数是"轮到谁走") */
+    const int moverColor = (c.sideToMove == Stone::COLOR_RED) ? Stone::COLOR_BLACK
+                                                              : Stone::COLOR_RED;
+    outcome = outcomeForMover(res, moverColor);   /* chess.h 的自由函数 */
+    return true;
+}
+
+/*
+ * 把 Chess::Result / "撞上限" 归到 DQNMCTSAgent::EndCode。
+ * 单独一个函数是为了让**三个**收尾点写同一条映射, 不再各写各的 if。
+ */
+int endCodeOfResult(int chessResult)
+{
+    switch (chessResult) {
+    case Chess::RESULT_RED_WIN:   return DQNMCTSAgent::END_RED_WIN;
+    case Chess::RESULT_BLACK_WIN: return DQNMCTSAgent::END_BLACK_WIN;
+    case Chess::RESULT_DRAW:      return DQNMCTSAgent::END_DRAW;
+    default:                      return DQNMCTSAgent::END_CAP;   /* ONGOING */
+    }
+}
+
+/*
+ * 一个局面上的动作别名 (走法数 -> 用到的 Q 槽位数)。
+ *
+ * 必须**局部解码**而不是调 `ag.stepToActionIdx`: 这个函数会拿 `chess` 的副本反复
+ * 走子回退地枚举, 而成员函数没有任何状态, 逐字抄一份哈希即可; 更要紧的是
+ * `selectMove` 用的是同一个下标口径, 两者必须一致 —— 不一致时探针/面板会与实际
+ * 训练脱节, 所以这里的哈希与 `stepToActionIdx` 是同一份公式 (改一处必须改两处,
+ * probe_dqnmcts_aliasing 会把两份都对一遍)。
+ */
+int aliasActionIdxOf(const Step &s)
+{
+    unsigned long long h = (unsigned long long)s.id * 37ULL
+                         + (unsigned long long)s.nextPos.x * 13ULL
+                         + (unsigned long long)s.nextPos.y * 7ULL;
+    return (int)(h % (unsigned long long)DQNMCTSAgent::ACTION_DIM);
+}
+
+/*
+ * 统计某个局面上"合法着法 -> Q 槽位"的别名情况。**只读**: 棋盘引用不再改动。
+ * legalCount/slotCount 写回给调用方累加。
+ */
+void aliasOfPosition(const std::vector<Step *> &legal,
+                     int &legalCount, int &slotCount, int &worstSlot)
+{
+    std::map<int, std::set<std::string> > bucket;
+    for (std::size_t i = 0; i < legal.size(); i++) {
+        const Step &s = *legal[i];
+        char key[64];
+        std::snprintf(key, sizeof(key), "%d>%d,%d", s.id, s.nextPos.x, s.nextPos.y);
+        bucket[aliasActionIdxOf(s)].insert(std::string(key));
+    }
+    legalCount = (int)legal.size();
+    slotCount = (int)bucket.size();
+    worstSlot = 0;
+    for (std::map<int, std::set<std::string> >::const_iterator it = bucket.begin();
+         it != bucket.end(); ++it) {
+        worstSlot = std::max(worstSlot, (int)it->second.size());
+    }
+}
+
+}  // namespace
 
 /* ------------------------------------------------------------------
  *  Constructor
@@ -255,6 +354,23 @@ Step DQNMCTSAgent::selectMove(int color, int iterations, bool training)
         return Step();
     }
 
+    /*
+       自检计数: 记下**这一个局面**的合法集与它用到几个 Q 槽位。
+         * 先在 `getLegalActions` 之后、`put(rootSteps)` **之前**算 ——
+           `put()` 会把 Step 还回对象池, 之后读到的是已被复用的内容。
+         * 每手只算一次 (不是每个 MCTS 迭代一次): 迭代里那次 (childSteps) 每次
+           都要分配 map/set/字符串, 在 400 次迭代下会变成可观测的常数开销;
+           而根节点的数已经代表"真实对局里遇到的局面"。
+    */
+    {
+        int legalN = 0, slotN = 0, worst = 0;
+        aliasOfPosition(rootSteps, legalN, slotN, worst);
+        aliasMoves += legalN;
+        aliasIndexed += slotN;
+        aliasClearedMoves += (legalN - slotN);
+        if (worst > aliasWorstSlot) { aliasWorstSlot = worst; }
+    }
+
     DQNMCTSNode rootNode;
     rootNode.currentColor = color;
     rootNode.parentID = -1;
@@ -451,21 +567,38 @@ void DQNMCTSAgent::trainVsRandom(int episodes, int iterations,
                 RL::Tensor nextState(STATE_DIM, 1);
                 encodeState(nextState);
 
-                int gameResult = chess.isGameOver();
-                bool done = (gameResult != Stone::COLOR_NONE);
-                float terminalReward = (gameResult == Stone::COLOR_BLACK) ? 1.0f : -1.0f;
+                /*
+                   终局判定: 原来这里是
+                       int gameResult = chess.isGameOver();
+                       bool done = (gameResult != Stone::COLOR_NONE);
+                       float terminalReward = (gameResult == COLOR_BLACK) ? 1.0f : -1.0f;
+                   两个错都在这一处:
+                     (1) isGameOver() 不认将杀/判和 ⇒ 正常对局永远不 done;
+                     (2) **没有"非终局就用即时奖励"那一支** ⇒ 每一手的奖励都被写成
+                         terminalReward; 而 gameResult 非黑胜时它恒为 -1.0f, 于是
+                         "每走一步 = 输一盘"进了回放池。这是损失下不去的直接原因。
+                   现在统一走 getResult() + outcomeForMover() (Phase 6 "终局口径统一"),
+                   再换算到黑方视角 —— 本函数其余部分的即时奖励也是黑方视角。
+                */
+                float outcomeMover = 0.0f;
+                const bool done = terminalOutcomeOf(chess, outcomeMover);
+                const float terminalReward =
+                    moverRewardToBlackFrame(outcomeMover, Stone::COLOR_BLACK);
 
                 dqn.perceive(state, oneHotAction, nextState,
                              done ? terminalReward : reward, done);
 
                 if (done) {
                     totalEpisodes++;
-                    if (gameResult == Stone::COLOR_BLACK) totalWins[1]++;
-                    if (gameResult == Stone::COLOR_RED) totalWins[0]++;
+                    /* 统计一律走 winnerOfResult(): Chess::Result 与 Stone::Color 数值
+                       错位, 直接比较会把红胜记成黑胜 (见 chess.h 的说明)。 */
+                    const int winner = winnerOfResult(chess.getResult(chess.sideToMove));
+                    if (winner == Stone::COLOR_BLACK) totalWins[1]++;
+                    if (winner == Stone::COLOR_RED) totalWins[0]++;
                     if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                         printf("  Episode %4d/%d: %s wins, %d moves, win_rate=%.2f, eps=%.4f\n",
                                ep + 1, episodes,
-                               (gameResult == Stone::COLOR_BLACK) ? "Black(AI)" : "Red(random)",
+                               (winner == Stone::COLOR_BLACK) ? "Black(AI)" : "Red(random)",
                                moveNum + 1, getWinRate(), dqn.exploringRate);
                     }
                     break;
@@ -534,13 +667,25 @@ void DQNMCTSAgent::trainVsRandom(int episodes, int iterations,
        计一次局数。改用 getResult() 判断是否已分胜负。
     */
         const int finalResult = chess.getResult(chess.sideToMove);
-        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
+        const bool decidedInLoop = (finalResult != Chess::RESULT_ONGOING);
+        if (!decidedInLoop) {
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                 printf("  Episode %4d/%d: Draw, win_rate=%.2f, eps=%.4f\n",
                        ep + 1, episodes, getWinRate(), dqn.exploringRate);
             }
         }
+        /*
+           自检计数 (界面"模型自检"的终局通道读数) —— **一局恰好一条**, 所以放在
+           循环外、并且两个出口都归到这里。
+           这个位置是被断言逼出来的: 第一版写在"每走一手"之后, 于是 12 手的一局被
+           记成 12 局 (test_dqnmcts 第 [6](5) 条断言 "跑完一局必须恰好记一条" 当场
+           抓到 12 != 1)。自检面板上的数字是要给人当决策依据的, 所以它自己必须被钉住。
+           `chess.isGameOver()` 另记一次, 用来量"旧口径会不会看见这一局" —— 两个数
+           的差就是 2026-09 那次"终局口径统一"修掉了多少被漏掉的终局。
+        */
+        noteEnd(decidedInLoop ? finalResult : Chess::RESULT_ONGOING,
+                chess.isGameOver() != Stone::COLOR_NONE);
     }
 }
 
@@ -602,27 +747,34 @@ void DQNMCTSAgent::trainSelfPlay(int episodes, int iterations,
             RL::Tensor nextState(STATE_DIM, 1);
             encodeState(nextState);
 
-            int gameResult = chess.isGameOver();
-            bool done = (gameResult != Stone::COLOR_NONE);
-            float terminalReward;
-            if (done) {
-                terminalReward = (gameResult == Stone::COLOR_BLACK) ? 1.0f
-                               : (gameResult == Stone::COLOR_RED) ? -1.0f : 0.0f;
-            } else {
-                terminalReward = reward;
-            }
+            /*
+               终局判定 (Phase 6 口径统一): 原来用 isGameOver(), 它只认"将/帅还在
+               不在场" —— 将杀/困毙/三次重复/60 回合自然限着都不算终局, 于是自对弈
+               几乎永远走不到 done, Q 目标一路用 r(材质) + gamma*maxQ 自举。
+               实测 (probe_dqnmcts_aliasing [3], 6 局 x 200 手): **终局信号 0 条**。
+            */
+            float outcomeMover = 0.0f;
+            const bool done = terminalOutcomeOf(chess, outcomeMover);
+            const int winner = done ? winnerOfResult(chess.getResult(chess.sideToMove))
+                                    : Stone::COLOR_NONE;
+
+            /* 终局常量按黑方视角 (本函数编码与即时奖励都是黑为正) */
+            const float terminalReward =
+                moverRewardToBlackFrame(outcomeMover, Stone::COLOR_BLACK);
 
             dqn.perceive(state, oneHotAction, nextState,
                          done ? terminalReward : reward, done);
 
             if (done) {
+                /* 注意: 自检计数**不在这里** —— 一局只记一条, 所以放在循环外
+                   (见下面 noteEnd 处的说明与 test_dqnmcts 第 [6](5) 条的断言)。 */
                 totalEpisodes++;
-                if (gameResult == Stone::COLOR_BLACK) totalWins[1]++;
-                if (gameResult == Stone::COLOR_RED) totalWins[0]++;
+                if (winner == Stone::COLOR_BLACK) totalWins[1]++;
+                if (winner == Stone::COLOR_RED) totalWins[0]++;
                 if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                     printf("  Episode %4d/%d: %s wins, %d moves, win_rate=%.2f, eps=%.4f\n",
                            ep + 1, episodes,
-                           (gameResult == Stone::COLOR_BLACK) ? "Black" : "Red",
+                           (winner == Stone::COLOR_BLACK) ? "Black" : "Red",
                            moveNum + 1, getWinRate(), dqn.exploringRate);
                 }
                 break;
@@ -647,13 +799,25 @@ void DQNMCTSAgent::trainSelfPlay(int episodes, int iterations,
        计一次局数。改用 getResult() 判断是否已分胜负。
     */
         const int finalResult = chess.getResult(chess.sideToMove);
-        if (finalResult == Chess::RESULT_ONGOING || finalResult == Chess::RESULT_DRAW) {
+        const bool decidedInLoop = (finalResult != Chess::RESULT_ONGOING);
+        if (!decidedInLoop) {
             totalEpisodes++;
             if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
                 printf("  Episode %4d/%d: Draw, win_rate=%.2f, eps=%.4f\n",
                        ep + 1, episodes, getWinRate(), dqn.exploringRate);
             }
         }
+        /*
+           自检计数 (界面"模型自检"的终局通道读数) —— **一局恰好一条**, 所以放在
+           循环外、并且两个出口都归到这里。
+           这个位置是被断言逼出来的: 第一版写在"每走一手"之后, 于是 12 手的一局被
+           记成 12 局 (test_dqnmcts 第 [6](5) 条断言 "跑完一局必须恰好记一条" 当场
+           抓到 12 != 1)。自检面板上的数字是要给人当决策依据的, 所以它自己必须被钉住。
+           `chess.isGameOver()` 另记一次, 用来量"旧口径会不会看见这一局" —— 两个数
+           的差就是 2026-09 那次"终局口径统一"修掉了多少被漏掉的终局。
+        */
+        noteEnd(decidedInLoop ? finalResult : Chess::RESULT_ONGOING,
+                chess.isGameOver() != Stone::COLOR_NONE);
     }
 }
 
@@ -774,15 +938,11 @@ void DQNMCTSAgent::recordExperience(const Step &chosenStep, int color)
     RL::Tensor nextState(STATE_DIM, 1);
     encodeState(nextState);
 
-    int gameResult = chess.isGameOver();
-    bool done = (gameResult != Stone::COLOR_NONE);
-    float terminalReward;
-    if (done) {
-        terminalReward = (gameResult == Stone::COLOR_BLACK) ? 1.0f
-                       : (gameResult == Stone::COLOR_RED) ? -1.0f : 0.0f;
-    } else {
-        terminalReward = reward;
-    }
+    /* 终局判定与上面两处同一口径 (getResult + outcomeForMover), 理由见那里的注释 */
+    float outcomeMover = 0.0f;
+    const bool done = terminalOutcomeOf(chess, outcomeMover);
+    const float terminalReward =
+        moverRewardToBlackFrame(outcomeMover, Stone::COLOR_BLACK);
 
     dqn.perceive(m_cachedState, oneHotAction, nextState,
                  done ? terminalReward : reward, done);
@@ -790,6 +950,130 @@ void DQNMCTSAgent::recordExperience(const Step &chosenStep, int color)
     /* Update the cached state for the next step */
     m_cachedState = nextState;
     m_onlineStepCount++;
+}
+
+/* ------------------------------------------------------------------
+ *  selfCheckReport —— 界面"模型自检"面板的数据源
+ *
+ *  这里只报告**结构 / 口径**类事实。判读写在每一行末尾, 因为面板的读者是看训练
+ *  曲线的人, 而这两类数恰恰是"曲线好看但棋力没动"的两个已知原因:
+ *
+ *    (1) 表示层: 状态 90 维只有"每格有什么子" —— 没有走子方、没有重复进度、
+ *        没有无吃子进度、没有被将标记。实测这些量在该编码下**逐字节不可分**
+ *        (probe_dqnmcts_aliasing [2])。于是"三次重复/自然限着判和"这类**决定
+ *        终局与回报**的规则, 网络读不到。
+ *    (2) 动作层: `stepToActionIdx` 把 (棋子 id, 目标格) 哈希进 128 个槽位,
+ *        而真实走法空间是 8100。同一个局面里若干个互不相同的走法会共用同一个
+ *        Q 槽位 —— 它们拿不到各自的值。
+ *
+ *  刻意**不**在这里报"棋力": 面板能回答的是"这个模型值不值得继续训", 而不是
+ *  "它有多强"。后者只有 bench_anchor 那种带置信区间的锚点对局能回答。
+ * ------------------------------------------------------------------ */
+std::string DQNMCTSAgent::selfCheckReport() const
+{
+    char buf[512];
+    std::string out;
+
+    /* ---- 1. 规模 ---- */
+    std::snprintf(buf, sizeof(buf), "状态 %d 维 (10x9 每格一个子力值) | 动作 %d 槽位\n",
+                  STATE_DIM, ACTION_DIM);
+    out += buf;
+
+    /* ---- 2. 规则上下文通道: 这个编码一个都没有 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "规则上下文通道: 0 个 (走子方/重复/无吃子/被将 全不可观测)\n");
+    out += buf;
+
+    /* ---- 3. 动作别名 ----
+       标准开局那一份是**确定性**的 (与当前棋盘无关), 增量统计则来自真实对局。
+       两者都给: 前者说明"这个编码在最常见的局面下就撞", 后者说明训练里撞多少。 */
+    int initLegal = 0, initSlots = 0, initWorst = 0;
+    int finalLegal = 0, finalSlots = 0, finalWorst = 0;
+    {
+        /* 只读副本: 绝不能在 GUI 线程碰 this->chess (搜索可能正在用它) */
+        Chess probe(chess);
+        probe.reset();
+        std::vector<Step *> legal;
+        probe.sample(probe.sideToMove, legal);
+        aliasOfPosition(legal, initLegal, initSlots, initWorst);
+        Steps::instance().put(legal);
+
+        Chess probe2(chess);   /* 保持 reset 后的状态; 这里只为不改动 probe */
+        std::vector<Step *> l2;
+        probe2.sample(probe2.sideToMove, l2);
+        aliasOfPosition(l2, finalLegal, finalSlots, finalWorst);
+        Steps::instance().put(l2);
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "动作别名(标准开局): %d 个合法着法 -> %d 个 Q 槽位, 挤掉 %d 个"
+                  " (最挤槽位 %d 个着法)\n",
+                  initLegal, initSlots, initLegal - initSlots, initWorst);
+    out += buf;
+
+    if (aliasMoves > 0) {
+        const double cleared = (double)aliasClearedMoves / (double)aliasMoves;
+        const double perGame = 0.0;   /* 留白: 每局的量由局数换算, 不在这里算 */
+        (void)perGame;
+        std::snprintf(buf, sizeof(buf),
+                      "动作别名(对局累计): %lld 个着法, 平均每次挤掉 %.2f 个"
+                      " (最挤槽位 %lld 个着法)\n",
+                      aliasMoves, cleared, aliasWorstSlot);
+        out += buf;
+    } else {
+        std::snprintf(buf, sizeof(buf), "动作别名(对局累计): 还没有对局数据\n");
+        out += buf;
+    }
+
+    /* ---- 4. 终局通道: getResult 判出的终局里, isGameOver 漏了多少 ---- */
+    const long long total = endCount[END_CAP] + endCount[END_RED_WIN]
+                          + endCount[END_BLACK_WIN] + endCount[END_DRAW];
+    if (total > 0) {
+        const long long decided = total - endCount[END_CAP];
+        const long long missed = decided - endSeenByGameOver;
+        std::snprintf(buf, sizeof(buf),
+                      "终局通道: %lld 局 | 截断 %lld | 红胜 %lld | 黑胜 %lld | 和 %lld\n",
+                      total, endCount[END_CAP], endCount[END_RED_WIN],
+                      endCount[END_BLACK_WIN], endCount[END_DRAW]);
+        out += buf;
+        std::snprintf(buf, sizeof(buf),
+                      "  已分出胜负/和棋的 %lld 局里, 旧口径 isGameOver 只看见 %lld 局"
+                      " (漏 %lld)\n",
+                      decided, endSeenByGameOver, missed > 0 ? missed : 0);
+        out += buf;
+        if (endCount[END_CAP] * 2 > total) {
+            std::snprintf(buf, sizeof(buf),
+                          "  截断占比 %.0f%% -> 这一批多数对局没有终局信号, "
+                          "Q 目标只有 材质+gamma*maxQ\n",
+                          100.0 * (double)endCount[END_CAP] / (double)total);
+            out += buf;
+        }
+    } else {
+        std::snprintf(buf, sizeof(buf), "终局通道: 还没有对局数据\n");
+        out += buf;
+    }
+
+    out += "以上是表示/口径事实, **不是棋力**; 棋力请用 bench_anchor 的锚点对局\n";
+    return out;
+}
+
+/* ------------------------------------------------------------------
+ *  noteEnd —— 记一局的结束方式 (界面"模型自检"面板的终局通道读数)
+ *
+ *  为什么要记: 训练损失与自对弈胜率都无法回答"终局信号到底进没进过目标"。
+ *  把 `getResult()` 的判定与旧口径 `isGameOver()` 的判定**一起**记下来, 两者的差
+ *  就是"有多少局的终局被漏掉了" —— 漏掉的那些局 Q 目标只有 材质 + gamma*maxQ。
+ *  （2026-09 已把三处收尾统一到 getResult(); 这个计数是那笔改动的**验收读数**,
+ *   同时也是回归指示器: 若 endSeenByGameOver 又追上 decided, 说明有人把口径改回去了。）
+ * ------------------------------------------------------------------ */
+void DQNMCTSAgent::noteEnd(int result, bool seenByGameOver)
+{
+    const int code = endCodeOfResult(result);
+    if (code >= 0 && code < 4) {
+        endCount[code]++;
+    }
+    if (seenByGameOver) {
+        endSeenByGameOver++;
+    }
 }
 
 /* ------------------------------------------------------------------

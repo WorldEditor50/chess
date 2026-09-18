@@ -148,6 +148,19 @@ public:
     /* 每次"探索环境 + 预训练"的说明 (线程安全) */
     std::string getLastExploreInfo() const;
 
+    /*
+     * 当前 agent 的**自检报告** (界面"模型自检"面板的数据源)。
+     *
+     * 转发给 `AgentBase::selfCheckReport()` (见 aiagent.h 的口径说明)。
+     * 为什么要有这一层转发而不是让 GUI 直接拿 agent:
+     *   * GUI 线程拿到的 agent 指针是 `m_agents` 里的那个, 而**自对弈训练跑在
+     *     后台线程的 clone 上** —— 主 agent 的计数器在训练期间不会动。这个转发
+     *     就是明确标注这件事的地方 (面板上会打印"主 agent 计数, 后台训练在 clone 上"),
+     *     免得面板显示 0 时被读成"没训练过"。
+     *   * 没有选中 agent / 该 agent 不支持自检时返回空串, 由 GUI 决定怎么显示。
+     */
+    std::string getAgentSelfCheck() const;
+
     /* 程序退出时保存所有已初始化的agent权重 */
     void shutdownSave();
 

@@ -54,6 +54,12 @@ private:
     /* 把曲线的"最新值/均值/样本数"写进图下面的标签 (见 .cpp 的注释) */
     void updateMetricsLabels();
     /*
+     * 把当前 agent 的自检报告写进右侧"模型自检"面板。
+     * 数据源 ChessBoard::getAgentSelfCheck() -> AgentBase::selfCheckReport()。
+     * 为什么需要它 (损失与自对弈胜率都答不了"值不值得继续训") 见 .cpp 里的长注释。
+     */
+    void updateSelfCheckPanel();
+    /*
      * 双击曲线 -> 弹一个放大的独立窗口 (见 metricsview.h 的 CurveChartDialog)。
      * 同一个源控件只保留一个窗口: 已经开着就抬到前面, 不再新开一个。
      */

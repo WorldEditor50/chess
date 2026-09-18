@@ -466,6 +466,15 @@ if(CHESS_BUILD_TESTS)
         #
         # Build them and run them by hand when you want the numbers; putting them
         # in the default suite only produces timeouts that look like failures.
+        #
+        # 2026-09 更新: test_dqnmcts **现在有断言**了 (第 [6] 节 16 条: 界面"模型自检"
+        # 面板所依赖的那些量 —— 报告非空/含关键字段、只读 (调用前后棋盘哈希不变)、
+        # 可重复、终局通道计数一局恰好一条), 并且 main() 按失败数返回非零退出码。
+        # 本机实测 339.7 s (Release, MSVC 2022, Qt 6.8.0) —— 仍然明显超过随手跑的成本,
+        # 所以它**依旧不注册进 ctest**; 但手动跑时 `echo %ERRORLEVEL%` 是有意义的:
+        # 0 = 全过。若要注册, 请先把上面那张耗时表更新到实测值。
+        # 另: 表示能力探针是独立目标 probe_dqnmcts_aliasing (秒级, 见文件末尾),
+        # 需要"不改代码就能复现结构结论"时用它, 不必跑这个 340 s 的基准。
     endforeach()
 
     # ------------------------------------------------------------------ EVAB test
@@ -1065,6 +1074,33 @@ if(CHESS_BUILD_TESTS)
     chess_add_header_deps(test_sacaz)
     add_test(NAME test_sacaz COMMAND test_sacaz)
     set_tests_properties(test_sacaz PROPERTIES TIMEOUT 600)
+
+    # ------------------------------------------- DQN+MCTS 表示能力探针 (2026-09)
+    # 为什么需要: DQNMCTSAgent 的训练数字 (50 胜 0 负 50 和 / 损失 22) 无法回答
+    # "它学没学会下棋"。这个探针量的是**表示层**的两条硬约束, 与训练量无关:
+    #   [1] 动作别名 —— STEP_TO_ACTION_IDX 把 (棋子 id, 目标格) 哈希进 128 个槽位,
+    #       而真实走法空间是 16x90 (静态) / 90x90 (全盘): 多少走法被迫共用一个下标。
+    #   [2] 状态不可分 —— 90 维只存"每格有什么子", 于是走子方 / 重复进度 /
+    #       自然限着逐字节不可分; 且 evaluateLeaf 用 isGameOver() 判终局 (只认将帅
+    #       是否还在场), 判和与将杀都不是终局。
+    # **不进 ctest**: 它是"值不值得继续训这个 agent"的前置闸门, 不是回归测试。
+    #   cmake --build <build> --target probe_dqnmcts_aliasing
+    #   <build>/probe_dqnmcts_aliasing --positions=32 --plies=20
+    add_executable(probe_dqnmcts_aliasing
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_dqnmcts_aliasing_main.cpp
+        ${SRC_DIR}/dqnmcts_agent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_include_directories(probe_dqnmcts_aliasing PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_dqnmcts_aliasing PRIVATE RL_CORE)
+    target_compile_options(probe_dqnmcts_aliasing PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_dqnmcts_aliasing PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(probe_dqnmcts_aliasing)
 
     # 想用 AddressSanitizer 查这类问题 (arena 里"agent 返回非法走法"/堆损坏),
     # 必须**整个构建**都带 /fsanitize=address —— 只给一个目标加会在链接时报
