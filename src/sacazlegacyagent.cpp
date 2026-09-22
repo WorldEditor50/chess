@@ -173,23 +173,48 @@ const char *SACAZLegacyAgent::hiddenActivationName() const
 }
 
 /*
- * 界面上的哪一支 —— 本类只服务一个界面类型 (AGENT_SACAZ_OLD), 所以是写死的字符串。
+ * 界面上的哪一支 —— 本类服务**两个**界面类型, 区别只有骨干:
+ *   AGENT_SACAZ_OLD     -> Mlp        (与 AGENT_SACAZ 同骨干)
+ *   AGENT_SACAZ_OLD_MOE -> SparseMoeTb (与 AGENT_SACAZ_MOE 同骨干)
+ * 所以标签按**骨干**分支, 而不是写死一句 (两支的参数量/耗时/自检读数差很多, 混在一本
+ * 账上会让"哪一支更强"这种结论直接错)。
  * (2026-09 之前这里是 virtual 覆写: 那一版是 SACAZAgent 的派生类, 基类也要报自己的
  * 身份; 现在两个类没有继承关系, 各自的标签各写各的。)
  */
 const char *SACAZLegacyAgent::guiAgentLabel() const
 {
-    return "SAC+AZ-59e5233 (AGENT_SACAZ_OLD, 行为还原版)";
+    if (backbone == Backbone::SparseMoeTb) {
+        return "SAC+AZ-59e5233-MoE (AGENT_SACAZ_OLD_MOE, 还原口径 + 稀疏MoE/TB专家)";
+    }
+    if (backbone == Backbone::Mlp) {
+        return "SAC+AZ-59e5233 (AGENT_SACAZ_OLD, 行为还原版)";
+    }
+    return "bench/测试构造 (界面不为它建实例)";
 }
 
 /*
  * 权重前缀 —— 必须与 SACAZAgent 的 "weights/sacaz_agent" 不同 (用户口径: 新旧权重文件
  * 用不同名字区分开)。两者参数结构完全相同, 结构指纹挡不住串权重, 共用前缀会让
  * "后训练的那一支静默覆盖另一支"。
+ *
+ * [2026-09] 按**骨干**再分一次: 本类现在服务两个界面类型 (Mlp 与 SparseMoeTb), 它们的
+ * 参数量不同、训练口径相同但权重不能互换 —— 一个骨干一个前缀, 免得"这份文件是哪一支的"
+ * 只能靠猜。界面只用前两个; 另外两个是 bench 里的对照骨干。
  */
 const char *SACAZLegacyAgent::defaultWeightPrefix()
 {
-    return "weights/sacaz_old_agent";
+    return defaultWeightPrefix(Backbone::Mlp);
+}
+
+const char *SACAZLegacyAgent::defaultWeightPrefix(Backbone b)
+{
+    switch (b) {
+    case Backbone::Mlp:          return "weights/sacaz_old_agent";
+    case Backbone::SparseMoeTb:  return "weights/sacaz_old_moe_agent";
+    case Backbone::SparseMoeMlp: return "weights/sacaz_old_moemlp_agent";
+    case Backbone::DenseMoeTb:   return "weights/sacaz_old_densetb_agent";
+    default:                     return "weights/sacaz_old_agent";
+    }
 }
 
 int SACAZLegacyAgent::moeExpertCount() const
@@ -1746,9 +1771,10 @@ std::string SACAZLegacyAgent::selfCheckReport() const
 
     /*
        ---- 0. 本实例是**哪一支** (必须放最前面) ----
-       本类只服务一个界面类型 (AGENT_SACAZ_OLD), 而它与 AGENT_SACAZ / AGENT_SACAZ_MOE
-       在面板上的读数长得很像 (同一骨干、同一表示、参数量相同) —— 不把身份写在第一行,
-       读者会把两个类的读数记到同一本账上。
+       本类服务**两个**界面类型 (AGENT_SACAZ_OLD = MLP 骨干 / AGENT_SACAZ_OLD_MOE =
+       稀疏 MoE+TB 专家骨干), 而它们与 AGENT_SACAZ / AGENT_SACAZ_MOE 在面板上的读数长得
+       很像 (同一表示、同样的口径、参数量也接近) —— 不把"界面类型 + 骨干"写在第一行,
+       读者会把四支的读数记到同一本账上。
        第二段是**本类最要紧的一句**: 它的口径全部硬编码, 而且**刻意保留**了 59e5233 的
        两个"看着像坏掉"的读数 (目标网移动率只有 2~4%、|Q| 会漂到 5.6)。不写出来,
        看面板的人第一反应会是"这个模型坏了", 然后去"修"它 —— 那正是这一支最不希望
@@ -1765,7 +1791,8 @@ std::string SACAZLegacyAgent::selfCheckReport() const
            "是本类**刻意保留**的还原对象: 目标网移动率 ~4%、|Q| 会漂到 5.6;\n";
     out += "  网络结构与 59e5233 逐字相同 (隐层激活 Layer<Tanh>, 没有开关);"
            " \"用 TanhNorm<Linear> r=1 复现那一层\"已实测证伪 (偏置在 tanh 外, max|dQ| = 8.9e-06);\n";
-    out += "  权重文件独立: " + std::string(SACAZLegacyAgent::defaultWeightPrefix())
+    /* 前缀按**本实例的骨干**取 (本类现在有两个骨干, 两个前缀), 见 defaultWeightPrefix */
+    out += "  权重文件独立: " + std::string(SACAZLegacyAgent::defaultWeightPrefix(backbone))
            + "_actor / _q1 / _q2 (与 AGENT_SACAZ 的 weights/sacaz_agent 不共用,"
              " 否则两边会互相覆盖/串权重)\n";
     out += "--------------------------------------------------------------\n";

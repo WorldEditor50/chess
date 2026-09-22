@@ -100,9 +100,10 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
   （见 `docs/sac_learn_reward_2026_09.md` §1.1 与 `chessboard.h` 的 `RewardAccounting`）。
 * 对弈结束后**静默保存权重**到标准路径（不弹窗；几百 MB 的写盘会显示"请稍候"沙漏）
 * **后台持续训练**（2026-09 补齐）：当前选中的 agent 在后台线程里持续"自对弈 → 在线更新 →
-  写回主 agent"。**十个有权重可训的 agent 全部接上**（PG / DQN / PPO+MCTS / PPO+MCTS-MLP /
-  DQN+MCTS / EVAB / SAC+AZ / SAC+AZ-MoE / SAC+AZ-59e5233 / DQN+AB —— PPO 的两种骨干与
-  SAC 的两支各自都有独立权重；Alpha-Beta 与 MCTS 没有可训练权重）。
+  写回主 agent"。**十一个有权重可训的 agent 全部接上**（PG / DQN / PPO+MCTS / PPO+MCTS-MLP /
+  DQN+MCTS / EVAB / SAC+AZ / SAC+AZ-MoE / SAC+AZ-59e5233 / SAC+AZ-59e5233-MoE / DQN+AB ——
+  PPO 的两种骨干、SAC 的两支与还原版的两种骨干各自都有独立权重；Alpha-Beta 与 MCTS
+  没有可训练权重）。
   训练**在对弈期间照常进行**（每轮把权重同步进主 agent ⇒ 一局之内模型会变，这条是明确
   选择的行为，见 `docs/issues_review.md` 零之二点二十三 §2b）。
   一轮的时长 = 关窗等待时间，各 agent 差两三个数量级（PG/DQN 秒级、SAC+AZ-MoE 与
@@ -155,20 +156,23 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
 | **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节；每次真实决策还会**从自己的搜索学一次**（不依赖"探索+预训练"勾选框） | 256 次模拟，约 12 ms |
 | **SAC+AZ (稀疏MoE+TB专家)** | 同上，骨干换成**稀疏路由 MoE + TransformerBlock 专家** | 16 次模拟，约 160 ms |
-| **SAC+AZ (59e5233 行为还原版)** | 同一个算法，但口径回到提交 `59e5233`：目标熵 0.98 / α 学习率 1e-3 / critic 不钳位且纯 MSE / 叶子全量估值。**独立的派生类** `SACAZLegacyAgent`，**权重文件独立**（`weights/sacaz_old_agent*`） | 256 次模拟，约 12 ms |
+| **SAC+AZ (59e5233 行为还原版)** | 口径回到提交 `59e5233`：目标熵 0.98 / α 学习率 1e-3 / critic 不钳位且纯 MSE / 叶子全量估值。**独立的类** `SACAZLegacyAgent`（不继承 `SACAZAgent`），**权重文件独立**（`weights/sacaz_old_agent*`） | 256 次模拟，约 12 ms |
+| **SAC+AZ (59e5233 还原版, 稀疏MoE+TB专家)** | 同一支还原版的**另一个骨干**：同一个类、同一套 59e5233 口径，骨干换成**稀疏路由 MoE + TransformerBlock 专家**（与 SAC+AZ (稀疏MoE+TB专家) 同骨干）—— 用来把"骨干"与"口径"两个变量分开比 | 16 次模拟，约 160 ms |
 
-> **"只换骨干"的两个 agent**（PPO+MCTS 的 MLP/TB 专家）刻意共用同一个类与同一份
-> 搜索/训练/自检代码，构造时传不同的 `RL::PPO::Backbone`（`src/rl/ppo.h`）——
-> 界面上并列，就是为了能直接对弈比较，而不是维护两份会漂移的实现。两者的权重文件、
-> agent 名、参数量都不同；**交叉载入会被结构指纹当场拒绝**（`test_match` [2.14] 钉住）。
+> **"只换骨干"的三个配对**（PPO+MCTS 的 MLP/TB 专家、SAC+AZ 的 MLP/TB 专家、
+> SAC+AZ-59e5233 的 MLP/TB 专家）刻意共用同一个类与同一份搜索/训练/自检代码，构造时传
+> 不同的骨干枚举 —— 界面上并列，就是为了能直接对弈比较，而不是维护两份会漂移的实现。
+> 它们的权重文件、agent 名、参数量都不同；PPO 那对**交叉载入会被结构指纹当场拒绝**
+> （`test_match` [2.14] 钉住）。
 >
-> **两个 SAC 的关系与上面相反、也更微妙**：SAC+AZ 与 SAC+AZ (59e5233 行为还原版) 是
-> **同一份算法 + 两个 C++ 类**（`SACAZAgent` 与派生类 `SACAZLegacyAgent`），差别只有
-> 4 个口径值。两者的**参数结构完全相同** ⇒ 结构指纹**挡不住**串权重，所以隔离只能靠
-> ① 不同的类、② 不同的文件名（`weights/sacaz_agent*` vs `weights/sacaz_old_agent*`），
-> 并由 `test_match` [2.11]（文件名清单不同）与 `test_sacaz` [14]（口径与逐位相同的网络）
-> 钉住。口径差异的完整表在 `src/sacazlegacyagent.h`，排查记录在
-> `docs/sac_regression_2026_09.md`。
+> **SAC 的两支与上面相反**：SAC+AZ 与 SAC+AZ (59e5233 行为还原版) 是**两份独立实现 +
+> 两个互不继承的 C++ 类**（`SACAZAgent` 与 `SACAZLegacyAgent`，后者自带一份 SAC 实现，
+> 目的是让前者的默认值/实现改动渗不进还原版），差别在口径。两者的**参数结构完全相同**
+> ⇒ 结构指纹**挡不住**串权重，所以隔离只能靠 ① 不同的类、② 不同的文件名
+> （`weights/sacaz_agent*` vs `weights/sacaz_old_agent*`；还原版的 TB 专家骨干那一支是
+> `weights/sacaz_old_moe_agent*`），并由 `test_match` [2.11]（文件名清单不同）与
+> `test_sacaz` [14]（口径、以及"那一批开关连成员都没有"的探针）钉住。口径差异的完整表在
+> `src/sacazlegacyagent.h`，排查记录在 `docs/sac_regression_2026_09.md`。
 
 所有可在线训练的 agent 都遵循同一条决策流程（仿 snakeAI）：**先探索环境 + 预训练一次，
 再基于当前局面决策**（`AgentBase::exploreAndTrain()` + `src/agentrollout.hpp`）。探索全程

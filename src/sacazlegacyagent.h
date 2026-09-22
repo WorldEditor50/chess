@@ -36,7 +36,12 @@ class ISparseMoE;
  * ============================================================================
  *
  *  用户口径 (2026-09): "另外实现 agent 还原回 59e5233 的 SAC agent", 并且要求**新旧
- *  SAC 用不同的 C++ 类区分开** —— 于是这一支是界面上的 AGENT_SACAZ_OLD。
+ *  SAC 用不同的 C++ 类区分开** —— 于是这一支是界面上的 AGENT_SACAZ_OLD (MLP 骨干)。
+ *
+ *  [2026-09 后续] 同一个类又接了**第二个界面类型** AGENT_SACAZ_OLD_MOE: 口径一字不改,
+ *  只把骨干换成稀疏 MoE + TransformerBlock 专家 (与 AGENT_SACAZ_MOE 那一支同骨干)。
+ *  它是"同一份还原口径、两个骨干", 所以本类的身份 = **界面类型(由骨干决定)**, 而不是
+ *  写死的单一字符串 —— 见 guiAgentLabel() 与 defaultWeightPrefix(Backbone) 的说明。
  *
  * ---------------------------------------------------------------------------
  *  2026-09 后续: 本类改为**独立类**, 不再继承 SACAZAgent
@@ -116,9 +121,10 @@ class ISparseMoE;
  * ---------------------------------------------------------------------------
  *  权重文件独立 (用户口径: "新旧 sac agent 的权重文件用不同名字区分开")
  * ---------------------------------------------------------------------------
- *   AGENT_SACAZ      -> weights/sacaz_agent      (_actor / _q1 / _q2)
- *   AGENT_SACAZ_OLD  -> weights/sacaz_old_agent  (_actor / _q1 / _q2)   <- 本类
- *   AGENT_SACAZ_MOE  -> weights/sacaz_moe_agent  (_actor / _q1 / _q2)
+ *   AGENT_SACAZ      -> weights/sacaz_agent          (_actor / _q1 / _q2)
+ *   AGENT_SACAZ_OLD  -> weights/sacaz_old_agent      (_actor / _q1 / _q2)   <- 本类 (MLP)
+ *   AGENT_SACAZ_OLD_MOE -> weights/sacaz_old_moe_agent (_actor / _q1 / _q2) <- 本类 (TB 专家)
+ *   AGENT_SACAZ_MOE  -> weights/sacaz_moe_agent      (_actor / _q1 / _q2)
  *
  *  为什么不能共用一个前缀 (两个后果都是**静默**的):
  *    * 两者的训练口径不同 (上表), 同一个局面会被训成两组不同的权重 —— 共用前缀 =
@@ -127,8 +133,9 @@ class ISparseMoE;
  *    * 载入也一样: 两者**参数结构完全相同** (都是 iFcLayer 的 w/b), 结构指纹挡不住,
  *      于是错的那一份会被当成对的那一份用 (本仓库 PPO+MCTS 就栽在"名字漂移 ⇒ 权重
  *      从来没被载入过"上, 见 chessboard.cpp 的 weightFilesOf 注释)。
- *  前缀由本类的 defaultWeightPrefix() 给出; 后台训练的临时前缀也独立
- *  (weights/_temp_train_sacaz_old*)。
+ *  前缀由本类的 defaultWeightPrefix() / defaultWeightPrefix(Backbone) 给出**单一来源**
+ *  (前者 = MLP 那一支, 保留给既有调用方); 后台训练的临时前缀也独立
+ *  (weights/_temp_train_sacaz_old* / _temp_train_sacaz_old_moe*)。
  *
  * ---------------------------------------------------------------------------
  *  本文件 / 实现的位置
@@ -259,9 +266,13 @@ public:
 
     /*
        ---- "我是界面上的哪一支" ----
-       自检面板第一行必须能回答这个问题。本类**不是**虚函数覆写: 它只服务一个界面类型
-       (AGENT_SACAZ_OLD), 没有第二个身份来源 (同族的 AGENT_SACAZ / AGENT_SACAZ_MOE 由
-       SACAZAgent 自己报)。写死在这里是因为"哪一支"完全由**类**决定。
+       自检面板第一行必须能回答这个问题。本类服务**两个**界面类型, 它们的区别只有骨干:
+         * AGENT_SACAZ_OLD     -> Backbone::Mlp        (与 AGENT_SACAZ 同骨干)
+         * AGENT_SACAZ_OLD_MOE -> Backbone::SparseMoeTb (与 AGENT_SACAZ_MOE 同骨干)
+       两块面板的读数差别很大 (参数量 / 每模拟耗时 / MoE 使用直方图), 所以标签必须随
+       **骨干**变 —— 只写死一个字符串就会让两支的读数记到同一本账上 (本仓库踩过一次:
+       "一个类背着两个界面 agent 类型")。
+       它**不是**虚函数覆写: 这个类与 SACAZAgent 没有继承关系, 那个基类也管不到这里。
     */
     const char *guiAgentLabel() const;
 
@@ -275,8 +286,15 @@ public:
          * 载入也一样: 两者**参数结构完全相同** (都是 iFcLayer 的 w/b), 结构指纹挡不住,
            于是错的那一份会被当成对的那一份用。
        所以前缀跟着**类**走, 界面按 agent 类型取默认值, 不靠各处手抄字符串。
+
+       [2026-09] 本类现在有两个骨干, 于是有**两个**前缀 —— 由
+       `defaultWeightPrefix(Backbone)` 给出**单一来源**:
+         * Mlp        -> weights/sacaz_old_agent      (AGENT_SACAZ_OLD)
+         * SparseMoeTb -> weights/sacaz_old_moe_agent  (AGENT_SACAZ_OLD_MOE)
+       无参版本 = Mlp 那一支 (保留给既有调用方与测试)。
     */
     static const char *defaultWeightPrefix();
+    static const char *defaultWeightPrefix(Backbone b);
 
     /*
        ---- 59e5233 的口径常数 (编译期, 不可从外部覆盖) ----

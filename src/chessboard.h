@@ -112,7 +112,26 @@ public:
            **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
            (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
         */
-        AGENT_SACAZ_OLD
+        AGENT_SACAZ_OLD,
+        /*
+           ---- 59e5233 行为还原版的**另一个骨干**: 稀疏 MoE + TransformerBlock 专家 ----
+           与 AGENT_SACAZ_OLD 的关系 = AGENT_SACAZ_MOE 与 AGENT_SACAZ 的关系:
+           **同一个类 (SACAZLegacyAgent)、同一套 59e5233 口径**, 只有构造时传的
+           Backbone 不同 (Mlp -> SparseMoeTb)。用途是在**同一个还原口径**下量"骨干换
+           TB 专家值多少", 而不是让骨干与口径两个变量混在一次对比里。
+             * 口径仍然全部硬编码在那个类里 (目标熵 0.98 / alpha 学习率 1e-3 /
+               critic 目标不夹 + 纯 MSE / 叶子估值全量 / 目标网 tau=1e-3 每 64 步);
+               本类型**不引入任何新开关** —— 它只是同一个类的另一个骨干;
+             * 算力贵得多 (一个 TB 专家前向实测 ~3.2 ms, MLP 骨干 0.07 ms/模拟),
+               所以模拟次数按 AGENT_SACAZ_MOE 那一档给 (SACAZ_MOE_SIMS = 16,
+               后台训练 BG_TRAIN_SACAZ_MOE_SIMS = 64);
+             * **权重文件独立** (`weights/sacaz_old_moe_agent_*`): 前缀与
+               AGENT_SACAZ_OLD 的不同 —— 两者的参数量差不多 (都是 iFcLayer 的 w/b),
+               命名上分开才不用靠猜"这是哪一支的权重"。
+           **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
+           (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
+        */
+        AGENT_SACAZ_OLD_MOE
     };
 
 public:
@@ -410,7 +429,8 @@ private:
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
     static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
-    static SACAZLegacyAgent *m_sfSACAZOld;   /* 行为还原版: 独立类 SACAZLegacyAgent (59e5233) */
+    static SACAZLegacyAgent *m_sfSACAZOld;      /* 行为还原版: 独立类 (59e5233), MLP 骨干 */
+    static SACAZLegacyAgent *m_sfSACAZOldMoe;   /* 同上, 但骨干换成稀疏 MoE + TB 专家 */
     static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */

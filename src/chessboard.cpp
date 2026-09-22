@@ -32,8 +32,9 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
     case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
     case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
-    /* 59e5233 行为还原版 (独立类 SACAZLegacyAgent) */
+    /* 59e5233 行为还原版 (独立类 SACAZLegacyAgent): MLP 骨干 / 稀疏 MoE+TB 专家骨干 */
     case ChessBoard::AGENT_SACAZ_OLD: return QStringLiteral("SAC+AZ-59e5233");
+    case ChessBoard::AGENT_SACAZ_OLD_MOE: return QStringLiteral("SAC+AZ-59e5233-MoE");
     case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
     case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
     }
@@ -52,6 +53,7 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
     case ChessBoard::AGENT_SACAZ_OLD:
+    case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
     case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
@@ -82,6 +84,7 @@ bool agentHasLearningRewardTable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
     case ChessBoard::AGENT_SACAZ_OLD:
+    case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
         return true;
     default:   /* AGENT_ALPHABETA / AGENT_MCTS / AGENT_EVAB */
@@ -278,6 +281,12 @@ static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe";
    (两者的训练口径不同, 覆盖之后是"棋力对不上训练量"这种没法归因的现象)。
 */
 static const char *TMP_WEIGHTS_SACAZ_OLD = "weights/_temp_train_sacaz_old";
+/*
+   还原版的**TB 专家骨干**那一支 (AGENT_SACAZ_OLD_MOE) 的临时前缀。
+   同样必须独立: 它与 AGENT_SACAZ_OLD 是"同一个类、不同骨干", 参数量差不多但结构不同 ——
+   共用前缀至少会让"这个临时文件是哪一支的"变成只能靠猜。
+*/
+static const char *TMP_WEIGHTS_SACAZ_OLD_MOE = "weights/_temp_train_sacaz_old_moe";
 static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab";
 
 /* 这个 agent 的后台训练临时前缀 (见上面那段注释) */
@@ -288,6 +297,7 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ:     return TMP_WEIGHTS_SACAZ;
     case ChessBoard::AGENT_SACAZ_MOE: return TMP_WEIGHTS_SACAZ_MOE;
     case ChessBoard::AGENT_SACAZ_OLD: return TMP_WEIGHTS_SACAZ_OLD;
+    case ChessBoard::AGENT_SACAZ_OLD_MOE: return TMP_WEIGHTS_SACAZ_OLD_MOE;
     case ChessBoard::AGENT_DQNAB:     return TMP_WEIGHTS_DQNAB;
     default:                          return TMP_WEIGHTS;
     }
@@ -343,29 +353,51 @@ static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
 }
 
 /*
- * createSACAZLegacyAgent —— AGENT_SACAZ_OLD (59e5233 行为还原版) 的**唯一**构造点。
+ * createSACAZLegacyAgent —— 59e5233 行为还原版 (AGENT_SACAZ_OLD / AGENT_SACAZ_OLD_MOE)
+ * 的**唯一**构造点。
  *
  * 为什么单独一个函数: 见上面那段 (两个类互不兼容, 不能合用一个返回类型)。
- * 这里只给**形状参数** —— hidden 64 / gamma 0.99 / lr 0.001 / cpuct 1.5 / MLP 骨干,
- * 与 AGENT_SACAZ 逐字相同, 于是两者是"同一骨干、同一表示", 界面上的差别只剩**训练口径**;
- * 而口径 (目标熵 0.98 / alpha 学习率 1e-3 / critic 目标不夹 + 纯 MSE / 叶子全量估值 /
+ * 这里只给**形状参数**: hidden 64 / gamma 0.99 / lr 0.001 / cpuct 1.5, 与 AGENT_SACAZ
+ * 那一支逐字相同, 于是"口径 vs 骨干"这两个变量不会混在一起。骨干由界面类型决定:
+ *   * AGENT_SACAZ_OLD     -> Mlp (与 AGENT_SACAZ 同骨干、同表示, 差别只剩口径);
+ *   * AGENT_SACAZ_OLD_MOE -> SparseMoeTb + expertHidden 64 + aux SACAZ_MOE_AUX
+ *                            (与 AGENT_SACAZ_MOE 逐字相同, 差别同样只剩口径)。
+ * 口径 (目标熵 0.98 / alpha 学习率 1e-3 / critic 目标不夹 + 纯 MSE / 叶子全量估值 /
  * 目标网 tau=1e-3 每 64 步 / 没有"从自己的搜索学一次") 全部硬编码在
  * SACAZLegacyAgent 自己的构造函数与实现里, 界面这一层一个字都不手抄。
  * 本类**没有**任何奖励塑形开关, 所以这里也没有可传的口径参数。
+ *
+ * 返回 nullptr = 这个 agent 类型不是**这两支中的任何一个** (调用方不该走到这里)。
  */
 static SACAZLegacyAgent *createSACAZLegacyAgent(Chess &board, ChessBoard::AgentType type)
 {
-    if (type != ChessBoard::AGENT_SACAZ_OLD) {
-        return nullptr;      /* 不是这一支 (调用方不该走到这里) */
+    switch (type) {
+    case ChessBoard::AGENT_SACAZ_OLD:
+        return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+    case ChessBoard::AGENT_SACAZ_OLD_MOE:
+        /*
+           TB 专家骨干: 参数与 AGENT_SACAZ_MOE **逐字相同** (只有类不同)。
+           注意本类**没有** learnFromSearch 那条路径, 所以 SACAZAgent 那一支在这里的
+           "关掉从搜索学一次" 那行代码在本函数里没有对应物 —— 还原版本来就是只读搜索。
+        */
+        return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                    SACAZLegacyAgent::Backbone::SparseMoeTb,
+                                    64, SACAZ_MOE_AUX);
+    default:
+        return nullptr;      /* 不是这两支 (调用方不该走到这里) */
     }
-    return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
 }
 
 /* 这个 agent 类型的后台训练每步给多少模拟次数 (见 BG_TRAIN_SACAZ* 的注释) */
 static int sacazTrainSims(ChessBoard::AgentType type)
 {
-    return (type == ChessBoard::AGENT_SACAZ_MOE) ? BG_TRAIN_SACAZ_MOE_SIMS
-                                                 : BG_TRAIN_SACAZ_SIMS;
+    /*
+       TB 专家骨干的两支 (AGENT_SACAZ_MOE / AGENT_SACAZ_OLD_MOE) 走 64 次那一档:
+       一次模拟 ~10.9 ms, 界面预算 (16 次) 对**训练**不够 —— 训练要的是 π 目标质量。
+    */
+    return (type == ChessBoard::AGENT_SACAZ_MOE || type == ChessBoard::AGENT_SACAZ_OLD_MOE)
+               ? BG_TRAIN_SACAZ_MOE_SIMS
+               : BG_TRAIN_SACAZ_SIMS;
 }
 
 /*
@@ -421,10 +453,12 @@ static const ChessBoard::AgentType kWeightAgents[] = {
     ChessBoard::AGENT_DQNAB,
     ChessBoard::AGENT_SACAZ_MOE,
     /*
-       行为还原版 SAC 排在最后: 它与 AGENT_SACAZ 是"同一份代码 + 另一套口径",
+       行为还原版 SAC 排在最后: 它与 AGENT_SACAZ 是"两份独立实现 + 另一套口径",
        启动日志里紧跟大的 MoE 那一组之后读起来最清楚。
+       它的 TB 专家骨干那一支紧跟其后 (同一口径、另一个骨干, 也是 3 x 146 MB 量级)。
     */
-    ChessBoard::AGENT_SACAZ_OLD
+    ChessBoard::AGENT_SACAZ_OLD,
+    ChessBoard::AGENT_SACAZ_OLD_MOE
 };
 
 /*
@@ -452,6 +486,7 @@ static std::vector<std::string> weightFilesOf(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
     case ChessBoard::AGENT_SACAZ_OLD:
+    case ChessBoard::AGENT_SACAZ_OLD_MOE:
         return { p + "_actor", p + "_q1", p + "_q2" };
     /* 一个模型三个文件: 主干 + V 头 + A 头 */
     case ChessBoard::AGENT_DQNAB:
@@ -471,7 +506,8 @@ DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
-SACAZLegacyAgent *ChessBoard::m_sfSACAZOld = nullptr;   /* 独立类, 不是 SACAZAgent 的派生类 */
+SACAZLegacyAgent *ChessBoard::m_sfSACAZOld = nullptr;      /* 独立类, 不是 SACAZAgent 的派生类 */
+SACAZLegacyAgent *ChessBoard::m_sfSACAZOldMoe = nullptr;   /* 同一口径 + TB 专家骨干 */
 DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
@@ -632,6 +668,29 @@ void ChessBoard::startupLoad()
         }
         m_sfSACAZOld->loadModel(prefix);
         logLoad("SAC+AZ-59e5233");
+    }
+    if (s_weightPaths.count(AGENT_SACAZ_OLD_MOE)) {
+        /*
+           59e5233 行为还原版的 **TB 专家骨干**那一支: 同一个类 (SACAZLegacyAgent)、
+           同一套还原口径, 只是 Backbone 不同 —— 所以权重前缀也再分一个
+           (weights/sacaz_old_moe_agent_*), 与 AGENT_SACAZ_OLD 的
+           weights/sacaz_old_agent_* 不共用。两组的前缀只差一个 _moe, 抄错一个字符
+           就是"载进来看着能用、其实是另一支"的静默错误, 所以这行注释写清了两边。
+        */
+        emit busyMessage(QStringLiteral("正在载入 SAC+AZ-59e5233 (稀疏MoE+TB专家) 权重… "
+                                        "(3 个 146 MB 文件)"));
+        if (m_sfSACAZOldMoe == nullptr) {
+            m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+        }
+        logLoad("SAC+AZ-59e5233-MoE 建网(5 个 TB 专家网络)");
+        std::string prefix = s_weightPaths[AGENT_SACAZ_OLD_MOE];
+        const std::string suffix = "_actor";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfSACAZOldMoe->loadModel(prefix);
+        logLoad("SAC+AZ-59e5233-MoE 读权重(3 x 146 MB)");
     }
     if (s_weightPaths.count(AGENT_PPOMCTS_MLP)) {
         /*
@@ -1453,6 +1512,7 @@ AgentBase *ChessBoard::agentInstance(AgentType type) const
     case AGENT_SACAZ:       return m_sfSACAZ;
     case AGENT_SACAZ_MOE:   return m_sfSACAZMoe;
     case AGENT_SACAZ_OLD:   return m_sfSACAZOld;
+    case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe;
     case AGENT_DQNAB:       return m_sfDQNAB;
     default:                return nullptr;   /* Alpha-Beta / MCTS: 没有常驻对象 */
     }
@@ -1598,6 +1658,11 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
     case AGENT_SACAZ_OLD:
         if (m_sfSACAZOld != nullptr) {
             return m_sfSACAZOld->selfCheckReport();
+        }
+        break;
+    case AGENT_SACAZ_OLD_MOE:
+        if (m_sfSACAZOldMoe != nullptr) {
+            return m_sfSACAZOldMoe->selfCheckReport();
         }
         break;
     case AGENT_DQNAB:
@@ -1976,6 +2041,42 @@ Step ChessBoard::aiThinkRaw(int color)
             return s;
         }
     }
+    case AGENT_SACAZ_OLD_MOE: {
+        /*
+           ---- 59e5233 行为还原版 + TB 专家骨干 ----
+           与上面 AGENT_SACAZ_MOE 完全对称: 同一个类、同一套还原口径, 只换骨干。
+           模拟次数也照那一档给 (SACAZ_MOE_SIMS = 16, 一次模拟 ~10.9 ms ≈ 175 ms/手):
+           给 256 次的话一步就是 2.8 s, 而且与 AGENT_SACAZ_MOE 的对照就不再是
+           "同预算、不同口径"了。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZOldMoe == nullptr) {
+            /* 兜底: 正常路径下 startupLoad() 已经预加载过它 */
+            m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+            auto it = s_weightPaths.find(AGENT_SACAZ_OLD_MOE);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ-59e5233 (稀疏MoE): "
+                                                "读取 3 个 146 MB 权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZOldMoe->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(m_sfSACAZOldMoe, color);
+        /* temp = 0: 取访问数最多的走法 (确定性), 与两支 SACAZ 同一口径 */
+        {
+            const int stepsBefore = m_sfSACAZOldMoe->getLearnSteps();
+            const Step s = m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZOldMoe, stepsBefore);
+            return s;
+        }
+    }
     case AGENT_DQNAB: {
         /*
            DQN+AB: AB 当 DQN 的 planning head。
@@ -2175,6 +2276,38 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
             const int stepsBefore = m_sfSACAZOld->getLearnSteps();
             const Step s = m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
             reportLearnedLoss(m_sfSACAZOld, stepsBefore);
+            return s;
+        }
+    }
+    case AGENT_SACAZ_OLD_MOE: {
+        /*
+           59e5233 行为还原版 + TB 专家骨干 (与上面 AGENT_SACAZ_MOE 对称):
+           同一条"建了对象就把权重载上"的兜底约定, 前缀独立
+           (weights/sacaz_old_moe_agent*)。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZOldMoe == nullptr) {
+            m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+            auto it = s_weightPaths.find(AGENT_SACAZ_OLD_MOE);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ-59e5233 (稀疏MoE): "
+                                                "读取 3 个 146 MB 权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZOldMoe->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(m_sfSACAZOldMoe, color);
+        {
+            const int stepsBefore = m_sfSACAZOldMoe->getLearnSteps();
+            const Step s = m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZOldMoe, stepsBefore);
             return s;
         }
     }
@@ -2670,8 +2803,13 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
        绝不能用 SACAZAgent::defaultWeightPrefix() —— 那是"当前口径"那一支的文件,
        两者参数结构相同, 结构指纹挡不住, 于是错误只会在训练很多轮之后以
        "棋力对不上训练量"的形式出现。见 sacazlegacyagent.h 的头注释。
+       它的 TB 专家骨干那一支再分一个前缀 (同一个类的另一个 Backbone ⇒ 另一个
+       参数量), 由类的重载 defaultWeightPrefix(Backbone) 给出**单一来源** ——
+       这里不再手抄字符串, 免得两条前缀漂移。
     */
     case AGENT_SACAZ_OLD: return SACAZLegacyAgent::defaultWeightPrefix();
+    case AGENT_SACAZ_OLD_MOE:
+        return SACAZLegacyAgent::defaultWeightPrefix(SACAZLegacyAgent::Backbone::SparseMoeTb);
     /* DQN+AB: 前缀 -> <prefix>_trunk / _v / _a */
     case AGENT_DQNAB:  return "weights/dqnab_agent";
     default:              return std::string();
@@ -2689,6 +2827,7 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     case AGENT_SACAZ:     return m_sfSACAZ != nullptr;
     case AGENT_SACAZ_MOE: return m_sfSACAZMoe != nullptr;
     case AGENT_SACAZ_OLD: return m_sfSACAZOld != nullptr;
+    case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe != nullptr;
     case AGENT_DQNAB:  return m_sfDQNAB != nullptr;
     case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP != nullptr;
     default:              return false;
@@ -2771,6 +2910,11 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
            (weights/sacaz_old_agent), 见 defaultWeightPath */
         return m_sfSACAZOld->saveModel(filepath);
     }
+    case AGENT_SACAZ_OLD_MOE: {
+        if (m_sfSACAZOldMoe == nullptr) return false;
+        /* 同上, 前缀是 weights/sacaz_old_moe_agent (TB 专家骨干那一支) */
+        return m_sfSACAZOldMoe->saveModel(filepath);
+    }
     case AGENT_DQNAB: {
         if (m_sfDQNAB == nullptr) return false;
         /* 一个模型三个文件: filepath 是前缀 -> filepath_trunk / _v / _a */
@@ -2851,11 +2995,13 @@ void ChessBoard::backgroundTrainLoop()
         case AGENT_PPOMCTS:
         case AGENT_DQNMCTS:
         case AGENT_EVAB:
-        /* 2026-09: 补齐剩下三个有可训练权重的 agent —— 至此**十个 agent 里所有
-           "有权重可训"的都接上了** (AB / MCTS 没有权重, 不在此列)。 */
+        /* 2026-09: 补齐剩下三个有可训练权重的 agent; 后来又加了 59e5233 还原版的
+           TB 专家骨干那一支 —— 至此**界面上的十一个 agent 里所有"有权重可训"的都
+           接上了** (AB / MCTS 没有权重, 不在此列)。 */
         case AGENT_SACAZ:
         case AGENT_SACAZ_MOE:
         case AGENT_SACAZ_OLD:
+        case AGENT_SACAZ_OLD_MOE:
         case AGENT_DQNAB:
         case AGENT_PPOMCTS_MLP:
             trainable = true;
@@ -2866,7 +3012,7 @@ void ChessBoard::backgroundTrainLoop()
         if (!trainable) {
             if (type != AGENT_ALPHABETA && type != AGENT_MCTS
                 && notWiredWarned.insert(type).second) {
-                /* 现在十个 agent 里"有权重可训"的**全部**接上了, 所以这一支只有在
+                /* 现在十一个 agent 里"有权重可训"的**全部**接上了, 所以这一支只有在
                    以后新增 agent 类型而忘了接线时才会响 —— 留着它就是为了那一天:
                    这条消息以前被"种子权重写入失败"顶替, 结果 EVAB 空转了很多轮而
                    没人发现。 */
@@ -2939,6 +3085,11 @@ void ChessBoard::backgroundTrainLoop()
                 if (m_sfSACAZOld == nullptr)
                     m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
                 break;
+            /* 同上, 但骨干是稀疏 MoE + TB 专家 (同一个类的另一个 Backbone) */
+            case AGENT_SACAZ_OLD_MOE:
+                if (m_sfSACAZOldMoe == nullptr)
+                    m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+                break;
             case AGENT_DQNAB:
                 if (m_sfDQNAB == nullptr) {
                     m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
@@ -2983,6 +3134,9 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_SACAZ_OLD:
                 if (m_sfSACAZOld) seeded = m_sfSACAZOld->saveModel(tmpWeights);
+                break;
+            case AGENT_SACAZ_OLD_MOE:
+                if (m_sfSACAZOldMoe) seeded = m_sfSACAZOldMoe->saveModel(tmpWeights);
                 break;
             case AGENT_DQNAB:
                 if (m_sfDQNAB) seeded = m_sfDQNAB->saveModel(tmpWeights);
@@ -3177,6 +3331,20 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             }
             /*
+               还原版 + TB 专家骨干: clone 的骨干必须与主 agent **同一支**
+               (SparseMoeTb + 同样的专家宽度/辅助系数), 否则结构指纹会让 loadModel
+               当场失败 —— 那种失败是"每轮都丢弃", 不是静默错误, 但白跑。
+            */
+            case AGENT_SACAZ_OLD_MOE: {
+                SACAZLegacyAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                       SACAZLegacyAgent::Backbone::SparseMoeTb,
+                                       64, SACAZ_MOE_AUX);
+                roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
+                                             roundEpisodes, sacazTrainSims(type),
+                                             roundMaxMoves, roundLoss);
+                break;
+            }
+            /*
                ---- DQN+AB (2026-09 补齐) ----
                trainSelfPlay(episodes, maxMoves, verbose, tempRoot, tempFinal) 内部按
                nodeBudget 搜 (与界面同一预算 DQNAB_NODES), 标签来自 Planned 目标。
@@ -3275,6 +3443,13 @@ void ChessBoard::backgroundTrainLoop()
                     qWarning() << "[train] SAC+AZ-59e5233 权重同步回主 agent 失败";
                 }
                 break;
+            case AGENT_SACAZ_OLD_MOE:
+                /* 同上: 防线在构造处 (createSACAZLegacyAgent 的骨干分支) 与
+                   tmpWeightsOf (独立前缀), 不在这里 */
+                if (m_sfSACAZOldMoe && !m_sfSACAZOldMoe->loadModel(tmpWeights)) {
+                    qWarning() << "[train] SAC+AZ-59e5233-MoE 权重同步回主 agent 失败";
+                }
+                break;
             case AGENT_DQNAB:
                 if (m_sfDQNAB && !m_sfDQNAB->loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN+AB 权重同步回主 agent 失败";
@@ -3306,7 +3481,7 @@ void ChessBoard::shutdownSave()
     */
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
                               AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB,
-                              AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD };
+                              AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD, AGENT_SACAZ_OLD_MOE };
     for (AgentType t : all) {
         if (hasAgentInstance(t)) {
             saveCurrentAgentModel(t, defaultWeightPath(t));

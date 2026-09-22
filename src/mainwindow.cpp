@@ -72,6 +72,15 @@ const AgentChoice kAgents[] = {
     */
     { "SAC+MCTS+AlphaZero (59e5233 行为还原版)", ChessBoard::AGENT_SACAZ_OLD },
     /*
+       同一支还原版的**另一个骨干**: 同一个类 (SACAZLegacyAgent)、同一套 59e5233 口径,
+       只把骨干换成"稀疏路由 MoE + TransformerBlock 专家" —— 与上面 SAC 那一对
+       (当前口径 / MoE+TB) 是同一种做法, 所以"骨干"与"口径"可以在界面上分开对比。
+       算力贵得多, 所以每次走子只给 16 次模拟 (SACAZ_MOE_SIMS, 约 175 ms);
+       **权重文件也独立** (weights/sacaz_old_moe_agent_*)。
+    */
+    { "SAC+MCTS+AlphaZero (59e5233 还原版, 稀疏MoE+TB专家)",
+      ChessBoard::AGENT_SACAZ_OLD_MOE },
+    /*
        DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
        网络 (稀疏 MoE + TB 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
        反过来当 TD 目标。与上面几个 agent 的关键差别: 它的"搜索"是**对抗展开**,
@@ -83,10 +92,12 @@ const AgentChoice kAgents[] = {
 
 /*
    ---- 下拉框: 整份列表都要**看得见** (2026-09) ----
-   Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表已经有 11 项 —— 第 11 项
-   (当时正是新加的 "PPO+MCTS (...MLP专家)") 会被折叠在滚动区里, 打开下拉框只看到 10 行。
+   Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表已经比这多 (加
+   "PPO+MCTS (...MLP专家)" 那次是 11 项, 现在是 **13 项**) —— 第 11 项及以后会被
+   折叠在滚动区里, 打开下拉框只看到 10 行。
    表现就是"明明加进列表了, 界面上却找不到" (UIA 实测: 展开后只有 10 行可见).
    所以这里按条数放宽: 全部条目一次性可见, 不需要滚动。
+   (这一行**不要**写死数字: 它读的是表的真实条数, 以后再加 agent 也不会忘。)
 */
 void fillAgentCombo(QComboBox *combo, ChessBoard::AgentType defaultType)
 {
@@ -116,6 +127,7 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
     case ChessBoard::AGENT_SACAZ_OLD:
+    case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
     case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
@@ -937,7 +949,8 @@ void MainWindow::selfCheckWorkerLoop()
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
-            ChessBoard::AGENT_PPOMCTS_MLP, ChessBoard::AGENT_SACAZ_OLD
+            ChessBoard::AGENT_PPOMCTS_MLP, ChessBoard::AGENT_SACAZ_OLD,
+            ChessBoard::AGENT_SACAZ_OLD_MOE
         };
         if (all) {
             text = QStringLiteral(
@@ -979,13 +992,13 @@ void MainWindow::selfCheckWorkerLoop()
             if (report.empty()) {
                 text += QStringLiteral(
                     "当前 agent 没有可报告的自检项。\n"
-                    "(十个 agent 都已实现自检; 空串一般表示这个 agent 还没有实例 ——\n"
+                    "(所有已实现的 agent 类型都有自检; 空串一般表示这个 agent 还没有实例 ——\n"
                     " 常见原因是它的权重文件没被扫到, 见上面那几行)\n"
                     "注意: 自检报告的是**结构与口径**, 不是棋力。\n"
                     "要判断棋力用 bench_anchor 的锚点对局 (带 95% 区间的 Elo 差)。");
             } else {
                 text += QString::fromStdString(report);
-                text += QStringLiteral("\n(点\"全部模型自检\"可以把十个 agent 排在一起对比)");
+                text += QStringLiteral("\n(点\"全部模型自检\"可以把所有 agent 排在一起对比)");
             }
         }
 
@@ -1015,7 +1028,7 @@ void MainWindow::applySelfCheckPanel()
 }
 
 /*
- * showAllAgentsSelfCheck - 十个 agent 的自检报告排在一起 (一次性快照)
+ * showAllAgentsSelfCheck - 所有 agent 的自检报告排在一起 (一次性快照)
  *
  * 为什么要横向对比: 单个 agent 的报告只能说明"我这个模型有没有表示/口径问题",
  * 而设计上的差别 (谁的动作编码是 128 槽哈希、谁能看见规则上下文、谁的权重文件
