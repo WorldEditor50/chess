@@ -77,6 +77,26 @@ struct Cfg {
     bool truncationBootstrap = true;
     bool rootNoise = true;
     bool verbose = true;
+    /*
+       ---- [2026-09] critic/actor 的三组新增旋钮 + 学习节拍 ----
+       这三组原来**一个都没有 CLI 开关**(只在测试里直接写成员), 而按本轮对 SAC 的诊断经验,
+       "口径类旋钮没有开关" 会导致结论只能靠改源码重编 (踩过"改了源码但二进制没重编")。
+
+       `learnPerEpisode`: 一局结束后做几次批学习。**这是本节拍问题的唯一杠杆** ——
+         `RL::PPO::learnFromReplay` 无论抽多少样本都只调一次优化器 (rl/ppo.cpp),
+         而每步位移又被逐张量 L2 归一化定死成 ~lr (rl/optimize.h/net.hpp 的 clipGrad),
+         所以"把损失/目标乘一个常数"在 PPO 这里**完全无效**, 只有步数能改。
+         实测 `--games=20` 的默认值是 **20 步** RMSProp。
+       `clampValue`: critic 目标的值域约束。**注释断言的前提是错的** (势能塑形让
+         |r'| 上界约 2.34 > 2), 所以"夹住多少"要先量出来 —— 诊断块会打印夹住比例。
+         `0` = 关掉, 负数 = 不改 (用类默认 2.0)。
+       `clipEps` / `entropyCoef`: PPO 的两个信任域/熵旋钮 (默认 0.2 / 0.01),
+         `<0` = 不改。
+    */
+    int learnPerEpisode = 1;
+    float clampValue = -1.0f;
+    float clipEps = -1.0f;
+    float entropyCoef = -1.0f;
 };
 
 Cfg g_cfg;
@@ -113,6 +133,10 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--no-material-reward") { g_cfg.materialReward = false; }
         else if (k == "--no-bootstrap") { g_cfg.truncationBootstrap = false; }
         else if (k == "--no-root-noise") { g_cfg.rootNoise = false; }
+        else if (k == "--learn-per-episode") { g_cfg.learnPerEpisode = std::atoi(v.c_str()); }
+        else if (k == "--clamp") { g_cfg.clampValue = (float)std::atof(v.c_str()); }
+        else if (k == "--clip-eps") { g_cfg.clipEps = (float)std::atof(v.c_str()); }
+        else if (k == "--entropy") { g_cfg.entropyCoef = (float)std::atof(v.c_str()); }
         else if (k == "--quiet") { g_cfg.verbose = false; }
         else if (k == "--help" || k == "-h") {
             std::printf(
@@ -121,7 +145,9 @@ bool parseArgs(int argc, char **argv)
                 "                 [--hidden=N] [--expert=N] [--replay=N]\n"
                 "                 [--temp-root=F] [--temp-final=F]\n"
                 "                 [--no-shaping] [--shaping-alpha=F] [--no-material-reward]\n"
-                "                 [--no-bootstrap] [--no-root-noise] [--quiet]\n");
+                "                 [--no-bootstrap] [--no-root-noise] [--quiet]\n"
+                "                 [--learn-per-episode=K] 每局几次批学习 (默认 1; 见头文件)\n"
+                "                 [--clamp=F] [--clip-eps=F] [--entropy=F]\n");
             return false;
         } else {
             std::printf("[警告] 未知参数: %s (--help 看用法)\n", argv[i]);
@@ -176,6 +202,22 @@ int main(int argc, char **argv)
     ag.openingPlies = g_cfg.opening;
     ag.openingSeed = g_cfg.seed;
     ag.replayBatchSize = g_cfg.replayBatch;
+    /*
+       [2026-09] 三个新旋钮 + 学习节拍 (见 Cfg 的说明)。
+       `learnStepsPerEpisode` 是**唯一**能改变"一次会话走多远"的杠杆 (逐张量归一化让
+       "把损失乘常数"完全无效), 所以 A/B 的第一件事就是把它的实际步数打出来对数。
+    */
+    ag.learnStepsPerEpisode = g_cfg.learnPerEpisode;
+    if (g_cfg.clampValue >= 0.0f)  { ag.ppo.clampValue = g_cfg.clampValue; }
+    if (g_cfg.clipEps >= 0.0f)     { ag.ppo.clipEps = g_cfg.clipEps; }
+    if (g_cfg.entropyCoef >= 0.0f) { ag.ppo.entropyCoef = g_cfg.entropyCoef; }
+    ag.ppo.resetCriticDiag();
+    const int stepsBefore = ag.ppo.learningSteps;
+    std::printf("[配置] 每局批学习 %d 次 (批 %d x %d epoch) | clampValue=%.2f clipEps=%.2f "
+                "entropyCoef=%.3f\n",
+                ag.learnStepsPerEpisode, ag.replayBatchSize, ag.replayEpochs,
+                (double)ag.ppo.clampValue, (double)ag.ppo.clipEps,
+                (double)ag.ppo.entropyCoef);
 
     /*
        P0.1 的核心: 一个常驻 agent + 一个按局日志指针。
@@ -293,6 +335,29 @@ int main(int argc, char **argv)
                 capRedSum / n, capBlackSum / n);
     if (std::isfinite((double)ag.getLastTrainLoss())) {
         std::printf("  最近一次 value MSE: %.6f\n", (double)ag.getLastTrainLoss());
+    }
+    /*
+       ---- [2026-09] critic 目标诊断 (夹前分布 + 夹住比例 + 优化器步数) ----
+       为什么必须有这一段: `clampValue=2` 的注释声称价值目标不会越界, 而势能塑形让
+       |r'| 的上界约 2.34 —— "夹住多少"是可测事实, 不能靠注释断言。优化器步数则回答
+       "这次会话到底学了几步" (默认一局一步, 20 局 = 20 步)。
+    */
+    {
+        const RL::PPO::CriticDiag &d = ag.ppo.criticDiag;
+        const int steps = ag.ppo.learningSteps - stepsBefore;
+        if (d.total > 0) {
+            std::printf("  critic 目标: |target| 均值 %.4f, 最大 %.4f, 带符号均值 %+.4f | "
+                        "|V| 均值 %.4f\n",
+                        d.targetAbsSum / (double)d.total, d.targetAbsMax,
+                        d.targetSum / (double)d.total, d.valueAbsSum / (double)d.total);
+            std::printf("              被 clampValue=%.2f 夹住 %lld/%lld = **%.1f%%**  "
+                        "(夹住 = 该样本的目标退化成常数)\n",
+                        (double)ag.ppo.clampValue, d.clamped, d.total,
+                        100.0 * (double)d.clamped / (double)d.total);
+        }
+        std::printf("  优化器步数: 本轮 %d 步 (每局 %d 次批学习) | "
+                    "critic/actor 的位移被逐张量 L2 归一化定死成 ~lr, 所以步数是唯一杠杆\n",
+                    steps, ag.learnStepsPerEpisode);
     }
 
     agg.print("train_ppo");

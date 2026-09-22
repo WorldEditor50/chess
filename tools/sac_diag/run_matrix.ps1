@@ -108,6 +108,26 @@ if ($Phase -eq '1d' -or $Phase -eq 'all') {
     }
 }
 
+if ($Phase -eq '3' -or $Phase -eq 'all') {
+    # [F1] 目标网同步率 —— 本轮定位到的主缺陷, 也是唯一"只改一个数"的一档。
+    # 基线臂**复用 phase 2 的 shape-new-k0**(同协议: --no-sparse-leaf, plies=200,
+    # mcts-sims=200, sims=256, pre-train=64, 同 4 个种子, 200 局/臂) —— 默认路径的行为
+    # 已验证与改动前逐位相同, 所以那批可以直接当配对基线, 不必重跑。
+    # 每臂 4 种子 x 50 局 = 200 局:
+    #   f1-t01-i08 : tau=0.01 每 8 步  (新默认候选: 2600 步移动 96%)
+    #   f1-t05-i08 : tau=0.05 每 8 步  (更快)
+    #   f1-hard-i256 : tau=1 每 256 步 (硬拷贝对照)
+    #   f1-f2      : 新 tau + 熵项不进目标 (F2)
+    #   f1-f2-f3   : 再加目标熵分母换槽位 (F3)
+    foreach ($s in $seeds4) {
+        Add-Run "f1-t01-i08-s$s"   50 "--no-sparse-leaf --target-tau=0.01 --target-iter=8 --seed=$s --label=f1-t01-i08-s$s"
+        Add-Run "f1-t05-i08-s$s"   50 "--no-sparse-leaf --target-tau=0.05 --target-iter=8 --seed=$s --label=f1-t05-i08-s$s"
+        Add-Run "f1-hard-i256-s$s" 50 "--no-sparse-leaf --target-tau=1 --target-iter=256 --seed=$s --label=f1-hard-i256-s$s"
+        Add-Run "f1-f2-s$s"        50 "--no-sparse-leaf --target-tau=0.01 --target-iter=8 --entropy-in-target=0 --seed=$s --label=f1-f2-s$s"
+        Add-Run "f1-f2-f3-s$s"     50 "--no-sparse-leaf --target-tau=0.01 --target-iter=8 --entropy-in-target=0 --entropy-slots --seed=$s --label=f1-f2-f3-s$s"
+    }
+}
+
 if ($Phase -eq '2' -or $Phase -eq 'all') {
     # ③ 奖励塑形: 200 局/档 (4 种子 x 50 局), 两个 agent 都跑, 两臂同副牌。
     foreach ($s in $seeds4) {

@@ -287,8 +287,22 @@ void RL::PPO::accumulateGrad(const Tensor &state,
     const double vt = (clampValue > 0.0f)
                           ? (double)std::min(std::max(valueTarget, -clampValue), clampValue)
                           : (double)valueTarget;
+    /*
+       [诊断] 夹**前**的目标分布与夹住比例 —— 只有这一面能回答"clampValue 是不是设小了"
+       (夹后的极值天生看不见夹了多少, 见 ppo.h 的 CriticDiag)。
+    */
+    criticDiag.total++;
+    criticDiag.targetSum += (double)valueTarget;
+    criticDiag.targetAbsSum += std::fabs((double)valueTarget);
+    if (std::fabs((double)valueTarget) > criticDiag.targetAbsMax) {
+        criticDiag.targetAbsMax = std::fabs((double)valueTarget);
+    }
+    if (clampValue > 0.0f && std::fabs((double)valueTarget) > (double)clampValue) {
+        criticDiag.clamped++;
+    }
     Tensor &v = critic.forward(state);
     const double err = (double)v[0] - vt;   /* backward 之前读 */
+    criticDiag.valueAbsSum += std::fabs((double)v[0]);
     Tensor valueTargetTensor(1, 1);
     valueTargetTensor[0] = (float)vt;
     Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);
@@ -596,8 +610,19 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
     const double vt = (clampValue > 0.0f)
                           ? (double)std::min(std::max(valueTarget, -clampValue), clampValue)
                           : (double)valueTarget;
+    /* [诊断] 与全量路径同一口径 (见 ppo.h 的 CriticDiag 说明) */
+    criticDiag.total++;
+    criticDiag.targetSum += (double)valueTarget;
+    criticDiag.targetAbsSum += std::fabs((double)valueTarget);
+    if (std::fabs((double)valueTarget) > criticDiag.targetAbsMax) {
+        criticDiag.targetAbsMax = std::fabs((double)valueTarget);
+    }
+    if (clampValue > 0.0f && std::fabs((double)valueTarget) > (double)clampValue) {
+        criticDiag.clamped++;
+    }
     Tensor &v = critic.forward(state);
     const double err = (double)v[0] - vt;
+    criticDiag.valueAbsSum += std::fabs((double)v[0]);
     Tensor valueTargetTensor(1, 1);
     valueTargetTensor[0] = (float)vt;
     Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);

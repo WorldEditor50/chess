@@ -619,6 +619,19 @@ public:
     /* 每次学习的批大小 / 过几遍 */
     int replayBatchSize = 64;
     int replayEpochs = 2;
+    /*
+       [2026-09] 每局自对弈结束后做几次"批学习" (默认 1 = 与改动前逐位一致)。
+       `RL::PPO::learnFromReplay(batch, epochs, lr)` 无论抽多少样本都**只调一次优化器**
+       (见 rl/ppo.cpp 的 applyGradients), 所以"一局 = 1 步 RMSProp"; 一次 20 局的会话
+       总共只有约 20 步 —— 而每步的位移又被逐张量 L2 归一化定死成 ~lr (见
+       rl/optimize.h 与 net.hpp 的 clipGrad), 于是"把损失乘一个常数"这类手段在这里
+       **完全无效**, 唯一能改变"一局走多远"的就是步数。
+
+       这与 SAC 那一轮定位到的主缺陷 (目标网 20 局只移动 2~4%) 是同一类问题:
+       学习节拍相对于会话长度太小。设成 K 表示每局把池子里的经验过 K 个批
+       (每个批都重新抽样), 用来做 A/B; 判据见 docs/train_ppo_optimization_2026_09.md。
+    */
+    int learnStepsPerEpisode = 1;
 
     /*
        左右镜像数据增广 (P6, 见上面 mirrorCell 的说明): 每一条样本进池时, 顺手把

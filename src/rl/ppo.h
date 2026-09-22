@@ -443,6 +443,35 @@ public:
     float clampValue = 2.0f;
 
     /*
+       ================================================================
+       ---- 训练中的 critic 诊断 (2026-09, 只读累计; 不参与任何计算) ----
+       ================================================================
+       为什么需要它: 上面 `clampValue` 的注释说"价值目标本身是折扣回报 (|r|<=1 + 势能塑形),
+       越界只可能来自自举发散" —— 这个前提**是错的**: 势能项 Φ(s_i)+γΦ(s_{i+1}) 的幅度
+       可达 ±1±0.99, 于是 |r'| 的上界约 **2.34** (见 stone.h 的 PBRS 一节与
+       docs/sac_critic_diagnosis_2026_09.md 的同类推导), 已经越过 clampValue=2。
+       也就是说"夹住多少"是个**可测的事实**, 而不是可以靠注释断言掉的。
+
+       与 SAC 那一轮完全同型的教训 (那边 `m_maxAbsTarget` 报的是**夹后**极值, 天生看不见
+       夹了多少 ⇒ 必须补"夹前分布 + 夹住比例"): 这里累计
+         clamped/total        : 目标被 clampValue 夹住的比例 (夹住 = 该样本的目标是常数, 
+                                对它所在的那一步只提供不了区分度)
+         |target| 均值/最大   : 夹**前**的量级 (判断 clampValue 该设多少)
+         |V| 均值             : 在线 critic 自己输出的量级 (与 |target| 一起看, 才知道
+                                "critic 有没有被推成常数偏置")
+       调用方 (train_ppo / GUI 自检) 读 `criticDiag()`; 需要按段读就自己取差值。
+    */
+    struct CriticDiag {
+        long long total = 0;        /* 参与统计的样本数 */
+        long long clamped = 0;      /* 夹**前** |target| > clampValue 的条数 */
+        double targetAbsSum = 0.0, targetAbsMax = 0.0;
+        double valueAbsSum = 0.0;
+        double targetSum = 0.0;
+    };
+    CriticDiag criticDiag;
+    void resetCriticDiag() { criticDiag = CriticDiag(); }
+
+    /*
        诊断钩子 (默认 nullptr = 零开销): 非空时 `accumulateGradSparse` 会把
        (probs, g, dlogit) 三组各 n 个数按序 push 进去 —— 供 `test_grad` 直接核对
        "解析梯度是否等于 p − t", 而不是在测试里用同一套公式重推一遍

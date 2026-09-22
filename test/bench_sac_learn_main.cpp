@@ -121,6 +121,14 @@ struct Cfg {
        负数 = 不覆盖 (默认 1.0 = 逐位不变)。
     */
     float valueScale = -1.0f;
+    /*
+       ---- [F1] 目标网同步率 (本轮定位到的主缺陷) ----
+       默认 (tau=1e-3 / 每 64 步) 在一次会话里只把目标网移动 2~4% ⇒ 自举项里没有游戏信息。
+       `--target-tau` / `--target-iter` 用来扫"多快才算跟得上"; 负数 = 不覆盖。
+       `--target-tau=1` 等价于硬拷贝 (softUpdateTo 的 tau>=1)。
+    */
+    float targetTau = -1.0f;
+    int targetIter = 0;
     std::string csv;
     std::string label = "sac";
     bool quiet = false;
@@ -451,6 +459,8 @@ int main(int argc, char **argv)
         else if (const char *v = val("--entropy-in-target")) { g.entropyInTarget = (float)std::atof(v); }
         else if (std::strcmp(a, "--entropy-slots") == 0) { g.entropySlots = true; }
         else if (const char *v = val("--value-scale")) { g.valueScale = (float)std::atof(v); }
+        else if (const char *v = val("--target-tau")) { g.targetTau = (float)std::atof(v); }
+        else if (const char *v = val("--target-iter")) { g.targetIter = std::atoi(v); }
         else if (std::strcmp(a, "--no-sparse-leaf") == 0) { g.sparseLeaf = false; }
         else if (std::strcmp(a, "--quiet") == 0)  { g.quiet = true; }
         else { std::fprintf(stderr, "[warn] 未知参数: %s\n", a); }
@@ -489,6 +499,8 @@ int main(int argc, char **argv)
     if (g.entropyInTarget >= 0.0f) { sac.entropyInTarget = g.entropyInTarget; }
     if (g.entropySlots)         { sac.entropySlotsAsLegal = true; }
     if (g.valueScale >= 0.0f)   { sac.valueScale = g.valueScale; }
+    if (g.targetTau >= 0.0f)    { sac.targetTau = g.targetTau; }
+    if (g.targetIter > 0)       { sac.replaceTargetIter = g.targetIter; }
     if (!g.sparseLeaf)          { sac.sparseLeafEval = false; }
     MCTS mcts(board, 1.414);
 
@@ -524,6 +536,14 @@ int main(int argc, char **argv)
                 (double)sac.entropyInTarget,
                 sac.entropySlotsAsLegal ? "**合法槽位数** (反事实)" : "合法着法数 (现状)",
                 (double)sac.valueScale);
+    {
+        const double it = (double)(sac.replaceTargetIter > 0 ? sac.replaceTargetIter : 1);
+        const double perIter = 1.0 - std::pow(1.0 - (double)sac.targetTau, 1.0 / it);
+        const double moved = 1.0 - std::pow(1.0 - perIter, 2600.0);
+        std::printf("目标网同步 : tau=%.4f 每 %d 次 learn (2600 步 ~20 局的移动率 %.1f%%) | "
+                    "老口径 tau=0.001/64 步 = 2~4%%\n",
+                    (double)sac.targetTau, sac.replaceTargetIter, 100.0 * moved);
+    }
 
     Score st;
     int lossTotal = 0;
@@ -650,7 +670,7 @@ int main(int argc, char **argv)
     */
     /* [①] 探针读数 (块外 CSV 也要用) */
     double probeQAbsMean = 0.0, probeQAbsMax = 0.0, probeNormEntropy = 0.0;
-    double probeQTargetAbsMean = 0.0;
+    double probeQTargetAbsMean = 0.0, probeQTargetSpread = 0.0;
     double probeHMean = 0.0, probeSlotMean = 0.0, probeMoveMean = 0.0;
     {
         double qAbs = 0.0, qAbsMax = 0.0;
@@ -673,6 +693,9 @@ int main(int argc, char **argv)
         */
         double qTAbs = 0.0, qTAbsMax = 0.0;
         int qTn = 0;
+        /* [F1] 目标网的**排序**信号: 它才是自举项 V(s') 里能用的那部分 (见下) */
+        double qTSpreadSum = 0.0;
+        int qTSpreadN = 0;
         int en = 0;
         for (int k = 0; k < 12; k++) {
             board.reset();
@@ -708,11 +731,20 @@ int main(int argc, char **argv)
             {
                 RL::Tensor qt1(SACAZAgent::ACTION_DIM, 1), qt2(SACAZAgent::ACTION_DIM, 1);
                 sac.qTargetValues(stx, qt1, qt2);
+                double qm = 0.0, qs = 0.0;
+                int cnt = 0;
                 for (int a : idx) {
                     const double q = std::min((double)qt1[a], (double)qt2[a]);
                     qTAbs += std::fabs(q);
                     qTAbsMax = std::max(qTAbsMax, std::fabs(q));
                     qTn++;
+                    qm += q; qs += q * q; cnt++;
+                }
+                if (cnt > 0) {
+                    qm /= (double)cnt;
+                    const double var = qs / (double)cnt - qm * qm;
+                    qTSpreadSum += (var > 0.0) ? std::sqrt(var) : 0.0;
+                    qTSpreadN++;
                 }
             }
             /* 策略熵 (只算合法动作上) */
@@ -769,16 +801,21 @@ int main(int argc, char **argv)
             const double iters = steps / (double)(sac.replaceTargetIter > 0
                                                       ? sac.replaceTargetIter : 1);
             const double moved = 1.0 - std::pow(1.0 - 1e-3, iters);
-            std::printf("  目标网尺度  : |Q_target| 均值 %.3f, 最大 %.3f (%d 个合法动作)  "
-                        "⇒ 相对随机初始化只移动了 %.2f%% (%d 步 / 每 %d 步 tau=1e-3)\n",
+            std::printf("  目标网尺度  : |Q_target| 均值 %.3f, 最大 %.3f (%d 个合法动作), "
+                        "排序信号 Qspread=%.4f ⇒ 相对随机初始化只移动了 %.2f%% "
+                        "(%d 步 / 每 %d 步 tau=%.4f)\n",
                         qTn > 0 ? qTAbs / (double)qTn : 0.0, qTAbsMax, qTn,
-                        100.0 * moved, sac.getLearnSteps(), sac.replaceTargetIter);
-            std::printf("                (V(s') 就是拿这张网算的: 它还在随机尺度上 ⇒ "
-                        "自举项里的**游戏信息 ≈ 0**, 目标的量级由 α·H 决定)\n");
+                        qTSpreadN > 0 ? qTSpreadSum / (double)qTSpreadN : 0.0,
+                        100.0 * moved, sac.getLearnSteps(), sac.replaceTargetIter,
+                        (double)sac.targetTau);
+            std::printf("                (V(s') 就是拿这张网算的: |Q_target| 停在随机尺度 "
+                        "(≈0.07) 就说明**自举项里的游戏信息 ≈ 0**, 目标量级由 α·H 决定; "
+                        "目标网的 Qspread 才是自举项能提供的排序信号)\n");
         }
         probeQAbsMean = (qn > 0) ? qAbs / (double)qn : 0.0;
         probeQAbsMax = qAbsMax;
         probeQTargetAbsMean = (qTn > 0) ? qTAbs / (double)qTn : 0.0;
+        probeQTargetSpread = (qTSpreadN > 0) ? qTSpreadSum / (double)qTSpreadN : 0.0;
         probeNormEntropy = (en > 0) ? normEntropy / (double)en : 0.0;
         probeHMean = (en > 0) ? hProbeSum / (double)en : 0.0;
         probeSlotMean = (en > 0) ? slotProbeSum / (double)en : 0.0;
@@ -854,14 +891,15 @@ int main(int argc, char **argv)
                              "hBelowHbarFrac,hBelowHbarSlotsFrac,qSpreadMean,"
                              "slotsMean,legalMean,"
                              "entropyInTarget,entropySlotsAsLegal,sparseLeaf,"
-                             "qTargetAbsMean,normEntropyProbe\n");
+                             "qTargetAbsMean,normEntropyProbe,qTargetSpread,"
+                             "targetTau,targetIter\n");
             std::fprintf(fp, "%s,%d,%d,%.4f,%d,%d,%d,%d,%u,%u,%d,"
                              "%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.2f,%d,%d,%d,"
                              "%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%d,%.6f,%.6f,"
                              "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                              "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                              "%.4f,%.4f,%.4f,%.2f,%.2f,"
-                             "%.2f,%d,%d,%.4f,%.4f\n",
+                             "%.2f,%d,%d,%.4f,%.4f,%.4f,%d\n",
                          g.label.c_str(), g.legacy ? 1 : 0, g.rewardShape, (double)g.gamma,
                          g.games, g.maxPlies, g.mctsSims, g.sims, g.seed, g.mctsSrand,
                          g.train ? 1 : 0,
@@ -880,7 +918,8 @@ int main(int argc, char **argv)
                          dx.slotsMean, dx.legalMean,
                          (double)sac.entropyInTarget, sac.entropySlotsAsLegal ? 1 : 0,
                          sac.sparseLeafEval ? 1 : 0,
-                         probeQTargetAbsMean, probeNormEntropy);
+                         probeQTargetAbsMean, probeNormEntropy, probeQTargetSpread,
+                         (double)sac.targetTau, sac.replaceTargetIter);
             std::fclose(fp);
             std::printf("  CSV         : %s\n", g.csv.c_str());
         } else {

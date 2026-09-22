@@ -1393,9 +1393,22 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
         }
     }
 
-    /* 池子够大就开始批量学习: 每次采样 batchSize 条、过 epochs 遍, 一次优化器更新 */
+    /*
+       池子够大就开始批量学习: 每次采样 batchSize 条、过 epochs 遍, 一次优化器更新。
+
+       [2026-09 F1-同型] `learnStepsPerEpisode` (默认 1 = 与改动前逐位一致):
+       `learnFromReplay` 无论抽多少样本都**只调一次优化器** (rl/ppo.cpp 的 applyGradients),
+       所以原来"一局 = 1 步"。实测 `train_ppo --games=20` 一共只有约 **20 步** RMSProp ——
+       而这一步的位移还被逐张量 L2 归一化定死成 ~lr, 于是"20 局之后权重几乎没动"。
+       这与 SAC 那一轮定位到的主缺陷 (目标网 20 局只移动 2~4%) 是**同一类**问题:
+       "学习节拍相对于会话长度太小", 只是它表现在优化器步数上而不是目标网上。
+       设成 K 就是"每局把池子里的经验过 K 个批" (每批都重新抽样), 用来做 A/B。
+    */
     if (replayBatchSize > 0 && ppo.replaySize() >= (std::size_t)replayBatchSize) {
-        ppo.learnFromReplay((std::size_t)replayBatchSize, replayEpochs, learningRate);
+        const int steps = (learnStepsPerEpisode > 0) ? learnStepsPerEpisode : 1;
+        for (int i = 0; i < steps; i++) {
+            ppo.learnFromReplay((std::size_t)replayBatchSize, replayEpochs, learningRate);
+        }
     }
 }
 

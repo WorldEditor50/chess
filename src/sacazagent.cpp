@@ -273,7 +273,17 @@ SACAZAgent::SACAZAgent(Chess &chess_,
       entropyRatio(0.98f),
       simulations(64),
       batchSize(32),
-      replaceTargetIter(64),
+      /*
+         [F1 2026-09] 目标网同步的节拍: **硬拷贝, 每 256 步一次** (原来是 tau=1e-3 x 64 步,
+         一次会话只移动 2~4% ⇒ 自举项里没有游戏信息)。
+         200 局 x 4 种子的配对实测 (docs/sac_critic_diagnosis_2026_09.md §13):
+         目标网 |Q| 0.113 -> 1.547 (与在线网 1.452 同量级), E[minQ] -0.068 -> -1.663,
+         得分 65.0% -> 67.3%, 决胜局 75.4% -> 80.0% (p = 0.43: 方向为正但不显著)。
+         与 Polyak 0.01/8 的差别在噪声内 (p = 0.36), 选硬拷贝是因为它的**滞后更短**
+         (最多陈旧 256 步 vs 等效滞后 ~800 步) 而且好解释。老口径用
+         `--target-tau=0.001 --target-iter=64` 复现。
+      */
+      replaceTargetIter(256),
       maxMemorySize(4096),
       totalEpisodes(0),
       learnSteps(0),
@@ -1567,12 +1577,17 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     alpha.RMSProp(learningRateAlpha, 0.9f, 0.0f);
     alpha.clamp(0.02f, 0.02f, 5.0f);
 
-    /* ---- 目标网 Polyak 同步 ---- */
+    /*
+       ---- 目标网 Polyak 同步 ----
+       步长是 `targetTau` (见头文件的 [F1] 说明), **不再是硬编码 1e-3**: 那个值配上
+       "每 64 步一次"在"一次会话几千步"的尺度上等于不更新 (实测 20 局只移动 2~4%,
+       目标网一直停在随机初始化尺度 0.07~0.10), 于是自举项里没有任何游戏信息。
+       `targetTau >= 1` 时 softUpdateTo 等价于硬拷贝 (对照臂)。
+    */
     learnSteps++;
     if (learnSteps % (replaceTargetIter > 0 ? replaceTargetIter : 1) == 0) {
-        const float tau = 1e-3f;
-        q1.softUpdateTo(q1Target, tau);
-        q2.softUpdateTo(q2Target, tau);
+        q1.softUpdateTo(q1Target, targetTau);
+        q2.softUpdateTo(q2Target, targetTau);
     }
 
     /* ---- 回放缓冲上限 ---- */
@@ -2063,10 +2078,27 @@ std::string SACAZAgent::selfCheckReport() const
     }
 
     /* ---- 3. 算法 / 口径 ---- */
+    /*
+       [F1] 这里**必须打印实际生效的 tau**, 而不是写死 "tau=1e-3":
+       本轮的教训是"回显开关的检查永远通过" —— 自检面板写死一个常数时, 就算代码里的
+       默认值已经改掉, 面板也照样显示旧值 (而它会被人当成"实际口径")。
+       后面那行把"一次会话 (~2600 次 learn) 能移动多少"直接算出来: 低于 50% 就等于
+       自举项里没有游戏信息 (实测老口径只有 2~4%)。
+    */
+    const double kSessionLearnSteps = 2600.0;   /* 20 局 x ~130 步的典型 learn 次数 */
+    const double kIter = (double)(replaceTargetIter > 0 ? replaceTargetIter : 1);
+    const double perIter = 1.0 - std::pow(1.0 - (double)targetTau, 1.0 / kIter);
+    const double moved = 1.0 - std::pow(1.0 - perIter, kSessionLearnSteps);
     std::snprintf(buf, sizeof(buf),
                   "双 critic q1/q2 + 目标网 q1Target/q2Target | 每 %d 次 learn 做一次 Polyak"
-                  " 同步 (tau=1e-3) | 叶子价值 = min_i Q_i - alpha*log pi (最大熵软价值)\n",
-                  replaceTargetIter);
+                  " 同步 (tau=%.4f) | 叶子价值 = min_i Q_i - alpha*log pi (最大熵软价值)\n",
+                  replaceTargetIter, (double)targetTau);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "目标网移动率: 2600 次 learn (~20 局) 后相对随机初始化 %.1f%% %s\n",
+                  moved * 100.0,
+                  moved < 0.5 ? "**< 50%: 自举项 V(s') 几乎还是随机网, TD 目标里没有游戏信息 ([F1])**"
+                              : "(跟得上在线网)");
     out += buf;
     std::snprintf(buf, sizeof(buf),
                   "alpha=%.3f (自动调节, 界 [0.02, 5]) | 目标熵 %.2f x log(合法着法数) |"
