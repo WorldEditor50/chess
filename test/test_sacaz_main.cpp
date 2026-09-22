@@ -1635,6 +1635,23 @@ static void testLegacyAgentClass()
         CHECK(cur.sparseLeafEval, "当前口径走稀疏头 (两边不同)");
         CHECK(!old.learnFromSearch && cur.learnFromSearch,
               "从自己的搜索学一次: 只有当前口径有 (59e5233 没有这条路径)");
+        /*
+           [2026-09 修正] 目标网同步率必须也被钉住。
+           事故现场: F1 那一轮把**基类默认**改成"硬拷贝 / 每 256 步", 而 SACAZLegacyAgent
+           当时没有显式写这两个成员 ⇒ "59e5233 行为还原版"跟着一起变了 (它的全部意义
+           就是行为还原)。这条断言读的是**对象里实际生效的值**, 所以以后任何"改基类默认"
+           的改动只要渗进还原版, 这里当场变红 —— 而不是靠人去记得改两处。
+        */
+        CHECK(old.targetTau == SACAZLegacyAgent::LEGACY_TARGET_TAU
+                  && old.replaceTargetIter == SACAZLegacyAgent::LEGACY_TARGET_ITER,
+              "59e5233 的目标网同步率被显式钉住 (tau=1e-3 / 每 64 步; 基类默认渗不进来)");
+        /*
+           当前实现这一支: 默认值 = 61a974d 的口径 (F1 的实测最好档 p = 0.43 不显著 ⇒
+           不作为默认; 要开就传 --target-tau/--target-iter)。这里把"默认值是什么"钉住,
+           免得它被下一次实验顺手改掉 (默认值也是结论)。
+        */
+        CHECK(cur.targetTau == 1e-3f && cur.replaceTargetIter == 64,
+              "当前实现的默认目标网同步率 = 61a974d 口径 (tau=1e-3 / 每 64 步)");
         CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix())
                   != std::string(SACAZAgent::defaultWeightPrefix()),
               "**权重前缀不同** (用户口径: 新旧 SAC 的权重文件必须用不同名字)");

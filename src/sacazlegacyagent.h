@@ -41,6 +41,7 @@
  *   Huber δ                 | 无 (纯 MSE)        | 1.0              | 损失 (训练)
  *   搜索叶子估值            | 全量 Q             | 稀疏头 (只算合法列) | 搜索 (推理)
  *   "从搜索学一次"          | 无                 | 有 (learnFromSearch) | 训练
+ *   目标网同步率            | tau=1e-3 / 每 64 步 | (2026-09 F1 期间曾被改成硬拷贝/256, 已改回) | 训练
  *   ------------------------|--------------------|------------------|----------
  *   网络结构 / 隐层激活     | **完全相同**       | 相同             | — (见下)
  *   动作/状态表示           | 128 槽 / 1263 维   | 相同 (默认构建)   | —
@@ -97,6 +98,16 @@ public:
     /* 59e5233 的两个数 (原值见 `git show 59e5233:src/sacazagent.cpp` 的构造初始化表) */
     static constexpr float LEGACY_ENTROPY_RATIO = 0.98f;
     static constexpr float LEGACY_ALPHA_LR = 1e-3f;
+    /*
+       [2026-09 修正] 目标网同步率也必须钉住。
+       为什么: F1 那一轮把**基类默认**改成了"硬拷贝每 256 步", 本类没有显式钉这两个成员
+       ⇒ "59e5233 行为还原版"跟着一起变了 —— 而它的全部意义就是**行为还原**。
+       这正是"基类默认值即口径"的坑 (与 docs/session_2026_09_sac.md §4 第 9 条同型):
+       凡是被 59e5233 固定下来的量, 本类都要显式写一遍。基类默认已改回 61a974d 口径,
+       但**这条钉住仍然保留** —— 下一个改基类默认的人不该再把还原版带跑。
+    */
+    static constexpr float LEGACY_TARGET_TAU = 1e-3f;   /* 59e5233: Polyak tau */
+    static constexpr int LEGACY_TARGET_ITER = 64;       /* 59e5233: 每 64 步同步一次 */
 
     /*
        本类的权重前缀。**静态**: ChessBoard::defaultWeightPath() 是按 agent 类型查表的
@@ -144,6 +155,15 @@ public:
            而本类的全部意义就是"钉住 59e5233 的行为"。
         */
         learnFromSearch = false;
+        /*
+           [2026-09 修正] 目标网同步率 (第 6/7 项口径): 基类默认值曾经被 F1 那一轮
+           改成"硬拷贝 / 每 256 步", 而本类当时**没有**钉它 ⇒ 还原版被"优化"污染了。
+           现在显式写死 59e5233 的值 (tau=1e-3 / 每 64 步 = 一次会话只移动 2~4%)。
+           test_sacaz [14] 有一组断言是拿**对象里实际生效的值**对这个表, 所以以后
+           基类默认再改也不会静默渗进来。
+        */
+        targetTau = LEGACY_TARGET_TAU;
+        replaceTargetIter = LEGACY_TARGET_ITER;
     }
 
     ~SACAZLegacyAgent() override = default;
