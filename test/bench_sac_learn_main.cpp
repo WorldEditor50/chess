@@ -35,6 +35,20 @@
  *                       [--pre-train=64] [--seed=20240901] [--mcts-srand=12345]
  *                       [--legacy] [--reward-shape=0|1|2] [--gamma=0.99]
  *                       [--no-train] [--csv=path] [--quiet] [--label=名字]
+ *
+ * ---- [2026-09 独立类拆分] 两支 SAC 现在是**两个没有继承关系的类** ----
+ *   * 不带 --legacy -> SACAZAgent (当前口径), 上面那批消融旋钮都可以用;
+ *   * 带 --legacy   -> SACAZLegacyAgent (59e5233 行为还原版)。它**刻意不含**奖励塑形、
+ *     **刻意不含**任何 critic 值域抑制 (目标不夹 + 纯 MSE), 目标网同步率是编译期常数
+ *     (tau=1e-3 / 每 64 步) —— 这些旋钮在它身上**连成员都没有**, 所以
+ *     `--legacy --reward-shape=... / --clamp / --huber / --value-scale /
+ *       --entropy-in-target / --entropy-slots / --target-tau / --target-iter`
+ *     一律**当场报错退出** (退出码 2), 绝不静默忽略: 静默忽略会让人以为"跑的是带塑形的
+ *     还原版", 而实际那个 run 没有塑形, 结论会直接反过来。
+ *     `--entropy-ratio` / `--alpha-lr` 例外: 两个类**都有**这两个成员 (还原版在构造
+ *     函数里把默认值设成 0.98 / 1e-3), 所以照旧可覆盖, 打印出来的是实际生效值。
+ *     另外 `--no-search-learn` / `--no-sparse-leaf` 对还原版是"恒已满足"(它本来就没有
+ *     "从自己的搜索学一次", 叶子估值本来就是全量), 工具会明说一句而不是默默接受。
  */
 #include <algorithm>
 #include <chrono>
@@ -136,6 +150,69 @@ struct Cfg {
 
 Cfg g;
 
+/*
+   ---- 命令行**显式给过**哪些旋钮 ----
+   为什么必须与"取到了默认值"分开: 还原版那一支 (--legacy) 有一批旋钮**连成员都不存在**
+   (见文件头), 而 `--reward-shape=0` 听起来无害, 却说明调用方以为自己在跑"带塑形的配置"
+   (或对照组)。给了就报错退出, 不给才走默认 —— 静默忽略这类参数会让日志与结论对不上。
+*/
+struct Given {
+    bool rewardShape = false, clamp = false, huber = false;
+    bool entropyRatio = false, alphaLr = false;
+    bool entropyInTarget = false, entropySlots = false, valueScale = false;
+    bool targetTau = false, targetIter = false;
+    bool searchLearn = false, sparseLeaf = false;
+};
+Given g_given;
+
+/*
+ * ================================================================
+ *  Caliber —— "实际生效的口径读数" (与 agent 类型无关的一层)
+ * ================================================================
+ * 为什么要这么一层: 两个 SAC 类是**独立的**, 而还原版**故意连成员都没有**
+ * (奖励塑形 / critic 值域抑制 / 目标网同步率 / 稀疏叶子 / 从搜索学一次), 所以
+ * "把生效的口径打印出来"这件事只能在**构造那一支的分支里**取数:
+ *   * 当前口径: 直接读对象成员 (可被本工具的消融旋钮覆盖);
+ *   * 还原版  : 读**编译期常数** (SACAZLegacyAgent::POLYAK_TAU / TARGET_SYNC_EVERY /
+ *               LEGACY_ENTROPY_RATIO / LEGACY_ALPHA_LR) —— 面板上写的就是代码里生效的,
+ *               命令行改不动 (hasCriticSwitches / hasTargetSyncSwitches 为 false 时,
+ *               打印走另一条分支, 明说"本类没有这个成员", 而不是印一个假的值)。
+ */
+struct Caliber {
+    const char *agentName = "";
+    /* 奖励 */
+    int rewardShape = 0;
+    const char *shapeNote = "";
+    /* 搜索学习 (learnFromSearch) */
+    bool searchLearn = true;
+    /* critic 值域约束 / 熵 / 叶子估值 */
+    bool hasCriticSwitches = true;
+    double clampTarget = 0.0, huberDelta = 0.0, entropyInTarget = 0.0, valueScale = 0.0;
+    bool entropySlots = false, sparseLeaf = true;
+    double entropyRatio = 0.0, alphaLr = 0.0;
+    /* 目标网同步率 */
+    bool hasTargetSyncSwitches = true;
+    double targetTau = 1e-3;
+    int targetIter = 64;
+};
+
+/*
+ * 还原版上**不许**出现的旋钮 (用户口径: 本类不含奖励塑形、不含任何 critic 抑制,
+ * 目标网同步率是编译期常数)。返回命令行里第一个违规的旗标名, 没有就返回 nullptr。
+ */
+static const char *forbiddenForLegacy(const Given &gv)
+{
+    if (gv.rewardShape)    { return "--reward-shape"; }
+    if (gv.clamp)          { return "--clamp"; }
+    if (gv.huber)          { return "--huber"; }
+    if (gv.valueScale)     { return "--value-scale"; }
+    if (gv.entropyInTarget){ return "--entropy-in-target"; }
+    if (gv.entropySlots)   { return "--entropy-slots"; }
+    if (gv.targetTau)      { return "--target-tau"; }
+    if (gv.targetIter)     { return "--target-iter"; }
+    return nullptr;
+}
+
 static double nowMs()
 {
     using clock = std::chrono::steady_clock;
@@ -231,7 +308,13 @@ struct DiagDelta {
     double qSpreadMean = 0.0, qAbsMean = 0.0;
     double alphaFirst = 0.0, alphaLast = 0.0;
     DiagDelta() = default;
-    DiagDelta(const SACAZAgent::TrainDiag &a, const SACAZAgent::TrainDiag &b)
+    /*
+       [2026-09] 模板构造: 两个 SAC 类是**独立的**, 它们各自的 TrainDiag 是**不同的类型**
+       (字段逐字相同, 因为还原版就是 1:1 拷贝)。工具要能对两支用同一套切片逻辑, 所以这里
+       按字段名取值, 而不是绑定某一个类 —— 两支的任何一支改了字段名, 这里当场编译失败。
+    */
+    template <class DiagT>
+    DiagDelta(const DiagT &a, const DiagT &b)
     {
         n = b.n - a.n;
         if (n <= 0) { return; }
@@ -290,8 +373,13 @@ static bool jiangAlive(Chess &c, int color)
 /*
  * 一局。sac 走 sacColor, 对手固定为 MCTS。
  * 协议逐条对齐 ChessBoard::playMatchGame / preTrainThenDecide (见文件头)。
+ *
+ * [2026-09] sac 是模板: 两支 SAC 是没有继承关系的两个类, 这里只用它们**同名同签名**的
+ * 那几个方法 (getLearnSteps / exploreAndTrain / selectMove / getLastTrainLoss /
+ * computeReward / terminalReward) —— 不碰任何消融成员, 所以还原版也能直接套进来。
  */
-static GameLog playGame(Chess &board, SACAZAgent &sac, MCTS &mcts, int sacColor,
+template <class AgentT>
+static GameLog playGame(Chess &board, AgentT &sac, MCTS &mcts, int sacColor,
                         float &lastLoss, int &lossTotal, double &lossSum, double &lossMax)
 {
     GameLog g1;
@@ -428,6 +516,10 @@ static GameLog playGame(Chess &board, SACAZAgent &sac, MCTS &mcts, int sacColor,
 
 } // namespace
 
+/* 定义在 main 之后 (它很长): 模板的两支都只在这里声明一次。 */
+template <class AgentT>
+static void runBench(Chess &board, AgentT &sac, MCTS &mcts, const Caliber &cal);
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -445,23 +537,23 @@ int main(int argc, char **argv)
         else if (const char *v = val("--pre-train")) { g.preTrain = std::atoi(v); }
         else if (const char *v = val("--seed"))   { g.seed = (unsigned)std::atoi(v); }
         else if (const char *v = val("--mcts-srand")) { g.mctsSrand = (unsigned)std::atoi(v); }
-        else if (const char *v = val("--reward-shape")) { g.rewardShape = std::atoi(v); }
+        else if (const char *v = val("--reward-shape")) { g.rewardShape = std::atoi(v); g_given.rewardShape = true; }
         else if (const char *v = val("--gamma"))  { g.gamma = (float)std::atof(v); }
         else if (const char *v = val("--csv"))    { g.csv = v; }
         else if (const char *v = val("--label"))  { g.label = v; }
         else if (std::strcmp(a, "--legacy") == 0) { g.legacy = true; }
         else if (std::strcmp(a, "--no-train") == 0) { g.train = false; }
-        else if (std::strcmp(a, "--no-search-learn") == 0) { g.searchLearn = false; }
-        else if (const char *v = val("--clamp"))   { g.clampTarget = (float)std::atof(v); }
-        else if (const char *v = val("--huber"))   { g.huberDelta = (float)std::atof(v); }
-        else if (const char *v = val("--entropy-ratio")) { g.entropyRatio = (float)std::atof(v); }
-        else if (const char *v = val("--alpha-lr")) { g.alphaLr = (float)std::atof(v); }
-        else if (const char *v = val("--entropy-in-target")) { g.entropyInTarget = (float)std::atof(v); }
-        else if (std::strcmp(a, "--entropy-slots") == 0) { g.entropySlots = true; }
-        else if (const char *v = val("--value-scale")) { g.valueScale = (float)std::atof(v); }
-        else if (const char *v = val("--target-tau")) { g.targetTau = (float)std::atof(v); }
-        else if (const char *v = val("--target-iter")) { g.targetIter = std::atoi(v); }
-        else if (std::strcmp(a, "--no-sparse-leaf") == 0) { g.sparseLeaf = false; }
+        else if (std::strcmp(a, "--no-search-learn") == 0) { g.searchLearn = false; g_given.searchLearn = true; }
+        else if (const char *v = val("--clamp"))   { g.clampTarget = (float)std::atof(v); g_given.clamp = true; }
+        else if (const char *v = val("--huber"))   { g.huberDelta = (float)std::atof(v); g_given.huber = true; }
+        else if (const char *v = val("--entropy-ratio")) { g.entropyRatio = (float)std::atof(v); g_given.entropyRatio = true; }
+        else if (const char *v = val("--alpha-lr")) { g.alphaLr = (float)std::atof(v); g_given.alphaLr = true; }
+        else if (const char *v = val("--entropy-in-target")) { g.entropyInTarget = (float)std::atof(v); g_given.entropyInTarget = true; }
+        else if (std::strcmp(a, "--entropy-slots") == 0) { g.entropySlots = true; g_given.entropySlots = true; }
+        else if (const char *v = val("--value-scale")) { g.valueScale = (float)std::atof(v); g_given.valueScale = true; }
+        else if (const char *v = val("--target-tau")) { g.targetTau = (float)std::atof(v); g_given.targetTau = true; }
+        else if (const char *v = val("--target-iter")) { g.targetIter = std::atoi(v); g_given.targetIter = true; }
+        else if (std::strcmp(a, "--no-sparse-leaf") == 0) { g.sparseLeaf = false; g_given.sparseLeaf = true; }
         else if (std::strcmp(a, "--quiet") == 0)  { g.quiet = true; }
         else { std::fprintf(stderr, "[warn] 未知参数: %s\n", a); }
     }
@@ -472,77 +564,180 @@ int main(int argc, char **argv)
     board.reset();
     /*
        与界面同一个构造: SACAZ_HIDDEN=64 / gamma / lr / cpuct=1.5。
-       --legacy 用 59e5233 行为还原版 (独立派生类), 它的 4 项口径在类里固定, 这里不覆盖。
+       两支的口径差别**不在构造参数里** —— 还原版把它的口径硬编码在自己的实现里
+       (见 sacazlegacyagent.h 的口径表), 所以这里两边传的是同一组形状参数。
     */
-    SACAZAgent *sacPtr = nullptr;
     if (g.legacy) {
-        sacPtr = new SACAZLegacyAgent(board, 64, g.gamma, 0.001f, 1.5f);
+        /*
+           ---- 还原版: 先检查"它没有的旋钮"有没有被传进来 ----
+           这些开关在 SACAZLegacyAgent 上**连成员都不存在** (用户口径: 不含奖励塑形、
+           不含任何 critic 抑制, 目标网同步率是编译期常数)。静默忽略是最坏的选择:
+           日志上会显示一个"带塑形的还原版"的参数, 而实际跑的 run 里没有塑形 ——
+           结论会直接反过来。所以这里**当场报错退出**。
+        */
+        if (const char *bad = forbiddenForLegacy(g_given)) {
+            std::fprintf(stderr,
+                "[error] --legacy 用的是 SACAZLegacyAgent (59e5233 行为还原版), 它**没有** %s\n"
+                "        这个开关, 而且不是\"默认关着\" —— 是**连成员都没有**:\n"
+                "          * 不含奖励塑形: 没有 rewardShape / rewardScale, 即时奖励恒为\n"
+                "            材质x0.1 + 每步代价, 终局恒为引擎真值 ±1/0;\n"
+                "          * 不含任何 critic 抑制: 没有 clampTarget / huberDelta / valueScale / \n"
+                "            entropyInTarget / entropySlotsAsLegal (目标不夹 + 纯 MSE);\n"
+                "          * 没有可调的目标网同步率 (编译期常数 tau=1e-3 每 64 步);\n"
+                "          * 没有 sparseLeafEval / learnFromSearch (叶子估值全量, 不从自己的搜索学)。\n"
+                "        与其静默忽略(那会让你以为跑了带塑形/带钳位的还原版), 这里直接失败。\n"
+                "        要做消融请去掉 --legacy, 用 SACAZAgent 那一支。\n", bad);
+            return 2;
+        }
+        if (g_given.searchLearn) {
+            std::fprintf(stderr, "[info] --no-search-learn 对还原版是**恒已满足**: 本类没有 "
+                                 "learnFromSearch 这条路径 (59e5233 就没有), 不做任何覆盖。\n");
+        }
+        if (g_given.sparseLeaf) {
+            std::fprintf(stderr, "[info] --no-sparse-leaf 对还原版是**恒已满足**: 本类的叶子"
+                                 "估值本来就是全量 (没有 sparseLeafEval 成员), 不做任何覆盖。\n");
+        }
+        SACAZLegacyAgent *sac = new SACAZLegacyAgent(board, 64, g.gamma, 0.001f, 1.5f);
+        Caliber cal;
+        cal.agentName = "SACAZLegacyAgent (59e5233 口径, 独立类)";
+        cal.rewardShape = 0;
+        cal.shapeNote = "**无塑形** (本类不含 rewardShape/rewardScale: 即时=材质x0.1+每步代价, "
+                        "终局=引擎真值 ±1/0)";
+        cal.searchLearn = false;          /* 本类没有这条路径 (硬口径, 不是被关掉的) */
+        cal.hasCriticSwitches = false;    /* clampTarget / huberDelta / valueScale / 熵项开关: 无成员 */
+        /*
+           这两项是"没有开关时的实际口径", 与当前口径**同义** (所以 CSV 还能直接对照):
+           熵项恒进软价值 (1.0), 搜索叶子不缩放 (1.0)。
+        */
+        cal.entropyInTarget = 1.0;
+        cal.valueScale = 1.0;
+        cal.entropyRatio = (double)SACAZLegacyAgent::LEGACY_ENTROPY_RATIO;
+        cal.alphaLr = (double)SACAZLegacyAgent::LEGACY_ALPHA_LR;
+        cal.sparseLeaf = false;           /* 全量 (没有开关) */
+        cal.hasTargetSyncSwitches = false;/* 目标网同步率 = 编译期常数 */
+        cal.targetTau = (double)SACAZLegacyAgent::POLYAK_TAU;
+        cal.targetIter = SACAZLegacyAgent::TARGET_SYNC_EVERY;
+        /*
+           --entropy-ratio / --alpha-lr 是**两支都有**的成员 (还原版在构造函数里把默认值
+           设成 0.98 / 1e-3), 所以照旧可覆盖 —— 覆盖之后打印的是实际生效值。
+        */
+        if (g.entropyRatio >= 0.0f) { sac->entropyRatio = g.entropyRatio; cal.entropyRatio = (double)g.entropyRatio; }
+        if (g.alphaLr >= 0.0f)      { sac->learningRateAlpha = g.alphaLr; cal.alphaLr = (double)g.alphaLr; }
+        MCTS mcts(board, 1.414);
+        /*
+           对手的随机流固定住 (构造之后重播): MCTS 用 std::rand(), 而 srand 播的是 time()
+           —— 不固定的话两版跑的不是同一副牌 (见 docs/sac_regression_2026_09.md §7 第 0 条)。
+        */
+        if (g.mctsSrand != 0u) { std::srand(g.mctsSrand); }
+        runBench(board, *sac, mcts, cal);
+        delete sac;
     } else {
-        sacPtr = new SACAZAgent(board, 64, g.gamma, 0.001f, 1.5f);
+        SACAZAgent *sac = new SACAZAgent(board, 64, g.gamma, 0.001f, 1.5f);
+        sac->rewardShape = g.rewardShape;     /* 这一支的唯一塑形旋钮 (界面没有它) */
+        if (!g.searchLearn) {
+            sac->learnFromSearch = false;
+        }
+        /* 学习口径的消融 (>=0 才覆盖) */
+        if (g.clampTarget >= 0.0f)  { sac->clampTarget = g.clampTarget; }
+        if (g.huberDelta >= 0.0f)   { sac->huberDelta = g.huberDelta; }
+        if (g.entropyRatio >= 0.0f) { sac->entropyRatio = g.entropyRatio; }
+        if (g.alphaLr >= 0.0f)      { sac->learningRateAlpha = g.alphaLr; }
+        if (g.entropyInTarget >= 0.0f) { sac->entropyInTarget = g.entropyInTarget; }
+        if (g.entropySlots)         { sac->entropySlotsAsLegal = true; }
+        if (g.valueScale >= 0.0f)   { sac->valueScale = g.valueScale; }
+        if (g.targetTau >= 0.0f)    { sac->targetTau = g.targetTau; }
+        if (g.targetIter > 0)       { sac->replaceTargetIter = g.targetIter; }
+        if (!g.sparseLeaf)          { sac->sparseLeafEval = false; }
+        Caliber cal;
+        cal.agentName = "SACAZAgent (当前口径)";
+        cal.rewardShape = g.rewardShape;
+        {
+            const char *shapeName[] = { "base(材质x0.1+终局±1)",
+                                        "no-material(只留每步代价+终局±1)",
+                                        "mate-bonus(终局 x(1+败方材质/3.5))" };
+            cal.shapeNote = shapeName[(g.rewardShape >= 0 && g.rewardShape <= 2)
+                                          ? g.rewardShape : 0];
+        }
+        cal.searchLearn = sac->learnFromSearch;
+        cal.hasCriticSwitches = true;
+        cal.clampTarget = (double)sac->clampTarget;
+        cal.huberDelta = (double)sac->huberDelta;
+        cal.entropyRatio = (double)sac->entropyRatio;
+        cal.alphaLr = (double)sac->learningRateAlpha;
+        cal.entropyInTarget = (double)sac->entropyInTarget;
+        cal.entropySlots = sac->entropySlotsAsLegal;
+        cal.valueScale = (double)sac->valueScale;
+        cal.sparseLeaf = sac->sparseLeafEval;
+        cal.hasTargetSyncSwitches = true;
+        cal.targetTau = (double)sac->targetTau;
+        cal.targetIter = sac->replaceTargetIter;
+        MCTS mcts(board, 1.414);
+        if (g.mctsSrand != 0u) { std::srand(g.mctsSrand); }
+        runBench(board, *sac, mcts, cal);
+        delete sac;
     }
-    SACAZAgent &sac = *sacPtr;
-    sac.rewardShape = g.rewardShape;     /* 唯一需要外部设的旋钮 (界面没有它) */
-    /*
-       只在**显式关闭**时覆盖: 派生类 (59e5233 还原版) 在自己的构造函数里把它钉成 false,
-       那是它的口径 —— 无条件赋 true 会把这个钉住的口径抹掉 (第一版工具就这么错过一次,
-       于是"--legacy --pre-train=0" 那个"完全不训练"的对照组其实训练了 1300 次)。
-    */
-    if (!g.searchLearn) {
-        sac.learnFromSearch = false;
-    }
-    /* 学习口径的消融 (>=0 才覆盖; 派生类的口径在它自己的构造函数里, 这里会**改掉它**,
-       所以 --legacy 时不建议再传这四个 —— 打印出来的实际值可以核对) */
-    if (g.clampTarget >= 0.0f)  { sac.clampTarget = g.clampTarget; }
-    if (g.huberDelta >= 0.0f)   { sac.huberDelta = g.huberDelta; }
-    if (g.entropyRatio >= 0.0f) { sac.entropyRatio = g.entropyRatio; }
-    if (g.alphaLr >= 0.0f)      { sac.learningRateAlpha = g.alphaLr; }
-    if (g.entropyInTarget >= 0.0f) { sac.entropyInTarget = g.entropyInTarget; }
-    if (g.entropySlots)         { sac.entropySlotsAsLegal = true; }
-    if (g.valueScale >= 0.0f)   { sac.valueScale = g.valueScale; }
-    if (g.targetTau >= 0.0f)    { sac.targetTau = g.targetTau; }
-    if (g.targetIter > 0)       { sac.replaceTargetIter = g.targetIter; }
-    if (!g.sparseLeaf)          { sac.sparseLeafEval = false; }
-    MCTS mcts(board, 1.414);
+    return 0;
+}
 
-    /*
-       对手的随机流固定住 (构造之后重播): MCTS 用 std::rand(), 而 srand 播的是 time()
-       —— 不固定的话两版跑的就不是同一副牌 (见 docs/sac_regression_2026_09.md §7 第 0 条)。
-    */
-    if (g.mctsSrand != 0u) { std::srand(g.mctsSrand); }
-
-    const char *shapeName[] = { "base(材质x0.1+终局±1)", "no-material(只留每步代价+终局±1)",
-                                "mate-bonus(终局 x(1+败方材质/3.5))" };
+/*
+ * ================================================================
+ *  runBench —— "边下边学 + 对 MCTS" 的整轮基准 (与 agent 类型无关)
+ * ================================================================
+ * 模板参数只用来**调用** (playGame / getTrainDiag / 探针), 口径读数全部从 Caliber 来:
+ * 还原版**连成员都没有** (奖励塑形 / critic 抑制 / 目标网同步率), 在模板体里写
+ * `sac.clampTarget` 这种话会让两支的编译一起挂掉 —— 这正是这次拆分的护栏, 所以这里
+ * 刻意只碰"两个类同名同签名"的那部分接口。
+ * 打印顺序与拆分前逐字一致, 好让历史日志 (docs/ 与 .r1build 里的那些) 还能对照。
+ */
+template <class AgentT>
+static void runBench(Chess &board, AgentT &sac, MCTS &mcts, const Caliber &cal)
+{
     std::printf("=== bench_sac_learn: %s ===\n", g.label.c_str());
     std::printf("agent      : %s (rewardShape=%d %s, gamma=%.4f)\n",
-                g.legacy ? "SACAZLegacyAgent (59e5233 口径)" : "SACAZAgent (当前口径)",
-                g.rewardShape, shapeName[(g.rewardShape >= 0 && g.rewardShape <= 2)
-                                             ? g.rewardShape : 0],
-                (double)g.gamma);
+                cal.agentName, cal.rewardShape, cal.shapeNote, (double)g.gamma);
     std::printf("协议       : 对 MCTS(%d 次模拟) %d 局, SAC %d 次模拟, 每手预训练 %d 步, "
                 "手数上限 %d, 交换先后手, 标准开局\n",
                 g.mctsSims, g.games, g.sims, g.preTrain, g.maxPlies);
     std::printf("可复现性   : seed=%u mcts-srand=%u  学习=%s\n",
                 g.seed, g.mctsSrand, g.train ? "开 (每手 exploreAndTrain)" : "**关** (只看随机权重)");
     std::printf("搜索学习   : learnFromSearch=%d (每次真实决策是否用**自己的搜索**样本学一次;"
-                " 关了就等于改动前的行为)\n", (int)sac.learnFromSearch);
-    std::printf("学习口径   : clampTarget=%.2f huberDelta=%.2f 熵比=%.3f alphaLr=%.4f "
-                "| 叶子估值=%s\n"
-                "             (实际生效值; 59e5233 是 0 / 0 / 0.98 / 1e-3 / 全量)\n",
-                (double)sac.clampTarget, (double)sac.huberDelta,
-                (double)sac.entropyRatio, (double)sac.learningRateAlpha,
-                sac.sparseLeafEval ? "稀疏头" : "全量");
-    std::printf("熵项去处   : entropyInTarget=%.2f (0 = 熵项不进软价值/critic 目标) | "
-                "目标熵分母=%s | 搜索叶子缩放 valueScale=%.2f\n",
-                (double)sac.entropyInTarget,
-                sac.entropySlotsAsLegal ? "**合法槽位数** (反事实)" : "合法着法数 (现状)",
-                (double)sac.valueScale);
+                " 关了就等于改动前的行为)\n", (int)cal.searchLearn);
+    if (cal.hasCriticSwitches) {
+        std::printf("学习口径   : clampTarget=%.2f huberDelta=%.2f 熵比=%.3f alphaLr=%.4f "
+                    "| 叶子估值=%s\n"
+                    "             (实际生效值; 59e5233 是 0 / 0 / 0.98 / 1e-3 / 全量)\n",
+                    cal.clampTarget, cal.huberDelta, cal.entropyRatio, cal.alphaLr,
+                    cal.sparseLeaf ? "稀疏头" : "全量");
+    } else {
+        /*
+           还原版这一支: 这些量**不是"0"、也不是"关着"** —— 是根本没这个成员。
+           印成 "clampTarget=0.00" 会让人以为存在一个取 0 的开关, 那是另一种谎。
+        */
+        std::printf("学习口径   : **无 critic 值域抑制** (本类没有 clampTarget / huberDelta 成员:"
+                    " 目标不夹 + 纯 MSE) 熵比=%.3f alphaLr=%.4f | 叶子估值=%s (本类没有"
+                    " sparseLeafEval 成员)\n",
+                    cal.entropyRatio, cal.alphaLr, cal.sparseLeaf ? "稀疏头" : "全量");
+    }
+    if (cal.hasCriticSwitches) {
+        std::printf("熵项去处   : entropyInTarget=%.2f (0 = 熵项不进软价值/critic 目标) | "
+                    "目标熵分母=%s | 搜索叶子缩放 valueScale=%.2f\n",
+                    cal.entropyInTarget,
+                    cal.entropySlots ? "**合法槽位数** (反事实)" : "合法着法数 (现状)",
+                    cal.valueScale);
+    } else {
+        std::printf("熵项去处   : 熵项恒进软价值 (entropyRatio=%.3f) | 目标熵分母=合法着法数 | "
+                    "**没有**熵项开关与 valueScale (本类不含这些成员)\n", cal.entropyRatio);
+    }
     {
-        const double it = (double)(sac.replaceTargetIter > 0 ? sac.replaceTargetIter : 1);
-        const double perIter = 1.0 - std::pow(1.0 - (double)sac.targetTau, 1.0 / it);
+        const double it = (double)(cal.targetIter > 0 ? cal.targetIter : 1);
+        const double perIter = 1.0 - std::pow(1.0 - cal.targetTau, 1.0 / it);
         const double moved = 1.0 - std::pow(1.0 - perIter, 2600.0);
         std::printf("目标网同步 : tau=%.4f 每 %d 次 learn (2600 步 ~20 局的移动率 %.1f%%) | "
-                    "老口径 tau=0.001/64 步 = 2~4%%\n",
-                    (double)sac.targetTau, sac.replaceTargetIter, 100.0 * moved);
+                    "老口径 tau=0.001/64 步 = 2~4%%%s\n",
+                    cal.targetTau, cal.targetIter, 100.0 * moved,
+                    cal.hasTargetSyncSwitches
+                        ? ""
+                        : "  [本类是编译期常数: 没有 targetTau / replaceTargetIter 成员]");
     }
 
     Score st;
@@ -552,8 +747,8 @@ int main(int argc, char **argv)
     double sacMatSum = 0.0, oppMatSum = 0.0;
     std::vector<double> pliesList;
     /* [①] 训练中诊断: 累计量起点 (每局取差值得"这一局"的分布) */
-    const SACAZAgent::TrainDiag diagStart = sac.getTrainDiag();
-    SACAZAgent::TrainDiag diagPrev = diagStart;
+    const typename AgentT::TrainDiag diagStart = sac.getTrainDiag();
+    typename AgentT::TrainDiag diagPrev = diagStart;
     const double t0 = nowMs();
 
     for (int i = 0; i < g.games; i++) {
@@ -608,7 +803,7 @@ int main(int argc, char **argv)
            靠的就是这个**轨迹**, 而不是训练后的快照。
         */
         if (!g.quiet) {
-            const SACAZAgent::TrainDiag now = sac.getTrainDiag();
+            const typename AgentT::TrainDiag now = sac.getTrainDiag();
             const DiagDelta dx(diagPrev, now);
             diagPrev = now;
             if (dx.n > 0) {
@@ -713,13 +908,13 @@ int main(int argc, char **argv)
             const int color = board.sideToMove;
             std::vector<Step *> legal;
             std::vector<int> idx;
-            RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor mask(AgentT::ACTION_DIM, 1);
             sac.getLegalActions(color, legal, idx, mask);
             Steps::instance().put(legal);
             if (idx.empty()) { continue; }
-            RL::Tensor stx(SACAZAgent::STATE_DIM, 1);
+            RL::Tensor stx(AgentT::STATE_DIM, 1);
             sac.encodeStateFor(color, stx);
-            RL::Tensor q1(SACAZAgent::ACTION_DIM, 1), q2(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor q1(AgentT::ACTION_DIM, 1), q2(AgentT::ACTION_DIM, 1);
             sac.qValues(stx, q1, q2);
             for (int a : idx) {
                 const double q = std::min((double)q1[a], (double)q2[a]);
@@ -729,7 +924,7 @@ int main(int argc, char **argv)
             }
             /* [①] 目标网的同一组读数 (V(s') 就是拿它算的) */
             {
-                RL::Tensor qt1(SACAZAgent::ACTION_DIM, 1), qt2(SACAZAgent::ACTION_DIM, 1);
+                RL::Tensor qt1(AgentT::ACTION_DIM, 1), qt2(AgentT::ACTION_DIM, 1);
                 sac.qTargetValues(stx, qt1, qt2);
                 double qm = 0.0, qs = 0.0;
                 int cnt = 0;
@@ -748,7 +943,7 @@ int main(int argc, char **argv)
                 }
             }
             /* 策略熵 (只算合法动作上) */
-            RL::Tensor piA(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor piA(AgentT::ACTION_DIM, 1);
             sac.policy(stx, mask, piA);
             /*
                熵必须按**掩码**累加 (槽位去重)。旧版按 idx 累加: 128 槽哈希有碰撞, 同一个
@@ -758,7 +953,7 @@ int main(int argc, char **argv)
             */
             double H = 0.0;
             int slotCount = 0;
-            for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+            for (int a = 0; a < AgentT::ACTION_DIM; a++) {
                 if (mask[a] <= 0.5f) { continue; }
                 slotCount++;
                 const double p = (double)piA[a];
@@ -798,16 +993,19 @@ int main(int argc, char **argv)
         */
         {
             const double steps = (double)sac.getLearnSteps();
-            const double iters = steps / (double)(sac.replaceTargetIter > 0
-                                                      ? sac.replaceTargetIter : 1);
-            const double moved = 1.0 - std::pow(1.0 - 1e-3, iters);
+            const double iters = steps / (double)(cal.targetIter > 0 ? cal.targetIter : 1);
+            /*
+               tau 用 Caliber 里的**实际生效值**: 还原版那一支它是编译期常数
+               (POLYAK_TAU = 1e-3), 当前口径那一支是对象成员 —— 拆分前这里写死了 1e-3,
+               于是传了 --target-tau 之后这一行与上面那行会互相矛盾。
+            */
+            const double moved = 1.0 - std::pow(1.0 - cal.targetTau, iters);
             std::printf("  目标网尺度  : |Q_target| 均值 %.3f, 最大 %.3f (%d 个合法动作), "
                         "排序信号 Qspread=%.4f ⇒ 相对随机初始化只移动了 %.2f%% "
                         "(%d 步 / 每 %d 步 tau=%.4f)\n",
                         qTn > 0 ? qTAbs / (double)qTn : 0.0, qTAbsMax, qTn,
                         qTSpreadN > 0 ? qTSpreadSum / (double)qTSpreadN : 0.0,
-                        100.0 * moved, sac.getLearnSteps(), sac.replaceTargetIter,
-                        (double)sac.targetTau);
+                        100.0 * moved, sac.getLearnSteps(), cal.targetIter, cal.targetTau);
             std::printf("                (V(s') 就是拿这张网算的: |Q_target| 停在随机尺度 "
                         "(≈0.07) 就说明**自举项里的游戏信息 ≈ 0**, 目标量级由 α·H 决定; "
                         "目标网的 Qspread 才是自举项能提供的排序信号)\n");
@@ -916,16 +1114,14 @@ int main(int argc, char **argv)
                          dx.hMean, dx.hBarMean, dx.hBarSlotsMean,
                          dx.hBelowFrac(), dx.hBelowSlotsFrac(), dx.qSpreadMean,
                          dx.slotsMean, dx.legalMean,
-                         (double)sac.entropyInTarget, sac.entropySlotsAsLegal ? 1 : 0,
-                         sac.sparseLeafEval ? 1 : 0,
+                         (double)cal.entropyInTarget, cal.entropySlots ? 1 : 0,
+                         cal.sparseLeaf ? 1 : 0,
                          probeQTargetAbsMean, probeNormEntropy, probeQTargetSpread,
-                         (double)sac.targetTau, sac.replaceTargetIter);
+                         cal.targetTau, cal.targetIter);
             std::fclose(fp);
             std::printf("  CSV         : %s\n", g.csv.c_str());
         } else {
             std::printf("  **CSV 写不出去**: %s\n", g.csv.c_str());
         }
     }
-    delete sacPtr;
-    return 0;
 }

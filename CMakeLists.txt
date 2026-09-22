@@ -261,6 +261,7 @@ set(APP_SOURCES
     ${SRC_DIR}/pos.cpp
     ${SRC_DIR}/ppomcts_agent.cpp
     ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazlegacyagent.cpp
     ${SRC_DIR}/dqnabagent.cpp
     ${SRC_DIR}/stone.cpp
     ${SRC_DIR}/thinkingindicator.cpp
@@ -557,6 +558,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/ppomcts_agent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/dqnabagent.cpp
         # [2.9] 节要直接构造 CurveChart, 钉住"换一批线"的语义 (clearData 只清点,
         # removeAllSeries 才清线) —— 曲线控件只依赖 Qt Widgets, 不需要主窗口。
@@ -610,6 +612,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/ppomcts_agent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/dqnabagent.cpp)
     target_include_directories(repro_concurrency PRIVATE ${SRC_DIR})
     target_link_libraries(repro_concurrency PRIVATE
@@ -786,7 +789,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/gamedb.cpp
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_moe PRIVATE ${SRC_DIR})
     target_link_libraries(bench_moe PRIVATE
         RL_CORE
@@ -899,6 +903,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/abagent.cpp)
     target_include_directories(bench_sacaz_vs_ab PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sacaz_vs_ab PRIVATE
@@ -952,7 +957,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_sac_mcts_min PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sac_mcts_min PRIVATE
         RL_CORE
@@ -977,7 +983,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_sac_learn PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sac_learn PRIVATE
         RL_CORE
@@ -1001,7 +1008,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
     target_compile_definitions(bench_sac_mcts_min_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
     target_include_directories(bench_sac_mcts_min_aligned PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sac_mcts_min_aligned PRIVATE
@@ -1026,6 +1034,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(probe_sac_head_grad PRIVATE ${SRC_DIR})
     target_link_libraries(probe_sac_head_grad PRIVATE
@@ -1061,6 +1070,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/abagent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(bench_agent_arena PRIVATE ${SRC_DIR})
     target_link_libraries(bench_agent_arena PRIVATE
@@ -1095,6 +1105,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/abagent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(bench_agent_arena_ab PRIVATE ${SRC_DIR})
     target_link_libraries(bench_agent_arena_ab PRIVATE
@@ -1155,6 +1166,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/dqnagent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/evagent.cpp)
     target_include_directories(test_reward_diag PRIVATE ${SRC_DIR})
     target_link_libraries(test_reward_diag PRIVATE
@@ -1297,6 +1309,7 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_compile_definitions(test_sacaz_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
     target_include_directories(test_sacaz_aligned PRIVATE ${SRC_DIR})
@@ -1317,7 +1330,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/gamedb.cpp
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(test_sacaz PRIVATE ${SRC_DIR})
     target_link_libraries(test_sacaz PRIVATE
         RL_CORE

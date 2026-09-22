@@ -1,4 +1,4 @@
-#include "sacazagent.h"
+#include "sacazlegacyagent.h"
 
 #include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "agentrollout.hpp"
@@ -65,7 +65,7 @@ RL::ISparseMoE *findSparseMoe(RL::Net &net)
 
 } // namespace
 
-const char *SACAZAgent::backboneName(Backbone b)
+const char *SACAZLegacyAgent::backboneName(Backbone b)
 {
     switch (b) {
     case Backbone::Mlp:          return "MLP";
@@ -87,7 +87,7 @@ const char *SACAZAgent::backboneName(Backbone b)
      * 专家权重由 SparseMoE 的构造函数调用 scaleExpertInit 缩放; 其余普通层由
        scaleLayerInit 缩放 (两者的依据都是 1/sqrt(fan_in))。
 */
-RL::Net SACAZAgent::buildNet(bool withGrad) const
+RL::Net SACAZLegacyAgent::buildNet(bool withGrad) const
 {
     const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
     RL::Net::Layers layers;
@@ -153,7 +153,7 @@ RL::Net SACAZAgent::buildNet(bool withGrad) const
  * 在自检面板上直接可见。它同时是一条回归断言: 正常情况下必须报 `tanh (Layer<Tanh>)`,
  * 正常的两个骨干 (Mlp / 稀疏 MoE 的专家骨干) 都是这一层。
  */
-const char *SACAZAgent::hiddenActivationName() const
+const char *SACAZLegacyAgent::hiddenActivationName() const
 {
     RL::Net &self = const_cast<RL::Net &>(actor);   /* Net::operator[] 没有 const 重载 */
     if (self.size() < 2) {
@@ -173,43 +173,40 @@ const char *SACAZAgent::hiddenActivationName() const
 }
 
 /*
- * 界面上的哪一支。本类按骨干区分 (同一个类被 AGENT_SACAZ 与 AGENT_SACAZ_MOE 复用)。
- * [2026-09] 59e5233 还原版**不再**覆盖它 —— 那一支是**独立的类** SACAZLegacyAgent
- * (两个类没有继承关系, 见 src/sacazlegacyagent.h), 它有自己的同名实现。
- * 见头文件里的说明。
+ * 界面上的哪一支 —— 本类只服务一个界面类型 (AGENT_SACAZ_OLD), 所以是写死的字符串。
+ * (2026-09 之前这里是 virtual 覆写: 那一版是 SACAZAgent 的派生类, 基类也要报自己的
+ * 身份; 现在两个类没有继承关系, 各自的标签各写各的。)
  */
-const char *SACAZAgent::guiAgentLabel() const
+const char *SACAZLegacyAgent::guiAgentLabel() const
 {
-    if (backbone == Backbone::SparseMoeTb) {
-        return "SAC+AZ-MoE (AGENT_SACAZ_MOE)";
-    }
-    if (backbone == Backbone::Mlp) {
-        return "SAC+AZ (AGENT_SACAZ, 当前口径)";
-    }
-    return "bench/测试构造 (界面不为它建实例)";
+    return "SAC+AZ-59e5233 (AGENT_SACAZ_OLD, 行为还原版)";
 }
 
-/* 当前 SAC 的权重前缀。59e5233 还原版另有一个 (在那个**独立的类**里) —— 见头文件的说明。 */
-const char *SACAZAgent::defaultWeightPrefix()
+/*
+ * 权重前缀 —— 必须与 SACAZAgent 的 "weights/sacaz_agent" 不同 (用户口径: 新旧权重文件
+ * 用不同名字区分开)。两者参数结构完全相同, 结构指纹挡不住串权重, 共用前缀会让
+ * "后训练的那一支静默覆盖另一支"。
+ */
+const char *SACAZLegacyAgent::defaultWeightPrefix()
 {
-    return "weights/sacaz_agent";
+    return "weights/sacaz_old_agent";
 }
 
-int SACAZAgent::moeExpertCount() const
+int SACAZLegacyAgent::moeExpertCount() const
 {
     RL::Net &self = const_cast<RL::Net&>(actor);
     RL::ISparseMoE *m = findSparseMoe(self);
     return (m != nullptr) ? m->expertCount() : 0;
 }
 
-int SACAZAgent::moeTopK() const
+int SACAZLegacyAgent::moeTopK() const
 {
     RL::Net &self = const_cast<RL::Net&>(actor);
     RL::ISparseMoE *m = findSparseMoe(self);
     return (m != nullptr) ? m->topK() : 0;
 }
 
-void SACAZAgent::moeUsage(std::vector<long long> &out) const
+void SACAZLegacyAgent::moeUsage(std::vector<long long> &out) const
 {
     RL::Net &self = const_cast<RL::Net&>(actor);
     RL::ISparseMoE *m = findSparseMoe(self);
@@ -220,7 +217,7 @@ void SACAZAgent::moeUsage(std::vector<long long> &out) const
     m->usageSnapshot(out);
 }
 
-void SACAZAgent::resetMoeUsage()
+void SACAZLegacyAgent::resetMoeUsage()
 {
     for (std::size_t i = 0; i < actor.size(); i++) {
         RL::ISparseMoE *m = dynamic_cast<RL::ISparseMoE*>(actor[i]);
@@ -230,7 +227,7 @@ void SACAZAgent::resetMoeUsage()
     }
 }
 
-SACAZAgent::SACAZAgent(Chess &chess_,
+SACAZLegacyAgent::SACAZLegacyAgent(Chess &chess_,
                        int hiddenDim_,
                        float gamma_,
                        float lr,
@@ -267,24 +264,28 @@ SACAZAgent::SACAZAgent(Chess &chess_,
          机制上也能对上 (同一工具训练后的读数): 改后那一支的 critic **尺度死掉了**
          (|Q| 均值 **0.035**, 与随机初始化 0.06 同量级), 而 αlr 大 5 倍 + 目标熵低一半
          会让 α 迅速缩小、策略被"没有信息的 Q"推着走; 改回 0.98/1e-3 之后 |Q| 落在
-         **2.04** (钳位边界附近), 搜索的 PUCT 重新拿到可用的排序信号。
-
-         **不是**"改回 59e5233 的一切": clampTarget=2 + huberDelta=1 保留着, 而且实测比
-         改回 0/0 更好 (67.5% vs 82.5%) —— 这两条约束压发散, α 口径决定 critic 有没有
-         信号, 是两件事。完整数据与复现命令见 docs/sac_learn_reward_2026_09.md §9。 */
+         **2.04** (那一档当时开着"目标钳位 2", 所以贴着钳位边界) —— 本类**不夹目标**,
+         所以这里的 |Q| 是 5.6 那一档, 见下面"本类刻意不含 critic 值域约束"那段。
+         这两组数是**两件事**: α 口径决定 critic 有没有信号, 值域约束决定它会不会发散。
+         完整数据与复现命令见 docs/sac_learn_reward_2026_09.md §9。 */
       entropyRatio(0.98f),
       simulations(64),
       batchSize(32),
       /*
-         [F1 2026-09] 目标网同步: **默认保持 61a974d 的口径** (tau=1e-3 / 每 64 步, 逐位相同)。
-         200 局 x 4 种子的配对实测确实证明"这个节拍太小 ⇒ 自举项里没有游戏信息"
-         (|Q_target| 只有 0.113 = 随机尺度; 调快之后能到 1.5~2.0, 见
-         docs/sac_critic_diagnosis_2026_09.md §13), 但**棋力差别不显著** (最好的一档
-         65.0% -> 67.3%, p = 0.43)。"默认值也是结论" ⇒ 不把未达显著的改动设成默认;
-         要开就显式传 `--target-tau=1 --target-iter=256`。
-         注意: `SACAZLegacyAgent` 把这个对**显式钉住**了 (基类默认不许渗进行为还原版)。
+         [F1 2026-09] 目标网同步率在本类里**不是成员**, 而是两个编译期常数
+         (POLYAK_TAU = 1e-3 / TARGET_SYNC_EVERY = 64, 见头文件里那张口径表)。
+
+         背景: SACAZAgent 把这一对做成了可调成员, 于是 2026-09 的 F1 那一轮把**基类
+         默认值**改成了"硬拷贝 / 每 256 步" —— 而当时"59e5233 行为还原版"是派生类,
+         没有显式钉这两个量, 于是它的行为**跟着一起变了**(见
+         docs/sac_critic_diagnosis_2026_09.md §13.5, 用户发现的就是这一条)。
+         本类与 SACAZAgent **没有继承关系**(见头文件的说明), 而且把这一对写成常数:
+         从外面没有任何办法把这一支调到别的同步率。
+         数值上的依据 (为什么 1e-3/64 就是 59e5233 的行为): 一次 20 局的会话 ~2600 次
+         learn 只把目标网从随机初始化挪动 2~4%, 所以自举项 V(s') 里的 E[min Q(s')]
+         几乎恒为"随机网络的输出" —— 而 |Q_target| ≈ 0.08 正是这个现象的直接读数
+         (bench_sac_learn --legacy 的实测)。这是**还原对象的一部分**, 不是待修的缺陷。
       */
-      replaceTargetIter(64),
       maxMemorySize(4096),
       totalEpisodes(0),
       learnSteps(0),
@@ -317,9 +318,10 @@ SACAZAgent::SACAZAgent(Chess &chess_,
     m_q2 = RL::Tensor(ACTION_DIM, 1);
 }
 
-std::string SACAZAgent::getName() const
+std::string SACAZLegacyAgent::getName() const
 {
-    return "SAC+MCTS+AlphaZero (最大熵搜索)";
+    /* 界面的对局日志/结果标签用这个名字; 与 AGENT_SACAZ 的名字明确区分开 */
+    return "SAC+MCTS+AlphaZero (59e5233 行为还原版)";
 }
 
 /* ============================================================
@@ -328,7 +330,7 @@ std::string SACAZAgent::getName() const
  *  同一个 canonicalCell 镜像、同一个 STATE_DIM=1710。下面有一条
  *  static_assert 把"两边维度一致"钉成编译期事实。
  * ============================================================ */
-void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
+void SACAZLegacyAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
 {
     cells.clear();
     cells.reserve(32);
@@ -352,7 +354,7 @@ void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) cons
    这边取同样的 5 个数进 Transition::ctx)。
    这一致性是"两边状态同构"的全部内容: 只要有一边换了公式, 对照就不再受控。
 */
-void SACAZAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
+void SACAZLegacyAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
 {
     /*
        两种表示下的**语义不同**, 这点很关键:
@@ -382,7 +384,7 @@ void SACAZAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
     }
 }
 
-void SACAZAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
+void SACAZLegacyAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
 {
     if (state.size() < (std::size_t)STATE_DIM) {
         return;
@@ -404,7 +406,7 @@ void SACAZAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
     }
 }
 
-void SACAZAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
+void SACAZLegacyAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
 {
     for (int i = 0; i < CTX_COUNT; i++) {
         out[i] = 0.0f;
@@ -419,7 +421,7 @@ void SACAZAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
     }
 }
 
-void SACAZAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state)
+void SACAZLegacyAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state)
 {
     state.zero();
     for (std::size_t i = 0; i < cells.size(); i++) {
@@ -430,7 +432,7 @@ void SACAZAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tenso
     }
 }
 
-void SACAZAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells)
+void SACAZLegacyAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells)
 {
     cells.clear();
     cells.reserve(32);
@@ -461,21 +463,21 @@ static void expandSparseGrids(const std::vector<std::uint16_t> &cells, RL::Tenso
 /* 5 个上下文标量铺成整平面 (每条 90 个相同值) —— 只在对齐表示下用。
    为什么值走标量而不是"再塞 450 个非零格": 稀疏回放只存棋子格; 稠密展开时按平面铺开
    是**确定性的函数**, 不增加任何回放内存。 */
-static void fillContextPlanes(RL::Tensor &state, const float ctx[SACAZAgent::CTX_COUNT])
+static void fillContextPlanes(RL::Tensor &state, const float ctx[SACAZLegacyAgent::CTX_COUNT])
 {
-    for (int p = 0; p < SACAZAgent::CTX_COUNT; p++) {
+    for (int p = 0; p < SACAZLegacyAgent::CTX_COUNT; p++) {
         const float v = ctx[p];
         if (v == 0.0f) {
             continue;   /* 0 平面本来就是零, 跳过 (省 90 次写) */
         }
-        float *dst = &state[(std::size_t)(SACAZAgent::PIECE_PLANES + p) * SACAZAgent::CELLS];
-        for (int c = 0; c < SACAZAgent::CELLS; c++) {
+        float *dst = &state[(std::size_t)(SACAZLegacyAgent::PIECE_PLANES + p) * SACAZLegacyAgent::CELLS];
+        for (int c = 0; c < SACAZLegacyAgent::CELLS; c++) {
             dst[c] = v;
         }
     }
 }
 
-void SACAZAgent::encodeStateFor(int color, RL::Tensor &state)
+void SACAZLegacyAgent::encodeStateFor(int color, RL::Tensor &state)
 {
     if (state.size() != (std::size_t)STATE_DIM) {
         state = RL::Tensor(STATE_DIM, 1);
@@ -490,7 +492,7 @@ void SACAZAgent::encodeStateFor(int color, RL::Tensor &state)
     writeContext(state, ctx);
 }
 
-void SACAZAgent::encodeState(RL::Tensor &state)
+void SACAZLegacyAgent::encodeState(RL::Tensor &state)
 {
     /*
        视角由棋盘当前的 sideToMove 决定 —— MCTS 里走法是真正落在棋盘上的
@@ -516,7 +518,7 @@ void SACAZAgent::encodeState(RL::Tensor &state)
  *  它让 SAC 与 PPO 的动作空间不同构, "算法对照"就没法解释。见
  *  docs/agents_design.md §11 / §20.4 与 docs/arena_sac_vs_ppo_report.md §8.4。
  * ============================================================ */
-int SACAZAgent::stepToActionIdx(const Step &s, int color) const
+int SACAZLegacyAgent::stepToActionIdx(const Step &s, int color) const
 {
     /*
        两种表示的索引公式 (与头文件的开关一一对应):
@@ -537,7 +539,7 @@ int SACAZAgent::stepToActionIdx(const Step &s, int color) const
     return ChessState::actionIndexOf(from, to);
 }
 
-void SACAZAgent::getLegalActions(int color,
+void SACAZLegacyAgent::getLegalActions(int color,
                                  std::vector<Step*> &steps,
                                  std::vector<int> &actionIndices,
                                  RL::Tensor &actionMask)
@@ -553,7 +555,7 @@ void SACAZAgent::getLegalActions(int color,
     }
 }
 
-float SACAZAgent::computeReward(const Step &s, int color)
+float SACAZLegacyAgent::computeReward(const Step &s, int color)
 {
     (void)color;   /* 走子方视角, 与颜色无关 */
 
@@ -583,68 +585,40 @@ float SACAZAgent::computeReward(const Step &s, int color)
        奖励曲线在 ChessBoard::playMatchGame 里显式换算成走子方视角。)
        回归钉在 test_match 的 [2.6] 节。
 
-       rewardScale 是**消融旋钮** (默认 1.0 = 逐位不变): 只缩放即时奖励, 不动终局 ±1。
-       终局是环境的真值, 缩放它等于换一个游戏; 即时项是"塑形", 缩它才是在问
-       "这个塑形值多少"。见 sacazagent.h 的说明。
-
-       **默认路径必须逐位等于改动前的代码** (2026-09 排查教训): `1.0f * x` 数学上是恒等,
-       但在"与参考实现逐位对比"的场合不该留任何多余运算 —— 一旦出现偏差, 排查者会先
-       怀疑这一行。所以写成显式分支: 1.0 时**原式返回**, 不进乘法。
+       ---- [2026-09] 本类**刻意不含奖励塑形** ----
+       本类没有"即时奖励整体缩放"与"去掉材质 / 终局放大"这两个旋钮 (SACAZAgent 那一支
+       有, 它们是 2026-09 之后才加的实验开关, 59e5233 里没有)。
+       用户口径是"这一支必须是 59e5233 的行为还原版", 所以这里**连成员都不留** ——
+       不是"默认关掉", 而是任何 flag 都打不开 (加了就说明被污染了)。
+       即时奖励就是 `stepReward(...)` 原式, 终局就是 engine 的真值 ±1/0。
     */
-    const float base = stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
-    /*
-       rewardShape = 1: **去掉材质塑形** (见 sacazagent.h 的说明)。
-       每步代价**保留**: 它是"别磨蹭"的那一项, 去掉只会让长局更多 —— 而这次实验要问的
-       恰恰是不是长局(和棋)太多。
-    */
-    if (rewardShape == 1) {
-        return stepReward(false, false, 0.0);
-    }
-    return (rewardScale == 1.0f) ? base : (rewardScale * base);
+    return stepReward(true, victim->type == Stone::TYPE_JIANG, victim->value);
 }
 
 /*
- * 终局值 (走子方视角) —— 塑形方案的**唯一出口**。三个产生点 (搜索叶子 terminalValue /
+ * 终局值 (走子方视角) —— 终局口径的**唯一出口**。三个产生点 (搜索叶子 terminalValue /
  * 自对弈 resultValue / rollout 的 outcomeForMover) 全部走这里, 理由是"搜索估的"与
- * "训练学的"必须是同一个游戏 (见 sacazagent.h 的 rewardShape 说明)。
+ * "训练学的"必须是同一个游戏。
  *
- * 读的是 this->chess 的**当前**局面 —— 三个调用点都保证棋盘就在终局那个局面上
- * (搜索是沿着路径 moveForward 走过来的; rollout 与自对弈都刚 moveForward 完)。
+ * ---- [2026-09] 本类**没有塑形分支** ----
+ * SACAZAgent 里这个方法还承担"终局放大" (将死时按败方剩余材质放大到 [1,2), 即
+ * 快杀 > 磨死)。那是 2026-09 用户提议的实验旋钮, 59e5233 里没有, 所以本类**只返回引擎
+ * 真值** (±1 / 0) —— 连那个成员都不存在, 没有任何 flag 能打开它。
+ * 函数名保留 (agentrollout.hpp 用 SFINAE 探测这个可选成员: 有就用它, 没有就退回共享的
+ * outcomeForMover), 但因为返回值就是真值, 这条路径与回退路径**逐位等价**。
+ *
+ * 不再读 this->chess: 真值只取决于 (result, perspective), 与棋盘无关。读棋盘是塑形
+ * 分支的需要 (它要数败方剩多少子) —— 那一支已经删掉, 于是这里也就成了纯函数。
  */
-float SACAZAgent::terminalReward(int chessResult, int perspective) const
+float SACAZLegacyAgent::terminalReward(int chessResult, int perspective) const
 {
-    const float base = outcomeForMover(chessResult, perspective);
-    if (rewardShape != 2 || base == 0.0f) {
-        return base;
-    }
-    /*
-       2 = "败方兵力越完整地被将死, 越值钱" (快杀 > 磨死)。
-       满材质 = 一方全部**非将**子力 = 3.5 (车 2x0.5 + 马 2x0.3 + 炮 2x0.3 +
-       相 2x0.2 + 仕 2x0.2 + 兵 5x0.1); 将不参与材质 (它的价值就是"被吃"= 终局本身)。
-       倍数落在 [1, 2]: 对方一个子没少就被将死 -> 2.0; 磨到只剩光将 -> 1.0。
-    */
-    const int loser = (base > 0.0f)
-                          ? ((perspective == Stone::COLOR_RED) ? Stone::COLOR_BLACK
-                                                               : Stone::COLOR_RED)
-                          : perspective;
-    double rem = 0.0;
-    for (int i = 0; i < 32; i++) {
-        const Stone *s = chess.stones[i];
-        if (s == nullptr || !s->alive || s->color != loser
-            || s->type == Stone::TYPE_JIANG) {
-            continue;
-        }
-        rem += s->value;
-    }
-    const double full = 3.5;      /* 一方全部非将子力 */
-    const double k = 1.0 + (rem / full);
-    return (float)((double)base * k);
+    return (float)outcomeForMover(chessResult, perspective);
 }
 
 /* ============================================================
  *  掩码 softmax 及其反向
  * ============================================================ */
-void SACAZAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
+void SACAZLegacyAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
                                RL::Tensor &pi)
 {
     pi.zero();
@@ -679,7 +653,7 @@ void SACAZAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
     }
 }
 
-void SACAZAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
+void SACAZLegacyAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
                                        RL::Tensor &dz)
 {
     /*
@@ -695,7 +669,7 @@ void SACAZAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g
     }
 }
 
-void SACAZAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
+void SACAZLegacyAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
 {
     bits[0] = 0;
     bits[1] = 0;
@@ -706,7 +680,7 @@ void SACAZAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
     }
 }
 
-void SACAZAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
+void SACAZLegacyAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
 {
     mask.zero();
     for (int i = 0; i < ACTION_DIM; i++) {
@@ -718,7 +692,7 @@ void SACAZAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
 /* ============================================================
  *  前向 / 软价值
  * ============================================================ */
-void SACAZAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
+void SACAZLegacyAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
                         RL::Tensor &pi)
 {
     /* actor 的输出缓冲会被下一次 forward 覆盖, 先拷出来再做掩码归一化 */
@@ -726,94 +700,29 @@ void SACAZAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
     maskedSoftmax(m_logits, mask, pi);
 }
 
-void SACAZAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor &q2Out)
+void SACAZLegacyAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor &q2Out)
 {
     q1Out = q1.forward(state);
     q2Out = q2.forward(state);
 }
 
-/* ------------------------------------------------------------------
- *  稀疏头推理 (只算合法列) —— 动作空间 8100 之后这是**必需**的性能路径
- *  语义等价的依据见头文件与 ilayer.h 的 sparseLogits 说明。
- * ------------------------------------------------------------------ */
-namespace {
+/*
+ * ---- [2026-09] 本类**没有稀疏头推理** ----
+ * SACAZAgent 那一支有三个"只算合法列"的函数 (稀疏策略 / 稀疏 Q / 稀疏软价值) 与它们的
+ * 静态助手, 服务于"叶子估值走稀疏头"的快路径 (为 8100 动作空间才加的, 由那边的一个
+ * 开关选择)。59e5233 的叶子估值是**全量** Q, 所以本类只需要 policy() / qValues() /
+ * softValueFrom() 这一条路径 —— 那四个函数一起删掉了: 少一条与训练不同的代码路径,
+ * 也少一个"两个口径差在哪"的变量。
+ */
 
-/* 把某个 Q 网络在 legalIdx 上的列抽出来 (affine: 故意不传激活, 因为 Q 头是无激活的
-   Linear —— 与 iFcLayer::sparseLogits 的注释一致: 它返回的是**激活前**的值)。 */
-bool sparseCols(RL::Net &net, const RL::Tensor &state, const std::vector<int> &idx,
-                std::vector<float> &out)
-{
-    if (idx.empty() || net.size() < 2) { return false; }
-    RL::iLayer *head = net[net.size() - 1];
-    if (head == nullptr || !head->supportsSparseLogits()) { return false; }
-    RL::Tensor &h = net.forwardTrunk(state);
-    return head->sparseLogits(h, idx, out);
-}
-
-} // namespace
-
-bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
-                               std::vector<float> &q1Out, std::vector<float> &q2Out)
-{
-    return sparseCols(q1, state, legalIdx, q1Out)
-           && sparseCols(q2, state, legalIdx, q2Out);
-}
-
-bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
-                              std::vector<float> &piOut)
-{
-    std::vector<float> logits;
-    if (!sparseCols(actor, state, legalIdx, logits) || logits.size() != legalIdx.size()) {
-        return false;
-    }
-    /* 合法集上的数值稳定 softmax (与 maskedSoftmax 的 Z≡1 口径等价) */
-    const std::size_t n = logits.size();
-    float m = logits[0];
-    for (std::size_t i = 1; i < n; i++) {
-        if (logits[i] > m) { m = logits[i]; }
-    }
-    piOut.assign(n, 0.0f);
-    double sum = 0.0;
-    for (std::size_t i = 0; i < n; i++) {
-        const float e = std::exp(logits[i] - m);
-        piOut[i] = e;
-        sum += (double)e;
-    }
-    if (!(sum > 1e-12) || !std::isfinite(sum)) {
-        return false;
-    }
-    const float inv = (float)(1.0 / sum);
-    for (std::size_t i = 0; i < n; i++) { piOut[i] *= inv; }
-    return true;
-}
-
-bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
-                                 double &valueOut)
-{
-    std::vector<float> pi, qa, qb;
-    if (!policySparse(state, legalIdx, pi)) { return false; }
-    if (!qValuesSparse(state, legalIdx, qa, qb)) { return false; }
-    if (qa.size() != pi.size() || qb.size() != pi.size()) { return false; }
-
-    const float a = alpha[0];
-    double v = 0.0;
-    for (std::size_t i = 0; i < pi.size(); i++) {
-        if (!(pi[i] > 0.0f)) { continue; }
-        const double qmin = (double)std::min(qa[i], qb[i]);
-        v += (double)pi[i] * (qmin - (double)a * std::log((double)pi[i]));
-    }
-    valueOut = (double)valueScale * v;
-    return true;
-}
-
-void SACAZAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
+void SACAZLegacyAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
                                RL::Tensor &q2Out)
 {
     q1Out = q1Target.forward(state);
     q2Out = q2Target.forward(state);
 }
 
-float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
+float SACAZLegacyAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
                                 const RL::Tensor &q1In, const RL::Tensor &q2In) const
 {
     const float a = alpha[0];
@@ -824,14 +733,13 @@ float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
         }
         const float qmin = std::min(q1In[i], q2In[i]);
         /*
-           `entropyInTarget == 1.0f` 走**原式** (不改动前逐位一致; 这里刻意不写成
-           `* entropyInTarget`, 免得后人以为默认路径有额外运算) —— 见头文件对该开关的说明:
-           熵项一旦进 V(s'), 它就以 −γ·α·H(s') 的形式进了 critic 的回归目标,
-           而那是一个与棋局无关的常数偏置。
+           ---- [2026-09] 本类没有"熵项去处"开关 ----
+           SACAZAgent 那边可以把熵项从软价值里摘掉 (用来量"是熵项把 critic 顶走的")。
+           本类**不含那个成员**: 熵项就是加上的 (`v = E[min Q] + α·H`), 与 59e5233 逐位
+           一致的一行原式。要做那个消融就到 SACAZAgent 那一支去做 —— 在"行为还原版"上
+           做消融等于把它变成另一支算法。
         */
-        const float ent = (entropyInTarget == 1.0f)
-                              ? (a * std::log(pi[i]))
-                              : (entropyInTarget * a * std::log(pi[i]));
+        const float ent = a * std::log(pi[i]);
         v += pi[i] * (qmin - ent);
     }
     return v;
@@ -840,7 +748,7 @@ float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
 /* ============================================================
  *  MCTS
  * ============================================================ */
-double SACAZAgent::getPUCT(int childID, int parentVisits) const
+double SACAZLegacyAgent::getPUCT(int childID, int parentVisits) const
 {
     const AZNode &child = nodes[childID];
     if (child.visitCount == 0) {
@@ -862,21 +770,23 @@ double SACAZAgent::getPUCT(int childID, int parentVisits) const
     return q + u;
 }
 
-bool SACAZAgent::terminalValue(int color, double &value) const
+bool SACAZLegacyAgent::terminalValue(int color, double &value) const
 {
     const int res = chess.getResult(color);
     if (res == Chess::RESULT_ONGOING) {
         return false;
     }
     /*
-       走**同一家**的终局口径 (terminalReward): 塑形开着时, 搜索叶子估的值必须与训练
-       目标同一个数, 否则 PUCT 是在为一个与实际学的不同的游戏排序 (见 rewardShape 说明)。
+       走**同一家**的终局口径 (terminalReward): 搜索叶子估的值必须与训练目标同一个数,
+       否则 PUCT 是在为一个与实际学的不同的游戏排序。
+       (本类没有塑形, 所以这里与 outcomeForMover 逐位相同; 这条纪律是留给"万一以后
+       终局口径要变"的 —— 三个产生点必须同时变。)
     */
     value = (double)terminalReward(res, color);
     return true;
 }
 
-bool SACAZAgent::resultValue(int result, int color, float &out)
+bool SACAZLegacyAgent::resultValue(int result, int color, float &out)
 {
     if (result == Chess::RESULT_ONGOING) {
         return false;
@@ -886,7 +796,7 @@ bool SACAZAgent::resultValue(int result, int color, float &out)
     return true;
 }
 
-void SACAZAgent::visitDistribution(int rootID, RL::Tensor &pi)
+void SACAZLegacyAgent::visitDistribution(int rootID, RL::Tensor &pi)
 {
     pi.zero();
     int total = 0;
@@ -915,96 +825,8 @@ void SACAZAgent::visitDistribution(int rootID, RL::Tensor &pi)
  *    2. 终局节点用真实胜负, 不再自举 (PPOMCTS 在终局也用网络值);
  *    3. 展开时按**先验**挑动作, 而不是随机挑 (同样模拟次数下更有效)。
  * ============================================================ */
-bool SACAZAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
-                                     const RL::Tensor &piVisit)
-{
-    /*
-       ============================================================
-        "这一步真实决策" -> 一条 AlphaZero 样本 (hasSearch=true) [+ 一次更新]
-       ============================================================
-       为什么需要它 (用户实测 + 代码核对, 2026-09):
-         界面里 SAC 的 per-move 学习**只**由 preTrainThenDecide 的 rollout 驱动, 而那批
-         样本是 hasSearch=false —— 策略损失里**只**有 SAC 的软 Q 项, 搜索出来的 π_MCTS
-         在对弈中被完全丢掉 (只有后台训练 trainSelfPlay 用它)。关掉 rollout 勾选框更是
-         一步都不学。这个方法把"已经花掉 256 次模拟算出来的那棵搜索树"接进学习回路。
 
-       三条必须有保证的细节:
-        1. **不改动真棋局**: 即时奖励必须在落子**之前**算 (落子会把被吃子置 alive=false),
-           然后 moveForward 取 s'/done, 再 moveBack 原样退回 —— 与
-           rolloutFromCurrent 同一条纪律 (那边也是这么做的)。sideToMove 必须显式存取,
-           因为 moveForward/moveBack 会来回翻转它。
-        2. **掩码与动作下标来自同一套编码**: `actionIdx` 用树里的 parentAction,
-           `getLegalActions` 给的掩码就是那套编码的掩码; 两者不一致会让更新学错列。
-        3. **终局值走 terminalReward()** (与搜索叶子、自对弈同一个出口), 否则搜索估的
-           与训练学的会是两个游戏。
-    */
-    const int savedSideToMove = chess.sideToMove;
-
-    Transition tr;
-    /* ---- s ---- */
-    encodeSparse(color, tr.cells);
-    contextOf(chess, color, tr.ctx);
-    for (int i = 0; i < ACTION_DIM; i++) {
-        tr.pi[i] = piVisit[i];
-    }
-    tr.action = actionIdx;
-    tr.hasSearch = true;                 /* 关键: 允许 AlphaZero 监督项 */
-    {
-        std::vector<Step*> legal;
-        std::vector<int> idx;
-        RL::Tensor mask(ACTION_DIM, 1);
-        getLegalActions(color, legal, idx, mask);
-        tr.legalCount = (int)idx.size();
-        maskToBits(mask, tr.curMask);
-        Steps::instance().put(legal);
-    }
-    /* ---- r (落子之前算: 被吃子此刻还活着) ---- */
-    tr.reward = computeReward(step, color);
-
-    /* ---- s' / done: 试走一手再原样退回 (与搜索的试走同一套 moveForward/moveBack) ---- */
-    Step applied = step;
-    double dummy = 0.0;
-    chess.moveForward(&applied, dummy);
-    const int nextColor = (color == Stone::COLOR_RED) ? Stone::COLOR_BLACK
-                                                      : Stone::COLOR_RED;
-    encodeSparse(nextColor, tr.nextCells);
-    contextOf(chess, nextColor, tr.nextCtx);
-    {
-        std::vector<Step*> legal;
-        std::vector<int> idx;
-        RL::Tensor mask(ACTION_DIM, 1);
-        getLegalActions(nextColor, legal, idx, mask);
-        maskToBits(mask, tr.nextMask);
-        Steps::instance().put(legal);
-    }
-    const int res = chess.getResult(nextColor);
-    tr.done = (res != Chess::RESULT_ONGOING);
-    if (tr.done) {
-        tr.reward = terminalReward(res, color);   /* 终局: 真实胜负覆盖即时奖励 */
-    }
-    chess.moveBack(&applied, dummy);
-    chess.sideToMove = savedSideToMove;           /* 试走会翻转它, 必须还原 */
-
-    /* ---- 入池 ---- */
-    memories.push_back(tr);
-    while (memories.size() > maxMemorySize) {
-        memories.pop_front();
-    }
-
-    /*
-       更新一次。批大小按池内实际条数夹一下 (与 exploreAndTrain 同一条理由:
-       learnBatch 在"池 < batchSize"时**故意**直接返回、不拿半个批去更新, 于是开局
-       前两手会白跑)。
-    */
-    const int onlineBatch = std::min(batchSize, (int)memories.size());
-    if (onlineBatch < 1) {
-        return false;
-    }
-    learnBatch(onlineBatch);
-    return true;
-}
-
-Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
+Step SACAZLegacyAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
 {
     nodes.clear();
     if (simulations_ < 1) {
@@ -1127,40 +949,24 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
             } else {
                 encodeStateFor(nextColor, m_stateBuf);
                 /*
-                   稀疏头路径 (只算合法列): 动作空间 8100 之后这是必须的 —— 否则每次叶子
-                   估值要算 8100 个 Q 值, 而这一步只有 ~44 个合法着法 (实测 216 ms/步 ->
-                   见 sacazagent.h 的说明)。取不到 (头不支持/下标越界) 就回退全量口径。
+                   ---- [2026-09] 叶子估值一律走**全量** (59e5233 的口径) ----
+                   SACAZAgent 在这里还有一条"稀疏头"(只算合法列) 的快路径, 由那边的一个
+                   开关选择。它是为 8100 动作空间 (对齐表示) 才加的, 而 59e5233 那时动作
+                   空间是 128 槽, 全量 Q 只要算 128 列 —— 本类**没有那条路径**, 永远走
+                   全量: 少一个变量, 也少一条与训练路径不同的代码 (两个口径之间任何一点
+                   差异都会被放大成棋力差)。
+                   (对齐表示 SACAZ_ALIGNED_REPR=1 下这条全量路径会慢, 那是刻意的:
+                   本类的意义是"行为还原", 不是"跑得快"。)
                 */
-                std::vector<float> piSp, qaSp, qbSp;
-                bool sparseOk = sparseLeafEval
-                                && policySparse(m_stateBuf, childIdx, piSp)
-                                && qValuesSparse(m_stateBuf, childIdx, qaSp, qbSp);
-                if (sparseOk) {
-                    for (std::size_t i = 0; i < childIdx.size(); i++) {
-                        child.untriedActionIndices.push_back(childIdx[i]);
-                        child.untriedSteps.push_back(*childSteps[i]);
-                        child.untriedPriors.push_back((double)piSp[i]);
-                    }
-                    const float a = alpha[0];
-                    double v = 0.0;
-                    for (std::size_t i = 0; i < piSp.size(); i++) {
-                        if (!(piSp[i] > 0.0f)) { continue; }
-                        const double qmin = (double)std::min(qaSp[i], qbSp[i]);
-                        v += (double)piSp[i] * (qmin - (double)a * std::log((double)piSp[i]));
-                    }
-                    leafValue = (double)valueScale * v;
-                } else {
-                    /* 回退: 全量口径 (语义与上面逐元素相同, 只是慢) */
-                    pi.zero();
-                    policy(m_stateBuf, mask, pi);
-                    qValues(m_stateBuf, qa, qb);
-                    for (std::size_t i = 0; i < childIdx.size(); i++) {
-                        child.untriedActionIndices.push_back(childIdx[i]);
-                        child.untriedSteps.push_back(*childSteps[i]);
-                        child.untriedPriors.push_back((double)pi[childIdx[i]]);
-                    }
-                    leafValue = (double)searchValueFrom(pi, mask, qa, qb);
+                pi.zero();
+                policy(m_stateBuf, mask, pi);
+                qValues(m_stateBuf, qa, qb);
+                for (std::size_t i = 0; i < childIdx.size(); i++) {
+                    child.untriedActionIndices.push_back(childIdx[i]);
+                    child.untriedSteps.push_back(*childSteps[i]);
+                    child.untriedPriors.push_back((double)pi[childIdx[i]]);
                 }
+                leafValue = (double)softValueFrom(pi, mask, qa, qb);
                 m_leafEvals++;
             }
             Steps::instance().put(childSteps);
@@ -1180,13 +986,11 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
             getLegalActions(nodes[nodeID].currentColor, ls, li, mask);
             Steps::instance().put(ls);
             encodeStateFor(nodes[nodeID].currentColor, m_stateBuf);
-            /* 同样先走稀疏头 (只算合法列), 失败再回退全量 */
-            if (!sparseLeafEval || !softValueSparse(m_stateBuf, li, leafValue)) {
-                pi.zero();
-                policy(m_stateBuf, mask, pi);
-                qValues(m_stateBuf, qa, qb);
-                leafValue = (double)searchValueFrom(pi, mask, qa, qb);
-            }
+            /* 全量叶子估值 (本类没有稀疏头开关, 见上面那一处的说明) */
+            pi.zero();
+            policy(m_stateBuf, mask, pi);
+            qValues(m_stateBuf, qa, qb);
+            leafValue = (double)softValueFrom(pi, mask, qa, qb);
             m_leafEvals++;
         }
 
@@ -1252,17 +1056,16 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
 
     if (bestChildID >= 0) {
         /*
-           ---- [2026-09 新] 从**自己的搜索**学一次 (见 sacazagent.h 的 learnFromSearch) ----
-           位置刻意放在这里: 棋盘已经恢复成根局面 (上面第 5 步把试走的都回退了),
-           π 也已经在 nodes 里算好 —— 于是这一步不需要重新搜索, 代价只有"试走一手再退回"。
-           `piOut` 为空时也要自己算一份访问分布 (调用方不一定要 π)。
+           ---- [2026-09] 本类**没有**"从自己的搜索学一次"这条路径 ----
+           SACAZAgent 那一支在这里还会用刚算出来的 π_MCTS 做一次 learnBatch (2026-09
+           新加的 AlphaZero 在线监督信号, 由一个成员开关控制)。59e5233 **没有**这条路径:
+           它对弈时只在 rollout (`exploreAndTrain`) 里学, 而那批样本 hasSearch=false。
+           所以本类**连成员带函数**都没有 (那个开关、"把这一步存成样本"的函数都不存在)
+           —— 不是"默认关掉", 是没有任何开关能打开。因此 `selectMove` 在本类里是
+           **只读搜索**: 不训练、不往回放池写样本。
+           (这也是 ops 上的差别: 工具/界面的"每手损失曲线"在本类里只由 rollout 与
+           自对弈产生。)
         */
-        if (learnFromSearch) {
-            RL::Tensor piVisit(ACTION_DIM, 1);
-            visitDistribution(rootID, piVisit);
-            learnFromSearchStep(color, nodes[bestChildID].parentAction,
-                                nodes[bestChildID].step, piVisit);
-        }
         return nodes[bestChildID].step;
     }
     /*
@@ -1284,7 +1087,7 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
     return Step();
 }
 
-void SACAZAgent::resetMoeBatchStats()
+void SACAZLegacyAgent::resetMoeBatchStats()
 {
     if (auxLossCoef <= 0.0f) {
         return;
@@ -1308,7 +1111,7 @@ void SACAZAgent::resetMoeBatchStats()
 /* ============================================================
  *  learnBatch: 一次 mini-batch 的 SAC 更新 (critic / actor / α)
  * ============================================================ */
-float SACAZAgent::learnBatch(int batchSize_, int epochs)
+float SACAZLegacyAgent::learnBatch(int batchSize_, int epochs)
 {
     if (batchSize_ < 1 || (int)memories.size() < batchSize_) {
         return 0.0f;
@@ -1383,41 +1186,38 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
         */
         const float y = tr.reward - gamma * (tr.done ? 0.0f : 1.0f) * vNext;
         /*
-           ---- 值域约束 (2026-09) ----
-           真实 Q 必然落在 [-1.5, 1.5] 量级内: 即时奖励上界 0.35 (=REWARD_MATERIAL_COEF
-           x 一方满子), 终局 ±1。但软备份把 V 反复回代, 而优化器没有任何把 V 拉回该区间
-           的机制 => 实测发散 |Q| 0.063 -> 4.15 (40 局) -> 13.4 (150 局), 并把搜索的
-           PUCT 打坏 (对 MCTS 得分率 73.3% -> 32.5%, 见
-           docs/arena_sac_vs_ppo_report.md §5.2)。这里把目标夹住 = 把"这个游戏的 Q 值域"
-           写进学习目标; 只夹目标不夹奖励, 所以不改变各着法的排序, 只挡住发散。
+           ---- [2026-09] 目标**不夹**, 损失**纯 MSE** (59e5233 的口径) ----
+           SACAZAgent 那一支在这里还有一对"值域约束": 把 y 夹到 ±2, 以及把 |err|>δ 的
+           损失从平方改成线性 (Huber)。它们是 2026-09 为了压住实测到的 critic 发散
+           (|Q| 0.063 -> 4.15 (40 局) -> 13.4 (150 局), 见
+           docs/arena_sac_vs_ppo_report.md §5.2) 才加的, **59e5233 里没有**。
+           本类两个成员都**不存在** (也没有第二条代码路径), 所以:
+             * y 原样进目标 (发散是这一支的已知性质: 训练 20 局后 |Q| 均值 ~5.6,
+               这正是"没有东西在抑制 critic"的可观测证据);
+             * 损失是纯 MSE (`0.5·err²`), 梯度走 RL::Loss::MSE::df —— 两者逐位一致
+               (那个 helper 给的就是 MSE 梯度)。
+           用户口径: 这一支是"59e5233 行为还原版", 不许被后续的改进污染。要压发散请到
+           SACAZAgent 那一支开它的两个约束, 不要在这里加。
         */
-        const float yClamped = (clampTarget > 0.0f)
-                                   ? std::min(std::max(y, -clampTarget), clampTarget)
-                                   : y;
-        m_maxAbsTarget = std::max(m_maxAbsTarget, std::fabs((double)yClamped));
+        m_maxAbsTarget = std::max(m_maxAbsTarget, std::fabs((double)y));
 
         /* ---- 当前局面 ---- */
         policy(state, mask, pi);
         qValues(state, q1o, q2o);
 
-        /* critic 损失: 只对实际走的那一步回归 (SAC 的标准做法, 其余动作误差为 0)。
-           Huber: |err| <= delta 时与 MSE 完全一致, 超出后转线性 —— 单个离群样本不会
-           再把 32 条样本的批平均方向带跑。
-           为什么**不**用 RL::Loss::MSE::df: 那个 helper 只支持平方损失, 而这里要报的
-           是 Huber 的数值+MSE 的梯度 (RL::Loss::MSE::df 给的就是 MSE 梯度, 与 Huber
-           在 |err|<=delta 时逐位相同)。所以梯度仍走它, 数值改由上面算 —— 这条注释就是
-           为了防止后人"顺手统一口径"时把 Huber 改回纯 MSE。 */
-        const float err = q1o[tr.action] - yClamped;
+        /*
+           critic 损失: 只对实际走的那一步回归 (SAC 的标准做法, 其余动作误差为 0),
+           纯 MSE。
+        */
+        const float err = q1o[tr.action] - y;
         const double ae = std::fabs((double)err);
         m_maxAbsTdErr = std::max(m_maxAbsTdErr, ae);
-        lossSum += (float)((huberDelta > 0.0f && ae > (double)huberDelta)
-                               ? (double)huberDelta * (ae - 0.5 * (double)huberDelta)
-                               : 0.5 * ae * ae);
+        lossSum += (float)(0.5 * ae * ae);
 
         for (int ci = 0; ci < 2; ci++) {
             RL::Net &qnet = (ci == 0) ? q1 : q2;
             RL::Tensor target = (ci == 0) ? q1o : q2o;
-            target[tr.action] = yClamped;
+            target[tr.action] = y;
             qnet.backward(state, RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
         }
 
@@ -1457,27 +1257,24 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             }
         }
         const int lc0 = (tr.legalCount > 1) ? tr.legalCount : 2;
-        int lc = lc0;
-        if (entropySlotsAsLegal) {
-            /*
-               H̄ 的分母换成**合法槽位数** (见头文件): π 只分布在槽位上, 而 128 槽哈希有
-               碰撞 ⇒ H ≤ log(槽位数) < log(着法数); H̄ 按着法数算时可能永远达不到, 而
-               α 的梯度恰好是 (H − H̄) ⇒ α 被单向推走。
-            */
-            int sc = 0;
-            for (int i = 0; i < ACTION_DIM; i++) {
-                if (mask[i] > 0.5f) { sc++; }
-            }
-            lc = (sc > 1) ? sc : 2;
-        }
+        /*
+           ---- [2026-09] 目标熵的分母恒为**合法着法数** (59e5233 的口径) ----
+           SACAZAgent 那一支还可以把分母换成"合法槽位数" (用来量 128 槽哈希碰撞对 α 的
+           影响)。那是 2026-09 的实验开关, 59e5233 没有 —— 本类不含它, 所以这里只有一条
+           路径, 原式 `H̄ = entropyRatio · log(合法着法数)`。
+        */
+        const int lc = lc0;
         const float Hbar = entropyRatio * std::log((float)lc);
         alphaGrad += (H - Hbar);
         n++;
 
         /*
            ---- [2026-09 ①] 训练中的 critic/α 诊断 (只累加, 不进任何梯度/更新路径) ----
-           三个问题见 sacazagent.h 的 TrainDiag 说明。这里全部是**读**已经算好的量,
-           不改变任何前向/反向/随机流 ⇒ 默认口径下的数值与改动前逐位一致。
+           三个问题见 sacazlegacyagent.h 的 TrainDiag 说明。这里全部是**读**已经算好的量,
+           不改变任何前向/反向/随机流 ⇒ 数值与改动前逐位一致。
+           `D.clamped` (目标被值域约束夹住的条数) 在本类里**恒为 0**: 本类不夹目标。
+           需要那个读数请到 SACAZAgent 那一支去量 —— 字段保留是为了两边的日志口径能直接
+           对照。
         */
         {
             TrainDiag &D = trainDiag;
@@ -1486,7 +1283,6 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             D.yPreAbsSum += yAbs;
             D.yPreSum += (double)y;
             if (yAbs > D.yPreAbsMax) { D.yPreAbsMax = yAbs; }
-            if (clampTarget > 0.0f && yAbs > (double)clampTarget) { D.clamped++; }
 
             /* V(s') 的两项分解: E_π[min Q] 与熵项 α·H (y = r − γV) */
             double vQ = 0.0, vEnt = 0.0;
@@ -1579,16 +1375,19 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     alpha.clamp(0.02f, 0.02f, 5.0f);
 
     /*
-       ---- 目标网 Polyak 同步 ----
-       步长是 `targetTau` (见头文件的 [F1] 说明), **不再是硬编码 1e-3**: 那个值配上
-       "每 64 步一次"在"一次会话几千步"的尺度上等于不更新 (实测 20 局只移动 2~4%,
-       目标网一直停在随机初始化尺度 0.07~0.10), 于是自举项里没有任何游戏信息。
-       `targetTau >= 1` 时 softUpdateTo 等价于硬拷贝 (对照臂)。
+       ---- 目标网 Polyak 同步: 两个硬编码常数 (本类没有可调成员) ----
+       59e5233 的值: Polyak 步长 tau = POLYAK_TAU = 1e-3, 每 TARGET_SYNC_EVERY = 64 次
+       learn 同步一次 (一次会话 ~2600 步只把目标网挪动 2~4%, 所以 |Q_target| 一直停在
+       随机初始化尺度 0.07~0.10 —— 这是**还原对象的一部分**, 不是待修的缺陷)。
+       SACAZAgent 后来把这一对做成了两个可调成员 (F1 那一轮的实验), 本类刻意**不暴露**:
+       从外面没有任何办法把这一支调到"硬拷贝 / 每 256 步" —— 那正是 2026-09 事故的形状
+       (当时派生类没显式钉住这一对, 于是基类默认值一改, "行为还原版"跟着变了; 见
+        docs/sac_critic_diagnosis_2026_09.md §13.5)。
     */
     learnSteps++;
-    if (learnSteps % (replaceTargetIter > 0 ? replaceTargetIter : 1) == 0) {
-        q1.softUpdateTo(q1Target, targetTau);
-        q2.softUpdateTo(q2Target, targetTau);
+    if (learnSteps % TARGET_SYNC_EVERY == 0) {
+        q1.softUpdateTo(q1Target, POLYAK_TAU);
+        q2.softUpdateTo(q2Target, POLYAK_TAU);
     }
 
     /* ---- 回放缓冲上限 ---- */
@@ -1602,7 +1401,7 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
 /* ============================================================
  *  trainSelfPlay: 自对弈 (MCTS 访问分布做策略目标) + 回放训练
  * ============================================================ */
-void SACAZAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
+void SACAZLegacyAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
                                bool verbose, float tempRoot, float tempFinal,
                                int learnEveryMoves)
 {
@@ -1697,7 +1496,7 @@ void SACAZAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
     }
 }
 
-void SACAZAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
+void SACAZLegacyAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
 {
     /* 从当前局面继续 (不 reset) —— 调用方负责棋盘状态 */
     const int savedTurn = chess.sideToMove;
@@ -1713,7 +1512,7 @@ void SACAZAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
  *  这些样本的策略目标不是搜索出来的, 所以 hasSearch=false —— 只训练 critic 与
  *  SAC 的软 Q 项, 不用 AlphaZero 的监督项 (否则就是把策略往它自己身上拉)。
  * ============================================================ */
-bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
+bool SACAZLegacyAgent::exploreAndTrain(int color, int rolloutSteps)
 {
     if (rolloutSteps <= 0) {
         m_exploreInfo = "SAC+AZ: 探索步数为 0, 已跳过";
@@ -1791,7 +1590,7 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
 /* ============================================================
  *  存取: 一个路径前缀 -> 三个文件
  * ============================================================ */
-bool SACAZAgent::saveModel(const std::string &filepath)
+bool SACAZLegacyAgent::saveModel(const std::string &filepath)
 {
     actor.save(filepath + "_actor");
     q1.save(filepath + "_q1");
@@ -1801,7 +1600,7 @@ bool SACAZAgent::saveModel(const std::string &filepath)
            && weightFileWritten(filepath + "_q2");
 }
 
-bool SACAZAgent::loadModel(const std::string &filepath)
+bool SACAZLegacyAgent::loadModel(const std::string &filepath)
 {
     if (!weightFileReadable(filepath + "_actor")
         || !weightFileReadable(filepath + "_q1")
@@ -1819,7 +1618,7 @@ bool SACAZAgent::loadModel(const std::string &filepath)
     const int r1 = q1.load(filepath + "_q1");
     const int r2 = q2.load(filepath + "_q2");
     if (ra != 0 || r1 != 0 || r2 != 0) {
-        std::cerr << "[weights] SACAZAgent::loadModel 失败 (actor=" << ra
+        std::cerr << "[weights] SACAZLegacyAgent::loadModel 失败 (actor=" << ra
                   << ", q1=" << r1 << ", q2=" << r2 << "), 未同步目标网" << std::endl;
         return false;
     }
@@ -1831,7 +1630,7 @@ bool SACAZAgent::loadModel(const std::string &filepath)
 /* ============================================================
  *  AgentBase
  * ============================================================ */
-Step SACAZAgent::getBestMove(int color)
+Step SACAZLegacyAgent::getBestMove(int color)
 {
     return selectMove(color, simulations, 0.0f);
 }
@@ -1906,7 +1705,7 @@ namespace {
  *  这正是本仓库的惯例 —— 把"本该成立的不变量"变成可见的断言, 而不是删掉读数。
  *
  *  为什么是**自由函数**: 它只做统计, 不碰棋盘、不碰网络, 唯一要用的是
- *  `stepToActionIdx` 那一份公式 —— 签名只要 `const SACAZAgent &` + color 就够。
+ *  `stepToActionIdx` 那一份公式 —— 签名只要 `const SACAZLegacyAgent &` + color 就够。
  *  这样一来**面板数的一定是训练用的同一个公式** (DQNMCTS 那边只能把哈希再抄一份
  *  并靠注释提醒"改一处必须改两处"; 这里换成编译期耦合: 谁把那个 const 去掉, 这里
  *  当场编不过)。
@@ -1916,7 +1715,7 @@ namespace {
  *
  *  只读: 只看传进来的走法列表 (调用方负责 `Steps::instance().put()` 归还)。
  */
-void aliasOfPosition(const SACAZAgent &ag, const std::vector<Step *> &legal, int color,
+void aliasOfPosition(const SACAZLegacyAgent &ag, const std::vector<Step *> &legal, int color,
                      int &legalCount, int &slotCount, int &worstSlot)
 {
     std::map<int, std::set<long long> > bucket;
@@ -1940,21 +1739,36 @@ void aliasOfPosition(const SACAZAgent &ag, const std::vector<Step *> &legal, int
 
 } // namespace
 
-std::string SACAZAgent::selfCheckReport() const
+std::string SACAZLegacyAgent::selfCheckReport() const
 {
     char buf[512];
     std::string out;
 
-    /* ---- 0. 本实例是**哪一支** ----
-       必须放在最前面: 这个类现在有两个身份来源 ——
-         * 骨干 (AGENT_SACAZ 与 AGENT_SACAZ_MOE 是同一个类、不同 backbone);
-         * [2026-09 之后这里**只剩骨干**: AGENT_SACAZ_OLD 是**独立的类**
-           SACAZLegacyAgent, 不再是本类的派生类, 也不走这个函数]。
-       两块面板的读数差别很大, 没有这几行就会张冠李戴 (本文件顶部那条"一个类背着
-       两个界面 agent 类型"的教训就是这个坑的第一次)。 */
+    /*
+       ---- 0. 本实例是**哪一支** (必须放最前面) ----
+       本类只服务一个界面类型 (AGENT_SACAZ_OLD), 而它与 AGENT_SACAZ / AGENT_SACAZ_MOE
+       在面板上的读数长得很像 (同一骨干、同一表示、参数量相同) —— 不把身份写在第一行,
+       读者会把两个类的读数记到同一本账上。
+       第二段是**本类最要紧的一句**: 它的口径全部硬编码, 而且**刻意保留**了 59e5233 的
+       两个"看着像坏掉"的读数 (目标网移动率只有 2~4%、|Q| 会漂到 5.6)。不写出来,
+       看面板的人第一反应会是"这个模型坏了", 然后去"修"它 —— 那正是这一支最不希望
+       发生的改动。
+    */
     std::snprintf(buf, sizeof(buf),
                   "界面 agent 类型 %s | 骨干 %s\n", guiAgentLabel(), backboneName(backbone));
     out += buf;
+    out += "【59e5233 行为还原版 = 独立类 SACAZLegacyAgent】与 SACAZAgent 是**两份独立实现**"
+           "(不继承), 所以那边的默认值/行为改动渗不进这里 (文件末尾有 static_assert 钉住);\n";
+    out += "  本类口径全部硬编码: 即时奖励=材质x0.1+每步代价 (无塑形) / 终局=引擎真值 ±1/0"
+           " (无塑形) / critic 目标不夹 + 纯 MSE / 叶子估值=全量 / 不从自己的搜索学 /\n";
+    out += "  目标网 tau=1e-3 每 64 次 learn (编译期常数) —— 于是下面两条\"看起来像缺陷\"的读数"
+           "是本类**刻意保留**的还原对象: 目标网移动率 ~4%、|Q| 会漂到 5.6;\n";
+    out += "  网络结构与 59e5233 逐字相同 (隐层激活 Layer<Tanh>, 没有开关);"
+           " \"用 TanhNorm<Linear> r=1 复现那一层\"已实测证伪 (偏置在 tanh 外, max|dQ| = 8.9e-06);\n";
+    out += "  权重文件独立: " + std::string(SACAZLegacyAgent::defaultWeightPrefix())
+           + "_actor / _q1 / _q2 (与 AGENT_SACAZ 的 weights/sacaz_agent 不共用,"
+             " 否则两边会互相覆盖/串权重)\n";
+    out += "--------------------------------------------------------------\n";
     /*
        隐层激活报**实测值** (读 actor 第 2 层的类型), 不是回显开关 —— 理由见
        hiddenActivationName() 的注释 (开关曾因"建网之后才赋值"而静默失效)。
@@ -2081,20 +1895,23 @@ std::string SACAZAgent::selfCheckReport() const
 
     /* ---- 3. 算法 / 口径 ---- */
     /*
-       [F1] 这里**必须打印实际生效的 tau**, 而不是写死 "tau=1e-3":
-       本轮的教训是"回显开关的检查永远通过" —— 自检面板写死一个常数时, 就算代码里的
-       默认值已经改掉, 面板也照样显示旧值 (而它会被人当成"实际口径")。
-       后面那行把"一次会话 (~2600 次 learn) 能移动多少"直接算出来: 低于 50% 就等于
-       自举项里没有游戏信息 (实测老口径只有 2~4%)。
+       [F1] 这里打印的是**两个编译期常数** (POLYAK_TAU / TARGET_SYNC_EVERY), 不是回显
+       某个开关: 本类没有"可调的目标网同步率"成员 (那是 SACAZAgent 那一支的实验旋钮),
+       所以"面板显示的值"与"实际生效的值"在结构上就不可能不一致 —— 这直接堵住了
+       2026-09 那次事故的形状 (回显开关的检查永远通过)。
+       后面那行把"一次会话 (~2600 次 learn) 能移动多少"算出来: 低于 50% 就等于自举项里
+       没有游戏信息 —— 老口径 (本类) 只有 2~4%, 而 |Q_target| ≈ 0.08 就是它的读数。
+       这不是缺陷, 是**还原对象的一部分**。
     */
     const double kSessionLearnSteps = 2600.0;   /* 20 局 x ~130 步的典型 learn 次数 */
-    const double kIter = (double)(replaceTargetIter > 0 ? replaceTargetIter : 1);
-    const double perIter = 1.0 - std::pow(1.0 - (double)targetTau, 1.0 / kIter);
+    const double kIter = (double)TARGET_SYNC_EVERY;
+    const double perIter = 1.0 - std::pow(1.0 - (double)POLYAK_TAU, 1.0 / kIter);
     const double moved = 1.0 - std::pow(1.0 - perIter, kSessionLearnSteps);
     std::snprintf(buf, sizeof(buf),
                   "双 critic q1/q2 + 目标网 q1Target/q2Target | 每 %d 次 learn 做一次 Polyak"
-                  " 同步 (tau=%.4f) | 叶子价值 = min_i Q_i - alpha*log pi (最大熵软价值)\n",
-                  replaceTargetIter, (double)targetTau);
+                  " 同步 (tau=%.4f, **硬编码常数** 59e5233 口径) |"
+                  " 叶子价值 = min_i Q_i - alpha*log pi (最大熵软价值)\n",
+                  (int)TARGET_SYNC_EVERY, (double)POLYAK_TAU);
     out += buf;
     std::snprintf(buf, sizeof(buf),
                   "目标网移动率: 2600 次 learn (~20 局) 后相对随机初始化 %.1f%% %s\n",
@@ -2109,21 +1926,20 @@ std::string SACAZAgent::selfCheckReport() const
                   (double)c_puct, simulations, (double)gamma);
     out += buf;
     /*
-       **口径行的价值**: AGENT_SACAZ 与 AGENT_SACAZ_OLD 用的是同一份算法, 差别只剩
-       下面这一行的几个数 (再加大括号里的激活)。不印出来, "两个 SAC 谁强"就没法归因。
-       `clampTarget/huberDelta <= 0` = 不夹目标 / 纯 MSE (59e5233 没有这两条约束)。
+       **口径行的价值**: AGENT_SACAZ 与 AGENT_SACAZ_OLD 是**两个没有继承关系的类**
+       (见头文件), 差别就是下面这一行。不印出来, "两个 SAC 谁强"就没法归因。
+       本类的这一行全部是**常数**: 没有值域约束、没有塑形、没有稀疏头、不从搜索学。
     */
     std::snprintf(buf, sizeof(buf),
-                  "口径: clampTarget=%s | huberDelta=%s | 叶子估值=%s | rewardScale=%.2f |"
-                  " valueScale=%.2f | 动作空间=%s\n",
-                  clampTarget > 0.0f ? std::to_string(clampTarget).c_str() : "关(不夹)",
-                  huberDelta > 0.0f ? std::to_string(huberDelta).c_str() : "关(纯 MSE)",
-                  sparseLeafEval ? "稀疏头(只算合法列)" : "全量(与 59e5233 相同)",
-                  (double)rewardScale, (double)valueScale,
+                  "口径(全是硬编码, 本类没有对应成员): critic 目标**不夹** + 纯 MSE |"
+                  " 叶子估值=全量(每片叶子算全量 Q) | 即时奖励=材质x0.1+每步代价 (无塑形) |"
+                  " 终局=引擎真值 ±1/0 (无塑形) | 不从自己的搜索学 | 动作空间=%s\n",
                   legacyHashAction ? "对齐双射 8100" : "128 槽哈希");
     out += buf;
-    out += "  这两行就是 AGENT_SACAZ 与 AGENT_SACAZ_OLD 的全部差异 (再加隐层激活);"
-           " 两边都保留是为了能在界面上直接对弈比较, 而不是靠两份会漂移的实现\n";
+    out += "  本类刻意不含奖励塑形、不含任何 critic 值域约束 (目标钳位 / Huber 分段 /"
+           " 搜索叶子缩放 / 熵项开关也都没有) —— 59e5233 就是这样; 加了就说明被污染了\n";
+    out += "  与 AGENT_SACAZ 的关系是**两份独立实现**(不继承): 那边的任何默认值/行为改动"
+           "都渗不进来, 代价是共享算法上的修复要**刻意**决定要不要同步过来\n";
     std::snprintf(buf, sizeof(buf),
                   " (-log pi >= 0), 所以 alpha 越大, 选择多的局面估值越高\n",
                   (double)learningRateActor, (double)learningRateCritic,

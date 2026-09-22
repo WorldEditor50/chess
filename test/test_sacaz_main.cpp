@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <type_traits>   /* [14] 节的"成员探测"探针 (std::void_t / std::false_type) */
 #include "chess.h"
 #include "chessstate.h"
 #include "sacazagent.h"
@@ -42,6 +43,37 @@ static int g_failed = 0;
             std::printf("  [FAIL] %s\n", (msg));                     \
         }                                                            \
     } while (0)
+
+/*
+ * ============================================================
+ *  ---- 编译期探测: "某类型有没有某个名字的成员" ----
+ * ============================================================
+ * 为什么要它 (2026-09 独立类拆分): 59e5233 还原版**故意不带**那一批开关 ——
+ * 奖励塑形 / critic 值域约束 / 熵项开关 / 稀疏叶子 / 从自己的搜索学一次 / 可调的目标网
+ * 同步率。在它还是 SACAZAgent 的派生类时, 这些成员**存在但取固定值**, 断言写的是
+ * "值等于多少"; 现在它是不继承的独立类, 这些名字**连声明都没有** —— 于是断言只能写成
+ * "这个名字探测不到", 否则"删掉开关"这件事在测试里就**不可查**了。
+ *
+ * SFINAE: 名字不存在时替换失败 ⇒ false_type (不是编译错误)。
+ * 每个探针都配一条 `Has_xxx<SACAZAgent>` 的**对照组**断言 (必须为真): 没有对照组的话,
+ * 一个写坏的探针会对所有类型都说"没有", 那正是"看起来通过的假测试"。
+ */
+#define DSH_DETECT_MEMBER(Name)                                                 \
+    template <class T, class = void> struct Has_##Name : std::false_type {};    \
+    template <class T> struct Has_##Name<T, std::void_t<decltype(&T::Name)>>    \
+        : std::true_type {}
+
+DSH_DETECT_MEMBER(rewardShape);
+DSH_DETECT_MEMBER(rewardScale);
+DSH_DETECT_MEMBER(clampTarget);
+DSH_DETECT_MEMBER(huberDelta);
+DSH_DETECT_MEMBER(valueScale);
+DSH_DETECT_MEMBER(entropyInTarget);
+DSH_DETECT_MEMBER(entropySlotsAsLegal);
+DSH_DETECT_MEMBER(targetTau);
+DSH_DETECT_MEMBER(replaceTargetIter);
+DSH_DETECT_MEMBER(sparseLeafEval);
+DSH_DETECT_MEMBER(learnFromSearch);
 
 /* 棋盘摘要: 用来判断"探索前后棋盘是否完全一致" */
 static std::string digest(Chess &c)
@@ -1565,20 +1597,25 @@ static void testTbExpertAgent()
 }
 
 /* ============================================================
- *  14. AGENT_SACAZ_OLD: 59e5233 行为还原版 (派生类 SACAZLegacyAgent)
+ *  14. AGENT_SACAZ_OLD: 59e5233 行为还原版 (**独立的类** SACAZLegacyAgent)
  *
  *  用户在界面上要能"当前口径 vs 59e5233 口径"直接对弈, 所以这是一支**独立的 C++ 类**
- *  (src/sacazlegacyagent.h), 不是同一个类里再来一个运行时开关。
+ *  (src/sacazlegacyagent.h/.cpp), 不是同一个类里再来一个运行时开关, 也**不再是**
+ *  SACAZAgent 的派生类 (2026-09 用户口径: "让 SACAZLegacyAgent 成为一个不继承
+ *  SACAZAgent 的独立类, 这样 SACAZAgent 以后任何默认值或实现上的改动都不可能渗进
+ *  59e5233 还原版")。
  *
- *  本节断言两件事, 都是**机器可查**的, 不靠注释:
- *   (a) **口径钉住了**: 那 5 项差异 (熵比 / alpha 学习率 / clampTarget / huberDelta /
- *       sparseLeafEval) 与"当前"那一支逐项不同且等于 59e5233 的值; 权重前缀也不同
- *       (用户口径: 新旧权重文件必须用不同名字);
- *   (b) **网络逐位相同**: 把网络 copyTo 成同一份权重、喂同一个局面之后, 派生类的策略
- *       与双 Q 输出必须与基类**逐位相同** (两个骨干都查)。
+ *  本节断言三件事, 都是**机器可查**的, 不靠注释:
+ *   (a) **不继承**: 它是独立类 (头文件里另有一条 static_assert 把这句话变成编译错误,
+ *       这里再用 std::is_base_of 钉一遍, 免得那一条被顺手删掉);
+ *   (b) **那一批开关连名字都没有**: 奖励塑形 / critic 值域约束 / 熵项开关 / 稀疏叶子 /
+ *       从自己的搜索学一次 / 可调的目标网同步率 —— 用 SFINAE 探针逐个检查"探测不到",
+ *       并用 SACAZAgent 做**对照组** (探针必须在那边探得到, 否则它对谁都说"没有");
+ *   (c) **网络逐位相同**: 把网络 copyTo 成同一份权重、喂同一个局面之后, 独立类的策略与
+ *       双 Q 输出必须与 SACAZAgent **逐位相同** (两个骨干都查)。
  *
- *  (b) 不是走过场, 它有两个真实作用:
- *   1. 它是"派生类没有偷偷改网络"的护栏 —— 本类唯一该改的是那 5 个口径值;
+ *  (c) 不是走过场, 它有两个真实作用:
+ *   1. 它是"把实现拷成独立类时没有偷偷改网络"的护栏 —— 该与 59e5233 不同的只有口径值;
  *   2. 它顺手记录了一条**被证伪**的等价写法: 曾经用 `TanhNorm<Linear>` 且 r=1 去
  *      "复现" 59e5233 的那层激活, 这个测试在稀疏 MoE 骨干上量到 max|Δπ| = 1.8e-07、
  *      **max|ΔQ| = 8.9e-06** —— 因为 TanhNorm 把偏置加在 tanh **外面**
@@ -1589,22 +1626,80 @@ static void testTbExpertAgent()
  * ============================================================ */
 static void testLegacyAgentClass()
 {
-    std::printf("\n[14] AGENT_SACAZ_OLD: 59e5233 行为还原版 (派生类)\n");
+    std::printf("\n[14] AGENT_SACAZ_OLD: 59e5233 行为还原版 (**独立类**, 不继承)\n");
 
-    struct Case { SACAZAgent::Backbone b; const char *name; };
+    /* ---- (a) 不继承, 但仍是 AgentBase ----
+       注意 CHECK 是宏, 而 `std::is_base_of<A, B>` 里的逗号会被预处理器当成**参数分隔**,
+       所以这两个条件必须**多加一层括号** (这不是风格问题, 少一层就是编译错误)。 */
+    CHECK((!std::is_base_of<SACAZAgent, SACAZLegacyAgent>::value),
+          "SACAZLegacyAgent **不是** SACAZAgent 的派生类 (独立实现: 基类的默认值改动渗不进来)");
+    CHECK((std::is_base_of<AgentBase, SACAZLegacyAgent>::value),
+          "它仍然是 AgentBase (界面/工具把它当普通 agent 用: preTrainThenDecide(AgentBase*))");
+
+    /* ---- (b) 那一批开关在还原版上**连名字都没有** ---- */
+    /*
+       对照组先来: 这些名字在"当前口径"那一支上必须**探得到**。没有这三条, 一个写坏的
+       探针 (永远返回 false_type) 会让下面 11 条"没有"全部通过。
+    */
+    CHECK(Has_rewardShape<SACAZAgent>::value && Has_clampTarget<SACAZAgent>::value
+              && Has_learnFromSearch<SACAZAgent>::value
+              && Has_targetTau<SACAZAgent>::value,
+          "[对照] 探针能在 SACAZAgent 上探到 rewardShape / clampTarget / learnFromSearch / targetTau");
+    /* 奖励塑形: 连名字都没有 */
+    CHECK(!Has_rewardShape<SACAZLegacyAgent>::value,
+          "还原版**没有** rewardShape (本类不含奖励塑形)");
+    CHECK(!Has_rewardScale<SACAZLegacyAgent>::value,
+          "还原版**没有** rewardScale (即时奖励不缩放)");
+    /* critic 值域抑制: 连名字都没有 */
+    CHECK(!Has_clampTarget<SACAZLegacyAgent>::value,
+          "还原版**没有** clampTarget (critic 目标不夹)");
+    CHECK(!Has_huberDelta<SACAZLegacyAgent>::value,
+          "还原版**没有** huberDelta (纯 MSE, 没有 Huber 分支)");
+    CHECK(!Has_valueScale<SACAZLegacyAgent>::value,
+          "还原版**没有** valueScale (搜索叶子值不缩放)");
+    CHECK(!Has_entropyInTarget<SACAZLegacyAgent>::value,
+          "还原版**没有** entropyInTarget (熵项恒进软价值, 不可关)");
+    CHECK(!Has_entropySlotsAsLegal<SACAZLegacyAgent>::value,
+          "还原版**没有** entropySlotsAsLegal (目标熵分母恒为合法着法数)");
+    /* 目标网同步率: 编译期常数, 没有可覆盖的成员 */
+    CHECK(!Has_targetTau<SACAZLegacyAgent>::value
+              && !Has_replaceTargetIter<SACAZLegacyAgent>::value,
+          "还原版**没有**可调的 targetTau / replaceTargetIter (硬编码常数)");
+    CHECK(SACAZLegacyAgent::POLYAK_TAU == 1e-3f
+              && SACAZLegacyAgent::TARGET_SYNC_EVERY == 64,
+          "目标网同步率是**编译期常数** tau=1e-3 每 64 步 (59e5233 的口径)");
+    /* 搜索期求值口径 */
+    CHECK(!Has_sparseLeafEval<SACAZLegacyAgent>::value,
+          "还原版**没有** sparseLeafEval (叶子估值恒为全量)");
+    CHECK(!Has_learnFromSearch<SACAZLegacyAgent>::value,
+          "还原版**没有** learnFromSearch (不从自己的搜索学一次: 59e5233 没有这条路径)");
+    /* 剩下两个"该有的"口径值 (它们是成员, 但默认值被钉在 59e5233 上) */
+    CHECK(SACAZLegacyAgent::LEGACY_ENTROPY_RATIO == 0.98f
+              && SACAZLegacyAgent::LEGACY_ALPHA_LR == 1e-3f,
+          "目标熵 0.98 / alpha 学习率 1e-3 (59e5233 的值)");
+
+    struct Case { const char *name; int backbone; };   /* 0 = Mlp, 1 = SparseMoeMlp */
     const Case cases[] = {
         /* Mlp: 界面上的两个 SAC 用的骨干 */
-        { SACAZAgent::Backbone::Mlp,          "mlp" },
+        { "mlp", 0 },
         /* moe-mlp: 曾经被 TanhNorm 换掉的那条隐层路径 (回归的发生地) */
-        { SACAZAgent::Backbone::SparseMoeMlp, "moe-mlp" }
+        { "moe-mlp", 1 }
     };
 
     for (const Case &cs : cases) {
         Chess c;
         c.reset();
+        /*
+           两个类**各自的** Backbone 是**不同的枚举类型** (互不能赋值) —— 这是拆分的直接
+           后果, 所以这里各取一次; 枚举项与 59e5233 逐字相同 (同一骨干、同一表示)。
+        */
+        const SACAZAgent::Backbone curB = (cs.backbone == 0)
+            ? SACAZAgent::Backbone::Mlp : SACAZAgent::Backbone::SparseMoeMlp;
+        const SACAZLegacyAgent::Backbone oldB = (cs.backbone == 0)
+            ? SACAZLegacyAgent::Backbone::Mlp : SACAZLegacyAgent::Backbone::SparseMoeMlp;
         /* 小隐层: 这一节只比"同权重同局面的输出", 与容量无关 */
-        SACAZAgent cur(c, 32, 0.99f, 0.001f, 1.5f, cs.b, 64, 0.01f);
-        SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f, cs.b, 64, 0.01f);
+        SACAZAgent cur(c, 32, 0.99f, 0.001f, 1.5f, curB, 64, 0.01f);
+        SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f, oldB, 64, 0.01f);
 
         std::printf("  骨干 %s: 隐层激活 当前='%s' / 59e5233='%s'\n", cs.name,
                     cur.hiddenActivationName(), old.hiddenActivationName());
@@ -1614,7 +1709,7 @@ static void testLegacyAgentClass()
                   != std::string::npos
                   && std::string(old.hiddenActivationName()).find("Layer<Tanh>")
                          != std::string::npos,
-              "两支的隐层激活都是 Layer<Tanh> (= 59e5233 那一层, 由代码本身保证)");
+              "两支的隐层激活都是 Layer<Tanh> (= 59e5233 那一层, 由**同一行代码**保证)");
         /*
            α 口径 (目标熵 / alpha 学习率) 现在是**相同**的: 2026-09 的受控实验把当前实现
            改回了 59e5233 的值 (0.5/5e-3 -> 0.98/1e-3, 对 MCTS 37.5% -> 82.5%,
@@ -1627,28 +1722,22 @@ static void testLegacyAgentClass()
         CHECK(cur.learningRateAlpha == old.learningRateAlpha
                   && cur.learningRateAlpha == SACAZLegacyAgent::LEGACY_ALPHA_LR,
               "alpha 学习率: 两支都是 1e-3 (同上)");
-        CHECK(old.clampTarget <= 0.0f && old.huberDelta <= 0.0f,
-              "critic 无值域约束 (59e5233 没有 clampTarget / huberDelta)");
-        CHECK(cur.clampTarget > 0.0f && cur.huberDelta > 0.0f,
-              "当前口径**有**值域约束 (两边不是同一个配置, 否则这一支没有意义)");
-        CHECK(!old.sparseLeafEval, "叶子估值走全量 (与 59e5233 相同)");
-        CHECK(cur.sparseLeafEval, "当前口径走稀疏头 (两边不同)");
-        CHECK(!old.learnFromSearch && cur.learnFromSearch,
-              "从自己的搜索学一次: 只有当前口径有 (59e5233 没有这条路径)");
         /*
-           [2026-09 修正] 目标网同步率必须也被钉住。
-           事故现场: F1 那一轮把**基类默认**改成"硬拷贝 / 每 256 步", 而 SACAZLegacyAgent
-           当时没有显式写这两个成员 ⇒ "59e5233 行为还原版"跟着一起变了 (它的全部意义
-           就是行为还原)。这条断言读的是**对象里实际生效的值**, 所以以后任何"改基类默认"
-           的改动只要渗进还原版, 这里当场变红 —— 而不是靠人去记得改两处。
+           奖励口径: "没有塑形"这件事现在是**行为**可查的 —— 终局值必须与引擎真值
+           (outcomeForMover) **逐位相同**, 而不是"某个开关取 0"。当前口径那一支反过来
+           有这个开关 (上面的探针已经钉住了名字存在), 所以两支不是同一个配置。
         */
-        CHECK(old.targetTau == SACAZLegacyAgent::LEGACY_TARGET_TAU
-                  && old.replaceTargetIter == SACAZLegacyAgent::LEGACY_TARGET_ITER,
-              "59e5233 的目标网同步率被显式钉住 (tau=1e-3 / 每 64 步; 基类默认渗不进来)");
+        CHECK(old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == 1.0f
+                  && old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK) == -1.0f
+                  && old.terminalReward(Chess::RESULT_DRAW, Stone::COLOR_RED) == 0.0f,
+              "终局值 = 引擎真值 ±1/0 (本类不含奖励塑形/放大, 连开关都没有)");
+        CHECK(old.rewardCaliperName() == std::string("学习口径") && old.hasLearningReward(),
+              "奖励曲线的口径来自本 agent 自己的出口 (学习口径, 与它学的是同一个游戏)");
         /*
            当前实现这一支: 默认值 = 61a974d 的口径 (F1 的实测最好档 p = 0.43 不显著 ⇒
            不作为默认; 要开就传 --target-tau/--target-iter)。这里把"默认值是什么"钉住,
            免得它被下一次实验顺手改掉 (默认值也是结论)。
+           **注意**: 还原版连这两个成员都没有, 它的同步率是编译期常数 (上面已断言)。
         */
         CHECK(cur.targetTau == 1e-3f && cur.replaceTargetIter == 64,
               "当前实现的默认目标网同步率 = 61a974d 口径 (tau=1e-3 / 每 64 步)");
@@ -1656,7 +1745,7 @@ static void testLegacyAgentClass()
                   != std::string(SACAZAgent::defaultWeightPrefix()),
               "**权重前缀不同** (用户口径: 新旧 SAC 的权重文件必须用不同名字)");
         CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix()).find("sacaz_old") != std::string::npos,
-              "派生类前缀是 weights/sacaz_old_agent*");
+              "还原版前缀是 weights/sacaz_old_agent*");
         CHECK(std::string(old.guiAgentLabel()).find("59e5233") != std::string::npos,
               "自检面板能认出这是哪一支 (标签里有 59e5233)");
         {
@@ -1700,7 +1789,7 @@ static void testLegacyAgentClass()
         }
         std::printf("       同权重同局面: max|Δπ| = %.3g, max|ΔQ| = %.3g\n", dPi, dQ);
         CHECK(dPi == 0.0,
-              "策略输出**逐位相同** (派生类没有改网络, 只改了训练/搜索口径)");
+              "策略输出**逐位相同** (独立类没有改网络, 只改了训练/搜索口径)");
         CHECK(dQ == 0.0, "双 Q 输出**逐位相同**");
     }
 }
@@ -1834,7 +1923,10 @@ static void testRewardShaping()
  *   (1) 不调 exploreAndTrain, 只反复 selectMove -> learnSteps 前进、损失是有限值;
  *   (2) 池里那条样本 **hasSearch=true** 且 π 归一 (否则"从搜索学"名不副实);
  *   (3) **棋盘逐位不变** (学习路径只许试走/回退, 绝不能改动真棋局);
- *   (4) learnFromSearch=false (派生类 59e5233 就是这个口径) -> 一步都不学。
+ *   (4) 还原版 (SACAZLegacyAgent) **根本没有这条路径** -> 一步都不学。
+ *       [2026-09 独立类] 这里不再写 `!old.learnFromSearch` (那个成员在独立类里**不存在**,
+ *       见 [14] 节的探针), 改成**行为**断言: 反复 selectMove 之后 learnSteps 不动、
+ *       回放池里不添样本。这比读开关更强 —— 它拦的是"实现里偷偷学了一次"。
  * ============================================================ */
 static void testLearnFromSearch()
 {
@@ -1902,13 +1994,23 @@ static void testLearnFromSearch()
         CHECK(agent.getMemorySize() == 0, "也不往池里存样本 (完全等于改动前的行为)");
     }
 
-    /* ---- 派生类 (59e5233 口径) 必须钉成关 ---- */
+    /* ---- 还原版 (59e5233 口径) 必须一条样本都不学 ---- */
     {
         Chess c;
         c.reset();
         SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f);
-        CHECK(!old.learnFromSearch,
-              "SACAZLegacyAgent 固定 learnFromSearch=false (59e5233 没有这条路径)");
+        /* 它连这个开关都没有 (见 [14] 节的探针), 所以只能从**行为**上钉: 一步都不学 */
+        CHECK(!Has_learnFromSearch<SACAZLegacyAgent>::value,
+              "SACAZLegacyAgent 没有 learnFromSearch 成员 (59e5233 没有这条路径)");
+        const int steps0 = old.getLearnSteps();
+        for (int i = 0; i < 3; i++) {
+            const Step s = old.selectMove(Stone::COLOR_RED, 8, 0.0f);
+            CHECK(s.valid, "还原版的 selectMove 是**只读搜索** (返回合法走法, 不学习)");
+        }
+        std::printf("  还原版: 3 次 selectMove -> learnSteps %d -> %d, 池 %zu\n",
+                    steps0, old.getLearnSteps(), old.getMemorySize());
+        CHECK(old.getLearnSteps() == steps0, "还原版 selectMove 不产生任何更新");
+        CHECK(old.getMemorySize() == 0, "也不往池里存样本 (只读搜索, 改动前的行为)");
     }
 }
 

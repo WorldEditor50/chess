@@ -1,6 +1,6 @@
 #include "chessboard.h"
 #include "rl/cpuinfo.hpp"
-/* AGENT_SACAZ_OLD 用的是这个**派生类** (不是 SACAZAgent + 开关), 见它的头注释 */
+/* AGENT_SACAZ_OLD 用的是这个**独立类** (不是 SACAZAgent + 开关, 也不是它的派生类), 见头注释 */
 #include "sacazlegacyagent.h"
 #include <QDebug>
 #include <QDir>
@@ -32,7 +32,7 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
     case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
     case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
-    /* 59e5233 行为还原版 (派生类 SACAZLegacyAgent) */
+    /* 59e5233 行为还原版 (独立类 SACAZLegacyAgent) */
     case ChessBoard::AGENT_SACAZ_OLD: return QStringLiteral("SAC+AZ-59e5233");
     case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
     case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
@@ -273,7 +273,7 @@ static const char *TMP_WEIGHTS_PPOMCTS_MLP = "weights/_temp_train_ppomcts_mlp";
 static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
 static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe";
 /*
-   行为还原版 SAC (AGENT_SACAZ_OLD = 派生类 SACAZLegacyAgent) 的临时前缀。
+   行为还原版 SAC (AGENT_SACAZ_OLD = 独立类 SACAZLegacyAgent) 的临时前缀。
    **必须有独立前缀**: 与 AGENT_SACAZ 共用会让两个 agent 的后台训练互相覆盖权重
    (两者的训练口径不同, 覆盖之后是"棋力对不上训练量"这种没法归因的现象)。
 */
@@ -295,19 +295,27 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
 
 /*
  * ================================================================
- *  createSACAZAgent —— SAC 三支的**唯一**构造点
+ *  createSACAZAgent / createSACAZLegacyAgent —— SAC 三支的**唯一**构造点
  * ================================================================
- * 为什么必须只有一处: 三支的**参数结构完全相同** (同一个类族, 都是 iFcLayer 的 w/b),
+ * 为什么必须只有一处: 三支的**参数结构完全相同** (都是 iFcLayer 的 w/b),
  * 所以"构造错了哪一支 / 少传了哪个参数"不会让 save/load 失败 —— 它会**静默地**按另一套
  * 口径跑 (AGENT_SACAZ_MOE 少传 backbone 就是 TB->MLP 的静默换骨干;
- * AGENT_SACAZ_OLD 建成基类就是静默换成当前口径, 两者连参数量都一样)。
+ * AGENT_SACAZ_OLD 建成当前口径那一支, 两者连参数量都一样)。
  * 本文件已经因为"三处各写一遍构造参数"栽过一次 (见 weightFilesOf 的注释), 所以:
  *   * 决策路径 (aiThinkRaw / aiThinkForAgentRaw)、启动预加载、后台训练的兜底建网、
  *     以及每轮的训练 clone, 全部走这两个函数;
- *   * AGENT_SACAZ_OLD 构造的是**派生类** SACAZLegacyAgent (口径写在那边的构造函数里),
+ *   * AGENT_SACAZ_OLD 构造的是**独立类** SACAZLegacyAgent (口径硬编码在那边的构造函数里),
  *     界面这一层不手抄它的口径值。
  *
- * 返回 nullptr = 这个 agent 类型不是 SAC 家族 (调用方不该走到这里)。
+ * ---- [2026-09 拆分] 为什么是**两个**函数而不是一个 ----
+ * 还原版与当前口径现在**没有任何继承关系** (用户口径: "用不同的 C++ 类把新旧 SAC agent
+ * 区分开", 见 sacazlegacyagent.h 的头注释), 于是两者的指针类型互不兼容 ——
+ * 一个返回 `SACAZAgent *` 的函数**装不下** SACAZLegacyAgent。这正是要的效果:
+ * 谁想让两支共用一条构造路径, 编译器当场拦下来, 不用靠注释提醒。
+ * 反过来, 也**不许**用 reinterpret_cast / static_cast 或"改回继承"来消除这个错误 ——
+ * 那会静默地把还原版变回当前口径 (两者的权重结构相同, save/load 不会报错)。
+ *
+ * 返回 nullptr = 这个 agent 类型不是**本函数负责的那一支** (调用方不该走到这里)。
  */
 static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
 {
@@ -329,12 +337,28 @@ static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
         a->learnFromSearch = false;
         return a;
     }
-    case ChessBoard::AGENT_SACAZ_OLD:
-        /* 59e5233 行为还原版: 派生类, 口径固定在它自己的构造函数里 (learnFromSearch=false) */
-        return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
     default:
         return nullptr;
     }
+}
+
+/*
+ * createSACAZLegacyAgent —— AGENT_SACAZ_OLD (59e5233 行为还原版) 的**唯一**构造点。
+ *
+ * 为什么单独一个函数: 见上面那段 (两个类互不兼容, 不能合用一个返回类型)。
+ * 这里只给**形状参数** —— hidden 64 / gamma 0.99 / lr 0.001 / cpuct 1.5 / MLP 骨干,
+ * 与 AGENT_SACAZ 逐字相同, 于是两者是"同一骨干、同一表示", 界面上的差别只剩**训练口径**;
+ * 而口径 (目标熵 0.98 / alpha 学习率 1e-3 / critic 目标不夹 + 纯 MSE / 叶子全量估值 /
+ * 目标网 tau=1e-3 每 64 步 / 没有"从自己的搜索学一次") 全部硬编码在
+ * SACAZLegacyAgent 自己的构造函数与实现里, 界面这一层一个字都不手抄。
+ * 本类**没有**任何奖励塑形开关, 所以这里也没有可传的口径参数。
+ */
+static SACAZLegacyAgent *createSACAZLegacyAgent(Chess &board, ChessBoard::AgentType type)
+{
+    if (type != ChessBoard::AGENT_SACAZ_OLD) {
+        return nullptr;      /* 不是这一支 (调用方不该走到这里) */
+    }
+    return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
 }
 
 /* 这个 agent 类型的后台训练每步给多少模拟次数 (见 BG_TRAIN_SACAZ* 的注释) */
@@ -351,8 +375,15 @@ static int sacazTrainSims(ChessBoard::AgentType type)
  * 三支的这份往返**逐字相同** (只有模拟次数不同), 所以写成一处; 返回 false = 本轮不能
  * 同步回主 agent (载入或写回失败)。诊断里带上 agent 名字: 三支共用前缀会让日志里的
  * "SAC 载入失败"分不清是哪一支。
+ *
+ * [2026-09] 这里是个**模板**, 不是 `SACAZAgent &`: AGENT_SACAZ / AGENT_SACAZ_MOE 的
+ * clone 是 SACAZAgent, 而 AGENT_SACAZ_OLD 的是 SACAZLegacyAgent —— 两个**没有继承
+ * 关系**的类 (见 createSACAZAgent 的注释)。参数只要满足"有 loadModel / trainSelfPlay /
+ * getLastTrainLoss / saveModel"就能用, 这比给两个类各写一遍往返、或硬塞一个公共基类都小,
+ * 也不会让两支的口径有机会混起来。
  */
-static bool trainSACRound(SACAZAgent &clone,
+template <class AgentT>
+static bool trainSACRound(AgentT &clone,
                           const char *tmpWeights,
                           const QString &label,
                           int episodes,
@@ -440,7 +471,7 @@ DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
-SACAZAgent *ChessBoard::m_sfSACAZOld = nullptr;
+SACAZLegacyAgent *ChessBoard::m_sfSACAZOld = nullptr;   /* 独立类, 不是 SACAZAgent 的派生类 */
 DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
@@ -585,13 +616,13 @@ void ChessBoard::startupLoad()
     }
     if (s_weightPaths.count(AGENT_SACAZ_OLD)) {
         /*
-           59e5233 行为还原版 (派生类 SACAZLegacyAgent)。权重是**独立前缀**
+           59e5233 行为还原版 (独立类 SACAZLegacyAgent)。权重是**独立前缀**
            (weights/sacaz_old_agent_*), 与 AGENT_SACAZ 不共用 —— 见 sacazlegacyagent.h
            的头注释 (两者参数结构相同, 结构指纹挡不住串权重, 而训练口径不同)。
         */
         emit busyMessage(QStringLiteral("正在载入 SAC+AZ (59e5233 行为还原版) 权重…"));
         if (m_sfSACAZOld == nullptr) {
-            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+            m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
         }
         std::string prefix = s_weightPaths[AGENT_SACAZ_OLD];
         const std::string suffix = "_actor";
@@ -1370,14 +1401,19 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
 }
 
 /*
- * reportLearnedLoss - 决策里"从自己的搜索学了一次"之后上报损失 (见头文件说明)。
+ * reportLearnedLossOf - "决策里学了一次"的**口径唯一实现** (头文件里那个模板转到这里)。
  *
  * 只有 learnSteps **前进**了才上报: 一次决策可能有两次更新 (rollout + 搜索样本),
  * 无条件上报会让损失曲线一步出现两个点, 把"每手一个点"的口径弄乱。
+ *
+ * [2026-09] 参数是 `AgentBase *` + 两个进度数 (不是 `SACAZAgent *`): 还原版
+ * SACAZLegacyAgent 与 SACAZAgent 是**两个没有继承关系的类**, 只有 AgentBase 这一层
+ * 是公共的 —— 而"是否上报"的口径本来就只依赖 learnSteps 有没有前进, 与是哪一支无关
+ * (还原版没有"从搜索学一次"这条路径, 所以它永远走到不前进那一支, 这里不需要特判)。
  */
-void ChessBoard::reportLearnedLoss(SACAZAgent *agent, int learnStepsBefore)
+void ChessBoard::reportLearnedLossOf(AgentBase *agent, int learnSteps, int learnStepsBefore)
 {
-    if (agent == nullptr || agent->getLearnSteps() <= learnStepsBefore) {
+    if (agent == nullptr || learnSteps <= learnStepsBefore) {
         return;      /* 这一步没发生更新 (例如 learnFromSearch 关着, 或池子还不够一个批) */
     }
     const float loss = agent->getLastTrainLoss();
@@ -1919,7 +1955,7 @@ Step ChessBoard::aiThinkRaw(int color)
         */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfSACAZOld == nullptr) {
-            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+            m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
             auto it = s_weightPaths.find(AGENT_SACAZ_OLD);
             if (it != s_weightPaths.end()) {
                 std::string prefix = it->second;
@@ -2116,12 +2152,12 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
     case AGENT_SACAZ_OLD: {
         /*
            59e5233 行为还原版: 与上面 AGENT_SACAZ 那一支同一条兜底约定
-           (建了对象就把权重载上), 但构造的是**派生类** SACAZLegacyAgent ——
+           (建了对象就把权重载上), 但构造的是**独立类** SACAZLegacyAgent ——
            口径不同, 所以权重前缀也独立 (weights/sacaz_old_agent*)。
         */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfSACAZOld == nullptr) {
-            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+            m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
             auto it = s_weightPaths.find(AGENT_SACAZ_OLD);
             if (it != s_weightPaths.end()) {
                 std::string prefix = it->second;
@@ -2630,7 +2666,7 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     case AGENT_SACAZ:     return SACAZAgent::defaultWeightPrefix();
     case AGENT_SACAZ_MOE: return "weights/sacaz_moe_agent";
     /*
-       59e5233 行为还原版: **独立前缀**, 由派生类自己给出 (weights/sacaz_old_agent)。
+       59e5233 行为还原版: **独立前缀**, 由那个类自己给出 (weights/sacaz_old_agent)。
        绝不能用 SACAZAgent::defaultWeightPrefix() —— 那是"当前口径"那一支的文件,
        两者参数结构相同, 结构指纹挡不住, 于是错误只会在训练很多轮之后以
        "棋力对不上训练量"的形式出现。见 sacazlegacyagent.h 的头注释。
@@ -2895,13 +2931,13 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             /*
                ---- 59e5233 行为还原版 ----
-               构造必须走 createSACAZAgent(): 这一支用的是**派生类** SACAZLegacyAgent,
-               在这里手写 `new SACAZAgent(...)` 会静默退回当前口径 (两者参数结构完全
-               相同, 连 save/load 都不会报错)。
+               构造必须走 createSACAZLegacyAgent(): 这一支用的是**独立类**
+               SACAZLegacyAgent, 在这里手写 `new SACAZAgent(...)` 会静默退回当前口径
+               (两者参数结构完全相同, 连 save/load 都不会报错)。
             */
             case AGENT_SACAZ_OLD:
                 if (m_sfSACAZOld == nullptr)
-                    m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+                    m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
                 break;
             case AGENT_DQNAB:
                 if (m_sfDQNAB == nullptr) {
@@ -3114,8 +3150,9 @@ void ChessBoard::backgroundTrainLoop()
 
                **clone 必须与主 agent 同一支**: 三支的参数结构完全相同 (都是 iFcLayer
                的 w/b), 所以建成另一支不会让 loadModel 失败 —— 它只会静默地按另一套口径
-               训练 (熵比/alpha 学习率/critic 约束/叶子估值口径不同)。AGENT_SACAZ_OLD
-               因此在这里构造**派生类** SACAZLegacyAgent; 共享的往返写成 trainSACRound()。
+               训练 (目标熵/alpha 学习率/critic 目标/叶子估值口径不同)。AGENT_SACAZ_OLD
+               因此在这里构造**独立类** SACAZLegacyAgent; 共享的往返写成 trainSACRound()
+               (模板: 两个类没有继承关系, 参数化比共用基类小, 也不会让口径混起来)。
             */
             case AGENT_SACAZ: {
                 SACAZAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);

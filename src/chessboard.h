@@ -30,6 +30,14 @@
 #include "sacazagent.h"
 #include "dqnabagent.h"
 
+/*
+   AGENT_SACAZ_OLD 的实例类型。这里只**前置声明**就够了 (成员是指针, 上报损失是个模板),
+   真正的定义在 src/sacazlegacyagent.cpp 里 —— 头文件不必把那份实现拖进来。
+   [2026-09] 它不再是 SACAZAgent 的派生类, 所以不能拿 SACAZAgent* 存它 (那是编译错误,
+   刻意如此: 两个类现在是**独立实现**)。见 sacazlegacyagent.h。
+*/
+class SACAZLegacyAgent;
+
 class ChessBoard : public QWidget
 {
     Q_OBJECT
@@ -82,17 +90,22 @@ public:
         AGENT_PPOMCTS_MLP,
         /*
            SAC+MCTS+AlphaZero 的**行为还原版**: 复现提交 59e5233 的那一支。
-           它是一个**独立的 C++ 类** SACAZLegacyAgent (src/sacazlegacyagent.h),
+           它是一个**独立的 C++ 类** SACAZLegacyAgent (src/sacazlegacyagent.h/.cpp),
            不是同一个类里的运行时开关 —— 用户口径 (2026-09): "用不同的 C++ 类把新旧
-           SAC agent 区分开"。与 AGENT_SACAZ 的关系:
-             * **算法/搜索/训练/自检是同一份代码** (SACAZLegacyAgent 派生自
-               SACAZAgent, 只钉住真正不同的那几项) —— 与 AGENT_SACAZ / AGENT_SACAZ_MOE
-               靠 Backbone 区分是同一种做法: 一份实现、两个可对弈的界面类型;
-             * 差别用 `git show 59e5233:src/sacazagent.cpp` 逐项核对过: 目标熵 0.98
-               (当前 0.5) / alpha 学习率 1e-3 (当前 5e-3) / critic 目标不钳位且纯 MSE
-               (当前夹 ±2 + Huber δ=1) / 叶子估值走全量 (当前稀疏头) / 隐层激活用
-               `TanhNorm<Linear>` 且 r=1 把 59e5233 的那一层显式钉住 (与 Layer<Tanh>
-               逐项相同)。完整表见 sacazlegacyagent.h 的头注释;
+           SAC agent 区分开"。
+           [2026-09 后续] 它**不再继承** SACAZAgent (那是它 2026-09 之前的样子):
+           用户口径是"以后任何对 SACAZAgent 的默认值或实现改动都不可能渗进还原版",
+           所以这一支自带一份 SAC 实现 —— 见 sacazlegacyagent.h 的头注释 (那里有一张
+           口径表 + 一条"不许再继承回去"的 static_assert), 代价是共享算法上的修复要
+           **刻意**决定要不要同步过来。与 AGENT_SACAZ 的关系:
+             * **两份独立实现** (代码是刻意的 1:1 拷贝 + 59e5233 的口径): 那边改默认值
+               或改行为, 这边**不会跟着变** (这正是要的效果);
+             * 口径按 `git show 59e5233:src/sacazagent.cpp` 逐项核对过: 目标熵 0.98 /
+               alpha 学习率 1e-3 / critic 目标**不钳位且纯 MSE** / 叶子估值走**全量** /
+               没有"从自己的搜索学一次" / 目标网 tau=1e-3 每 64 步。完整表见
+               sacazlegacyagent.h 的头注释;
+             * **不含奖励塑形、不含任何 critic 值域约束** (用户 2026-09 追加口径):
+               连成员都没有, 任何 flag 都打不开;
              * **权重文件独立** (`weights/sacaz_old_agent_*`): 两者参数结构完全相同
                (都是 iFcLayer 的 w/b), 结构指纹挡不住串权重; 而训练口径不同 ⇒ 共用
                前缀会让两边**静默**互相覆盖 (用户口径: 新旧权重必须用不同名字)。
@@ -397,7 +410,7 @@ private:
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
     static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
-    static SACAZAgent *m_sfSACAZOld;   /* 行为还原版: 派生类 SACAZLegacyAgent (59e5233) */
+    static SACAZLegacyAgent *m_sfSACAZOld;   /* 行为还原版: 独立类 SACAZLegacyAgent (59e5233) */
     static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */
@@ -424,8 +437,26 @@ private:
      *
      * 判据是 **learnSteps 是否前进** (不是"每手无条件上报"): 一次决策最多可能有两次
      * 更新 (rollout 一次 + 搜索样本一次), 无条件上报会把"每手一个点"的口径弄乱。
+     *
+     * [2026-09 独立类拆分] 这里是个**模板**, 参数从 `SACAZAgent *` 放宽成"任何有
+     * getLearnSteps() / getLastTrainLoss() / getName() 的 agent": 59e5233 还原版
+     * (SACAZLegacyAgent) 现在**不是** SACAZAgent 的派生类, 一个非模板签名接不住它,
+     * 而两个类之间**不许**做类型转换 (见 sacazlegacyagent.h 的头注释)。实际口径写在
+     * reportLearnedLossOf() 里 —— 只有一份, 不会两边漂移。
      */
-    void reportLearnedLoss(SACAZAgent *agent, int teachStepsBefore);
+    template <class AgentT>
+    void reportLearnedLoss(AgentT *agent, int teachStepsBefore)
+    {
+        /*
+           getLearnSteps() 只在"会学习的 agent"上有 (AgentBase 没有这个接口), 所以读取
+           必须留在模板里: 模板参数负责**取数**, 非模板的 reportLearnedLossOf 负责**口径**。
+        */
+        reportLearnedLossOf(agent, agent != nullptr ? agent->getLearnSteps() : 0,
+                            teachStepsBefore);
+    }
+
+    /* reportLearnedLoss 模板的公共实现 (定义在 .cpp: 信号与曲线口径不进头文件) */
+    void reportLearnedLossOf(AgentBase *agent, int learnSteps, int teachStepsBefore);
 
     /* ---- 思考过程可视化 (全部只在 GUI 线程读写, 除了 m_thinkGeneration) ---- */
     void initThinkVisuals();

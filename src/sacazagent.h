@@ -193,11 +193,12 @@ public:
 
     /*
        ---- "我是界面上的哪一支" ----
-       自检面板第一行必须能回答这个问题。基类里它是**虚函数**而不是写死的字符串,
-       因为 59e5233 复现版是**派生类** (SACAZLegacyAgent, 见 src/sacazlegacyagent.h),
-       它复用同一份算法但口径不同 —— 若第一行还印"AGENT_SACAZ", 看面板的人会把
-       两套口径的读数混成一个 agent (本文件顶部那条"一个类背着两个界面类型"的教训
-       是同一个坑的第一次)。
+       自检面板第一行必须能回答这个问题。这里它是**虚函数**而不是写死的字符串,
+       因为同一个类被两个界面类型复用 (AGENT_SACAZ / AGENT_SACAZ_MOE 按骨干分),
+       若第一行还印"AGENT_SACAZ", 看面板的人会把两套读数混成一个 agent (本文件顶部
+       那条"一个类背着两个界面类型"的教训就是这个坑的第一次)。
+       [2026-09] 59e5233 还原版**不是**本类的派生类了 (它是独立类 SACAZLegacyAgent,
+       见 src/sacazlegacyagent.h), 所以它不覆盖这个虚函数 —— 它有自己的同名实现。
     */
     virtual const char *guiAgentLabel() const;
 
@@ -210,8 +211,9 @@ public:
            共用一个前缀 = 后训练的那一支**静默覆盖**另一支, 而界面上一切正常;
          * 载入也一样: 载进来的权重看起来"能用" (结构指纹相同), 于是错的那一份会被
            当成对的那一份用。
-       所以前缀跟着**类**走 (基类一个、派生类一个), 界面按 agent 类型取默认值,
-       不靠各处手抄字符串。派生类的返回值见 SACAZLegacyAgent。
+       所以前缀跟着**类**走 (当前口径一个、还原版一个), 界面按 agent 类型取默认值,
+       不靠各处手抄字符串。还原版的返回值在**另一个类**里 (SACAZLegacyAgent, 不是本类的
+       派生类: 两个类没有继承关系, 只是刻意共用同一套命名约定)。
     */
     static const char *defaultWeightPrefix();
 
@@ -603,7 +605,9 @@ public:
          * 策略终于收到自己的搜索结果当监督 —— 那正是它比自身策略更准的地方;
          * 代价只有一次棋盘试走/回退 + 一次已经存在的 learnBatch (搜索本身早已付过)。
        `learnFromSearch = false` 恢复改动前的行为 (只在 rollout / 自对弈里学)。
-       **派生类 SACAZLegacyAgent 固定为 false**: 59e5233 没有这条路径, 它的口径要钉住。
+       **59e5233 还原版没有这个成员**: 那一支是独立类 SACAZLegacyAgent, 它的
+       selectMove 是**只读搜索** (59e5233 没有这条路径) —— 那边是"连名字都没有",
+       不是"默认关着" (见 src/sacazlegacyagent.h)。
     */
     bool learnFromSearch = true;
 

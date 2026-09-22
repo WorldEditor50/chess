@@ -208,7 +208,7 @@ int main(int argc, char *argv[])
             { ChessBoard::AGENT_EVAB,      "EVAB",         true },
             { ChessBoard::AGENT_SACAZ,     "SAC+AZ",       true },
             { ChessBoard::AGENT_SACAZ_MOE, "SAC+AZ-MoE",   true },
-            /* 59e5233 行为还原版 (派生类 SACAZLegacyAgent): 显示名与"上报损失"都要接上 */
+            /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent): 显示名与"上报损失"都要接上 */
             { ChessBoard::AGENT_SACAZ_OLD, "SAC+AZ-59e5233", true },
             { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP", true }
         };
@@ -575,7 +575,7 @@ int main(int argc, char *argv[])
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
             ChessBoard::AGENT_PPOMCTS_MLP,
-            /* 59e5233 行为还原版 (派生类 SACAZLegacyAgent), 2026-09 新增 */
+            /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent), 2026-09 新增 */
             ChessBoard::AGENT_SACAZ_OLD
         };
         int reported = 0;
@@ -732,9 +732,9 @@ int main(int argc, char *argv[])
             { ChessBoard::AGENT_SACAZ,     "SAC+AZ" },
             { ChessBoard::AGENT_SACAZ_MOE, "SAC+AZ-MoE" },
             /*
-               59e5233 行为还原版 (派生类 SACAZLegacyAgent)。这一条特别值得跑: 它的
+               59e5233 行为还原版 (**独立类** SACAZLegacyAgent)。这一条特别值得跑: 它的
                **训练 clone 是另一个类**, 而两支的参数结构完全相同 ⇒ 如果后台训练那一支
-               忘了建派生类, save/load 一样成功、损失一样上报, 界面上**看不出任何异常**
+               忘了建**独立类**, save/load 一样成功、损失一样上报, 界面上**看不出任何异常**
                (只是按另一套口径在训)。这条断言挡的是"跑得通但训错了"。
             */
             { ChessBoard::AGENT_SACAZ_OLD, "SAC+AZ-59e5233" },
@@ -1072,7 +1072,7 @@ int main(int argc, char *argv[])
         CHECK(ChessBoard::agentHasLearningReward(ChessBoard::AGENT_SACAZ),
               "口径表: SAC+AZ 有学习口径");
         CHECK(ChessBoard::agentHasLearningReward(ChessBoard::AGENT_SACAZ_OLD),
-              "口径表: 59e5233 还原版也有 (它是 SAC 的派生类, 同一份学习口径)");
+              "口径表: 59e5233 还原版也有 (它是**独立的类** SACAZLegacyAgent, 但用同一套学习口径)");
         CHECK(!ChessBoard::agentHasLearningReward(ChessBoard::AGENT_MCTS),
               "口径表: MCTS 没有学习口径 (纯搜索)");
         CHECK(!ChessBoard::agentHasLearningReward(ChessBoard::AGENT_ALPHABETA),
