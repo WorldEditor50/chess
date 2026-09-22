@@ -91,6 +91,14 @@ public:
     /* Compute immediate reward for a move */
     float computeReward(const Step &s, int color);
 
+    /* [④] 学习口径的奖励: 界面奖励曲线取这一份 (见 AgentBase 的说明) */
+    bool hasLearningReward() const override { return true; }
+    float learningStepReward(const Step &s, int color) override
+    {
+        return computeReward(s, color);
+    }
+    std::string rewardCaliperName() const override { return std::string("学习口径"); }
+
     /* Online training (human-vs-AI) */
     void beginOnline();
     void recordOnline(const Step& s, int color, const RL::Tensor& stateBefore);

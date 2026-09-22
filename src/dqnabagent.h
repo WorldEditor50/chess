@@ -287,6 +287,14 @@ public:
     void getLegalActions(int color, std::vector<Step*> &steps,
                          std::vector<int> &actionIndices, RL::Tensor &actionMask);
     float computeReward(const Step &s, int color);
+
+    /* [④] 学习口径的奖励: 界面奖励曲线取这一份 (见 AgentBase 的说明) */
+    bool hasLearningReward() const override { return true; }
+    float learningStepReward(const Step &s, int color) override
+    {
+        return computeReward(s, color);
+    }
+    std::string rewardCaliperName() const override { return std::string("学习口径"); }
     double materialPhase() const;
     double tempoPhase() const;
     /*

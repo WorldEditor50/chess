@@ -60,6 +60,35 @@ bool agentCanExplore(ChessBoard::AgentType type)
     }
 }
 
+/*
+ * [④] 哪些 agent 有"学习口径"的奖励 (即时奖励有它自己的量纲: 材质 x0.1 + 每步代价)。
+ *
+ * 为什么这里要有一张**静态表** (而不是只问对象): 界面在**开局前**就要把口径标签写在
+ * 曲线名上, 那时对象可能还没建 (它们是每手决策时按需 new 出来的)。运行期取数时仍然
+ * 以对象自己的 `hasLearningReward()` 为准 (见 learningStepRewardOrNaN) —— 两者必须
+ * 一致, test_match [2.19] 拿真实对象对过表。
+ *
+ * EVAB 故意不在表里: 它的"探索"产物是蒸馏给评估网络的 (没有 computeReward),
+ * 环境奖励对它就是引擎那本账。
+ */
+bool agentHasLearningRewardTable(ChessBoard::AgentType type)
+{
+    switch (type) {
+    case ChessBoard::AGENT_PG:
+    case ChessBoard::AGENT_DQN:
+    case ChessBoard::AGENT_PPOMCTS:
+    case ChessBoard::AGENT_PPOMCTS_MLP:
+    case ChessBoard::AGENT_DQNMCTS:
+    case ChessBoard::AGENT_SACAZ:
+    case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_OLD:
+    case ChessBoard::AGENT_DQNAB:
+        return true;
+    default:   /* AGENT_ALPHABETA / AGENT_MCTS / AGENT_EVAB */
+        return false;
+    }
+}
+
 /* 状态条上的短耗时: "3.24s" / "1:05" */
 QString shortElapsed(long long ms)
 {
@@ -1358,6 +1387,71 @@ void ChessBoard::reportLearnedLoss(SACAZAgent *agent, int learnStepsBefore)
     }
 }
 
+/* ================================================================
+ *  ---- ④ 奖励曲线的"学习口径" (2026-09, 见 aiagent.h 的说明) ----
+ * ================================================================ */
+
+bool ChessBoard::agentHasLearningReward(AgentType type)
+{
+    return agentHasLearningRewardTable(type);
+}
+
+QString ChessBoard::agentRewardCaliperLabel(AgentType type)
+{
+    if (!agentHasLearningRewardTable(type)) {
+        return QStringLiteral("引擎口径(材质x1+终局±1)");
+    }
+    return QStringLiteral("学习口径(材质x0.1+每步代价+终局±1)");
+}
+
+AgentBase *ChessBoard::agentInstance(AgentType type) const
+{
+    /* 静态成员: 与 aiThinkForAgentRaw 里按需 new 出来的是**同一批对象** (单一来源)。 */
+    switch (type) {
+    case AGENT_PG:          return m_sfPG;
+    case AGENT_DQN:         return m_sfDQN;
+    case AGENT_PPOMCTS:     return m_sfPPOMCTS;
+    case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP;
+    case AGENT_DQNMCTS:     return m_sfDQNMCTS;
+    case AGENT_EVAB:        return m_sfEVAB;
+    case AGENT_SACAZ:       return m_sfSACAZ;
+    case AGENT_SACAZ_MOE:   return m_sfSACAZMoe;
+    case AGENT_SACAZ_OLD:   return m_sfSACAZOld;
+    case AGENT_DQNAB:       return m_sfDQNAB;
+    default:                return nullptr;   /* Alpha-Beta / MCTS: 没有常驻对象 */
+    }
+}
+
+double ChessBoard::learningStepRewardOrNaN(AgentType type, const Step &step, int mover)
+{
+    if (!agentHasLearningRewardTable(type)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    AgentBase *agent = agentInstance(type);
+    /*
+       对象还没建 = 该方在本局还没走过一手。返回 NaN 表示"这一手拿不到学习口径值",
+       调用方按"还没拿到"处理 (learnOk* 只在真拿到值时才置真), 于是曲线在拿到之前
+       显示引擎口径 —— 这种局面只会出现在"某一方一手都没走"的极端短局里, 正常对局
+       第一手决策就会把对象建出来 (见 aiThinkForAgentRaw 的 lazy new)。
+    */
+    if (agent == nullptr || !agent->hasLearningReward()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return (double)agent->learningStepReward(step, mover);
+}
+
+double ChessBoard::learningTerminalRewardOrNaN(AgentType type, int result, int mover)
+{
+    if (!agentHasLearningRewardTable(type)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    AgentBase *agent = agentInstance(type);
+    if (agent == nullptr || !agent->hasLearningReward()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return (double)agent->learningTerminalReward(result, mover);
+}
+
 std::string ChessBoard::getLastExploreInfo() const
 {
     QMutexLocker locker(&m_infoMutex);
@@ -2169,6 +2263,18 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
         rewardA = aIsRed ? rewardRed : rewardBlack;
         rewardB = aIsRed ? rewardBlack : rewardRed;
     };
+    /*
+       ---- ④ 两本账 (本次改动新增) ----
+       `rewardRed/rewardBlack` 从此是"**曲线口径**的即时累计": 哪一方有学习口径就用
+       学习口径, 没有就用引擎口径 (见下面每手的取值)。另外两对本地的账只用于
+         * 本局的 RewardAccounting (断言/自检要能同时看到两个口径);
+         * 曲线口径的**选择** (learnOk* 一旦为真就一直用学习口径)。
+       `movesRed/movesBlack` 是"每步代价"那一项的乘数, 断言里的换算关系要用到它。
+    */
+    double engineRed = 0.0, engineBlack = 0.0;
+    double learnRed = 0.0, learnBlack = 0.0;
+    int movesRed = 0, movesBlack = 0;
+    bool learnOkRed = false, learnOkBlack = false;
     {
         QMutexLocker locker(&mutex);
         chess.reset();
@@ -2252,6 +2358,14 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
             double totalReward = 0;
             /* 走这一步的是 turn 方, moveForward 之前先记下来 */
             const int mover = turn;
+            /*
+               ---- ④ 学习口径的即时奖励: **必须在 moveForward 之前算** ----
+               `computeReward` 要按 `s.nextId` 去读被吃子的 value, 而 moveForward 会把
+               它置成 alive=false (见 stone.h 的 stepReward 注释)。这是本改动唯一一处
+               顺序敏感的地方, 放错位置的表现是"吃子奖励恒为 0" —— 曲线看起来正常,
+               只是永远只有每步代价。
+            */
+            const double learnNow = learningStepRewardOrNaN(who, step, mover);
             chess.moveForward(&step, totalReward);
             /*
                环境奖励记账。`Chess::moveForward` 的 totalReward 是**黑方视角**的记账
@@ -2264,11 +2378,31 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
             */
             const double moverReward =
                 (mover == Stone::COLOR_RED) ? -totalReward : totalReward;
+            /* 两本账都记 (见 RewardAccounting 的说明): 引擎口径恒记; 学习口径在 agent
+               给了数的时候记 —— 纯搜索 agent (Alpha-Beta / MCTS) 没有学习口径, 它的曲线
+               就继续用引擎口径, 只是界面上会**标注**出来。 */
             if (mover == Stone::COLOR_RED) {
-                rewardRed += moverReward;
+                engineRed += moverReward;
+                movesRed++;
+                if (std::isfinite(learnNow)) {
+                    learnRed += learnNow;
+                    learnOkRed = true;
+                }
             } else {
-                rewardBlack += moverReward;
+                engineBlack += moverReward;
+                movesBlack++;
+                if (std::isfinite(learnNow)) {
+                    learnBlack += learnNow;
+                    learnOkBlack = true;
+                }
             }
+            /*
+               曲线取哪一本账: 有学习口径就用学习口径 (本次改动的**目的**), 否则回退引擎
+               口径。学习口径一旦拿到过值 (learnOk*), 本局就一直用它 —— 不能逐手在两个
+               口径之间跳 (那会把曲线变成一条量纲来回变的折线)。
+            */
+            rewardRed = learnOkRed ? learnRed : engineRed;
+            rewardBlack = learnOkBlack ? learnBlack : engineBlack;
             /* A/B 的归属由 aIsRed 换算, 这里只管红黑 */
             /* sideToMove 必须跟着 turn 走, 否则下一手 getResult 会看错方 */
             turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
@@ -2286,18 +2420,56 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
     }
 
     /*
-       终局奖励 ±1 也算进"本局环境奖励"里 —— 否则这条曲线只反映吃子, 看不出输赢。
-       和棋不加不减 (0)。
+       ---- 终局值 (④ 之后按**口径**取, 不再一律 ±1) ----
+       学习口径的 agent 走它自己的 `terminalReward()`: SAC 塑形开着 (rewardShape=2) 时
+       那是 ±(1 + 败方剩余材质/3.5)。**必须**问 agent 要, 不能在界面这侧照抄一份公式 ——
+       抄一份就等于"界面上显示的游戏"与"它真正学的游戏"是两个 (见 sacazagent.h 的
+       rewardShape 说明: 三个终局出口只允许有一个来源)。
+       引擎口径 (Alpha-Beta / MCTS / EVAB) 仍然是 ±1, 和棋 0。
     */
-    if (ret == Chess::RESULT_RED_WIN) {
-        rewardRed += 1.0;
-        rewardBlack -= 1.0;
-    } else if (ret == Chess::RESULT_BLACK_WIN) {
-        rewardBlack += 1.0;
-        rewardRed -= 1.0;
+    if (learnOkRed || learnOkBlack) {
+        /*
+           同步 env 到**终局局面**再取终局值: SAC 的 terminalReward 在塑形开着时要数
+           "败方还剩多少材质", 而 env 此刻停在最后一手**之前** (它只在每手决策前 sync
+           一次)。不同步的话它数的是上一手, 曲线上的终局值会比它真正学到的少一个子。
+        */
+        std::lock_guard<std::mutex> envLock(m_agentMutex);
+        env = chess;
     }
-    /* 局末的 ±1 也换算进去, 于是出参就是"本局最终环境奖励" */
+    double termRed = 0.0, termBlack = 0.0;
+    if (learnOkRed) {
+        const double t = learningTerminalRewardOrNaN(redType, ret, Stone::COLOR_RED);
+        termRed = std::isfinite(t) ? t : outcomeForMover(ret, Stone::COLOR_RED);
+    } else {
+        termRed = outcomeForMover(ret, Stone::COLOR_RED);
+    }
+    if (learnOkBlack) {
+        const double t = learningTerminalRewardOrNaN(blackType, ret, Stone::COLOR_BLACK);
+        termBlack = std::isfinite(t) ? t : outcomeForMover(ret, Stone::COLOR_BLACK);
+    } else {
+        termBlack = outcomeForMover(ret, Stone::COLOR_BLACK);
+    }
+    rewardRed += termRed;
+    rewardBlack += termBlack;
+    /* 局末这一点也换算进去, 于是出参就是"本局最终值" */
     syncAB();
+
+    /* ---- ④ 记下本局的两种口径账 (断言/自检用, 见 RewardAccounting) ---- */
+    m_lastReward.clear();
+    m_lastReward.engineImmediateA = aIsRed ? engineRed : engineBlack;
+    m_lastReward.engineImmediateB = aIsRed ? engineBlack : engineRed;
+    m_lastReward.learnImmediateA = aIsRed ? learnRed : learnBlack;
+    m_lastReward.learnImmediateB = aIsRed ? learnBlack : learnRed;
+    m_lastReward.learnTerminalA = aIsRed ? termRed : termBlack;
+    m_lastReward.learnTerminalB = aIsRed ? termBlack : termRed;
+    m_lastReward.engineTerminalA = aIsRed ? outcomeForMover(ret, Stone::COLOR_RED)
+                                          : outcomeForMover(ret, Stone::COLOR_BLACK);
+    m_lastReward.engineTerminalB = aIsRed ? outcomeForMover(ret, Stone::COLOR_BLACK)
+                                          : outcomeForMover(ret, Stone::COLOR_RED);
+    m_lastReward.movesA = aIsRed ? movesRed : movesBlack;
+    m_lastReward.movesB = aIsRed ? movesBlack : movesRed;
+    m_lastReward.learnCaliperA = aIsRed ? learnOkRed : learnOkBlack;
+    m_lastReward.learnCaliperB = aIsRed ? learnOkBlack : learnOkRed;
 
     /*
        达到步数上限: 原来 selfPlay 按 evaluate() 判胜 (score == 0 也返回红胜),
@@ -2395,9 +2567,19 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         /*
            每局明细里带上"本局环境奖励": 这条曲线的意义是"模型下完一局拿到了多少
            奖励", 所以它同时也是逐局明细的一部分 (界面上的列表直接用它)。
+           **口径必须一起写出来** (2026-09): 学习口径 (材质 x0.1) 与引擎口径 (材质 x1)
+           差 10 倍, 不标口径的数字在事后回看时无法解释 (用户就是拿引擎口径的 4.5 推出
+           "材质比赢棋重要 3.5 倍" 的)。哪一方用哪个口径由 agent 自己决定 —— 纯搜索
+           agent (Alpha-Beta / MCTS) 没有学习口径, 仍旧是引擎口径。
         */
         const QString rewardText =
-            QStringLiteral("  奖励 A=%1 B=%2").arg(rA, 0, 'f', 2).arg(rB, 0, 'f', 2);
+            QStringLiteral("  奖励 A=%1[%2] B=%3[%4]")
+                .arg(rA, 0, 'f', 2)
+                .arg(m_lastReward.learnCaliperA ? QStringLiteral("学习口径")
+                                                : QStringLiteral("引擎口径"))
+                .arg(rB, 0, 'f', 2)
+                .arg(m_lastReward.learnCaliperB ? QStringLiteral("学习口径")
+                                                : QStringLiteral("引擎口径"));
         st.log += line + QStringLiteral("  (%1 手)").arg(m_selfPlayMoveNo.load())
                   + rewardText + QStringLiteral("\n");
 

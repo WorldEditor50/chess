@@ -326,6 +326,17 @@ public:
     int stepToActionIdx(const Step &s, int color) const;
     float computeReward(const Step &s, int color);
 
+    /*
+       [④] 学习口径的奖励: 界面奖励曲线取这一份 (材质 x0.1 + 每步代价 + 势能塑形),
+       终局用基类默认的 ±1 (本 agent 的终局值就是 outcomeForMover, 见 2272/2641 行)。
+    */
+    bool hasLearningReward() const override { return true; }
+    float learningStepReward(const Step &s, int color) override
+    {
+        return computeReward(s, color);
+    }
+    std::string rewardCaliperName() const override { return std::string("学习口径"); }
+
     /* ----------------------------------------------------------------
      *  势能塑形 (PBRS, Phase 2): 把"棋盘局面价值评估"接进训练信号
      * ----------------------------------------------------------------

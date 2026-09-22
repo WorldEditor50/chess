@@ -127,6 +127,22 @@ function Get-Desc([string]$name) {
     return [string]$e.Current.HelpText
 }
 
+# 同上, 但按**名字前缀**找 (文案会改: 例 "环境奖励 (每手累计..." 后面挂了口径说明)。
+# 找不到时返回 "" 并**打印一条警告** —— 静默返回空会把"文案改了"伪装成"没数据"。
+function Get-DescPrefix([string]$prefix) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::IsControlElementProperty, $true)
+    $all = $script:root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants, $cond)
+    foreach ($t in $all) {
+        if ([string]$t.Current.Name -like "$prefix*") {
+            return [string]$t.Current.HelpText
+        }
+    }
+    Write-Output ("[warn] 找不到名字以 '{0}' 开头的控件 (文案改了? 这条读数会是空的)" -f $prefix)
+    return ""
+}
+
 # 界面上所有列表项的文字 (逐局明细在 QListWidget 里)
 function All-ListItems {
     $cond = New-Object System.Windows.Automation.PropertyCondition(
@@ -366,7 +382,9 @@ try {
     $gameLines = @()
     foreach ($it in $items) { if ($it -like "第*局*") { $gameLines += $it } }
     $lossDesc = Get-Desc "训练损失 (每完成一次在线训练一个点)"
-    $rewardDesc = Get-Desc "环境奖励 (每手累计, 局末含终局 ±1; 走子方视角)"
+    # 奖励曲线的标题在 2026-09 换口径时改过 (现在写明了"学习口径")。按**前缀**取,
+    # 免得每次改文案就把这条读数变成空字符串 (那时脚本只会"看起来没数据")。
+    $rewardDesc = Get-DescPrefix "环境奖励 (每手累计"
     # 曲线内容是画出来的, UIA 读不到数字; 图下面的数字读数标签才是可读的凭据
     $lossText = ""
     $rewardText = ""
@@ -424,6 +442,24 @@ try {
     # 只在真打过点的时候要求"无空线" (一次都没采样过的场次本来就是空线, 不算 bug)
     if ($rewardPtsFinal -ge 1) {
         $rewardOk = $rewardOk -and ($seriesChunks -eq 2) -and $noEmpty
+    }
+    # ---- [④ 2026-09] 奖励曲线必须**标出口径** ----
+    # 奖励曲线现在取 agent 自己的学习口径 (材质 x0.1 + 每步代价 + 终局), 纯搜索 agent
+    # (Alpha-Beta / MCTS / EVAB) 没有学习口径、仍是引擎口径 (材质 x1) —— 两个口径差 10 倍,
+    # 不标出来两条线就不能直接比大小。曲线名后缀是这件事唯一的提示, 所以在这里钉住:
+    # 读数里必须出现 [学习口径] / [引擎口径], 而且**两条线各一次**。
+    $learnTags = [regex]::Matches($rewardText, "\[学习口径\]").Count
+    $engineTags = [regex]::Matches($rewardText, "\[引擎口径\]").Count
+    Write-Output ("reward caliper tags = 学习 {0} / 引擎 {1} (期望合计 2)" -f `
+        $learnTags, $engineTags)
+    $caliperOk = (($learnTags + $engineTags) -eq 2)
+    if (-not $caliperOk) { Write-Output "   [warn] 奖励曲线的口径标签不见了 (曲线名/口径改动后漏了标注?)" }
+    $rewardOk = $rewardOk -and $caliperOk
+    if ($expectSave) {
+        # 可训练的 agent 一定有学习口径; 这条把"标签写反"也钉住 (A/B 两方各一个标签)
+        Write-Output ("   (A 方是可训练 agent => 至少应有一个 [学习口径] 标签: {0})" -f `
+            ($learnTags -ge 1))
+        $rewardOk = $rewardOk -and ($learnTags -ge 1)
     }
     # 损失读数: 会上报损失的 agent 才有数字; 两边都是 Alpha-Beta/MCTS 时读数就是 "-"
     # (没有可训练参数 -> 不上报, 曲线里没有点, 这是**正确**行为, 不能算失败)。

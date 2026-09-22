@@ -156,6 +156,14 @@ private:
     /* Agent 对弈状态 (只在 GUI 线程读写) */
     bool m_matchRunning = false;
     QString m_matchLog;
+    /*
+       [④] 本场对弈双方的 agent 类型 —— **唯一**用途是给奖励曲线的名字加上口径标签
+       (学习口径 / 引擎口径, 见 ChessBoard::agentRewardCaliperLabel)。
+       为什么在本窗口存一份而不从 matchStarted 信号里取: 那个信号只带两个**名字**, 而
+       口径是**类型的属性**; 主窗口本来就在 onStartMatch 里拿着两个类型。
+    */
+    ChessBoard::AgentType m_matchTypeA = ChessBoard::AGENT_ALPHABETA;
+    ChessBoard::AgentType m_matchTypeB = ChessBoard::AGENT_ALPHABETA;
 };
 
 #endif // MAINWINDOW_H

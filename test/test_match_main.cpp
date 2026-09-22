@@ -23,6 +23,7 @@
 #include "chessboard.h"
 #include "abagent.h"      /* [2.10] "必输局面"下 ABAgent 必须仍返回合法走法 */
 #include "dqnagent.h"
+#include "sacazagent.h"   /* [2.19] 学习口径 == agent 自己的 computeReward/terminalReward */
 #include "metricsview.h"
 #include <cmath>
 #include <algorithm>   /* std::count: 数自检报告有几行 */
@@ -1047,6 +1048,189 @@ int main(int argc, char *argv[])
         CHECK(st.games == 1, "这一小局正常打完");
         CHECK(!samples.isEmpty(),
               "**关掉 rollout 仍然上报了训练损失** (selectMove 里从自己的搜索学的那一次)");
+    }
+
+    /* --------------------------------- 2.19 奖励曲线改用"学习口径" (2026-09) */
+    /*
+       用户在界面导出的 CSV 上实测到 (docs/sac_learn_reward_2026_09.md §1.1): 界面那条
+       奖励曲线用的是 `Chess::moveForward` 的 totalReward (**材质按原值 x1**), 而 agent
+       在线学习用的是**自己的** `computeReward()` (**材质 x0.1** + 每步代价) 加终局值。
+       两个口径差 **10 倍**, 于是"曲线上的比例"永远解释不了"学习信号的比例" —— 用户从
+       CSV 里奖励最大值 4.5 读出"材质比赢棋重要 3.5 倍", 而 agent 学的是 0.35 : 1。
+
+       这一节钉住四件事:
+         (1) 口径表 (界面在开局前写标签要用它) 与**真实对象**一致;
+         (2) 学习口径就是 agent 自己那两个函数 (逐位相同, 不是另抄一份公式);
+         (3) 端到端: 曲线上发的值 == 学习口径账, 而学习口径账与引擎口径账之间**精确**
+             满足   学习即时 = 0.1 x 引擎即时 − 0.001 x 该方手数
+             (这条换算与棋局无关、逐手可验 —— 它就是"两本账都记"换来的可比对参照);
+         (4) 纯搜索对手 (Alpha-Beta) 没有学习口径, 曲线仍旧走引擎口径并被标出来。
+    */
+    std::printf("\n[2.19] 奖励曲线改用学习口径 (agent 自己的 computeReward + 终局)\n");
+    {
+        /* ---- (1) 口径表与标签 ---- */
+        CHECK(ChessBoard::agentHasLearningReward(ChessBoard::AGENT_SACAZ),
+              "口径表: SAC+AZ 有学习口径");
+        CHECK(ChessBoard::agentHasLearningReward(ChessBoard::AGENT_SACAZ_OLD),
+              "口径表: 59e5233 还原版也有 (它是 SAC 的派生类, 同一份学习口径)");
+        CHECK(!ChessBoard::agentHasLearningReward(ChessBoard::AGENT_MCTS),
+              "口径表: MCTS 没有学习口径 (纯搜索)");
+        CHECK(!ChessBoard::agentHasLearningReward(ChessBoard::AGENT_ALPHABETA),
+              "口径表: Alpha-Beta 没有学习口径 (纯搜索)");
+        CHECK(!ChessBoard::agentHasLearningReward(ChessBoard::AGENT_EVAB),
+              "口径表: EVAB 没有 computeReward (它蒸馏给评估网络), 算引擎口径");
+        const QString lLearn = ChessBoard::agentRewardCaliperLabel(ChessBoard::AGENT_SACAZ);
+        const QString lEngine = ChessBoard::agentRewardCaliperLabel(ChessBoard::AGENT_MCTS);
+        std::printf("    标签: SAC+AZ -> %s | MCTS -> %s\n",
+                    lLearn.toUtf8().constData(), lEngine.toUtf8().constData());
+        CHECK(contains(lLearn, QStringLiteral("学习口径")), "SAC+AZ 的标签写明学习口径");
+        CHECK(contains(lEngine, QStringLiteral("引擎口径")), "MCTS 的标签写明引擎口径");
+
+        /* ---- (2) 学习口径 == agent 自己那两个函数 (逐位) ---- */
+        {
+            Chess c;
+            c.reset();
+            Step probe;
+            probe.valid = false;
+            {
+                std::vector<Step *> legal;
+                c.sample(Stone::COLOR_RED, legal);
+                /* 先挑着法再还池子: put 之后 legal 里的指针就不该再解引用了 */
+                for (std::size_t i = 0; i < legal.size(); ++i) {
+                    if (legal[i]->nextId != Stone::ID_NONE) {
+                        probe = *legal[i];
+                        break;
+                    }
+                }
+                if (!probe.valid && !legal.empty()) {
+                    probe = *legal[0];   /* 没找到吃子就用第一个合法着法 */
+                }
+                Steps::instance().put(legal);
+            }
+            CHECK(probe.valid, "探针棋盘上找得到一个合法着法");
+            SACAZAgent sac(c, 64, 0.99f, 0.001f, 1.5f);
+            CHECK(sac.hasLearningReward(), "SACAZAgent 自报有学习口径");
+            const float viaCaliper = sac.learningStepReward(probe, Stone::COLOR_RED);
+            const float viaAgent = sac.computeReward(probe, Stone::COLOR_RED);
+            std::printf("    learningStepReward=%.6f vs computeReward=%.6f "
+                        "(吃子=%s)\n", (double)viaCaliper, (double)viaAgent,
+                        probe.nextId != Stone::ID_NONE ? "是" : "否");
+            CHECK(viaCaliper == viaAgent,
+                  "学习口径的即时奖励**逐位**等于 agent 的 computeReward");
+            /*
+               终局: 塑形开着 (rewardShape=2) 时它是 ±(1+败方材质/3.5), 与引擎口径的
+               ±1 **不同** —— 这正是"必须问 agent 要"的理由 (抄一份公式迟早分叉)。
+            */
+            sac.rewardShape = 2;
+            const float tCaliper =
+                sac.learningTerminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED);
+            const float tAgent = sac.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED);
+            std::printf("    rewardShape=2 的终局值: 学习口径 %.4f vs terminalReward %.4f "
+                        "(引擎口径是 %.1f)\n", (double)tCaliper, (double)tAgent,
+                        (double)outcomeForMover(Chess::RESULT_RED_WIN, Stone::COLOR_RED));
+            CHECK(tCaliper == tAgent,
+                  "学习口径的终局值**逐位**等于 agent 的 terminalReward");
+            /*
+               塑形开着时终局值 = ±(1 + 败方剩余材质/3.5) ∈ [1,2]:
+               初始局面下败方一个子没少 (剩余 = 3.5) ⇒ 正好 **2.0** (实测值);
+               磨到光将 ⇒ 1.0。这里断言"与引擎口径的 1.0 不同", 才是"真的走了 agent"。
+            */
+            CHECK(tCaliper >= 1.0f && tCaliper <= 2.0f,
+                  "塑形开着时终局值落在 [1,2] (与引擎口径的常数 1.0 不同 -> 真的走了 agent)");
+            sac.rewardShape = 0;
+            CHECK(sac.learningTerminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == 1.0f,
+                  "rewardShape=0 时终局值就是 ±1 (与引擎口径一致)");
+        }
+
+        /* ---- (3) 端到端: 曲线值 == 学习口径账, 且两本账精确换算 ---- */
+        board.setPreTrainEnabled(false);
+        board.setMaxPliesPerGame(12);
+        QVector<double> progA, progB;
+        bool gotFinal = false;
+        double finalA = 0.0, finalB = 0.0;
+        const QMetaObject::Connection cp = QObject::connect(
+            &board, &ChessBoard::matchRewardProgress,
+            [&progA, &progB](int gameNo, int, double ra, double rb) {
+                if (gameNo < 1) { return; }
+                progA.append(ra);
+                progB.append(rb);
+            });
+        const QMetaObject::Connection cf = QObject::connect(
+            &board, &ChessBoard::gameRewardSample,
+            [&gotFinal, &finalA, &finalB](int gameNo, const QString &, const QString &,
+                                          double ra, double rb) {
+                if (gameNo < 1) { return; }
+                gotFinal = true;
+                finalA = ra;
+                finalB = rb;
+            });
+        const ChessBoard::MatchStats st19 =
+            board.matchAgents(ChessBoard::AGENT_SACAZ, ChessBoard::AGENT_ALPHABETA, 1);
+        QObject::disconnect(cp);
+        QObject::disconnect(cf);
+        board.setPreTrainEnabled(true);
+        board.setMaxPliesPerGame(300);
+
+        const ChessBoard::RewardAccounting &acct = board.lastRewardAccounting();
+        std::printf("    一局: %s\n", st19.summary().toUtf8().constData());
+        std::printf("    A(SAC+AZ, 学习口径=%d): 即时 引擎口径 %+.4f / 学习口径 %+.4f, "
+                    "手数 %d, 终止 %+.3f -> 曲线 %+.4f\n",
+                    (int)acct.learnCaliperA, acct.engineImmediateA, acct.learnImmediateA,
+                    acct.movesA, acct.learnTerminalA, acct.curveFinalA());
+        std::printf("    B(Alpha-Beta, 学习口径=%d): 即时 引擎口径 %+.4f, 手数 %d, "
+                    "终止 %+.3f -> 曲线 %+.4f\n",
+                    (int)acct.learnCaliperB, acct.engineImmediateB, acct.movesB,
+                    acct.engineTerminalB, acct.curveFinalB());
+        CHECK(st19.games == 1, "这一小局正常打完");
+        CHECK(acct.learnCaliperA, "A(SAC+AZ) 的曲线用**学习口径**");
+        CHECK(!acct.learnCaliperB, "B(Alpha-Beta) 没有学习口径 -> 曲线仍是引擎口径");
+        CHECK(gotFinal, "收到局末奖励采样");
+        CHECK(std::fabs(finalA - acct.curveFinalA()) < 1e-9,
+              "局末曲线值 == 学习口径账 (A): 局末的点就是这条账算出来的");
+        CHECK(std::fabs(finalB - acct.curveFinalB()) < 1e-9,
+              "局末曲线值 == 引擎口径账 (B)");
+        if (!progA.isEmpty()) {
+            CHECK(std::fabs(progA.last() - acct.curveImmediateA()) < 1e-9,
+                  "最后一个进度点 == 本局**即时**累计 (A, 不含终局值)");
+        }
+        /*
+           两本账的精确换算 (容差 1e-6: 学习口径那一侧是用 float 的 0.1f / -0.001f 算的,
+           与 double 的 0.1 / -0.001 有 ~1e-8 量级的表示误差; 逐手累积后仍远小于 1e-6)。
+        */
+        const double expectLearnA =
+            0.1 * acct.engineImmediateA + (double)REWARD_STEP_COST * (double)acct.movesA;
+        const double expectLearnB =
+            0.1 * acct.engineImmediateB + (double)REWARD_STEP_COST * (double)acct.movesB;
+        std::printf("    换算核对: A 学习 %+.6f vs 期望 %+.6f | B 学习 %+.6f vs 期望 %+.6f\n",
+                    acct.learnImmediateA, expectLearnA, acct.learnImmediateB, expectLearnB);
+        CHECK(std::fabs(acct.learnImmediateA - expectLearnA) < 1e-6,
+              "学习口径即时 == 0.1x引擎即时 + 每步代价x手数 (A)");
+        /*
+           B 侧 (Alpha-Beta) 没有学习口径 ⇒ 它的学习账**故意**是空的 (0), 而不是
+           "0.1x 引擎"。这一条把"没有口径就不记学习账"钉住 —— 否则 [2.19] 的换算关系
+           会被误用到纯搜索 agent 身上 (那就是在半口径上做断言)。
+        */
+        if (acct.learnCaliperB) {
+            CHECK(std::fabs(acct.learnImmediateB - expectLearnB) < 1e-6,
+                  "学习口径即时 == 0.1x引擎即时 + 每步代价x手数 (B)");
+        } else {
+            CHECK(acct.learnImmediateB == 0.0,
+                  "B 没有学习口径 ⇒ 学习账为空 (0), 曲线用的是它的引擎账");
+            CHECK(std::fabs(acct.curveImmediateB() - acct.engineImmediateB) < 1e-12,
+                  "B 的曲线值就是引擎口径账 (没有口径时不替换)");
+        }
+        CHECK(acct.movesA + acct.movesB > 0, "两方手数都记下来了 (每步代价的乘数)");
+        /*
+           手数之和 vs st.plies: st.plies 数是**决策次数**(含最后那次"无合法走法"),
+           而被将死/困毙的那一手不会执行 moveForward, 所以账上的手数至多少 1。
+        */
+        CHECK(acct.movesA + acct.movesB <= st19.plies
+                  && acct.movesA + acct.movesB + 1 >= st19.plies,
+              "两方手数之和 == 总手数 (差至多 1: 被将死那一手没有落子)");
+        if (std::fabs(acct.engineImmediateA) > 1e-9) {
+            CHECK(std::fabs(acct.learnImmediateA) < std::fabs(acct.engineImmediateA),
+                  "学习口径的量级小于引擎口径 (材质 x0.1 vs x1) —— 这正是两个口径差 10 倍");
+        }
     }
 
     /* ---------------------------------------------------------------- 3. 中止 */    std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");

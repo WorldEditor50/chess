@@ -32,6 +32,48 @@ public:
     /* Optional: reset internal state (tree, history, etc.) */
     virtual void resetState() {}
 
+    /*
+     * ================================================================
+     *  ---- ④ 学习口径的奖励 (界面奖励曲线用, 2026-09) ----
+     * ================================================================
+     * 背景 (用户在界面导出 CSV 上实测到的, 见 docs/sac_learn_reward_2026_09.md §1.1):
+     * 界面那条奖励曲线用的是 `Chess::moveForward` 的 totalReward (**材质按原值 ×1**,
+     * 而且是黑方视角记账), 而 agent 在线学习用的是**自己的** `computeReward()`
+     * (**材质 ×REWARD_MATERIAL_COEF = 0.1** + 每步代价 −0.001) 加终局 ±1。
+     * 两个口径差 **10 倍** —— 于是"曲线上的比例"永远解释不了"学习信号的比例":
+     * 用户从 CSV 里奖励最大值 4.5 读出"材质比赢棋重要 3.5 倍", 而 agent 学的是 0.35 : 1。
+     *
+     * 这三个虚函数把"这个 agent 的学习口径"暴露给界面 (由 ChessBoard 在每手/局末取数):
+     *   hasLearningReward()      : 有没有学习口径。纯搜索 agent (Alpha-Beta / MCTS / EVAB)
+     *                              没有 —— 它们的"环境奖励"就是引擎那本账, 界面照旧显示
+     *                              引擎口径并**标注**出来。
+     *   learningStepReward()     : 即时奖励 (走子方视角)。**必须在 moveForward 之前调**:
+     *                              实现要按 `s.nextId` 去读被吃子的 value, 而落子后它已经
+     *                              alive=false (见 stone.h 的 stepReward 注释)。
+     *   learningTerminalReward() : 终局值。默认与引擎一致 (±1, 和棋 0); SAC 开着塑形时
+     *                              它是 ±(1+败方剩余材质/3.5) —— 必须走 agent 自己的
+     *                              `terminalReward()`, 否则界面上显示的游戏与它学的是两个。
+     *
+     * 契约: 只读棋盘, 不改任何状态, 不训练 (对局线程持有 mutex 时调用)。
+     */
+    virtual bool hasLearningReward() const { return false; }
+    virtual float learningStepReward(const Step &s, int color)
+    {
+        (void)s;
+        (void)color;
+        return 0.0f;
+    }
+    virtual float learningTerminalReward(int chessResult, int perspective) const
+    {
+        return outcomeForMover(chessResult, perspective);
+    }
+    /* 界面标签用: 这个 agent 的奖励曲线是哪个口径 */
+    virtual std::string rewardCaliperName() const
+    {
+        return hasLearningReward() ? std::string("学习口径")
+                                   : std::string("引擎口径(材质x1)");
+    }
+
     /* --- 决策流程: 先探索环境 + 预训练, 再决策 (仿 snakeAI) --- */
 
     /*

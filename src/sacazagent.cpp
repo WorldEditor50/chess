@@ -812,7 +812,16 @@ float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
             continue;
         }
         const float qmin = std::min(q1In[i], q2In[i]);
-        v += pi[i] * (qmin - a * std::log(pi[i]));
+        /*
+           `entropyInTarget == 1.0f` 走**原式** (不改动前逐位一致; 这里刻意不写成
+           `* entropyInTarget`, 免得后人以为默认路径有额外运算) —— 见头文件对该开关的说明:
+           熵项一旦进 V(s'), 它就以 −γ·α·H(s') 的形式进了 critic 的回归目标,
+           而那是一个与棋局无关的常数偏置。
+        */
+        const float ent = (entropyInTarget == 1.0f)
+                              ? (a * std::log(pi[i]))
+                              : (entropyInTarget * a * std::log(pi[i]));
+        v += pi[i] * (qmin - ent);
     }
     return v;
 }
@@ -1436,10 +1445,80 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
                 H -= pi[i] * std::log(pi[i]);
             }
         }
-        const int lc = (tr.legalCount > 1) ? tr.legalCount : 2;
+        const int lc0 = (tr.legalCount > 1) ? tr.legalCount : 2;
+        int lc = lc0;
+        if (entropySlotsAsLegal) {
+            /*
+               H̄ 的分母换成**合法槽位数** (见头文件): π 只分布在槽位上, 而 128 槽哈希有
+               碰撞 ⇒ H ≤ log(槽位数) < log(着法数); H̄ 按着法数算时可能永远达不到, 而
+               α 的梯度恰好是 (H − H̄) ⇒ α 被单向推走。
+            */
+            int sc = 0;
+            for (int i = 0; i < ACTION_DIM; i++) {
+                if (mask[i] > 0.5f) { sc++; }
+            }
+            lc = (sc > 1) ? sc : 2;
+        }
         const float Hbar = entropyRatio * std::log((float)lc);
         alphaGrad += (H - Hbar);
         n++;
+
+        /*
+           ---- [2026-09 ①] 训练中的 critic/α 诊断 (只累加, 不进任何梯度/更新路径) ----
+           三个问题见 sacazagent.h 的 TrainDiag 说明。这里全部是**读**已经算好的量,
+           不改变任何前向/反向/随机流 ⇒ 默认口径下的数值与改动前逐位一致。
+        */
+        {
+            TrainDiag &D = trainDiag;
+            D.n++;
+            const double yAbs = std::fabs((double)y);
+            D.yPreAbsSum += yAbs;
+            D.yPreSum += (double)y;
+            if (yAbs > D.yPreAbsMax) { D.yPreAbsMax = yAbs; }
+            if (clampTarget > 0.0f && yAbs > (double)clampTarget) { D.clamped++; }
+
+            /* V(s') 的两项分解: E_π[min Q] 与熵项 α·H (y = r − γV) */
+            double vQ = 0.0, vEnt = 0.0;
+            for (int i = 0; i < ACTION_DIM; i++) {
+                if (nextMask[i] <= 0.5f || piNext[i] <= 0.0f) { continue; }
+                const double p = (double)piNext[i];
+                vQ += p * (double)std::min(q1n[i], q2n[i]);
+                vEnt += p * (-(double)a * std::log(p));
+            }
+            D.vNextSum += (double)vNext;
+            D.vQSum += vQ;
+            D.vEntSum += vEnt;
+
+            /* 当前局面的合法槽位数 / 着法数, 以及 H 与两种 H̄ */
+            double slotsCur = 0.0;
+            double qm = 0.0, qs2 = 0.0;
+            for (int i = 0; i < ACTION_DIM; i++) {
+                if (mask[i] <= 0.5f) { continue; }
+                slotsCur += 1.0;
+                const double qq = (double)std::min(q1o[i], q2o[i]);
+                qm += qq;
+                qs2 += qq * qq;
+            }
+            double qSpread = 0.0;
+            if (slotsCur > 0.0) {
+                qm /= slotsCur;
+                const double var = qs2 / slotsCur - qm * qm;
+                qSpread = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+            D.qSpreadSum += qSpread;
+            D.qAbsMeanSum += std::fabs(qm);
+            D.slotsSum += slotsCur;
+            D.legalSum += (double)lc0;
+            D.hSum += (double)H;
+            D.hBarSum += (double)Hbar;
+            const double hBarSlots = (double)entropyRatio
+                                     * std::log((double)((slotsCur > 1.0) ? slotsCur : 2.0));
+            D.hBarSlotsSum += hBarSlots;
+            if ((double)H < (double)Hbar) { D.hBelowHbar++; }
+            if ((double)H < hBarSlots) { D.hBelowHbarSlots++; }
+            if (D.alphaFirst < 0.0) { D.alphaFirst = (double)a; }
+            D.alphaLast = (double)a;
+        }
     }
     }   /* ---- epochs 循环结束 (P4) ---- */
 

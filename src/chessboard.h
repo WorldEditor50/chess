@@ -278,13 +278,20 @@ signals:
     void matchScoreChanged(const QString &scoreLine);
     /*
      * ---- 指标曲线用的采样 ----
-     * gameRewardSample   : 每局结束后两位参赛者各自拿到的**环境奖励累计**
-     *                      (即时奖励之和, 走子方视角; 吃子与终局 ±1 都在里面)
+     * gameRewardSample   : 每局结束后两位参赛者各自拿到的**本局环境奖励累计**
+     *                      (走子方视角; 即时奖励与终局值都在里面)
      * matchRewardProgress: 一局**进行中**每手一次的"本局累计"环境奖励 (同样走子方
-     *                      视角, 同样含吃子, 但**不含**局末的 ±1 —— 那个由
+     *                      视角, 同样含即时奖励, 但**不含**局末的终局值 —— 那个由
      *                      gameRewardSample 补上最后一点)
      * trainLossSample    : 每完成一次在线训练上报一次损失 (哪个 agent / 第几次)
      * 三者都在后台线程 emit, 队列投递到 GUI 线程后进曲线。
+     *
+     * **[2026-09 ④] 奖励的"口径"**: 奖励曲线现在取 agent **自己的学习口径**
+     *   (材质 x REWARD_MATERIAL_COEF(0.1) + 每步代价 + 终局; SAC 开着塑形时终局是
+     *    ±(1+败方材质/3.5))。没有学习口径的纯搜索 agent (Alpha-Beta / MCTS / EVAB)
+     *   仍旧是引擎口径 (材质 x1 + 终局 ±1), 曲线名与逐局明细里都会标出来。
+     *   **两个口径差 10 倍** —— 同一张图上混着两种口径的线时不可直接比大小
+     *   (见 RewardAccounting 与 docs/sac_learn_reward_2026_09.md §1.1)。
      *
      * 为什么要有 matchRewardProgress: 一局可能有几百手、跑十几分钟 (实测 276 手
      * 621 秒), 而 gameRewardSample 一局只发一次 —— 用户看到的是"对弈时奖励曲线
@@ -444,19 +451,97 @@ private:
     std::atomic<int> m_matchGameNo{0};
     std::atomic<int> m_matchGames{0};
     int m_maxPliesPerGame = DEFAULT_MAX_PLIES;   /* 单局手数上限, 到顶判和 */
-    /* 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_* */
     /*
      * 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_*。
      * aIsRed 说明"这一局 A 方是不是执红", 只用来把红/黑两本账换算成 A/B 两本账
      * (换算出来的值同时用于 rewardA/rewardB 出参和每手的 matchRewardProgress)。
      * rewardRed / rewardBlack / rewardA / rewardB 都是**出参**: 本局各方累计到的
-     * 即时环境奖励 (走子方视角) + 终局 ±1。A/B 的换算是**唯一**在这里做的,
-     * 调用方不要再自己算一遍 (以前 matchAgents 里重复算了一次, 两处规则万一不一致
-     * 就是"曲线和逐局明细对不上")。被中止时返回 ONGOING, 四个出参停在中止那一刻的值。
+     * **奖励曲线上那条口径**的累计值 (见下面的 RewardAccounting) + 终局值。
+     * A/B 的换算是**唯一**在这里做的, 调用方不要再自己算一遍。
+     * 被中止时返回 ONGOING, 四个出参停在中止那一刻的值。
      */
     int playMatchGame(AgentType redType, AgentType blackType, bool aIsRed, MatchStats &st,
                       double &rewardRed, double &rewardBlack, double &rewardA,
                       double &rewardB);
+
+public:
+    /*
+     * ================================================================
+     *  ---- ④ 一局的奖励账 (两种口径都记, 2026-09) ----
+     * ================================================================
+     * 为什么两种都记 (而不是只留"曲线用的那一种"):
+     *   1. 端到端断言需要一个**可比对**的参照。学习口径与引擎口径之间有一条精确关系:
+     *        学习即时 = 0.1 x 引擎即时 − 0.001 x 该方手数      (与棋局无关, 逐手可验)
+     *      只留一种口径的话, 这条换算规则就只能"看着代码相信", 而本工程的教训是
+     *      "看着等价"不算数 (见 docs/session_2026_09_sac.md §4)。
+     *   2. 换口径会**破坏界面历史读数的可比性** (旧截图/旧 CSV 是引擎口径)。把两本账
+     *      都留在结构里, 事后至少要能解释差多少。
+     *
+     * 字段口径:
+     *   engineImmediate* : 引擎口径的即时奖励累计 (材质 x1, 已换算成**走子方视角**)
+     *   engineTerminal*  : 引擎口径的终局值 (±1 / 和棋: 0)
+     *   learnImmediate*  : 学习口径的即时奖励累计 (材质 x0.1 + 每步代价)
+     *   learnTerminal*   : 学习口径的终局值 (SAC 塑形开着时是 ±(1+败方材质/3.5))
+     *   moves*           : 该方在本局走子的手数 (每步代价那一项的乘数)
+     *   learnCaliper*    : true = 这个 agent **有**学习口径 (曲线就用它); false = 纯搜索
+     *                      agent, 曲线用引擎口径 (界面上以标签标注)
+     *   curve*()         : 曲线上实际取的那个值 (先取即时累计再取终局, 与信号的分工一致)
+     */
+    struct RewardAccounting {
+        double engineImmediateA = 0.0, engineImmediateB = 0.0;
+        double engineTerminalA = 0.0, engineTerminalB = 0.0;
+        double learnImmediateA = 0.0, learnImmediateB = 0.0;
+        double learnTerminalA = 0.0, learnTerminalB = 0.0;
+        int movesA = 0, movesB = 0;
+        bool learnCaliperA = false, learnCaliperB = false;
+        /* 曲线上的"本局累计"(不含终局) —— 每手 emit 的那个值 */
+        double curveImmediateA() const
+        {
+            return learnCaliperA ? learnImmediateA : engineImmediateA;
+        }
+        double curveImmediateB() const
+        {
+            return learnCaliperB ? learnImmediateB : engineImmediateB;
+        }
+        /* 曲线上的"本局最终值" —— 局末 emit 的那个值 */
+        double curveFinalA() const
+        {
+            return learnCaliperA ? (learnImmediateA + learnTerminalA)
+                                 : (engineImmediateA + engineTerminalA);
+        }
+        double curveFinalB() const
+        {
+            return learnCaliperB ? (learnImmediateB + learnTerminalB)
+                                 : (engineImmediateB + engineTerminalB);
+        }
+        void clear() { *this = RewardAccounting(); }
+    };
+    /*
+     * 最近**打完**的那一局的奖励账。
+     * 线程契约: 由对弈线程在 playMatchGame 里写; 读它要等这一局结束 (测试是同步调
+     * matchAgents 之后读)。界面不用它 (界面走信号)。
+     */
+    const RewardAccounting &lastRewardAccounting() const { return m_lastReward; }
+
+    /* 该 agent 类型有没有"学习口径"的奖励 (纯搜索 agent: 没有) */
+    static bool agentHasLearningReward(AgentType type);
+    /*
+     * 奖励曲线的口径标签 (界面用, 挂在曲线名后面):
+     *   有学习口径 -> "学习口径(材质x0.1+每步代价+终局±1)"
+     *   没有       -> "引擎口径(材质x1+终局±1)"
+     * 为什么要标出来: 两个口径差 10 倍, 同一张图上 A 用学习口径、B 用引擎口径时
+     * **两条线不可直接比大小** —— 标签是这件事唯一的提示 (见 §1.1 的坑)。
+     */
+    static QString agentRewardCaliperLabel(AgentType type);
+
+private:
+    /* 取该类型的 agent 实例 (没建过 = nullptr; 纯搜索 agent 永远 nullptr) */
+    AgentBase *agentInstance(AgentType type) const;
+    /* 学习口径的即时奖励; 没有口径 (或实例还没建) 时返回 NaN, 调用方回退引擎口径 */
+    double learningStepRewardOrNaN(AgentType type, const Step &step, int mover);
+    /* 学习口径的终局值; 同上 */
+    double learningTerminalRewardOrNaN(AgentType type, int result, int mover);
+    RewardAccounting m_lastReward;
     /* 是否轮到这个 agent 走 (对弈中 arena 用) */
     AgentType typeForTurn(int turn, AgentType redType, AgentType blackType) const;
 

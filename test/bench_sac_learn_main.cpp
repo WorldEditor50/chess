@@ -100,6 +100,27 @@ struct Cfg {
        什么, 却多走一条与训练不同的代码路径)。类里默认开着; 59e5233 那一支是关的。
     */
     bool sparseLeaf = true;
+    /*
+       ---- [2026-09 ①] 熵项与目标熵的两个实验开关 (默认 = 现状) ----
+       `--entropy-in-target=0` : 熵项不进软价值 ⇒ 不进 critic 的自举目标 (只留在策略损失)。
+                                假设: y 里的 −γ·α·H(s') 是个与棋局无关的常数偏置, 它才是
+                                critic 被顶到钳位边界 (或压到 0) 的原因。
+       `--entropy-slots`       : 目标熵 H̄ 的分母从"合法着法数"换成"合法槽位数"。
+                                假设: 128 槽哈希有碰撞 ⇒ H ≤ log(槽位) < log(着法) ⇒ 按着法
+                                算的 H̄ 永远达不到 ⇒ α 被单向推到边界。
+       负数 = 不覆盖, 用类里的默认值 (与改动前逐位一致)。
+    */
+    float entropyInTarget = -1.0f;
+    bool entropySlots = false;
+    /*
+       ---- [①] 搜索叶子值的**整体缩放** (SACAZAgent::valueScale 的透传) ----
+       用它做一个只动"搜索侧"的对照: `--no-train --value-scale=0/1/4` 时策略与 critic
+       完全不动 (随机权重、一次都不学), 只有叶子值的**常数**在变。若得分率跟着这个常数
+       走, 就说明本轮看到的那些得分率差异是**搜索侧的常数偏置**造成的, 不是"学到了更多"。
+       (`valueScale` 只乘搜索用的软价值, 不动学习侧的目标 —— 见 sacazagent.h。)
+       负数 = 不覆盖 (默认 1.0 = 逐位不变)。
+    */
+    float valueScale = -1.0f;
     std::string csv;
     std::string label = "sac";
     bool quiet = false;
@@ -188,10 +209,54 @@ struct GameLog {
     int lossPoints = 0;                  /* 这一局产生的损失曲线点数 */
 };
 
+/*
+ * [2026-09 ①] 训练中诊断的**一段**(两个累计量之差) —— 用来把"整轮"切成"每局"看。
+ * 为什么必须能切片: 本轮要回答的是 α 的**轨迹** (它是不是被单向推到边界) 与 clamp 比例,
+ * 只看训练结束后的快照会把"一路推到 5.0"和"一直在 0.2 附近"看成同一个结果。
+ */
+struct DiagDelta {
+    long long n = 0, clamped = 0, hBelow = 0, hBelowSlots = 0;
+    double yPreAbsMean = 0.0, yPreMean = 0.0, yPreAbsMax = 0.0;
+    double vMean = 0.0, vQMean = 0.0, vEntMean = 0.0;
+    double hMean = 0.0, hBarMean = 0.0, hBarSlotsMean = 0.0;
+    double slotsMean = 0.0, legalMean = 0.0;
+    double qSpreadMean = 0.0, qAbsMean = 0.0;
+    double alphaFirst = 0.0, alphaLast = 0.0;
+    DiagDelta() = default;
+    DiagDelta(const SACAZAgent::TrainDiag &a, const SACAZAgent::TrainDiag &b)
+    {
+        n = b.n - a.n;
+        if (n <= 0) { return; }
+        const double d = (double)n;
+        clamped = b.clamped - a.clamped;
+        hBelow = b.hBelowHbar - a.hBelowHbar;
+        hBelowSlots = b.hBelowHbarSlots - a.hBelowHbarSlots;
+        yPreAbsMean = (b.yPreAbsSum - a.yPreAbsSum) / d;
+        yPreMean = (b.yPreSum - a.yPreSum) / d;
+        yPreAbsMax = b.yPreAbsMax;
+        vMean = (b.vNextSum - a.vNextSum) / d;
+        vQMean = (b.vQSum - a.vQSum) / d;
+        vEntMean = (b.vEntSum - a.vEntSum) / d;
+        hMean = (b.hSum - a.hSum) / d;
+        hBarMean = (b.hBarSum - a.hBarSum) / d;
+        hBarSlotsMean = (b.hBarSlotsSum - a.hBarSlotsSum) / d;
+        slotsMean = (b.slotsSum - a.slotsSum) / d;
+        legalMean = (b.legalSum - a.legalSum) / d;
+        qSpreadMean = (b.qSpreadSum - a.qSpreadSum) / d;
+        qAbsMean = (b.qAbsMeanSum - a.qAbsMeanSum) / d;
+        alphaFirst = (a.alphaFirst >= 0.0) ? a.alphaFirst : b.alphaFirst;
+        alphaLast = b.alphaLast;
+    }
+    double clampFrac() const { return n > 0 ? (double)clamped / (double)n : 0.0; }
+    double hBelowFrac() const { return n > 0 ? (double)hBelow / (double)n : 0.0; }
+    double hBelowSlotsFrac() const {
+        return n > 0 ? (double)hBelowSlots / (double)n : 0.0;
+    }
+};
+
 static int otherColor(int c) {
     return (c == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
 }
-
 static void materialOf(Chess &c, int color, double &nonJiang)
 {
     nonJiang = 0.0;
@@ -383,6 +448,9 @@ int main(int argc, char **argv)
         else if (const char *v = val("--huber"))   { g.huberDelta = (float)std::atof(v); }
         else if (const char *v = val("--entropy-ratio")) { g.entropyRatio = (float)std::atof(v); }
         else if (const char *v = val("--alpha-lr")) { g.alphaLr = (float)std::atof(v); }
+        else if (const char *v = val("--entropy-in-target")) { g.entropyInTarget = (float)std::atof(v); }
+        else if (std::strcmp(a, "--entropy-slots") == 0) { g.entropySlots = true; }
+        else if (const char *v = val("--value-scale")) { g.valueScale = (float)std::atof(v); }
         else if (std::strcmp(a, "--no-sparse-leaf") == 0) { g.sparseLeaf = false; }
         else if (std::strcmp(a, "--quiet") == 0)  { g.quiet = true; }
         else { std::fprintf(stderr, "[warn] 未知参数: %s\n", a); }
@@ -418,6 +486,9 @@ int main(int argc, char **argv)
     if (g.huberDelta >= 0.0f)   { sac.huberDelta = g.huberDelta; }
     if (g.entropyRatio >= 0.0f) { sac.entropyRatio = g.entropyRatio; }
     if (g.alphaLr >= 0.0f)      { sac.learningRateAlpha = g.alphaLr; }
+    if (g.entropyInTarget >= 0.0f) { sac.entropyInTarget = g.entropyInTarget; }
+    if (g.entropySlots)         { sac.entropySlotsAsLegal = true; }
+    if (g.valueScale >= 0.0f)   { sac.valueScale = g.valueScale; }
     if (!g.sparseLeaf)          { sac.sparseLeafEval = false; }
     MCTS mcts(board, 1.414);
 
@@ -448,6 +519,11 @@ int main(int argc, char **argv)
                 (double)sac.clampTarget, (double)sac.huberDelta,
                 (double)sac.entropyRatio, (double)sac.learningRateAlpha,
                 sac.sparseLeafEval ? "稀疏头" : "全量");
+    std::printf("熵项去处   : entropyInTarget=%.2f (0 = 熵项不进软价值/critic 目标) | "
+                "目标熵分母=%s | 搜索叶子缩放 valueScale=%.2f\n",
+                (double)sac.entropyInTarget,
+                sac.entropySlotsAsLegal ? "**合法槽位数** (反事实)" : "合法着法数 (现状)",
+                (double)sac.valueScale);
 
     Score st;
     int lossTotal = 0;
@@ -455,6 +531,9 @@ int main(int argc, char **argv)
     double learnSAC = 0.0, learnOpp = 0.0, dispSAC = 0.0, dispOpp = 0.0;
     double sacMatSum = 0.0, oppMatSum = 0.0;
     std::vector<double> pliesList;
+    /* [①] 训练中诊断: 累计量起点 (每局取差值得"这一局"的分布) */
+    const SACAZAgent::TrainDiag diagStart = sac.getTrainDiag();
+    SACAZAgent::TrainDiag diagPrev = diagStart;
     const double t0 = nowMs();
 
     for (int i = 0; i < g.games; i++) {
@@ -503,6 +582,26 @@ int main(int argc, char **argv)
                         gl.displayRewardSAC, gl.displayRewardOpp,
                         gl.sacMaterial, gl.oppMaterial, gl.lossPoints);
         }
+        /*
+           [①] 这一局的训练分布 (α / 目标 y 被夹的比例 / V 的两项分解 / H 与 H̄)。
+           每局一行: 判断"α 是不是被单向推到边界""critic 的目标是不是常被夹成常数"
+           靠的就是这个**轨迹**, 而不是训练后的快照。
+        */
+        if (!g.quiet) {
+            const SACAZAgent::TrainDiag now = sac.getTrainDiag();
+            const DiagDelta dx(diagPrev, now);
+            diagPrev = now;
+            if (dx.n > 0) {
+                std::printf("              [①] α %.4f→%.4f | y夹前均值|y| %.2f (符号 %+.2f, "
+                            "最大 %.2f) 被夹 %.0f%% | V %+.2f = E[minQ] %+.2f + αH %+.2f | "
+                            "H %.2f vs H̄ %.2f (H<H̄ %.0f%%) | Qspread %.3f | 槽位/着法 %.1f/%.1f\n",
+                            dx.alphaFirst, dx.alphaLast, dx.yPreAbsMean, dx.yPreMean,
+                            dx.yPreAbsMax, 100.0 * dx.clampFrac(),
+                            dx.vMean, dx.vQMean, dx.vEntMean,
+                            dx.hMean, dx.hBarMean, 100.0 * dx.hBelowFrac(),
+                            dx.qSpreadMean, dx.slotsMean, dx.legalMean);
+            }
+        }
     }
     const double sec = (nowMs() - t0) / 1000.0;
 
@@ -549,6 +648,10 @@ int main(int argc, char **argv)
        无约束的 critic 从 |Q| 0.063 一路漂到 13.38, 那时搜索的 PUCT 被 Q 压坏。
        这里在**训练后的权重**上量同一组读数 (随机开局 12 个局面)。
     */
+    /* [①] 探针读数 (块外 CSV 也要用) */
+    double probeQAbsMean = 0.0, probeQAbsMax = 0.0, probeNormEntropy = 0.0;
+    double probeQTargetAbsMean = 0.0;
+    double probeHMean = 0.0, probeSlotMean = 0.0, probeMoveMean = 0.0;
     {
         double qAbs = 0.0, qAbsMax = 0.0;
         int qn = 0;
@@ -560,6 +663,16 @@ int main(int argc, char **argv)
            这也是本轮"α 目标熵"那个改动的机制读数 (见 docs §9)。
         */
         double normEntropy = 0.0;
+        double hProbeSum = 0.0, slotProbeSum = 0.0, moveProbeSum = 0.0;
+        /*
+           [①] **目标网**的尺度 —— 这一条是"critic 为什么没有游戏信息"的直接证据:
+           软备份 V(s') 用的是 q1Target/q2Target, 而它们每 64 步才做一次 tau=1e-3 的
+           Polyak 同步 ⇒ 一次 20 局的对弈 (~2600 步) 只把目标网从随机初始化挪动了
+           1-(1-1e-3)^(步数/64) ≈ **4%**。也就是说训练目标里的 E[min Q(s')] 几乎一直是
+           "随机网络的输出", 与棋局无关; 真正决定目标量级的是 α·H 那一项 (见 [①] 诊断)。
+        */
+        double qTAbs = 0.0, qTAbsMax = 0.0;
+        int qTn = 0;
         int en = 0;
         for (int k = 0; k < 12; k++) {
             board.reset();
@@ -591,24 +704,134 @@ int main(int argc, char **argv)
                 qAbsMax = std::max(qAbsMax, std::fabs(q));
                 qn++;
             }
+            /* [①] 目标网的同一组读数 (V(s') 就是拿它算的) */
+            {
+                RL::Tensor qt1(SACAZAgent::ACTION_DIM, 1), qt2(SACAZAgent::ACTION_DIM, 1);
+                sac.qTargetValues(stx, qt1, qt2);
+                for (int a : idx) {
+                    const double q = std::min((double)qt1[a], (double)qt2[a]);
+                    qTAbs += std::fabs(q);
+                    qTAbsMax = std::max(qTAbsMax, std::fabs(q));
+                    qTn++;
+                }
+            }
             /* 策略熵 (只算合法动作上) */
             RL::Tensor piA(SACAZAgent::ACTION_DIM, 1);
             sac.policy(stx, mask, piA);
+            /*
+               熵必须按**掩码**累加 (槽位去重)。旧版按 idx 累加: 128 槽哈希有碰撞, 同一个
+               槽位可能在 idx 里出现两次, 那份质量被重复计进熵 ⇒ 会出现"归一化熵 1.098 > 1"
+               这种数学上不可能的数 (_H 不可能超过 log(支撑大小)_), 而它正是本轮 ① 要找的
+               那条线索: **槽位数 < 着法数**, 而 α 的目标熵 H̄ = 熵比·log(着法数)。
+            */
             double H = 0.0;
-            for (int a : idx) {
+            int slotCount = 0;
+            for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+                if (mask[a] <= 0.5f) { continue; }
+                slotCount++;
                 const double p = (double)piA[a];
                 if (p > 0.0) { H -= p * std::log(p); }
             }
-            const double logLegal = std::log((double)idx.size());
-            if (logLegal > 1e-9) { normEntropy += H / logLegal; en++; }
+            if (slotCount > 1) {
+                normEntropy += H / std::log((double)slotCount);
+                hProbeSum += H;
+                slotProbeSum += (double)slotCount;
+                moveProbeSum += (double)idx.size();
+                en++;
+            }
         }
-        std::printf("  策略熵      : 归一化 H/log(合法) 均值 %.3f (%d 个局面; 1.0 = 完全均匀)\n",
+        std::printf("  策略熵      : H 均值 %.3f, 归一化 H/log(槽位) 均值 %.3f (%d 个局面; "
+                    "1.0 = 完全均匀)\n",
+                    en > 0 ? hProbeSum / (double)en : 0.0,
                     en > 0 ? normEntropy / (double)en : 0.0, en);
+        /*
+           "分母"这一行是 ① 的关键读数: π 只分布在**槽位**上, 而目标熵 H̄ 按**着法数**算,
+           两者的 log 之差就是 α 的梯度里那个永远补不平的缺口。
+        */
+        std::printf("  熵的分母    : 平均 %.1f 槽位 vs %.1f 着法 = 平均挤掉 %.1f 个着法 ⇒ "
+                    "log 差 %.3f (H̄ 按着法算时 H 达不到)\n",
+                    en > 0 ? slotProbeSum / (double)en : 0.0,
+                    en > 0 ? moveProbeSum / (double)en : 0.0,
+                    en > 0 ? (moveProbeSum - slotProbeSum) / (double)en : 0.0,
+                    en > 0 ? (std::log(moveProbeSum / (double)en)
+                             - std::log(slotProbeSum / (double)en)) : 0.0);
         std::printf("  critic 尺度 : |Q| 均值 %.3f, |Q| 最大 %.3f (%d 个合法动作)  "
                     "%s\n", qn > 0 ? qAbs / (double)qn : 0.0, qAbsMax, qn,
                     (qn > 0 && qAbs / (double)qn > 3.0)
                         ? "**疑似发散: 搜索的 PUCT 会被 Q 压坏 (见 docs §5.2)**"
                         : "(量级正常)");
+        /*
+           [①] 目标网 = 软备份 V(s') 的来源。它几乎停在随机初始化上 (Polyak 太慢),
+           所以"训练目标里那一部分游戏信息"其实是 0 —— 详见下面 [①] 诊断的 V(s') 分解。
+        */
+        {
+            const double steps = (double)sac.getLearnSteps();
+            const double iters = steps / (double)(sac.replaceTargetIter > 0
+                                                      ? sac.replaceTargetIter : 1);
+            const double moved = 1.0 - std::pow(1.0 - 1e-3, iters);
+            std::printf("  目标网尺度  : |Q_target| 均值 %.3f, 最大 %.3f (%d 个合法动作)  "
+                        "⇒ 相对随机初始化只移动了 %.2f%% (%d 步 / 每 %d 步 tau=1e-3)\n",
+                        qTn > 0 ? qTAbs / (double)qTn : 0.0, qTAbsMax, qTn,
+                        100.0 * moved, sac.getLearnSteps(), sac.replaceTargetIter);
+            std::printf("                (V(s') 就是拿这张网算的: 它还在随机尺度上 ⇒ "
+                        "自举项里的**游戏信息 ≈ 0**, 目标的量级由 α·H 决定)\n");
+        }
+        probeQAbsMean = (qn > 0) ? qAbs / (double)qn : 0.0;
+        probeQAbsMax = qAbsMax;
+        probeQTargetAbsMean = (qTn > 0) ? qTAbs / (double)qTn : 0.0;
+        probeNormEntropy = (en > 0) ? normEntropy / (double)en : 0.0;
+        probeHMean = (en > 0) ? hProbeSum / (double)en : 0.0;
+        probeSlotMean = (en > 0) ? slotProbeSum / (double)en : 0.0;
+        probeMoveMean = (en > 0) ? moveProbeSum / (double)en : 0.0;
+    }
+
+    /*
+       ================================================================
+       [2026-09 ①] 训练**过程中**的 critic/α 诊断 (整轮累计)
+       ================================================================
+       三条要看的事:
+         1. `y` 被 clampTarget 夹住的比例 —— 夹住的部分目标是个常数, 对"排序"零贡献;
+         2. V(s') 的两项 (E[min Q] 与 α·H) 谁大谁小 —— 假设是"αH 项把 critic 顶走的";
+         3. α 从哪走到哪, 以及 H 与两种 H̄ 的对比 (α 的梯度是 H − H̄)。
+       `m_maxAbsTarget` 是**夹后**的极值 (所以它永远 ≤ clampTarget, 天生看不见"夹了多少"),
+       这里补的正是它看不见的那一面。
+       ================================================================
+    */
+    {
+        const DiagDelta dx(diagStart, sac.getTrainDiag());
+        std::printf("\n--- [①] 训练中的 critic/α 诊断 (整轮累计, %lld 个样本) ---\n", dx.n);
+        if (dx.n > 0) {
+            std::printf("  α 轨迹      : %.4f → %.4f  (上界 5.0 / 下界 0.02; 落到边界 = "
+                        "被单向推走)\n",
+                        dx.alphaFirst, dx.alphaLast);
+            std::printf("  目标 y      : 夹**前** 均值 |y| %.2f (符号 %+.2f, 最大 %.2f); "
+                        "被夹 %.1f%% (%lld/%lld)\n",
+                        dx.yPreAbsMean, dx.yPreMean, dx.yPreAbsMax,
+                        100.0 * dx.clampFrac(), dx.clamped, dx.n);
+            std::printf("                (对照: 夹后的极值 m_maxAbsTarget=%.3f, "
+                        "|td err| 极值 %.3f)\n",
+                        sac.getMaxAbsTarget(), sac.getMaxAbsTdErr());
+            std::printf("  V(s') 分解  : 总 %+.3f = E_π[min Q] %+.3f + α·H %+.3f  "
+                        "⇒ 熵项占 %.0f%%\n",
+                        dx.vMean, dx.vQMean, dx.vEntMean,
+                        (std::fabs(dx.vMean) > 1e-9)
+                            ? 100.0 * std::fabs(dx.vEntMean) / std::fabs(dx.vMean) : 0.0);
+            std::printf("  熵与目标熵  : H %.3f | H̄(按着法) %.3f | H̄(按槽位) %.3f  ⇒  "
+                        "H<H̄ %.1f%% / H<H̄(槽位) %.1f%%\n",
+                        dx.hMean, dx.hBarMean, dx.hBarSlotsMean,
+                        100.0 * dx.hBelowFrac(), 100.0 * dx.hBelowSlotsFrac());
+            std::printf("                (%s)\n",
+                        (dx.hBelowFrac() > 0.9 && dx.hBelowSlotsFrac() < 0.1)
+                            ? "**H̄ 按着法算时基本达不到 ⇒ α 被单向推大** (换分母即翻号)"
+                            : (dx.hBelowFrac() < 0.1)
+                                  ? "H̄ 基本能达到 ⇒ α 被推小 (趋向下界)"
+                                  : "两种方向都出现 (α 在中间找平衡)");
+            std::printf("  critic 排序 : 合法槽位上 min(Q1,Q2) 的标准差均值 %.4f, "
+                        "|均值| %.3f  (塌到 0 = Q 对搜索不再提供排序; PUCT 的 U 项量级 "
+                        "≈ c_puct·P·√N)\n", dx.qSpreadMean, dx.qAbsMean);
+            std::printf("  槽位/着法   : 平均 %.1f / %.1f (哈希碰撞平均挤掉 %.1f 个着法)\n",
+                        dx.slotsMean, dx.legalMean, dx.legalMean - dx.slotsMean);
+        }
     }
     std::printf("  学习步数    : %d, 回放池 %zu, 用时 %.1f s\n",
                 sac.getLearnSteps(), sac.getMemorySize(), sec);
@@ -616,16 +839,29 @@ int main(int argc, char **argv)
     if (!g.csv.empty()) {
         FILE *fp = std::fopen(g.csv.c_str(), "w");
         if (fp != nullptr) {
+            /* [①] 诊断列: |Q| 与 α/y/clamp/熵 的口径都在这里, 目的是让"|Q| 区间 → 得分率"
+               这条曲线能从 CSV 直接画出来 (而不是靠人工抄 log)。 */
+            const DiagDelta dx(diagStart, sac.getTrainDiag());
             std::fprintf(fp, "label,legacy,rewardShape,gamma,games,pliesCap,mctsSims,sims,"
                              "seed,mctsSrand,train,"
                              "wins,losses,draws,drawCap,drawNoCapture60,drawRepetition,"
                              "drawOther,scoreRate,ciLo,ciHi,"
                              "meanPlies,jiangCaptured,checkmate,stalemate,"
                              "learnRewardSAC,learnRewardOpp,displayRewardSAC,displayRewardOpp,"
-                             "sacMaterial,oppMaterial,lossPoints,lossMean,lossMax\n");
+                             "sacMaterial,oppMaterial,lossPoints,lossMean,lossMax,"
+                             "qAbsMean,qAbsMax,alphaFirst,alphaLast,clampFrac,yPreAbsMean,"
+                             "vMean,vQMean,vEntMean,hMean,hBarMean,hBarSlotsMean,"
+                             "hBelowHbarFrac,hBelowHbarSlotsFrac,qSpreadMean,"
+                             "slotsMean,legalMean,"
+                             "entropyInTarget,entropySlotsAsLegal,sparseLeaf,"
+                             "qTargetAbsMean,normEntropyProbe\n");
             std::fprintf(fp, "%s,%d,%d,%.4f,%d,%d,%d,%d,%u,%u,%d,"
                              "%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.2f,%d,%d,%d,"
-                             "%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%d,%.6f,%.6f\n",
+                             "%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%d,%.6f,%.6f,"
+                             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                             "%.4f,%.4f,%.4f,%.2f,%.2f,"
+                             "%.2f,%d,%d,%.4f,%.4f\n",
                          g.label.c_str(), g.legacy ? 1 : 0, g.rewardShape, (double)g.gamma,
                          g.games, g.maxPlies, g.mctsSims, g.sims, g.seed, g.mctsSrand,
                          g.train ? 1 : 0,
@@ -635,7 +871,16 @@ int main(int argc, char **argv)
                          st.jiangCaptured, st.checkmate, st.stalemate,
                          learnSAC / n, learnOpp / n, dispSAC / n, dispOpp / n,
                          sacMatSum / n, oppMatSum / n,
-                         lossTotal, lossTotal > 0 ? lossSum / (double)lossTotal : 0.0, lossMax);
+                         lossTotal, lossTotal > 0 ? lossSum / (double)lossTotal : 0.0, lossMax,
+                         probeQAbsMean, probeQAbsMax, dx.alphaFirst, dx.alphaLast,
+                         dx.clampFrac(),
+                         dx.yPreAbsMean, dx.vMean, dx.vQMean, dx.vEntMean,
+                         dx.hMean, dx.hBarMean, dx.hBarSlotsMean,
+                         dx.hBelowFrac(), dx.hBelowSlotsFrac(), dx.qSpreadMean,
+                         dx.slotsMean, dx.legalMean,
+                         (double)sac.entropyInTarget, sac.entropySlotsAsLegal ? 1 : 0,
+                         sac.sparseLeafEval ? 1 : 0,
+                         probeQTargetAbsMean, probeNormEntropy);
             std::fclose(fp);
             std::printf("  CSV         : %s\n", g.csv.c_str());
         } else {

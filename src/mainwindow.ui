@@ -258,7 +258,7 @@
        <item>
         <widget class="QLabel" name="metricsHintLabel">
          <property name="text">
-          <string>曲线: 训练损失 / 环境奖励(每手累计)</string>
+          <string>曲线: 训练损失 / 环境奖励(每手累计, 学习口径)</string>
          </property>
         </widget>
        </item>

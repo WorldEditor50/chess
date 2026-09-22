@@ -682,6 +682,10 @@ void MainWindow::onStartMatch()
         ui->matchBComboBox->itemData(idxB).toInt());
     const int games = ui->gamesSpin->value();
 
+    /* [④] 记下类型: 奖励曲线的口径标签要靠它 (见 mainwindow.h 的 m_matchTypeA/B) */
+    m_matchTypeA = typeA;
+    m_matchTypeB = typeB;
+
     /* 界面上的设置同步给棋盘 (对弈线程会读这两个开关) */
     board->setPreTrainSteps(ui->preTrainStepsSpin->value());
     board->setPreTrainEnabled(ui->preTrainCheck->isChecked());
@@ -763,8 +767,17 @@ void MainWindow::setupMetricsPanel()
     ui->lossChart->setValueSuffix(QString());
     ui->lossChart->setWindow(2000);
 
+    /*
+       [④] 奖励曲线的**口径** (2026-09): 现在取 agent **自己学的那一份** —— 材质 x0.1
+       + 每步代价 + 终局 (SAC 塑形开着时终局是 ±(1+败方材质/3.5))。纯搜索 agent
+       (Alpha-Beta / MCTS / EVAB) 没有学习口径, 仍旧画引擎口径 (材质 x1 + 终局 ±1)。
+       两个口径差 10 倍 (docs/sac_learn_reward_2026_09.md §1.1), 所以
+         * 曲线名上标出各自的口径 (见 resetMetricsForMatch);
+         * 标题里写清规则 —— 曲线上的比例现在**就是**学习信号的比例。
+    */
     ui->rewardChart->setTitle(
-        QStringLiteral("环境奖励 (每手累计, 局末含终局 ±1; 走子方视角)"));
+        QStringLiteral("环境奖励 (每手累计, 走子方视角) · 学习口径: 材质x0.1+每步代价+终局; "
+                       "标[引擎口径]的是纯搜索 agent (材质x1)"));
     ui->rewardChart->setValueSuffix(QString());
     ui->rewardChart->setWindow(2000);
 
@@ -1028,8 +1041,21 @@ void MainWindow::showAllAgentsSelfCheck()
 void MainWindow::resetMetricsForMatch(const QString &agentA, const QString &agentB)
 {
     ui->rewardChart->removeAllSeries();
-    m_rewardSeriesA = ui->rewardChart->addSeries(agentA, kSeriesColors[0]);
-    m_rewardSeriesB = ui->rewardChart->addSeries(agentB, kSeriesColors[1]);
+    /*
+       [④] 曲线名带上**口径标签**。奖励曲线取的是 agent 的学习口径 (见 setupMetricsPanel
+       与 aiagent.h 的说明), 而纯搜索 agent 没有学习口径、画的是引擎口径 —— 两个口径差
+       10 倍, 同一张图上混着两种口径的线时**不能直接比大小**。标签是这件事唯一的提示
+       (用户以前就是拿引擎口径 CSV 里的 4.5 推出"材质比赢棋重要 3.5 倍", 而 agent 学的
+       是 0.35 : 1, 见 docs/sac_learn_reward_2026_09.md §1.1)。
+    */
+    const QString suffixA = ChessBoard::agentHasLearningReward(m_matchTypeA)
+                                ? QStringLiteral(" [学习口径]")
+                                : QStringLiteral(" [引擎口径]");
+    const QString suffixB = ChessBoard::agentHasLearningReward(m_matchTypeB)
+                                ? QStringLiteral(" [学习口径]")
+                                : QStringLiteral(" [引擎口径]");
+    m_rewardSeriesA = ui->rewardChart->addSeries(agentA + suffixA, kSeriesColors[0]);
+    m_rewardSeriesB = ui->rewardChart->addSeries(agentB + suffixB, kSeriesColors[1]);
 }
 
 /* agent 名 -> 损失曲线下标; 第一次见到这个 agent 时新建一条 */

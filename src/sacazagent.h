@@ -433,6 +433,71 @@ public:
     float huberDelta = 1.0f;     /* <=0 表示用纯 MSE (对照用) */
 
     /*
+       ================================================================
+       [2026-09 ①] 熵项的**去处**与目标熵的**分母** (两个实验开关, 默认 = 现状)
+       ================================================================
+       背景 (本轮要验证的机制假设, 见 docs/session_2026_09_sac.md §3-①):
+       软价值是 `softValueFrom = E_π[min Q] + α·H(π)` (H = 策略熵), 而 TD 目标是
+           y = r − γ(1−done)·V(s')
+       于是 **熵项以 −γ·α·H(s') 的形式直接进入 critic 的回归目标** —— 它与棋局无关,
+       是一个常数偏置。若 Q 在各动作上近似相等 (= q), 不动点解就是
+           q = (r − γ·α·H) / (1 + γ)
+       即"α·H 有多大, critic 就被推到多远": αH ≳ 4 时 q 已经越过 clampTarget=2 的边界,
+       整个 critic 退化成"所有动作都等于钳位边界上的同一个常数"(实测 |Q| 均值 2.008 /
+       最大 2.162, 而钳位是 2.0 —— 贴着边界正是这个形状); αH → 0 时 q → 0
+       (实测 0.5/5e-3 档 |Q| = 0.035)。**两种都是没有排序信息**, 只是被推到的常数不同。
+
+       开关 (都是"关掉才变", 默认口径与改动前逐位一致):
+         entropyInTarget = 1.0 : 现状 —— 熵项进 V(s'), 因此既进搜索叶子也进 critic 目标;
+                          = 0.0 : 熵项**不进**软价值 (只留在策略损失里) —— 用来单独检验
+                                  "是熵项把 critic 顶走的" 这条因果, 而不是只看相关性。
+         entropySlotsAsLegal = false : 现状 —— 目标熵 H̄ = 熵比·log(合法**着法**数);
+                              = true  : H̄ = 熵比·log(合法**槽位**数)。
+                                 为什么这是个真差别: 128 槽哈希有碰撞 (实测同局面平均挤掉
+                                 5.16 个着法), 而 π 只分布在**槽位**上, 所以
+                                 H ≤ log(槽位数) < log(着法数) —— H̄ 按着法数算时**可能永远
+                                 达不到**, 而 α 的梯度恰好是 (H − H̄): 达不到 ⇒ 单向推走
+                                 (推到 5.0 上界或 0.02 下界, 两种都坏)。
+       */
+    float entropyInTarget = 1.0f;
+    bool entropySlotsAsLegal = false;
+
+    /*
+       ================================================================
+       [2026-09 ①] 训练中的 critic/α 诊断累计量 (只读; 不参与任何计算)
+       ================================================================
+       为什么需要它: 原有读数 (m_maxAbsTarget / m_maxAbsTdErr / 训练后的 |Q| 快照) 只能看到
+       "最后一次"和"最后的状态", 而本轮要回答的是**过程**里的三个问题:
+         1. 目标 y 有多少比例被 clampTarget 夹住? 夹住 = 那部分样本的目标是个常数,
+            对 critic 的**排序**学习毫无贡献 (而搜索要的正是排序);
+         2. V(s') 的量级是不是被 α·H 撑起来的? (vQSum 与 vEntSum 的均值一比就见分晓);
+         3. α 的轨迹长什么样? (alphaFirst/alphaLast, 工具再按局打印差值)
+       另外两条:
+         hSum / hBarSum / hBarSlotsSum —— α 的梯度是 (H − H̄), 所以"目标熵可不可达"直接
+           决定 α 往哪边跑 (配上 hBelowHbar / hBelowHbarSlots 两个计数就是直接证据);
+         qSpreadSum —— min(Q1,Q2) 在合法槽位上的**标准差**: 这是 critic 真正能给搜索的
+           排序信号尺度。Q 被推成常数时它会塌到 0, 于是 PUCT 里 Q 项恒等, 选择完全由
+           先验与访问计数决定 (搜索与 critic 脱钩)。
+       全部是累加量 (自 agent 构造起), 调用方读两次取差值即可得到"这一段的分布"。
+       */
+    struct TrainDiag {
+        long long n = 0;               /* 样本数 */
+        long long clamped = 0;         /* 夹前 |y| > clampTarget 的条数 */
+        long long hBelowHbar = 0;      /* H < H̄ (把 α 推大) 的条数 */
+        long long hBelowHbarSlots = 0; /* H < 熵比·log(槽位数) 的条数 (反事实) */
+        double yPreAbsSum = 0.0, yPreSum = 0.0, yPreAbsMax = 0.0;
+        double vNextSum = 0.0;         /* V(s') = E_π[min Q] + α·H */
+        double vQSum = 0.0;            /* E_π[min Q(s')] */
+        double vEntSum = 0.0;          /* α·H(s') —— 假设里那个偏置项 */
+        double hSum = 0.0, hBarSum = 0.0, hBarSlotsSum = 0.0;
+        double slotsSum = 0.0, legalSum = 0.0;
+        double qSpreadSum = 0.0, qAbsMeanSum = 0.0;
+        double alphaFirst = -1.0, alphaLast = -1.0;
+    };
+    TrainDiag trainDiag;
+    const TrainDiag &getTrainDiag() const { return trainDiag; }
+
+    /*
        [诊断/消融] 即时奖励的整体缩放 (默认 1.0 = 与改动前逐位一致)。
        为什么需要它: 奖励 = 材质(0.1 x 子力) + 每步代价, 而终局是 ±1 —— 也就是说
        **即时奖励只占终局奖励的百分之几**。把它整体放大/缩小可以单独检验
@@ -589,6 +654,23 @@ public:
     */
     int stepToActionIdx(const Step &s, int color) const;
     float computeReward(const Step &s, int color);
+
+    /*
+       [④] 学习口径的奖励 —— 界面奖励曲线现在取的是**这一份** (见 AgentBase 的说明)。
+       终局那一条必须覆写成 terminalReward(): 塑形开着 (rewardShape=2) 时它是
+       ±(1+败方剩余材质/3.5), 而引擎口径永远是 ±1 —— 覆写它, 界面上显示的游戏才与它
+       真正学的是同一个。
+    */
+    bool hasLearningReward() const override { return true; }
+    float learningStepReward(const Step &s, int color) override
+    {
+        return computeReward(s, color);
+    }
+    float learningTerminalReward(int chessResult, int perspective) const override
+    {
+        return terminalReward(chessResult, perspective);
+    }
+    std::string rewardCaliperName() const override { return std::string("学习口径"); }
 
     /* ----------------------------------------------------------------
      *  掩码 softmax 与它的反向

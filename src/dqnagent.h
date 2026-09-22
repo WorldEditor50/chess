@@ -85,6 +85,14 @@ public:
     /* Material reward from a move (from color's perspective) */
     float computeReward(const Step &s, int color);
 
+    /* [④] 学习口径的奖励: 界面奖励曲线取这一份 (见 AgentBase 的说明) */
+    bool hasLearningReward() const override { return true; }
+    float learningStepReward(const Step &s, int color) override
+    {
+        return computeReward(s, color);
+    }
+    std::string rewardCaliperName() const override { return std::string("学习口径"); }
+
     /* Online training: call after each AI move */
     void trainAfterMove(const RL::Tensor& stateBefore,
                         const Step& chosenStep,
