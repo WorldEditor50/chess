@@ -105,6 +105,12 @@
 | **C16** | **`BG_TRAIN_SIMS = 20` 是结构性退化（不是"少一点"）**：选择阶段只在"未展开列表为空"时才向下深挖，于是**前 #legal 次模拟只够把先验最高的那些孩子各展开一次**，`max(0, sims − #legal)` 次才是真正的深挖。象棋中局实测根节点平均 **38.7** 个合法着法，而训练只给 **20** 次 ⇒ **一次深挖都没有**。于是 π_target = "我自己先验前 20 名上各 1/20 的均匀分布"，出招再从这 20 个里采样 —— **搜索提供的信息量为零**，目标实际是个"把先验抹平"的算子。根节点诊断实测：20 次模拟下"根孩子数"恰好 **20.0**、深挖余量恰好 **0.0**（80 次 → 41.3，400 次 → 380.0）；20 vs 400 次模拟**有 85% 的决策不同**（即 20 次预算下的出招基本是任意的） | **已修复**：`BG_TRAIN_SIMS` 20 → **400**、`PPO_SIMS` 80 → **400**（保持训练/对局一致，符合"评估 sims ≥ 训练 sims"）。代价：当前 52.4 M 参数骨干下每步约 8 ms/模拟 ⇒ 单步 0.16 s → 约 3.2 s、一步决策 0.65 s → 3.2 s（关窗等待时间由单轮决定，`BG_TRAIN_EPISODES` 保持 1）。**注意 80 次时仍有约 48% 的访问落在"每个孩子一次"的地板里**（400 次降到约 10%） |
 | **C17** | **搜索从不判终局叶子**：`selectMove` / `trainSelfPlay` / `warmupFromCurrent` 三处**无条件** `encodeState + ppo.value` 估叶子，从不调 `getResult`。于是"一步杀"那步落子后，叶子被交给一个只会**评估**的网络去猜 —— 它甚至不知道局面已经终局。诊断仪表盘实测：**一步杀命中 0/20 = 0%**，而非终局的"白吃子"有 16.7% —— 这个 0% vs 16.7% 的对比就是证据。`SACAZAgent` 一直有 `terminalValue()`（`sacazagent.cpp:663/698`），PPO 这条路径一直没有，两个 agent 的搜索口径本来就不一致 | **已修复**：新增 `PPOMCTSAgent::evaluateLeaf()` 作为三个入口的**唯一口径**（终局叶子按**叶子走棋方**给确定 ±1、判和给 0，非终局才走 critic）；`test_diag` **[7]** 段自动生成一步杀题并断言命中率 ≥ 50%。实测 **0/20 → 20/20**，战术总准确率 10.0% → **50.0%**；而**自对弈那几行读数一点没变**（Q(吃子)−Q(退让) 仍 −0.0998、吃子访问份额仍 0.136）⇒ 修复是**外科式**的，没有扰动自对弈分布 |
 | **C18** | **根节点没有任何探索噪声；`selectMove` 的 `temp` 是死参数**：全仓 `Dirichlet` 零命中（内核里**连 Gamma/Dirichlet 采样器都没有**，这才是真正的原因 —— 不是不想要，是没工具）。而这套搜索的扩展开关是**确定性**的（按先验挑最大），于是低先验着法（典型是吃子）可能整局都不会被模拟一次。同时 `selectMove(color, sims, temp)` 的 `temp` **从头到尾没被读过**，无论传什么都走 argmax，与函数注释承诺的"temp > 0 时按访问分布采样"不符 | **已修复**：内核加 `RL::Random::gamma/dirichlet`（Marsaglia-Tsang + alpha<1 提升，零样本兜底成均匀分布，**绝不产生 NaN**）；`acquireRoot(color, withRootNoise)` 在 `P' = (1−eps)·P + eps·Dir(α)` 后接入，eps 按手数线性退火，**只在自对弈取数据时开**（评测/对局保持关，`evalRootNoise` 留作诊断 A/B）；出招逻辑抽成 `pickRootChildByVisits()` 供两处共用（采样数学与随机数调用顺序逐位不变）；截断局自举 `bootstrapOutcome()`（用 critic 估最后一步之后的局面、取负号换算到走子方视角，口径与在线路径 `endOnline` 一致）。`test_ppomcts` 新增两节：Dirichlet 采样器性质（和的偏差 ≤ 6.68e-08、alpha 语义）+ 根噪声接线（评测不开/自对弈开/合法集归一/30 手后自动关）+ 温度（`temp=1` 频率 0.721/0.185/0.094 对期望 0.727/0.182/0.091）。**但实测噪声救不了"怕吃子"**：吃子着访问份额 关 0.1263 vs 开 0.1225（差 **−0.0037**）—— 见"零之二点二十"的结论 |
+| **C19** | **`ABAgent::findBestMove` 在"每一步都必输"时返回默认 `Step`**（`valid=false, id=0, pos=(0,0)`）：根节点窗口初值就是 `±Stone::value_infi`，而更新用严格不等号 ⇒ 所有根走法都等于 `±value_infi` 时一次都不更新，`best` 保持 `nullptr`。调用方把 `valid=false` 读成"真无棋可走" ⇒ **明明还有合法走法却判负**（用户报障 `[arena] agent(0) 返回无效走法 (第 6 局第 55 手): valid=0 id=0 pos=(0,0)->(0,0), 仍有 1 个合法走法, 已兜底`）。**同形状还有四处**：`MCTS` / `DQN+MCTS` / `PPO+MCTS` / `SAC+AZ` 的"根有合法走法但一个孩子都没展开"（`iterations/simulations ≤ 0`）也返回 `Step()` | **已修复**：AB 两处改 `best == nullptr \|\| ...`；四处搜索 agent 补"取根节点未展开列表的第一手"兜底；再加统一闸门 `ChessBoard::legalStepOrFallback()`（`aiThink`/`aiThinkForAgent` 出口，无效走法 + 还有合法走法 ⇒ 兜底 + 打印**带 agent 名字**的 `[gate]` 日志）。`test_match` **[2.10]** 用"红方怎么走都输"的构造局面钉住（修前必失败）。见"零之二点二十三" |
+| **C20** | **`backgroundTrainLoop` 的三个 switch 都缺 EVAB/SAC+AZ/SAC+AZ-MoE/DQN+AB 的 case，却报成"种子权重写入失败"**：选这些 agent 时 `seeded` 恒为 false ⇒ 用户看到的 `[train] 种子权重写入失败, 跳过本轮训练: agent "EVAB" 路径 weights/_temp_train.dat` 把"这一支没接"说成了"写盘失败"，**排查方向完全错**（EVAB 是界面上可选、也确实有在线训练的 agent，等于它的后台训练一直是空转） | **已修复**：新增 `trainable` 判定把"接没接"与"写盘成不成功"分开报（未接的明说"后台训练尚未接入"，且每种 agent 只报一次）；**八个有权重可训的 agent 全部接上**（EVAB + SAC+AZ + SAC+AZ-MoE + DQN+AB），多文件家族各用独立临时前缀（PPO 的 `_actor` 与 SAC+AZ 的 `_actor` 不再同名）；新增 `setBackgroundTrainRound()` 让"一轮"可调；`test_match` **[2.12]/[2.13]** 逐个 agent 断言"跑完一轮并做了一次真实更新"（EVAB / SAC+AZ / SAC+AZ-MoE / DQN+AB 四条支路）。见"零之二点二十三" |
+| **C22** | **后台训练的一轮可能"零更新"，而且不报错**：SAC+AZ / DQN+AB 的 `learnBatch` 在"回放池 < batchSize(32)"时**直接返回且不写 `m_lastLoss`**，而 clone 每轮都从空池开始 —— 所以一轮少于 32 手时它们一次梯度更新都不做，却照样把"没变过的权重"写回主 agent（损失曲线也不上报，因为还是 NaN）。是写[2.13]那条断言时踩出来的：给 6 手 → 三个 agent 全部"上报 0 次" | **已修复/已钉住**：`BG_TRAIN_MAX_MOVES` 的注释写明"必须 > 32"并给出两处门控的行号；`setBackgroundTrainRound()` 的文档同样写明"缩短轮次只适合验证接线"；断言把这条形状写进测试（不是改测试去迁就） |
+| **C23** | **新 agent 加进了列表，界面上却"找不到"**：`QComboBox` 的 `maxVisibleItems` 默认是 **10**，而 agent 列表已经 11 项 —— 新加的 "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)" 恰好排在第 11 位，于是它**在 model 里、能被测试与命令行创建、却折叠在下拉框的滚动区里看不到**（UIA 实测：展开只有 10 行可见）。这类"加了但看不见"最容易被误判成"没加"。顺带发现第二个隐患：`fillAgentCombo(ui->matchBComboBox, 6)` 用的是**写死的下标**，插入一项之后它会静默指到 DQN+MCTS | **已修复**：`fillAgentCombo()` 把 `maxVisibleItems` 放宽到列表长度 + 2（整份列表一次可见，不需要滚动）；默认项改成**按 agent 类型**查找（`findData(AGENT_EVAB)`），下标再也不会因为重排而指错；新 agent 移到 `PPO+MCTS (AlphaZero)` **后面**（两种骨干成对排列）。新增界面级验证 `tools/verify_agent_combo.ps1`：它把 `kAgents` 从源码里解析成期望值，展开三个下拉框逐条断言**可见性**（只"在模型里"不算），实测 `11 项 / missing = 0 / RESULT: PASS` |
+| **C24** | **对弈时崩溃（`0xC0000374` 堆损坏）**：用户报"对弈时自动保存权重的时候导致程序崩溃"，Windows 事件日志三次记录都是 **ntdll + 0xC0000374（STATUS_HEAP_CORRUPTION）**。真因**不在保存**，而在 `ChessBoard::env` 的并发访问：`env = chess;`（决策入口那句"把局面复制到试走棋盘"）写在**锁外**，而 **Alpha-Beta / MCTS 两支在共用的 `env` 上搜索却完全不持锁**。于是"对弈线程在 `env.history` 上 push_back/moveBack"与"另一条线程读 `env`"（界面自检 worker 的 `Chess probe(agent->chess)`、AI 工作线程的决策、并发的另一场对弈）同时发生 —— **加锁的读者挡不住不加锁的写者**。ASan 给出精确位置：`Chess::Chess(const Chess&)`（chess.cpp:526 的 `history(other.history)`）**堆越界写**（按撕裂的 size 分配 96 字节、却按 112 字节搬元素）。触发条件（真界面逐项排除得到）：**后台训练的目标 == 对弈的某一方**，且对弈跑在独立线程、自检面板在刷；用 EVAB 也能复现 ⇒ **与新 agent 无关，是早就存在的问题**（事件日志里 04:55 / 11:29 两次崩溃早于本轮改动） | **已修复**：规则统一为"**凡碰 `env` 都拿 `m_agentMutex`**" —— `aiThinkRaw` / `aiThinkForAgentRaw` 的 `env = chess` 进锁；AB / MCTS 两个分支补上锁（它们同样在 env 上搜索）；`saveCurrentAgentModel` 与 `getAgentSelfCheck` 也进同一把锁（读者必须与写者同锁）。新增最小复现探针 **`repro_concurrency`**（对弈在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；故意不进 ctest）与 `test_match` **[2.16]**；实测：修前 `agent=5/7/10` 全部 `0xC0000374` 秒崩，修后全部通过；ASan 版本修前报 `heap-buffer-overflow`、修后干净；真界面两种配置各跑一遍 **新增崩溃条目 = 0**，且"静默保存 + 保存计时日志"都正常出现。见"零之二点二十五" |
+| **C21** | **PPO+MCTS 的权重从来没被启动加载过**：扫描表探测 `weights/ppomcts_agent.dat`，而 `PPOMCTSAgent::saveModel(prefix)` 写出的是 `<prefix>_actor` / `_critic` ⇒ 磁盘上 **279 MB × 2** 的文件一直没被读进来（`docs/agents_design.md` §18 已记过"RL::PPO 那一支栽在这里"，但那次只改对了 DQN+AB 那一行）。三份名字（扫描表 / `defaultWeightPath` / 各 `saveModel`）各自维护，漂移的表现就是**静默地从随机初始化开始跑** | **已修复**：新增 `weightFilesOf(type)`（"`saveModel(prefix)` 会写出哪些文件"的**唯一来源**，扫描与自检面板共用），`s_weightPaths` 统一存前缀；自检面板顶端直接打出"扫描有没有命中 + 每个文件在不在/多大"。见"零之二点二十三" |
 
 ### B19 修复后的实测数据
 
@@ -2059,6 +2065,491 @@ cmake --build <build> --target probe_dqnmcts_aliasing test_dqnmcts
 
 界面侧：启动 `chess.exe` → 选 "DQN+MCTS" → 右侧"模型自检"面板；或跑一手（走子前探索）再回来看
 "对局累计"两行。
+
+---
+
+## 零之二点二十三、用户报障的两条错误 + 九个 agent 全部自检（2026-09）
+
+**起因**：用户贴了两行运行时输出，要求修掉它们，另外"给所有模型都配上自检方法"：
+
+```
+[arena] agent(0) 返回无效走法 (第 6 局第 55 手): valid=0 id=0 pos=(0,0)->(0,0), 仍有 1 个合法走法, 已兜底
+[train] 种子权重写入失败, 跳过本轮训练: agent "EVAB" 路径 weights/_temp_train.dat
+```
+
+两条**都不是"偶发"**，而是各自的支路从来没有被走到过。修的过程中又顺手抓到第三个同类的
+静默失效（PPO+MCTS 的权重从没被载入）。
+
+### 1. `[arena] agent(0) 返回无效走法` —— 根因在 `ABAgent::findBestMove` 的根节点
+
+`agent(0)` 就是 **Alpha-Beta**（枚举顺序），而 `valid=0 id=0 pos=(0,0)` 是**默认构造**的
+`Step`。造成它的条件非常具体：
+
+| | 根节点窗口初值 | 更新条件 | "每一步都必输"时 |
+|---|---|---|---|
+| 黑方（MAX 节点） | `beta = -Stone::value_infi` | `r > beta` | 每个 `r` 都是 `-value_infi` ⇒ 一次都不成立 |
+| 红方（MIN 节点） | `alpha = +Stone::value_infi` | `r < alpha` | 每个 `r` 都是 `+value_infi` ⇒ 一次都不成立 |
+
+于是 `best` 保持 `nullptr`，函数返回默认 `Step`（`valid=false`），调用方把它读成
+**"这一步真无棋可走"** ⇒ 明明还有合法走法却被判负（界面上就是"棋子没动，我却输了"）。
+第 55 手出现，正是因为那时一方已经进入"怎么走都输"的残局。
+
+* **修**：`best == nullptr || r > beta`（黑）/ `best == nullptr || r < alpha`（红）——
+  第一个走法无条件成为候选；"全负"时退化成"返回 MVV-LVA 排序后的第一手"（棋理上无差别，
+  但契约上必须返回一步合法走法）。
+* **同类形状还有四处**：`MCTS` / `DQN+MCTS` / `PPO+MCTS` / `SAC+AZ` 在"根有合法走法、但
+  一个孩子都没展开"（`iterations`/`simulations <= 0`，或循环里没走到 EXPANSION）时同样
+  返回 `Step()`。全部补上"取根节点未展开列表的第一手"兜底。
+* **再加一道统一闸门**：`ChessBoard::legalStepOrFallback()`（放在 `aiThink` /
+  `aiThinkForAgent` 的出口，大 switch 因此改名为 `aiThinkRaw` / `aiThinkForAgentRaw`）——
+  无效走法 + 棋盘上还有合法走法 ⇒ 用第一个合法走法兜底，并打印**带 agent 名字**的
+  `[gate]` 日志。原来那条 arena 日志只报 `agent(%d)` 编号，排查时要回去数枚举。
+* **回归钉**（`test_match` [2.10]）：构造一个"红方怎么走都输"的局面——
+  红 `帅(9,4)` + `车(7,1)`；黑 `将(0,3)` + `车(9,0)` + `车(8,0)`：红被沿第 9 行将着，
+  帅的另外三个格子都被控制/占住，唯一的合法走法是 `车(7,1)->(9,1)` 垫将，而垫上之后
+  `车x(9,1)` 就是杀。断言三件事：**只有一个合法走法**、**确实必输**（黑方有杀）、
+  **`ABAgent(depth=4)` 返回的仍是那一步合法走法**。修之前这条断言会失败（返回 `valid=false`）。
+
+### 2. `[train] 种子权重写入失败 … EVAB` —— 其实是"这一支根本没接"
+
+`backgroundTrainLoop()` 里三个 switch（建实例 / 写种子 / 训 clone / 同步回主 agent）原来只有
+`PG`、`DQN`、`PPO+MCTS`、`DQN+MCTS` 四个 `case`。选 EVAB 时 `seeded` **恒为 false**，
+于是那条为"写盘失败"写的消息被用来描述"这一支没写"——**排查方向完全错**（用户看到
+"写不出去"，实际上是"没人去写"）。
+
+* **修 (a)**：把"接没接"与"写盘成不成功"分成两件事报。新增 `trainable` 判定；未接入的
+  agent 明说 `[train] 该 agent 的后台训练尚未接入, 跳过本轮`，不再借用"种子权重写入失败"。
+* **修 (b)**：真正把 EVAB 接上——建实例（与 `aiThink` 用同一组构造参数，否则结构对不上、`load` 必失败）
+  → `saveModel` 写种子 → clone `loadModel` → `trainSelfPlay(...)` → `saveModel` 写回 →
+  主 agent `loadModel` 同步。损失照旧走 `trainLossSample`。
+* **修 (c)**：新增 `BG_TRAIN_EVAB_PLAY_DEPTH = 3` / `BG_TRAIN_EVAB_LABEL_DEPTH = 4`。
+  理由是一轮 60 手里**每一手要搜两次**（`playDepth` 选步 + `labelDepth` 生成 TD-leaf 标签），
+  而实测初始局面 `depth 4 = 90 ms`、`depth 5 = 188 ms`、`depth 6 = 890 ms`——照抄界面上的
+  `EVAB_DEPTH = 6` 会让"关窗"要等分钟级（训练线程只在每轮开头看停止标志）。
+* **仍未接的**：SAC+AZ / SAC+AZ-MoE / DQN+AB 的后台训练 —— 这一条只成立了半天，
+  随后用户就要求补齐，见下面的 **§2b**（现在九个有权重可训的 agent 全部接上，
+  再加上新增的 PPO+MCTS-MLP 就是十个里的九个；Alpha-Beta / MCTS 没有权重）。
+
+### 2b. 把剩下三个 agent 也接上（同日追加）
+
+用户随后要求"对弈时将所有模型 agent 接入后台训练"。三个支路（建实例 / 写种子 / 训 clone /
+同步回主 agent）全部补齐，于是**八个有权重可训的 agent 一个不落**（AB / MCTS 没有权重）。
+
+| Agent | 一轮的搜索预算 | 一轮的实测量级 | 说明 |
+|---|---|---|---|
+| PG / DQN | — | 秒级 | 原有 |
+| EVAB | `playDepth 3` + `labelDepth 4` | ~15 s | 原有（C20 补的） |
+| **SAC+AZ** | `BG_TRAIN_SACAZ_SIMS = 400` | ~1–2 s | MLP 骨干 ~0.05 ms/模拟，可以给足（400 ≫ 分支数 39 ⇒ π 目标是真搜出来的） |
+| **SAC+AZ-MoE** | `BG_TRAIN_SACAZ_MOE_SIMS = 64` | ~1–2 min | 一次模拟 ~10.9 ms，给 400 就是小时级；给 16（界面决策预算）则**一次深挖都没有**（C16），64 刚过分支数地板 |
+| **DQN+AB** | `nodeBudget = DQNAB_NODES(256)` | ~1–2 min | 主干 37.5 M 参数：临时文件一次往返就是 ~276 MB × 2 写 + 2 读（启动读一次实测 3.8 s） |
+
+**三件必须一起做的事**（少任何一件都会"看起来接上了"）：
+
+1. **多文件家族的临时前缀要分开**。`TMP_WEIGHTS` 是共用前缀，而 PPO 写 `<prefix>_actor`、
+   SAC+AZ 也写 `<prefix>_actor` —— 同名。结构指纹会让误读当场失败（不会静默串权重），但
+   那是"靠断言兜住的设计"，所以新增 `_temp_train_sacaz` / `_temp_train_sacaz_moe` /
+   `_temp_train_dqnab` 三套前缀，由 `tmpWeightsOf(type)` 统一给出。
+2. **构造参数必须与 `aiThinkRaw` 那一支逐字一致**（宽度 / 骨干 / c_puct / 专家宽度 / 辅助系数），
+   否则主 agent 与训练 clone 的网络结构对不上，`save`/`load` 的结构指纹会让每一轮都载入失败。
+3. **一轮的步数不能低于 32** —— 见下面的 C22。
+
+**新增 `setBackgroundTrainRound(episodes, maxMoves)`**：一轮的时长 = 关窗等待时间，而不同 agent
+的一轮成本差两三个数量级。把它做成可调的，测试就能在秒级验证"某条支路的往返通不通"，而不必等
+一整轮（[2.13] 用 1 局 × 40 手跑完三个 agent）。默认值不变（1 局 × 60 手）。
+
+**"对弈期间继续训练"是明确选择的行为**：后台训练线程不因对弈而暂停 —— 代价是每轮把权重同步进
+主 agent，于是**一局之内模型会变**（同一份权重不再能解释完整一局的结果），而且训练与对弈抢
+CPU。这一点写在 `backgroundTrainLoop` 的注释里，改主意时只需在对弈开始/结束处暂停/恢复训练线程。
+
+### 3. 顺手抓到的第三个静默失效：PPO+MCTS 的权重从来没被载入过
+
+启动扫描权重的那张表探测的是 `weights/ppomcts_agent.dat`，而 `PPOMCTSAgent::saveModel(prefix)`
+写出的实际是 `<prefix>_actor` / `<prefix>_critic` —— 于是磁盘上那两个 **279 MB** 的文件一直
+躺在 `weights/` 里没人读（`docs/agents_design.md` §18 的更正里已经记着"RL::PPO 那一支栽在这里"，
+但那次只把 DQN+AB 那一行改对了，PPO 那一行留成了同样的形状）。
+
+* **修**：新增 `weightFilesOf(type)` —— "`saveModel(prefix)` 会写出哪些文件"的**唯一来源**，
+  启动扫描与自检面板共用；`s_weightPaths` 统一存**前缀**（下游 `load*()` 本来就是按前缀用的，
+  SAC+AZ / DQN+AB 那两处 `_actor` / `_trunk` 后缀剥离因此变成无害的 no-op）。
+  实测证据：修好之后界面启动日志里才出现 `[weights] PPO+MCTS: 9034 ms`（以前那一整段
+  加载代码根本不会被执行）。
+* 这正是自检面板第一段要报"权重文件在不在 + 启动扫描有没有命中"的理由：三份名字各自维护时，
+  漂移的表现就是**静默地从随机初始化开始跑**。
+
+### 4. 九个 agent 全部自检（`selfCheckReport()`）
+
+面板的派发从"只接了 DQN+MCTS"扩到全部九个（`ChessBoard::getAgentSelfCheck(AgentType)`）。
+Alpha-Beta / MCTS **没有常驻实例**（每一步现场构造），所以这两支由 `ChessBoard` 在棋盘**副本**上
+现场造一个（唯一需要在自检路径上锁的地方）；其余七个转发各自的常驻实例。
+
+| Agent | 表示层 | 动作层 | 该 agent 特有的读数 |
+|---|---|---|---|
+| Alpha-Beta | 手工 `evaluate()`（材质 + 位置表） | 搜索给出（无别名） | **决策合法性自检** + 开局合法走法数/评估值尺子 |
+| MCTS | 随机走子终局（±1/0，高方差） | 搜索给出 | **决策合法性自检** + `MCTS_SIMS=800` 摊到分支因子的平均次数 |
+| Policy Gradient / DQN | 90 维每格一值 ⇒ **规则上下文 0 个** | 128 槽哈希 ⇒ **别名（开局 44→N）** | 探索率/回放池/学习率 + 奖励口径（走子方视角） |
+| PPO+MCTS | 1710 = 19 平面（含 3 规则上下文） | 8100 **双射（无别名）** | **根搜索展开覆盖率 / top1 份额 / 访问熵 / KL(访问‖先验)** + MoE 直方图 |
+| DQN+MCTS | 90 维 ⇒ 规则上下文 0 个 | 128 槽哈希 ⇒ 别名 + 对局累计 | 终局通道四分桶（旧口径漏了多少局） |
+| EVAB | 1530 = 17 平面（含 3 规则上下文） | alpha-beta 直接选（无动作头） | `blend`（手工/网络混合比例）+ 置换表命中率 + 节点/到达深度 |
+| SAC+AZ / SAC+AZ-MoE | 1263 = 14×90 + **3 个规则上下文标量** | 128 槽哈希 ⇒ 别名 | 双 critic/软价值口径 + **MoE 路由直方图与坍缩判读** |
+| DQN+AB | 1710 = 19 平面（材质/节奏阶段 + 规则上下文） | 8100 **双射** | **值门控**（容差 / gap 前后 / 是否回滚）+ 手工锚 gap/corr |
+
+另外两处工程化：
+
+* 面板顶端统一给出**权重文件状态**（`getAgentWeightStatus()`）：扫描有没有命中、每个文件在不在、多大
+  （多文件模型逐个列出，如 SAC+AZ 的 `_actor/_q1/_q2`）。
+* 新增按钮 **"全部模型自检"**：把九个 agent 排在一起 —— 编码/口径的差别只有横向对比才看得出来。
+* 启动时对每个**已加载**的模型各跑一次自检并打一行 `[selfcheck] <名字>: <表示层摘要>`：
+  自检被约定为只读、可重复、不动棋盘，所以这一步很便宜，而"权重没载进来"这类静默失效
+  当场就会暴露。
+
+### 5. 复现与实测
+
+```bat
+cmake --build <build> --target test_match test_evab test_pretrain
+<build>\test_match.exe      :: 109 项断言 / 0 失败 (含 [2.10] / [2.11] / [2.12] / [2.13] 四节新断言)
+<build>\ctest.exe           :: 13/13 通过; test_match 现在 ~250 s (原来 ~94 s), ctest 超时已 600 -> 900
+```
+
+* **[2.10]**（必输局面）：`红方合法走法 1 个` → `ABAgent(depth=4) 返回: valid=1 id=0
+  pos=(7,1)->(9,1)` —— 就是那唯一的合法走法（车垫将）。修之前这里返回的是
+  `valid=0 id=0 pos=(0,0)->(0,0)`，断言当场失败。
+* **[2.11]**（九个 agent 自检）：`type=0..9` 逐个报告行数/字节数 + **两次调用逐字节相同**；
+  能报的 9 个（DQN+AB 在本测试里没有实例 —— 它的实例要 `startupLoad()` 扫到权重才建）。
+  顺带钉住"报告里必须写明**不是棋力**"。第一版 MCTS 的自检在这里被判为**不可重复**
+  （它那一次模拟要 `std::rand()`），于是拆成"0 次模拟（兜底路径，可报坐标）/ 1 次模拟
+  （正常路径，只报合法性）"两条 —— 这条断言当场抓到的第二个 bug。
+* **[2.12]**（EVAB 后台训练）：切到 EVAB → `startBackgroundTraining()` → 等 `trainLossSample`
+  上报。实测 `EVAB 后台训练上报损失 2 次, 全部有限=1` —— 整条
+  "写种子 → clone 载入 → `trainSelfPlay` → 写回 → 同步回主 agent" 走通（`roundApplied`
+  为假时根本不会 emit），而报障时这一支**根本不存在**。
+* **[2.13]**（三个新接入的支路）：同一判据逐个跑 **SAC+AZ / SAC+AZ-MoE / DQN+AB**，
+  用 `setBackgroundTrainRound(1, 40)` 把一轮缩到 40 手。实测三个都是
+  `上报损失 1 次, 全部有限=1`。第一版给的是 6 手，三个**全部"上报 0 次"** —— 那不是接线
+  坏了，而是它们 `learnBatch` 的"池 < batchSize(32) 就什么都不做"门控把一个 6 手的轮次
+  变成了**零梯度更新**（于是也不写 `m_lastLoss`），这正是 C22；断言没有为了通过而放松，
+  而是把"轮次必须 > 32"这件事写进注释与测试。
+* **界面启动日志**（`QT_QPA_PLATFORM=offscreen` 跑 45 s，只看启动阶段）：
+
+  ```
+  [weights] PPO+MCTS: 9034 ms          <- 修好扫描名字之前, 这一行根本不会出现
+  [weights] EVAB: 27 ms
+  [selfcheck] Policy Gradient: 状态 90 维 (10x9 每格一个子力值) | 动作 128 槽位
+  [selfcheck] EVAB: 状态 1530 维 = 17 平面 x 90 格 (14 棋子平面 + 3 规则上下文)
+  [selfcheck] PPO+MCTS: 表示: 状态 1710 维 = 19 平面 x 90 格
+  [selfcheck] SAC+AZ-MoE: 骨干 稀疏MoE(TB专家) | 界面 agent 类型 SAC+AZ-MoE (AGENT_SACAZ_MOE) ...
+  [selfcheck] DQN+AB: 状态 1710 维 = 19 平面 x 90 格: 14 棋子平面(规范视角) + [14]剩余子力 ...
+  ```
+
+  八个已加载的模型都在启动时各打了一行表示层摘要；PPO+MCTS 那 9034 ms 正是那两个
+  279 MB 的文件（以前它们躺在盘上没人读，所以启动更快 —— 那 9 秒是**修好之后**才出现的）。
+  代价要说清楚：**启动从约 17 s 变成约 26 s**（那些权重本来就在盘上，只是从来没被读过）。
+  要更快只有两条路：把这组权重删掉/换小骨干，或者明确选择"不加载 PPO+MCTS"
+  （`tools/verify_eager_load.ps1` 里那句"启动约 8~10 s"因此也过期了）。
+
+界面侧：启动 `chess.exe` → 右侧"模型自检"面板（顶端是权重文件状态）→ 点"全部模型自检"
+看九个 agent 的横向对照；选 EVAB / SAC+AZ / SAC+AZ-MoE / DQN+AB 让后台训练跑一轮，
+日志里不再出现"种子权重写入失败"或"尚未接入"。想看某条支路的往返通不通、又不想等一整轮，
+在测试里用 `setBackgroundTrainRound(1, 40)`（**别低于 32 手**，见 C22）。
+
+---
+
+## 零之二点二十四、新 agent：PPO+MCTS+AlphaZero（稀疏 MoE + MLP 专家）（2026-09）
+
+**需求**：新增一个"PPO + MCTS + AlphaZero，使用 MLP 专家"的 agent。
+
+**关键决定：不复制任何一份实现。** `rl/ppo.h` 里原本只有一条编译期骨干
+（`using PPOExpert = TransformerBlock<16,360>;`，E=4 top-1），而 2026-09 之前用的是
+`MlpExpert`（E=8 top-2）。这次把"用哪套专家"变成 **`RL::PPO::Backbone` 这个构造参数**
+（默认 = TB，现役行为逐位不变），两种骨干的**唯一差异点**收在一个工厂函数里：
+
+```
+rl/ppo.h        PPO::Backbone { TbExperts(默认) | MlpExperts } + PPO_MOE_MLP_EXPERTS/TOPK
+rl/ppo.cpp      makeMoeLayer(backbone) —— 只在这里分支 (专家的模板参数不同)
+ppomcts_agent   构造参数加一个 Backbone (默认 TB); getName()/自检报告带上骨干
+chessboard      AGENT_PPOMCTS_MLP (追加在枚举末尾) + 各 switch 分支 + 独立临时/正式权重前缀
+mainwindow      kAgents 多一行 -> 两个骨干能在界面上直接对弈
+```
+
+**为什么不复制 `ppo.cpp` 或 `ppomcts_agent.cpp`**：`expert.hpp` 顶部那条教训就是"三份拷贝
+迟早漂移"。而且 PPO 的其余部分（损失 / 优化器 / 权重格式 / MoE 诊断 / 多线程分身）**完全
+不知道专家是什么类型** —— 它只通过 `ISparseMoE` 接口用它（辅助损失、使用直方图、读写权重
+都是虚函数分派），所以两种骨干真的只差那一个工厂。
+**为什么不把专家改成运行时多态**：`SparseMoE<Expert, E, K>` 的三个参数都是模板参数，
+虚化它要动整个 `RL::Net` 的层体系，代价远大于收益。
+
+### 实测对照（`test_match` [2.14] 打印的真值）
+
+| 骨干 | 专家/topK | actor 参数量 | 界面预算 | 每手实测 |
+|---|---|---|---|---|
+| TB（现役，默认） | 4 / 1 | **52,388,888** | 400 次模拟 | ~3.2 s |
+| MLP（新 agent） | 8 / 2 | **2,448,204**（~21× 小） | 1600 次模拟 | **0.23 ~ 0.39 s** |
+
+同一份"每手 400 次模拟"的预算下 MLP 骨干只花 ~80 ms，所以 `PPO_MLP_SIMS` 给到 **1600**
+（"模拟次数 ≫ 分支数 39"是 π 目标有没有信息量的分水岭，见 C16）—— 结果是**参数少 21 倍、
+模拟多 4 倍、每手仍快 8 倍**。这是"便宜换更准的访问分布"，不是省时间。
+
+### 四条必须钉住的性质（少任何一条就会退化成"两个会漂移的实现"或"静默共用权重"）
+
+全部在 `test_match` **[2.14]**（6 条断言 + 3 条结构断言）：
+
+1. **结构确实不同**：4/1 vs 8/2；参数量 52.4 M vs 2.45 M；两种骨干的 `actionMasked`
+   都给出归一化的概率（和 = 1）。
+2. **agent 名不同**（`PPO+MCTS (AlphaZero)` vs `PPO+MCTS (AlphaZero, MLP专家)`）——
+   损失曲线按名字分线，同名会把两条线并成一条。
+3. **权重文件前缀不同**（`weights/ppomcts_agent.dat` vs `weights/ppomcts_mlp_agent.dat`）；
+   后台训练的临时前缀也不同（多文件家族共用 `_temp_train.dat` 时 `_actor` 会**同名**）。
+4. **交叉载入必须失败**：实测把 MLP 的权重载入 TB 骨干，内核打印
+   `参数量不匹配 (文件 2448204 个元素, 当前网络 52388888 个) … 拒绝载入` 且 `PPO::load`
+   返回失败；同一份权重载回 MLP 骨干则成功 —— 这是"权重格式的结构指纹"在跨骨干场景下
+   的验收读数。
+
+### 顺带确认（现役配置没有被这次改动碰到）
+
+* TB 骨干的 actor 参数量 **52,388,888** 与 C14 里记的旧值**逐位相同**；
+* 界面启动日志里 `[weights] PPO+MCTS: 8831 ms` 照旧（那 279 MB × 2 的旧检查点仍然能载入，
+  没有出现"参数量不匹配"）；
+* `test_ppomcts` / 全部 13 个 ctest 通过。
+
+### 复现
+
+```bat
+cmake --build <build> --target test_match chess
+<build>\test_match.exe     :: [2.14] 新 agent 的结构/命名/权重隔离 + 一小局实测耗时
+```
+
+界面侧：`chess.exe` → 任一 agent 下拉框里多出 "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)"；
+选它走一手（懒创建），退出时它的权重会落到 `weights/ppomcts_mlp_agent.dat_actor/_critic`，
+之后启动日志里会多一行 `[selfcheck] PPO+MCTS-MLP: 骨干: 稀疏MoE(MLP专家) | 专家 8 个, topK=2 …`。
+
+### 下拉框：加进去 ≠ 看得见（C23）
+
+第一版把它**追加在列表末尾**（第 11 项），结果打开下拉框**看不到它** —— Qt 的
+`QComboBox::maxVisibleItems` 默认 10，第 11 行落在滚动区里。UIA 实测（展开后逐行读）：
+
+```
+before: agent rows = 10   (PPO+MCTS ... DQN+AB, 新的那一项不可见)
+after : agent rows = 11   (missing = 0)
+```
+
+两处一起改：`maxVisibleItems` 放宽到列表长度 + 2；新 agent 移到 `PPO+MCTS (AlphaZero)`
+**后面**（两个骨干挨着，对照实验一眼能选中）。同时把 `fillAgentCombo` 的默认项从
+**写死的下标**（`matchB` 原来是 `6`）改成**按 agent 类型查找** —— 否则插入一项之后
+默认对手会静默变成别的 agent（正是这次差点发生的事）。
+
+界面级验证脚本 `tools/verify_agent_combo.ps1`：把 `kAgents` 从 `src/mainwindow.cpp`
+解析成期望值，启动真界面、展开三个下拉框，逐条断言**可见性**（"在 model 里"不算），
+并显式打印缺了哪几条。实测输出：
+
+```
+combo #1: current = 'Alpha-Beta Pruning (深度=4)' | rows seen = 12 (agent rows 11) | missing = 0
+combo #2: current = 'Alpha-Beta Pruning (深度=4)' | rows seen = 12 (agent rows 11) | missing = 0
+combo #3: current = 'EVAB (学会评估的 Alpha-Beta)' | rows seen = 12 (agent rows 11) | missing = 0
+agent selectors checked     = 3
+every kAgents entry visible = True
+RESULT: PASS
+```
+
+**这个脚本能证明什么、不能证明什么**（实测过再写下来的）：它能证明"每一行都看得见"，
+但**不能**通过 UIA 驱动"点这一行把 agent 切过去" —— Qt 组合框弹出层的行接受
+`SelectionItemPattern.Select()` 与 `InvokePattern.Invoke()` 却**什么都不做**（探针实测：
+两个调用都返回成功，combo 的值不变、`onAgentSelected` 从不执行），而改用 `SendKeys`
+需要前台焦点（本目录其它脚本刻意避开）。所以那一半由 `test_match` **[2.14]** 覆盖：
+它用 `AGENT_PPOMCTS_MLP` 真的走了一局 6 手（走的就是 GUI 同一条
+`ChessBoard::aiThinkForAgent` 路径），外加结构/命名/权重隔离四条断言。
+
+---
+
+## 零之二点二十五、对弈时崩溃：`env` 的并发访问把堆写坏了（2026-09）
+
+**报障**：*"对弈时自动保存权重的时候导致程序崩溃了"*。
+
+### 1. 先看清"崩溃"是什么形状（别顺着报障的措辞查）
+
+Windows 事件日志里有三次 `chess.exe` 崩溃，异常码全是 **`0xC0000374`
+= STATUS_HEAP_CORRUPTION（ntdll 报的堆损坏）**，出错偏移每次都一样：
+
+```
+出错应用程序名称： chess.exe
+出错模块名称：     ntdll.dll        异常代码： 0xc0000374
+```
+
+`0xC0000374` 的含义是"**有人写越界 / 用了已释放的内存**"，而不是"某个函数返回了错误"。
+所以"保存失败导致崩溃"这个方向一开始就不对 —— 保存只是**碰巧在旁边**。
+另外：其中两次（04:55 / 11:29）**早于本轮所有改动**，说明这不是新引入的 bug。
+
+### 2. 在真界面里逐项排除（UIA 驱动，见 `tools/verify_match_ui.ps1 -TrainIndex`）
+
+| 配置 | 结果 |
+|---|---|
+| 对战AI(后台训练目标)=EVAB，A=EVAB | **崩** |
+| 对战AI=PPO+MCTS-MLP，A=PPO+MCTS-MLP | **崩** |
+| 对战AI=PPO+MCTS-MLP，A=Alpha-Beta（训练目标 ≠ 参赛者） | 不崩 |
+| 对战AI=Alpha-Beta（不训练），A=PPO+MCTS-MLP | 不崩 |
+
+两条结论：**(a)** 需要"后台训练的目标 == 对弈的某一方"；**(b)** 用 **EVAB 也能复现**
+⇒ 与新加的 MLP agent 无关。
+
+### 3. 搬进无界面的最小复现（`repro_concurrency`）
+
+关键差别是**对弈必须跑在独立线程**（`test_match` 里"对弈在主线"的用例复现不出来，
+这本身就是线索）。把形状照搬过去 —— 对弈在另一个线程、主线程按"每手一次"刷
+`getAgentSelfCheck()`（界面自检 worker 干的事）、后台训练开着、结束后保存 —— 秒级稳定复现：
+
+```
+=== 对弈 x 后台训练 并发复现 ===
+[ok] 后台训练已启动 (目标 = agent 5), 对弈每局 12 手
+EXITCODE=-1073740940        <- 0xC0000374
+```
+
+### 4. ASan 给出精确位置（`/fsanitize=address`，独立 build 目录）
+
+```
+==ERROR: AddressSanitizer: heap-buffer-overflow ... WRITE of size 112
+    #3 std::vector<Chess::HistoryRecord>::vector(...)        <- 拷贝构造
+    #4 Chess::Chess                                         chess.cpp:526  (history(other.history))
+    #5 DQNMCTSAgent::selfCheckReport                        dqnmcts_agent.cpp:1004   <- Chess probe(chess)
+    #6 ChessBoard::getAgentSelfCheck                        chessboard.cpp
+0x...6580 is located 0 bytes after 96-byte region      <- 按撕裂的 size 分配, 却按 112 字节搬元素
+```
+
+也就是：**拷贝一个正在被另一条线程修改的 `std::vector`**（新的 `env.history`）。
+
+### 5. 真因：`env` 那把锁根本不对
+
+`ChessBoard::env` 是**所有 agent 共用的试走棋盘**（每个 agent 构造时都拿它的引用），
+而它有两个访问方从来没有同步：
+
+* `aiThinkRaw` / `aiThinkForAgentRaw` 开头的 **`env = chess;`（写！）写在锁外** ——
+  `=` 会把 `envelope.history` 整个替换掉；
+* **Alpha-Beta / MCTS 两个分支在 `env` 上搜索（moveForward/moveBack → `env.history`
+  push_back）却完全不持锁**（只有 RL 分支拿了 `m_agentMutex`）。
+
+于是"加锁的读者"（界面自检 worker 的 `Chess probe(agent->chess)`、以及现在也加了锁的
+`getAgentSelfCheck` / `saveCurrentAgentModel`）**挡不住不加锁的写者** —— 锁本身没错，
+错的是"不是所有人都用同一把锁"。
+
+### 6. 修法：一句话的规则 + 两处补锁
+
+> **凡是碰 `env` 的地方，都拿 `m_agentMutex`。**
+
+* `aiThinkRaw` / `aiThinkForAgentRaw`：`env = chess;` 进锁（一个单独的作用域）；
+* `ABAGENT` / `MCTS` 分支补锁（它们也在 env 上搜索）；
+* 顺带把两个"裸的"读者也接进同一把锁（它们各自都是独立的真问题）：
+  `saveCurrentAgentModel()`（原来直接从保存线程序列化主 agent 的网络，与后台训练
+  写同一张网 —— 这就是"对弈结束静默保存"最容易撞上的那一处）与
+  `getAgentSelfCheck()`（读常驻 agent 的搜索树/网络）。
+
+同时把界面那两条后台线程改成**常驻 + 请求标志**（`m_saveThread` / `m_selfCheckThread`），
+因为它们在 GUI 线程上 `join()` 或同步等锁会把界面冻住几秒
+（"上一场还在写 558 MB，这一场结束就要 join" 是原来就有的隐患）。
+
+### 7. 验收
+
+```bat
+cmake --build <build> --target repro_concurrency test_match
+<build>\repro_concurrency.exe 2 12 5      :: 修前 0xC0000374 秒崩; 修后 "全部跑完, 没有崩溃"
+<build>\repro_concurrency.exe 2 12 7      :: EVAB 同样
+<build>\repro_concurrency.exe 2 12 10     :: PPO+MCTS-MLP 同样
+:: ASan 版本 (独立目录; 二进制已被 .gitignore 排除, 复跑不必重编):
+::   cmake -S . -B build-asan -G Ninja -DCMAKE_PREFIX_PATH=C:/Qt/6.9.2/msvc2022_64 ^
+::         -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="/fsanitize=address /Zi /Od"
+::   cmake --build build-asan --target repro_concurrency
+::   (把 clang_rt.asan_dynamic-x86_64.dll 放到 exe 旁边, 并把 Qt 的 bin 加进 PATH)
+build-asan\repro_concurrency.exe 2 10 5   :: 修前 heap-buffer-overflow, 修后干净
+:: 真界面 (需要真桌面):
+powershell -File tools/verify_match_ui.ps1 -TrainIndex 7 -AIndex 7 -BIndex 0 -Games 1
+powershell -File tools/verify_match_ui.ps1 -TrainIndex 5 -AIndex 5 -BIndex 0 -Games 1
+```
+
+实测：修前 agent 5/7/10 全部秒崩；修后全部通过；ASan 干净；真界面两种配置各跑一遍
+**新增崩溃事件 = 0**，且"已静默保存权重"那一行与 `[weights] 保存 … ms` 计时日志都正常出现。
+`test_match` 新增 **[2.16]**（对弈在独立线程 + 并发刷自检 + 同一 agent 的后台训练）
+作为回归钉子；`repro_concurrency` **故意不进 ctest**：它压的是时序，调度一变可能一时不
+复现，拿它当门禁只会得到随机红灯。
+
+---
+
+## 零之二点二十六、"开关写好了、也测过、其实一直没生效"：构造函数建网之后才赋值（2026-09）
+
+**症状**：为了实现"把 agent 还原回 `59e5233`"，给 `SACAZAgent` 加了一个运行时开关
+`bool legacyNet`（true = 用 `TanhNorm<Linear>` 且 `r=1` 表达 59e5233 的那层隐层激活）。
+开关接线完毕、编译通过、`bench_sac_mcts_min --legacy-net` 也跑出了"与基线逐手等价"的
+结果。**但那个开关从来没有生效过**：
+
+```cpp
+SACAZAgent sac(board, ...);
+sac.legacyNet = true;      // <- 赋值在这里
+// 而 SACAZAgent 的构造函数里:
+//     actor = buildNet(true);  q1 = ...; q2 = ...; q1Target = ...; q2Target = ...;
+// 5 张网**在建网时**就决定了用哪个层类型, 之后改成员没有任何作用。
+```
+
+**为什么没被发现（这一条比 bug 本身值钱）**：那个开关的两种取值**本来就几乎等价**
+（见下一条），所以"两种设置跑出同一结果"被读成了"等价性验证通过"，而不是
+"开关没生效"。**凡是靠"回显开关的值"做的检查，都必然通过。**
+
+**修法（两层）**：
+1. **让错误的写法编译不过**：`legacyNet` 改成 `const` 成员，只能由**构造参数**给出
+   （`SACAZAgent(..., bool legacyNet_ = false)`）。事后赋值直接报错。
+2. **让面板说真话**：`SACAZAgent::hiddenActivationName()` 不回声开关，而是
+   `dynamic_cast` 读 **actor 第 2 层的真实类型**，印在自检面板第一段。
+   上一轮那个"激活被换成 `TanhNorm<Sigmoid>`、随机权重棋力掉 26 个点"的回归，
+   面板上原本**一个字都看不出来**（同形状层 ⇒ 参数量、权重指纹全都一样）。
+
+**顺带被证伪的一件事**：那个开关想表达的等价关系**根本不成立**。
+`TanhNorm::forward` 把偏置加在 tanh **外面**（`o1=Wx; o1*=r; o2=tanh(o1); o=Fn(o2+b)`），
+而 `Layer<Tanh>::forward` 是 `tanh(W·x + b)` —— 取 `Fn=Linear`、`r=1` 只在 `b ≡ 0` 时相同。
+实测（`test_sacaz` [14]，同权重同局面，稀疏 MLP 专家骨干）：max|Δπ| = 1.8e-07、
+**max|ΔQ| = 8.9e-06**。所以开关**已删除**：需要 59e5233 的那一层，就用
+`Layer<RL::Tanh>` 那一行代码本身（当前 `buildNet` 与 `git show 59e5233:src/sacazagent.cpp`
+逐行相同，17 行全同）。"等价"这件事只能拿**同一输入比输出**来判定 —— 与
+`docs/sac_regression_2026_09.md` §7 第 2 条同源。
+
+**回归钉**：`test_sacaz` [14] 断言"同权重同局面下，59e5233 还原版（派生类
+`SACAZLegacyAgent`）与 `SACAZAgent` 的策略/双 Q 输出**逐位相同**"，
+`tools/verify_sac_golden.ps1` 钉住走法序列，`test_match` [2.11] 钉住两支的权重文件名不同。
+
+---
+
+## 零之二点二十七、"训练让 agent 变弱"：默认值也是结论，而且**方向可能反了**（2026-09）
+
+**症状**（用户实测 + 本轮受控复现）：界面对弈里 SAC **不训练反而更强** ——
+同一协议 20 局、固定对手随机流：完全不训练 **52.5%**，只 rollout 25.0%，
+rollout + 从搜索学 37.5%。与 `docs/arena_sac_vs_ppo_report.md` §5.2 早先记过的
+"训练 14 局后 38.3%、不如随机权重"是同一件事。
+
+**根因**：α 自动调节的**口径**。上一轮以"实测 α 恒为初值 0.200 ⇒ 自动调节名存实亡"为由，
+把目标熵从 **0.98 降到 0.5**、把 alpha 学习率从 **1e-3 提到 5e-3** —— 理由本身没错，
+**结论是错的**：这一改让 α 迅速缩小、策略被"**没有信息的 Q**"推着走
+（训练后 `|Q|` 均值 **0.034**，与随机初始化 0.06 同量级 ⇒ critic 等于没学到）。
+
+**逐个消融（20 局/档，其余条件相同）**
+
+| 配置 | 胜-负-和 | 得分率 | 训练后 \|Q\| |
+|---|---|---|---|
+| 熵比 0.5 / αlr 5e-3（改后默认） | 2-7-11 | 37.5% | 0.034 |
+| 只改 αlr → 1e-3 | 8-11-1 | 42.5% | — |
+| 只改熵比 → 0.98 | 10-2-8 | 70.0% | — |
+| **熵比 0.98 + αlr 1e-3（= 59e5233 的值）** | **13-0-7** | **82.5%** | **2.01** |
+| clampTarget→0 / huberDelta→0 / 两者都改 | 2-7-11 | 37.5% | — |
+
+**就地配对验证（同 seed、同 mcts-srand）**：seed 20240901 **37.5% → 82.5%**，
+seed 777 **35.0% → 72.5%**；合池 40 局 **36.25% → 77.5%**，分胜负局 24:2 vs 4:15，
+**Fisher 双侧 p = 1.2e-06**，约 **+313 Elo**。
+
+**修法**：`src/sacazagent.cpp` 的构造初始化表改回 `entropyRatio(0.98f)` /
+`learningRateAlpha(1e-3f)`（只影响最新 SAC；派生类本来就显式写这两个值，行为不变）。
+`clampTarget=2` / `huberDelta=1` **保留**（实测比关掉更好：82.5% vs 67.5%）。
+
+**回归钉**：`test_sacaz` [14] 断言"两支的熵比与 alpha 学习率一致"（防止以后只改一边、
+把差别误读成"新旧口径"）；`test_sacaz` [16] 与 `test_match` [2.17] 钉住"关掉 rollout 也训练"。
+
+**教训（写进 `docs/session_2026_09_sac.md` §4）**：**默认值也是结论**。
+"α 恒为初值"只是"自动调节没在动"这一现象，不构成"该把目标熵降到 0.5"的推论 ——
+数据驱动的默认值必须写清测量协议，否则下一个人无法判断它是否还成立。
+
+**完整清单与下一步 4 项验证**（① critic 尺度新状态、② 还原版开约束、③ 塑形 200 局配对、
+④ 界面奖励曲线换学习口径）：见 [`docs/session_2026_09_sac.md`](session_2026_09_sac.md)。
 
 ---
 

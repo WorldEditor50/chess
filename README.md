@@ -88,17 +88,39 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 * **实时比分** + **逐局明细列表**（每局一行，含本局环境奖励与手数）
 * **训练损失曲线**（每个 agent 一条线）与**环境奖励曲线**（A/B 两条，**每手一个点**：
   值是"本局累计"的走子方视角奖励，局末再补一个含终局 ±1 的点）：
-  自绘控件，**双击可放大**到独立窗口（跟随源控件实时同步），支持**导出 CSV**
+  自绘控件，**双击可放大**到独立窗口（跟随源控件实时同步），支持**导出 CSV**；
+  另有单独的**"导出损失曲线"**按钮（只导损失那一段）。导出用的是**全部采样点**，
+  而屏幕曲线/读数按 2000 点滚动窗口 —— 两者口径不同是刻意的（见 `metricsview.h`
+  的 `Series::history` 说明：拿窗口当整场分析会把结论带偏）
 * 对弈结束后**静默保存权重**到标准路径（不弹窗；几百 MB 的写盘会显示"请稍候"沙漏）
+* **后台持续训练**（2026-09 补齐）：当前选中的 agent 在后台线程里持续"自对弈 → 在线更新 →
+  写回主 agent"。**十个有权重可训的 agent 全部接上**（PG / DQN / PPO+MCTS / PPO+MCTS-MLP /
+  DQN+MCTS / EVAB / SAC+AZ / SAC+AZ-MoE / SAC+AZ-59e5233 / DQN+AB —— PPO 的两种骨干与
+  SAC 的两支各自都有独立权重；Alpha-Beta 与 MCTS 没有可训练权重）。
+  训练**在对弈期间照常进行**（每轮把权重同步进主 agent ⇒ 一局之内模型会变，这条是明确
+  选择的行为，见 `docs/issues_review.md` 零之二点二十三 §2b）。
+  一轮的时长 = 关窗等待时间，各 agent 差两三个数量级（PG/DQN 秒级、SAC+AZ-MoE 与
+  DQN+AB 分钟级），可用 `setBackgroundTrainRound()` 调小 —— 但 **maxMoves 不要低于 32**：
+  SAC+AZ / DQN+AB 的 `learnBatch` 在"回放池 < batchSize(32)"时直接返回，更短的轮次会
+  **一次梯度更新都不做**（且损失曲线上报不出来）。
 * **模型自检面板**（2026-09）：选中 agent 后自动显示该 agent 的**结构与口径**读数。
   存在的理由：面板上原来只有损失曲线与逐局明细，而**这两样都不能判断"模型值不值得继续训"**
   —— 损失只说明网络与自己的目标一致（PPO 的 0.003 与 DQN 的 22 量纲不同、都不可比，也都
   与棋力无关），自对弈的胜负里赢家和输家是同一份权重。面板报的是真正的前置判据：
-  状态维度与**规则上下文通道数**、**动作别名**（同一局面里有多少互不相同的着法被迫共用
-  一个 Q 槽位）、**终局通道**（`getResult()` 判出的终局里，旧口径 `isGameOver()` 漏掉了
-  多少局）。数据源是 `AgentBase::selfCheckReport()`（默认空串，目前 DQN+MCTS 已实现），
-  由 `ChessBoard::getAgentSelfCheck()` 转发，刷新时机是"选中 agent / 每手预训练之后 /
-  启动加载完成"。面板明确写着"这是表示/口径事实，**不是棋力**"。
+  **权重文件状态**（启动扫描有没有命中、文件在不在、多大）、状态维度与**规则上下文通道数**、
+  **动作别名**（同一局面里有多少互不相同的着法被迫共用一个 Q 槽位）、**终局通道**
+  （`getResult()` 判出的终局里，旧口径 `isGameOver()` 漏掉了多少局）、搜索/训练口径
+  （根搜索展开覆盖率、值门控的 gap 与回滚、MoE 路由直方图……）。
+  **十二个 agent 全部实现了自检**（数据源 `AgentBase::selfCheckReport()`，由
+  `ChessBoard::getAgentSelfCheck()` 转发），另外两个纯搜索 agent（Alpha-Beta / MCTS）
+  还会在面板里跑一次**决策合法性自检**（"这一步返回值在合法集里吗"）—— 它正是
+  "agent 返回默认 Step 被误读成无棋可走"那类 bug 的回归指示器。
+  刷新时机是"选中 agent / 每手预训练之后 / 启动加载完成"；启动时每个已加载的模型也会
+  各打一行 `[selfcheck] <名字>: <表示层摘要>`。面板明确写着"这是表示/口径事实，**不是棋力**"。
+  按钮 **"全部模型自检"** 会把十二个 agent 排在一起 —— 编码/口径的差别只有横向对比才看得出来。
+  自检面板第一段现在还会报**实测的隐层激活类型**（读 actor 第 2 层，不回显开关）与
+  **实际生效的口径**（clampTarget / huberDelta / 叶子估值 / 动作空间）：上一轮那个
+  "激活被换成 TanhNorm<Sigmoid>、棋力掉 26 个点"的回归，面板上原本一个字都看不出来。
 
 ### 工程
 
@@ -113,7 +135,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 ## AI Agent
 
-界面上可选的 9 个 agent（`主界面 → 对战AI / A方 / B方`）：
+界面上可选的 12 个 agent（`主界面 → 对战AI / A方 / B方`）：
 
 | Agent | 说明 | 每步预算（本机实测） |
 |-------|------|---------------------|
@@ -121,11 +143,26 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
 | **Policy Gradient** | REINFORCE + baseline，走子前在线训练 | 预训 64 步 |
 | **Deep Q-Network** | 双网 + 经验回放 + ε-greedy | 预训 64 步 |
-| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor | 400 次模拟 |
+| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（E=4 top-1） | 400 次模拟，约 3.2 s |
+| **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~25×、容量小 ~18×，于是同一时间预算下模拟次数给到 4 倍 | 1600 次模拟，约 0.23~0.39 s |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
-| **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节 | 256 次模拟，约 12 ms |
+| **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节；每次真实决策还会**从自己的搜索学一次**（不依赖"探索+预训练"勾选框） | 256 次模拟，约 12 ms |
 | **SAC+AZ (稀疏MoE+TB专家)** | 同上，骨干换成**稀疏路由 MoE + TransformerBlock 专家** | 16 次模拟，约 160 ms |
+| **SAC+AZ (59e5233 行为还原版)** | 同一个算法，但口径回到提交 `59e5233`：目标熵 0.98 / α 学习率 1e-3 / critic 不钳位且纯 MSE / 叶子全量估值。**独立的派生类** `SACAZLegacyAgent`，**权重文件独立**（`weights/sacaz_old_agent*`） | 256 次模拟，约 12 ms |
+
+> **"只换骨干"的两个 agent**（PPO+MCTS 的 MLP/TB 专家）刻意共用同一个类与同一份
+> 搜索/训练/自检代码，构造时传不同的 `RL::PPO::Backbone`（`src/rl/ppo.h`）——
+> 界面上并列，就是为了能直接对弈比较，而不是维护两份会漂移的实现。两者的权重文件、
+> agent 名、参数量都不同；**交叉载入会被结构指纹当场拒绝**（`test_match` [2.14] 钉住）。
+>
+> **两个 SAC 的关系与上面相反、也更微妙**：SAC+AZ 与 SAC+AZ (59e5233 行为还原版) 是
+> **同一份算法 + 两个 C++ 类**（`SACAZAgent` 与派生类 `SACAZLegacyAgent`），差别只有
+> 4 个口径值。两者的**参数结构完全相同** ⇒ 结构指纹**挡不住**串权重，所以隔离只能靠
+> ① 不同的类、② 不同的文件名（`weights/sacaz_agent*` vs `weights/sacaz_old_agent*`），
+> 并由 `test_match` [2.11]（文件名清单不同）与 `test_sacaz` [14]（口径与逐位相同的网络）
+> 钉住。口径差异的完整表在 `src/sacazlegacyagent.h`，排查记录在
+> `docs/sac_regression_2026_09.md`。
 
 所有可在线训练的 agent 都遵循同一条决策流程（仿 snakeAI）：**先探索环境 + 预训练一次，
 再基于当前局面决策**（`AgentBase::exploreAndTrain()` + `src/agentrollout.hpp`）。探索全程
@@ -166,12 +203,13 @@ ctest --output-on-failure
 | `test_rules` | 棋规回归：走法数 / 应将 / 自杀 / 照面 / 将杀 / 重复 / 限着 + **`Chess::Result` 与 `Stone::Color` 的枚举换算**（两者数值撞号，手写比较会把红胜记成黑胜） |
 | `test_diag` | **诊断指标的解析验证**（68 断言，秒级）：熵 / CE / KL / explained variance / 变异系数 / 校准分桶 / `qForParent` 的符号 / CSV 列数与表头一致 / `rootDiag` 的不变量（**根访问数之和 == 模拟次数**）/ **搜索能不能看见一步杀** |
 | `test_pretrain` | **探索不得改动真棋局**（逐字段比对） |
-| `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** |
+| `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** + **必输局面仍返回合法走法** + 十一个 agent 的自检与**两支 SAC 的权重文件名必须不同**（[2.11]）+ 五条后台训练支路（含 59e5233 版 SAC 的派生类 clone）+ **自动保存 × 后台训练并发**（[2.15]/[2.16]） |
 | `test_grad` | **有限差分核对 SIMD 之后的解析梯度** + MM 内核"累加 vs 覆盖"语义探针 |
 | `test_weights` | 权重格式：逐比特往返 / 坏文件拒绝 / 失败不改动网络 / 老格式兼容 |
 | `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
+| **`repro_concurrency`** | **"对弈 × 后台训练"并发的最小复现**（对弈跑在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；**故意不进 ctest**，见 `docs/issues_review.md` C24 与零之二点二十五）：修前秒崩 `0xC0000374`（堆损坏），修后"全部跑完，没有崩溃"。用法 `repro_concurrency.exe [轮数] [每局手数] [agent枚举值]` |
 
 `test_ppomcts` 也在这 13 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
 置换表 / **PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）。
@@ -346,6 +384,8 @@ PPO 权重对 AB 深度 4 是 **0 胜 1 和 23 负**（Elo 差 −669），与"�
 | `tools/verify_thinking_ui.ps1` | 采样像素：思考中状态条出现、空闲/结束后干净 |
 | `tools/verify_busy_ui.ps1` | 启动载入权重时弹沙漏、载完收起（**不残留**） |
 | `tools/verify_eager_load.ps1` | **启动时加载所有模型**的两个后果：启动沙漏出现并收起；首次使用稀疏 MoE 变体**不再**弹沙漏（回到懒加载就会 FAIL），且对局确实在推进 |
+| `tools/verify_agent_combo.ps1` | **每个 agent 都能在界面上被选中**：把 `src/mainwindow.cpp` 的 `kAgents` 解析出来当期望值，展开三个下拉框，逐条断言它们**可见**（只"在模型里"不算 —— Qt 的 `maxVisibleItems` 默认 10，第 11 项曾被折叠在滚动区里，见 `issues_review.md` C23） |
+| **`bench_sac_learn`** | **"SAC 边下边学"的受控复现**：每手 `exploreAndTrain()` + `selectMove()`（与界面 `preTrainThenDecide` 逐条同协议），对 MCTS 打 N 局，报**胜负和 / 和棋成因（手数上限·60 回合·重复）/ 分胜负的终局类型（吃将·将死·困毙）/ 两种口径的奖励累计 / 损失曲线点数与均值最大值 / 训练后 critic 的 \|Q\| 尺度与策略熵**。带 `--legacy`（59e5233 口径）、`--reward-shape=0\|1\|2`、`--no-search-learn`、`--entropy-ratio/--alpha-lr/--clamp/--huber/--no-sparse-leaf` 等消融旋钮。详见 `docs/sac_learn_reward_2026_09.md` |
 | `tools/verify_app_icon.ps1` | ICO 结构 / 字形真的渲染 / 运行时加载 / exe 图标是"我们的" |
 | `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） |
 
@@ -369,6 +409,7 @@ chess/
 │   ├── busydialog.*        # 载入/保存权重时的"请稍候"弹窗 (复用上面的沙漏)
 │   ├── metricsview.*       # 自绘折线图 + 双击放大窗口
 │   ├── *_agent.* / abagent.* / mcts.* / evagent.*   # 9 个 agent
+│   ├── sacazlegacyagent.h                          # 第 10 个 agent: 59e5233 还原版 (派生于 sacazagent)
 │   ├── app.rc app.ico app.png res.qrc              # 程序图标与资源
 │   └── rl/                 # RL 内核 -> RL_CORE (纯 C++, 不含 Qt)
 │       ├── tensor.hpp net.hpp layer.h ...          # 张量/网络/层
@@ -402,6 +443,9 @@ chess/
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |
 | [`docs/rl_plan_optimized.md`](docs/rl_plan_optimized.md) | **三轮讨论收敛出的可执行方案**（过强对手/信心崩塌、和棋率、更新器与回放容量）：逐条"原建议 → 优化后"、数字按本机吞吐重算、明确不做清单、验收标准；**Part 6 是 P0 实施记录**（改了什么 / 怎么跑 / 实测数字 / 下一步） |
 | [`docs/agent_evab_design.md`](docs/agent_evab_design.md) | EVAB 专篇 |
+| [`docs/sac_regression_2026_09.md`](docs/sac_regression_2026_09.md) | **SAC 与 59e5233 的回归排查**：根因（隐层激活被换成 `TanhNorm<Sigmoid>`，-26 点）、等价性证明（逐手相同 + 黄金基准）、§7 方法学（评测器不可复现等） |
+| [`docs/sac_learn_reward_2026_09.md`](docs/sac_learn_reward_2026_09.md) | **"SAC 边下边学"的实测复核**：用户两份 CSV 的两个口径陷阱、奖励塑形实验（含"最终棋子数"为什么在即时奖励上不可实现）、**§9 训练为什么有害 + α 口径定位（37.5%→82.5%）** |
+| [`docs/session_2026_09_sac.md`](docs/session_2026_09_sac.md) | **本轮会话交接件**：P1~P13 问题清单（现象/根因/证据/状态）、①~⑩ 优化清单（依据与效果）、**四项待验证清单（含命令与验收标准）**、方法学教训 |
 
 ---
 
