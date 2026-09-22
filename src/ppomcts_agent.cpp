@@ -6,7 +6,48 @@
 #include "agentrollout.hpp"
 #include "rl/util.hpp"
 
+#include <cstdio>         /* selfCheckReport / printSortedRoot: std::snprintf */
 #include <random>         /* P0.1: 随机开局 (playRandomOpening) */
+#include <cstdlib>        /* std::getenv —— 训练进度诊断 (见 ppoTrainTrace) */
+#include <cstdarg>
+
+/* ================================================================
+ *  训练进度诊断 (2026-09)
+ *
+ *  为什么需要: 当时 `trainSelfPlay` 在某些调用顺序下稳定崩在 0xC0000005, 而 Release
+ *  构建没有 PDB, 拿不到符号化栈。把"崩前最后到达的阶段/手数"写进文件是零成本、可复现
+ *  的定位手段: 读最后一行就知道死在搜索、commitEpisode 还是存盘。
+ *
+ *  **后来的结论**: 那次崩溃的真因不在本函数, 而在调用方 (bench_agent_arena 的 train
+ *  分支无条件访问了 `A.sac`, `--a=ppo` 时是空指针)。但这组标记保留下来 —— 训练路径
+ *  本来就长、本来就难定位, 留着它下次直接能用。它没有断言, 不属于长期机制。
+ *
+ *  只在设了环境变量 `PPO_TRAIN_TRACE=<文件名>` 时写文件; 未设时只剩一次
+ *  `std::getenv` 调用 (每手一次, 与一次 8ms 的网络前向相比可忽略)。
+ * ================================================================ */
+namespace {
+
+FILE *g_ppoTrace = nullptr;
+bool g_ppoTraceInit = false;
+
+void ppoTrainTrace(const char *fmt, ...)
+{
+    if (!g_ppoTraceInit) {
+        g_ppoTraceInit = true;
+        const char *p = std::getenv("PPO_TRAIN_TRACE");
+        if (p != nullptr && *p != '\0') {
+            g_ppoTrace = std::fopen(p, "w");
+        }
+    }
+    if (g_ppoTrace == nullptr) { return; }
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(g_ppoTrace, fmt, ap);
+    va_end(ap);
+    std::fflush(g_ppoTrace);
+}
+
+} // namespace
 
 /* ================================================================
  *  PPOMCTSAgent - PPO + MCTS (AlphaZero-style) implementation
@@ -27,18 +68,21 @@ PPOMCTSAgent::PPOMCTSAgent(Chess &chess_,
                            float cpuct,
                            int expertHidden_,
                            float moeAuxCoef_,
-                           bool withGrad_)
+                           bool withGrad_,
+                           RL::PPO::Backbone backbone_)
     : AgentBase(),
       chess(chess_),
       ppo(STATE_DIM, hiddenDim, ACTION_DIM,
           expertHidden_ > 0 ? expertHidden_ : 64,
           moeAuxCoef_,
-          withGrad_),
+          withGrad_,
+          backbone_),
       gamma(gamma_),
       learningRate(lr),
       c_puct(cpuct),
       expertHidden(expertHidden_ > 0 ? expertHidden_ : 64),
       moeAuxCoef(moeAuxCoef_),
+      backbone(backbone_),
       totalEpisodes(0)
 {
     totalWins[0] = 0;
@@ -53,8 +97,16 @@ Step PPOMCTSAgent::getBestMove(int color)
     return selectMove(color, 400, 0.0f);
 }
 
+/*
+ * 名字里**只在 MLP 骨干时**带上后缀: 曲线是按 agent 名分线的 (mainwindow 的
+ * lossSeriesFor), 而 TB 骨干是现役配置 —— 它的名字必须保持原样, 否则既有的
+ * 基准/测试里那些按名字比对的地方会全部失效。骨干在构造时定, 所以名字是稳定的。
+ */
 std::string PPOMCTSAgent::getName() const
 {
+    if (backbone == Backbone::MlpExperts) {
+        return "PPO+MCTS (AlphaZero, MLP专家)";
+    }
     return "PPO+MCTS (AlphaZero)";
 }
 
@@ -173,7 +225,7 @@ void PPOMCTSAgent::getLegalActions(int color,
  *    * 与状态一样按 color 做规范镜像, 所以红黑双方的"同一步棋"共享同一个动作槽位,
  *      与规范视角的棋盘编码保持一致。
  * ------------------------------------------------------------------ */
-int PPOMCTSAgent::stepToActionIdx(const Step &s, int color)
+int PPOMCTSAgent::stepToActionIdx(const Step &s, int color) const
 {
     const int from = canonicalCell(s.pos, color);
     const int to   = canonicalCell(s.nextPos, color);
@@ -705,6 +757,407 @@ bool PPOMCTSAgent::rootDiag(RL::Diag::RootDiag &out) const
 }
 
 /* ------------------------------------------------------------------
+ *  selfCheckReport —— 界面"模型自检"面板的数据源 (2026-09)
+ *
+ *  为什么这一份报告值得单独写 (面板上其它读数都答不了这些问题):
+ *
+ *   (a) **损失与自对弈胜率都不能判断"值不值得继续训"** (见 aiagent.h 的契约)。
+ *       本 agent 的损失与棋力脱节得尤其厉害: 本工程实测同一份 PPO 权重对 AB 深度 4
+ *       是 0 胜 1 和 23 负, 而面板上的损失看着很正常。
+ *
+ *   (b) 本 agent 是"**完备 MDP**"的那一个 —— 状态里真的带规则上下文 (无吃子进度/
+ *       重复次数/被将), 动作是 8100 维**双射**而不是 128 槽哈希。这两条恰恰是
+ *       DQN+MCTS 那套老编码的两个已知病灶 (见 dqnmcts_agent.cpp 的自检报告)。
+ *       所以这里要把"好"的那一半**明确写出来**: 表示层没有别名、规则历史可观测,
+ *       于是"棋力不动"的根因只能在别处 (搜索预算/奖励口径/数据), 不该再回头查编码。
+ *
+ *   (c) **搜索预算是本 agent 最常见的"白跑"** —— 模拟数不比根的分支数大多少时,
+ *       前 #legal 次模拟只是把先验最高的那些孩子各展开一次 (每人恰好 1 次访问),
+ *       于是 π_target = "我自己先验前 N 名上的均匀分布", 出招再从这个分布里采样:
+ *       搜索对策略目标的信息量是**零**, 目标反而成了一个把先验抹平的算子。
+ *       实测口径: 象棋中局根平均 38.7 个合法着法, 20 次模拟 ⇒ 0 次深挖
+ *       (推导见 chessboard.cpp 的 BG_TRAIN_SIMS)。这一节是面板里最有用的读数。
+ *
+ *   (d) 奖励与探索的口径容易"接错线"而看不出来: PBRS 的 Φ 里**已含材质**,
+ *       显式材质奖励同时为开就是一次吃子计账两次 (Ng 1999: 中间奖励只留势能差);
+ *       根噪声若开在评测路径上, 量出来的棋力就掺了探索噪声、改动前后不可比。
+ *       两项都直接印出来 + 一句判读。
+ *
+ *  **只读**: 全部走 `Chess` 副本与现有树的读数 (rootDiag), 不改任何成员、不动棋盘、
+ *  不起新搜索。开销: 一次开局合法着法生成 + 一次 MoE 计数快照, 远低于一帧;
+ *  合法着法列表是从 Steps 池里借的, 用完立刻 put 回去。
+ * ------------------------------------------------------------------ */
+std::string PPOMCTSAgent::selfCheckReport() const
+{
+    char buf[512];
+    std::string out;
+
+    /* ================= 1. 表示层 (本 agent 是完备 MDP 的那一个) ============ */
+    /*
+       ---- 先报骨干 (2026-09) ----
+       这一个类支撑**两个界面 agent** (AGENT_PPOMCTS / AGENT_PPOMCTS_MLP), 两者的
+       参数量、每模拟耗时、每步模拟预算都不同。面板不写清骨干就会张冠李戴 ——
+       "同一个名字读数却不一样"会被记到错的账上 (与 SACAZAgent 的自检同一个理由)。
+    */
+    std::snprintf(buf, sizeof(buf), "骨干: %s | 专家 %d 个, topK=%d | 隐层 %d\n",
+                  backboneName(backbone), moeExpertCount(), moeTopK(), expertHidden);
+    out += buf;
+    if (backbone == Backbone::MlpExperts) {
+        out += "  界面 agent 类型 PPO+MCTS-MLP (AGENT_PPOMCTS_MLP): MlpExpert 便宜 ~25x "
+               "(前向 0.139 ms vs TB 3.59 ms), 容量小 ~18x (2.15 M vs 38.0 M 参数)\n";
+    } else {
+        out += "  界面 agent 类型 PPO+MCTS (AGENT_PPOMCTS): TransformerBlock<16,360> 专家"
+               " (E=4 top-1), 现役骨干\n";
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "表示: 状态 %d 维 = %d 平面 x %d 格\n", STATE_DIM, PLANES, CELLS);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "  平面 0..%d: %d 类棋子 x {己方, 对方} (规范视角) | %d: 被对方攻击"
+                  " | %d: 己方子被攻击\n",
+                  PIECE_PLANES - 1, PIECE_TYPES, PLANE_ATTACKED, PLANE_UNDER_ATTACK);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "  平面 %d/%d/%d: 规则上下文 无吃子进度 / 重复次数 / 被将"
+                  " (同一标量铺满 90 格)\n",
+                  PLANE_HALFMOVE, PLANE_REPEAT, PLANE_CHECK);
+    out += buf;
+    out += "  规则上下文**可观测** (本编码与旧 90 维编码的分水岭): 同一盘面的第 2 次"
+           "与第 3 次出现编码不同, 而第 3 次直接判和\n";
+    out += "  旧 90 维编码 (每格一个子力值) 下这两者逐字节相同 => V(s) 不是 s 的函数,"
+           " 判和规则网络读不到\n";
+    out += "  规范视角: 轮到黑方时 x -> 9-x (canonicalCell/mirrorCell/mirrorPlanes),"
+           " 红黑共用同一套权重\n";
+    std::snprintf(buf, sizeof(buf),
+                  "动作: %d 维 = %d x %d 的 (from, to), actionIdx = from*%d + to\n",
+                  ACTION_DIM, CELLS, CELLS, CELLS);
+    out += buf;
+    out += "  与棋子 id 无关 (id 会随吃子回收复用, 用它做索引会让同一个走法漂移)\n";
+
+    /*
+       动作编码的**双射验证**: 在"标准开局"这份**确定性**样本上数一遍 —— 与当前棋盘
+       和训练进度都无关, 所以面板一打开就有数 (老编码的"动作别名"只能靠对局累计统计,
+       训练期间一直显示 0)。用的就是生产路径那一份 `stepToActionIdx` (已标 const),
+       而不是在这里重抄公式 —— 重抄一遍等于验证了个假的。
+    */
+    int openingLegal = 0;
+    int openingDistinct = 0;
+    int mirrorInvolutive = 0;
+    {
+        /* 只读副本: GUI 线程上绝不能碰 this->chess (搜索线程可能正在用它) */
+        Chess probe(chess);
+        probe.reset();
+        std::vector<Step *> legal;
+        probe.sample(probe.sideToMove, legal);
+
+        openingLegal = (int)legal.size();
+        std::vector<int> idx;
+        idx.reserve(legal.size());
+        for (std::size_t i = 0; i < legal.size(); i++) {
+            const int a = stepToActionIdx(*legal[i], probe.sideToMove);
+            idx.push_back(a);
+            /* 镜像自反 (mirrorCell 自反 ⇒ 两次镜像回到原值): 双向无别名的旁证 */
+            if (mirrorActionIdx(mirrorActionIdx(a)) == a) {
+                mirrorInvolutive++;
+            }
+        }
+        /* 着法列表是从 Steps 池借的, 必须还回去 (不还就是池子泄漏) */
+        Steps::instance().put(legal);
+
+        std::sort(idx.begin(), idx.end());
+        openingDistinct = (int)(std::unique(idx.begin(), idx.end()) - idx.begin());
+    }
+    if (openingLegal > 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "动作编码: 双射 (开局 %d 个合法着法 -> %d 个动作下标, %s)"
+                      " | 镜像自反 %d/%d\n",
+                      openingLegal, openingDistinct,
+                      (openingDistinct == openingLegal) ? "无别名" : "**有别名: 编码坏了**",
+                      mirrorInvolutive, openingLegal);
+        out += buf;
+    } else {
+        /* 开局位置不可能没有合法着法; 真出现说明棋局生成坏了, 说清楚而不是印 0 别名 */
+        out += "动作编码: 双射 (开局合法着法数为 0, 没法在这份样本上验证"
+               " —— 检查 sample/reset)\n";
+    }
+    out += "  对照: 旧 128 槽哈希 (id*37 + x*13 + y*7) % 128 —— 全空间 2880 种走法挤进"
+           " 128 个槽位 (平均 22 个/槽); 开局实测 44 个合法着法只落在 38 个槽位上 (挤掉 6 个),"
+           " 策略目标被摊平到错误槽位\n";
+
+    /* ================= 2. 根搜索诊断 (面板里最有用的读数) ============ */
+    /*
+       只在**已有树**时读 (currentRoot() < 0 = 本进程还没走过一手)。rootDiag 自己会
+       再挡一次 (无树/零访问返回 false), 这里两层都留着 —— 它被 GUI 线程调用, 而树
+       是搜索线程写过的, 宁可多判一次也不能读越界。
+    */
+    if (currentRoot() < 0) {
+        out += "根搜索: 还没有搜索数据 (本进程还没走过一手)\n";
+    } else {
+        RL::Diag::RootDiag d;
+        if (!rootDiag(d) || d.children <= 0 || d.totalVisits <= 0) {
+            out += "根搜索: 有树, 但一个孩子都还没展开 (或零访问), 没有可判读的分布\n";
+        } else {
+            /* 不可能的取值一律夹回合法区间, 免得面板上出现 >1 的"份额" */
+            double topShare = d.topShare;
+            if (!(topShare >= 0.0)) { topShare = 0.0; }        /* 顺手挡掉 NaN */
+            if (topShare > 1.0) { topShare = 1.0; }
+            std::snprintf(buf, sizeof(buf),
+                          "根搜索: 孩子 %d/合法 %d (覆盖 %.2f) | ΣN %d | top1 份额 %.2f"
+                          " | 访问熵 %.2f nats | KL(访问||先验) %.2f\n",
+                          d.children, d.legalCount, d.expandCoverage, d.totalVisits,
+                          topShare, d.visitEntropy, d.priorKl);
+            out += buf;
+
+            /* ---- (i) ΣN vs 分支数: 这一条直接决定"搜索有没有给出信息" ---- */
+            const int deep = d.totalVisits - d.children;
+            if (deep <= 0) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: ΣN %d <= 分支数 %d -> 每个孩子平均只有 %.2f 次访问,"
+                              " 访问分布退化成\"自己先验前 %d 名的均匀分布\" ⇒ 搜索对"
+                              "策略目标零信息\n",
+                              d.totalVisits, d.children,
+                              (double)d.totalVisits / (double)d.children, d.children);
+                out += buf;
+                out += "        (这就是 BG_TRAIN_SIMS 从 20 提到 400 的那个病: 20 次模拟"
+                       "对 38.7 个分支 = 0 次深挖; 深挖余量 = ΣN − 分支数)\n";
+            } else if (deep < d.children) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: ΣN %d 只比分支数 %d 大 %d 次 -> 目标仍以\"每孩子"
+                              "一次\"的均匀分布为主, 搜索只贡献了一点点信息 (深挖余量 %.0f%%)\n",
+                              d.totalVisits, d.children, deep,
+                              100.0 * (double)deep / (double)d.totalVisits);
+                out += buf;
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: ΣN %d 远大于分支数 %d -> 有真正的深挖"
+                              " (余量 %d 次, 占 %.0f%%)\n",
+                              d.totalVisits, d.children, deep,
+                              100.0 * (double)deep / (double)d.totalVisits);
+                out += buf;
+            }
+
+            /* ---- (ii) top1 份额 > 0.7 = 过早锁定 (阈值同 rl/diag.h 的仪表盘) ---- */
+            if (topShare > 0.70) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: top1 份额 %.2f > 0.70 -> 过早锁定 (其余候选的 Q"
+                              "基本没被更新, 深挖都花在一个着法上了)\n",
+                              topShare);
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: top1 份额 %.2f <= 0.70 -> 没有过早锁定\n", topShare);
+            }
+            out += buf;
+
+            /* ---- (iii) KL(访问||先验) ≈ 0 = 搜索只是在复现先验 (白跑) ---- */
+            if (d.priorKl < 0.05) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: KL %.3f ≈ 0 -> 搜索没纠正网络 (目标只是在复现"
+                              "先验, 这一手白跑)\n",
+                              d.priorKl);
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: KL %.3f 明显 > 0 -> 搜索给出了先验之外的信息"
+                              " (这正是它该干的活)\n",
+                              d.priorKl);
+            }
+            out += buf;
+
+            /* ---- (iv) 展开覆盖率 < 1 = 有合法着法整局拿不到 Q ---- */
+            if (d.expandCoverage < 0.999 && d.legalCount > d.children) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 覆盖 %.2f < 1 -> 还有 %d 个合法着法从未被展开"
+                              " (低先验着法拿不到自己的 Q, 正是根噪声要救的那件事)\n",
+                              d.expandCoverage, d.legalCount - d.children);
+                out += buf;
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 覆盖 %.2f -> 全部合法着法都被展开过 (先验没有把"
+                              "任何着法挡在门外)\n",
+                              d.expandCoverage);
+                out += buf;
+            }
+
+            /* ---- (v) 访问熵 vs 均匀上界 ln(children): 分布有多尖 ---- */
+            if (d.children > 1) {
+                const double hUniform = std::log((double)d.children);
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 访问熵 %.2f nats / 均匀上界 ln%d=%.2f (占 %.0f%%)"
+                              " -> %s\n",
+                              d.visitEntropy, d.children, hUniform,
+                              (hUniform > 1e-9) ? 100.0 * d.visitEntropy / hUniform : 0.0,
+                              (d.visitEntropy < 0.3 * hUniform)
+                                  ? "分布很尖, 访问集中在少数候选" : "没有异常集中");
+                out += buf;
+            }
+
+            /* ---- (vi) 吃子 vs 退让: rl/diag.h 点名的"胆小"核心读数 ---- */
+            if (d.captureCount > 0) {
+                const double qGap = d.qCaptureMax - d.qQuietMax;
+                std::snprintf(buf, sizeof(buf),
+                              "  搜索偏好: 吃子着法访问份额 %.2f | Q(吃子)max %.3f -"
+                              " Q(退让)max %.3f = %+.3f%s\n",
+                              d.captureVisitShare, d.qCaptureMax, d.qQuietMax, qGap,
+                              (qGap < -0.02)
+                                  ? "  <- 为负: 搜索认为吃子不如退让 (\"胆小不吃子\")"
+                                  : "");
+                out += buf;
+            }
+        }
+    }
+
+    /* ================= 3. 训练 / 规格口径 ============ */
+    std::snprintf(buf, sizeof(buf),
+                  "训练口径: c_puct=%.3f | gamma=%.3f | lr=%.4g | 回放 %d/批 x %d epoch"
+                  " | 镜像增广=%s | 稀疏策略头=%s\n",
+                  (double)c_puct, (double)gamma, (double)learningRate,
+                  replayBatchSize, replayEpochs,
+                  mirrorAugment ? "开" : "关", sparsePolicyHead ? "开" : "关");
+    out += buf;
+    if (sparsePolicyHead) {
+        out += "  判读: 稀疏策略头=开 -> 先验是\"合法集上归一\"的概率, 比全量 p_full 大 1/Z 倍;"
+               " PUCT 的 U 项对 P 线性, 于是等价于 c_puct/Z (A/B 用 sparsePolicyHead=false)\n";
+    } else {
+        out += "  判读: 稀疏策略头=关 -> 先验直接用原始 p_full (合法集上的质量 Z 没被除掉),"
+               " 探索项比稀疏路径弱 1/Z 倍: 这是 R1 之前的口径\n";
+    }
+
+    std::snprintf(buf, sizeof(buf),
+                  "奖励 (PBRS): 势能塑形=%s alpha=%.2f | 显式材质奖励=%s | 截断自举=%s\n",
+                  potentialShaping ? "开" : "关", (double)shapingAlpha,
+                  materialRewardEnabled ? "开" : "关",
+                  truncationBootstrap ? "开" : "关");
+    out += buf;
+    if (!potentialShaping || shapingAlpha <= 0.0f) {
+        out += "  判读: 塑形关闭或 α=0 -> 价值目标只剩 材质 + gamma*maxQ 这条基线"
+               " (这是 A/B 对照口径, 不是默认)\n";
+    } else if (materialRewardEnabled) {
+        out += "  判读: Φ=tanh(evaluate/2) 里**已含材质**, 显式材质奖励又为开 ⇒ 一次吃子"
+               "被计账两次 (Ng 1999: 中间奖励只留势能差); materialRewardEnabled=false 是那个对照\n";
+    } else {
+        out += "  判读: 材质只由 Φ 承担 (标准做法), 显式项只剩每步代价; 任意 α 都是状态"
+               "函数, 保持策略不变性, 可退火\n";
+    }
+
+    std::snprintf(buf, sizeof(buf),
+                  "根噪声: rootNoise=%s alpha=%.2f eps=%.2f 仅前 %d 手 | 评测路径"
+                  " evalRootNoise=%s\n",
+                  rootNoise ? "开" : "关", (double)rootNoiseAlpha, (double)rootNoiseEps,
+                  rootNoiseMoves, evalRootNoise ? "开" : "关");
+    out += buf;
+    if (evalRootNoise) {
+        out += "  判读: 评测路径也加噪 = 只该用于诊断 A/B; 生产对局必须关, 否则量出来的"
+               "棋力掺了探索噪声、改动前后不可比\n";
+    } else {
+        out += "  判读: 只有自对弈取数据加噪 (eps 按手数退火到 0), 评测/对局不加 ->"
+               " 棋力读数不含探索噪声\n";
+    }
+
+    std::snprintf(buf, sizeof(buf),
+                  "树复用: %s | ttMaxDepth=%d | 置换表 %llu 条 | 命中 %lld 次 / 共创建"
+                  " %lld 个节点\n",
+                  treeReuse ? "开" : "关", ttMaxDepth,
+                  (unsigned long long)ttSize(), ttReuseHits(), ttNodesCreated());
+    out += buf;
+    if (!treeReuse) {
+        out += "  判读: 每 ply 从零重搜 (改动前的口径), 搜索成本白扔; 打开才有"
+               " ELF/Leela 那种跨 ply 累积的策略目标\n";
+    } else if (ttReuseHits() == 0) {
+        out += "  判读: 还没命中过 (每局首次取根必然如此) -> 整局都不涨才说明复用没生效\n";
+    } else {
+        out += "  判读: 落子到达的局面就是上一棵树的孩子 (自对弈里 100% 可达), 统计与"
+               "先验跨 ply 继续用 -> 等模拟数下 π 目标更尖\n";
+    }
+
+    /* ---- MoE 规模与专家负载 (容量 ≠ 棋力) ---- */
+    const int moeLayers = moeLayerCount();
+    const int moeExperts = moeExpertCount();
+    const int moeK = moeTopK();
+    std::snprintf(buf, sizeof(buf),
+                  "MoE: %d 层 x %d 专家 (topK=%d, auxCoef=%.2f) | actor 参数 %lld |"
+                  " critic 参数 %lld (容量, 不是棋力)\n",
+                  moeLayers, moeExperts, moeK, (double)moeAuxCoef,
+                  actorParamCount(), criticParamCount());
+    out += buf;
+
+    std::vector<long long> usage;
+    moeUsage(usage);   /* 两个网络的专家使用次数逐专家相加 (只读快照) */
+    if (!usage.empty()) {
+        long long sum = 0;
+        long long mx = usage[0];
+        long long mn = usage[0];
+        int mxIdx = 0;
+        int dead = 0;
+        for (std::size_t e = 0; e < usage.size(); e++) {
+            const long long v = usage[e];
+            sum += v;
+            if (v > mx) { mx = v; mxIdx = (int)e; }
+            if (v < mn) { mn = v; }
+            if (v <= 0) { dead++; }
+        }
+        if (sum <= 0) {
+            /* 全 0 ≠ 路由塌陷: 更可能是"这份网络的用量计数根本没被记录" -> 说清楚 */
+            out += "  专家使用: 全为 0 (还没跑过前向, 或这份网络没开用量计数)"
+                   " -> 不能据此判路由塌陷\n";
+        } else {
+            const double mean = (double)sum / (double)usage.size();
+            std::snprintf(buf, sizeof(buf),
+                          "  专家使用: max %lld (第 %d 个) | min %lld | mean %.0f |"
+                          " max/mean %.2f | 从未被选中 %d 个\n",
+                          mx, mxIdx, mn, mean,
+                          (mean > 0.0) ? (double)mx / mean : 0.0, dead);
+            out += buf;
+            if (dead > 0) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 有 %d 个专家从未被选中 -> 路由塌陷 (本工程实测过"
+                              "极端 [0,0,542,98]), 那份容量是白给的; 看 moeAuxCoef=%.2f\n",
+                              dead, (double)moeAuxCoef);
+                out += buf;
+            } else if (mean > 0.0 && (double)mx / mean > 3.0) {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 最大专家是均值的 %.2f 倍 -> 负载偏心 (CV 大),"
+                              " 专家容量没被均匀使用\n",
+                              (double)mx / mean);
+                out += buf;
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  判读: 专家负载大致均匀 (max/mean %.2f) -> 没有路由塌陷\n",
+                              (mean > 0.0) ? (double)mx / mean : 0.0);
+                out += buf;
+            }
+        }
+    } else {
+        /* 骨干不是稀疏 MoE (MlpExpert) 时 moeUsage 为空 —— 说"不适用", 而不是印 0 个专家 */
+        out += "  专家使用: 这个骨干没有稀疏 MoE 层 -> 负载均衡不适用 (无专家可塌陷)\n";
+    }
+
+    /* ---- 最近一次学习的损失 (NaN = 该 agent 不上报, 曲线直接丢点) ---- */
+    const float criticLoss = getLastTrainLoss();
+    const float actorLoss = getLastActorLoss();
+    char criticText[32];
+    char actorText[32];
+    if (std::isfinite(criticLoss)) {
+        std::snprintf(criticText, sizeof(criticText), "%.5g", (double)criticLoss);
+    } else {
+        std::snprintf(criticText, sizeof(criticText), "未上报");
+    }
+    if (std::isfinite(actorLoss)) {
+        std::snprintf(actorText, sizeof(actorText), "%.5g", (double)actorLoss);
+    } else {
+        std::snprintf(actorText, sizeof(actorText), "未上报");
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "最近一次学习: critic MSE=%s | actor CE=%s | 累计局数 %d\n",
+                  criticText, actorText, totalEpisodes);
+    out += buf;
+    out += "  判读: 损失只说明网络与自己的目标一致 (把 Q/V 学成常数也能很低), 与棋力"
+           "无关; \"未上报\"= NaN, 曲线丢点而不是画假水平线\n";
+
+    out += "以上是表示/口径事实, **不是棋力**; 棋力只有带 95% 置信区间的锚点对局"
+           " (bench_anchor 的 Elo 差) 能回答\n";
+    return out;
+}
+
+/* ------------------------------------------------------------------
  *  printSortedRoot: 把根的已展开着法按访问数排序打印 (P/Q/N + 是否吃子)
  *
  *  这是最省事的单局面定位手段: 挑一个"明显该吃"的局面跑一次搜索, 看吃子着排第几、
@@ -896,7 +1349,23 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
         } else {
             legal.clear();
         }
-        ppo.addReplay(trajectory[t].state, idx, prob, returns[t], legal);
+        /*
+           信任域 (2026-09): **入库时**把这个局面的策略概率算一份存下来, 作为 PPO
+           ratio 的分母 p_old。
+           为什么必须现在算: `learnFromReplay` 时 actor 已经被更新过, 那时重算出来的是
+           p_new; 拿 p_new 当分母等于恒等比值 1, 裁剪项完全失效 —— 那正是本仓库改版前
+           的状态 (策略项只有交叉熵 = 行为克隆, 见 ppo.h 顶部"无 clip"的自述)。
+           口径: 用 actionMasked (合法集上归一, Z≡1), 与 accumulateGradSparse 里的
+           probs 同一归一化 —— 两边口径不同的话 ratio 会带一个常数因子, 裁剪阈值
+           就失去意义。取不到 (没有合法集/没有梯度缓冲) 时留空 -> 自动退化。
+        */
+        std::vector<float> oldProb;
+        if (!legal.empty()) {
+            if (!ppo.actionMasked(trajectory[t].state, legal, oldProb)) {
+                oldProb.clear();
+            }
+        }
+        ppo.addReplay(trajectory[t].state, idx, prob, returns[t], legal, oldProb);
 
         if (mirrorAugment) {
             mirrorIdx.resize(idx.size());
@@ -908,7 +1377,19 @@ void PPOMCTSAgent::commitEpisode(std::vector<RL::Step> &trajectory,
                 mirrorLegal[i] = mirrorActionIdx(legal[i]);
             }
             mirrorPlanes(trajectory[t].state, mirrorState);
-            ppo.addReplay(mirrorState, mirrorIdx, prob, returns[t], mirrorLegal);
+            /*
+               镜像样本的 p_old: 策略在镜像局面上必须**重新算**而不是把 oldProb 重排 ——
+               规范视角下"镜像局面"与"原局面"是两个不同的输入, π(镜面) 一般 ≠ π(原面),
+               把概率按镜像下标搬过去会得到一个错的 ratio 分母 (不会报错, 只是噪声)。
+               镜像后的合法集用 mirrorLegal, 但**状态**必须用镜像后的状态。
+            */
+            std::vector<float> mirrorOld;
+            if (!mirrorLegal.empty()) {
+                if (!ppo.actionMasked(mirrorState, mirrorLegal, mirrorOld)) {
+                    mirrorOld.clear();
+                }
+            }
+            ppo.addReplay(mirrorState, mirrorIdx, prob, returns[t], mirrorLegal, mirrorOld);
         }
     }
 
@@ -1381,6 +1862,16 @@ Step PPOMCTSAgent::selectMove(int color, int simulations, float temp)
         return nodes[chosenID].step;
     }
 
+    /*
+       根有合法走法却一个孩子都没展开 (simulations <= 0, 或循环里没走到展开):
+       以前直接返回 Step() (valid=false) -> 调用方读成"真无棋可走" -> 判负, 而棋盘上
+       还有棋可下 (同 ABAgent 的"全负不返回走法", 见 abagent.cpp 的长注释)。
+       兜底取根节点未展开列表的第一手 (合法集的副本)。
+    */
+    if (!nodes[(std::size_t)rootID].untriedSteps.empty()) {
+        return nodes[(std::size_t)rootID].untriedSteps.front();
+    }
+
     return Step();
 }
 
@@ -1519,10 +2010,13 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
             chess.sideToMove = currentColor;
             /* 势能塑形 (Phase 2): 首手之前那个局面的势能, 是第 0 步的 Φ_before */
             m_phiInit = potentialOf(currentColor);
+            ppoTrainTrace("[ppo] ep=%d move=%d phi 完成\n", ep, moveNum);
 
             /* Encode current state */
             RL::Tensor state(STATE_DIM, 1);
             encodeState(state);
+            ppoTrainTrace("[ppo] ep=%d move=%d encode 完成 (sideToMove=%d)\n",
+                          ep, moveNum, chess.sideToMove);
 
             /*
                Run MCTS to get improved policy.
@@ -1537,6 +2031,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                掺探索噪声, 而且必须与改动前可比。
             */
             const int rootID = acquireRoot(currentColor, /*withRootNoise=*/true);
+            ppoTrainTrace("[ppo] ep=%d move=%d acquireRoot=%d\n", ep, moveNum, rootID);
 
             if (rootID < 0) {
                 /* 没有合法走法: 当前走子方输 (acquireRoot 返回 -1, 见那里的说明) */
@@ -1722,7 +2217,10 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
             Step chosenStep;
             int chosenAction = -1;
 
+            ppoTrainTrace("[ppo] ep=%d move=%d 模拟循环结束 (nodes=%zu)\n",
+                          ep, moveNum, nodes.size());
             const int chosenID = pickRootChildByVisits(rootID, temp);
+            ppoTrainTrace("[ppo] ep=%d move=%d chosenID=%d\n", ep, moveNum, chosenID);
             if (chosenID >= 0) {
                 chosenStep = nodes[(std::size_t)chosenID].step;
                 chosenAction = nodes[(std::size_t)chosenID].parentAction;
@@ -1788,7 +2286,12 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
 
                     /* Train PPO on complete trajectory */
                     if (!trajectory.empty()) {
+                        ppoTrainTrace("[ppo] ep=%d move=%d commitEpisode(终局) 开始 "
+                                      "(traj=%zu, legalPerStep=%zu)\n",
+                                      ep, moveNum, trajectory.size(), legalPerStep.size());
                         commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
+                        ppoTrainTrace("[ppo] ep=%d move=%d commitEpisode(终局) 结束\n",
+                                      ep, moveNum);
                     }
 
                     totalEpisodes++;

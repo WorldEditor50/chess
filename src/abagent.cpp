@@ -1,6 +1,8 @@
 #include "abagent.h"
 #include <algorithm>
+#include <cstdio>   /* selfCheckReport 的 snprintf */
 #include <cstdlib>
+#include <string>
 
 /*
  * ABAgent - Alpha-Beta Pruning Chess Agent
@@ -99,7 +101,19 @@ Step ABAgent::findBestMove(int color)
             chess.moveForward(s, totalReward);
             double r = minimizeAlpha(Stone::COLOR_RED, maxDepth - 1, beta, totalReward);
             chess.moveBack(s, totalReward);
-            if (r > beta) {
+            /*
+               `best == nullptr ||` 不是冗余判断, 它修的是 2026-09 用户报的那个 bug
+               ("[arena] agent(0) 返回无效走法 ... valid=0 id=0 pos=(0,0)->(0,0)"):
+                 若**每一步都必输**, 所有 r 都等于 -value_infi (子节点里对方无合法走法,
+                minimizeAlpha 直接返回 ±value_infi), 而这里的初值 beta 也是 -value_infi,
+                于是严格不等号 `r > beta` 一次都不成立 -> best 保持 nullptr -> 函数返回
+                默认构造的 Step (valid=false, id=0, pos=(0,0))。
+               调用方把 valid=false 读成"这一步没棋可走" -> 明明还有合法走法却被判负。
+               现在第一个走法无条件成为候选, "全负" 时退化成"返回排序后的第一手"
+               (走法已按 MVV-LVA 排序, 所以是"先看吃子"), 棋理上无差别 (都输), 但
+               契约上必须返回一步**合法**走法。
+            */
+            if (best == nullptr || r > beta) {
                 best = s;
                 beta = r;
             }
@@ -116,7 +130,10 @@ Step ABAgent::findBestMove(int color)
             chess.moveForward(s, totalReward);
             double r = maximizeBeta(Stone::COLOR_BLACK, maxDepth - 1, alpha, totalReward);
             chess.moveBack(s, totalReward);
-            if (r < alpha) {
+            /* 同样的兜底, 对称的那一半: 红方每一步都必输时所有 r 都是 +value_infi,
+               而初值 alpha 也是 +value_infi, 严格不等号一次都不成立 (见上面黑方分支
+               的长注释: 那正是 arena 里 "agent(0) 返回无效走法" 的来源)。 */
+            if (best == nullptr || r < alpha) {
                 best = s;
                 alpha = r;
             }
@@ -128,6 +145,11 @@ Step ABAgent::findBestMove(int color)
     if (best != nullptr) {
         step = *best;
     }
+    /*
+       走到这里 best == nullptr **只可能**是因为 steps 为空 —— 即真的无合法走法
+       (将杀/困毙), 此时返回默认构造的 Step (valid=false) 才是正确语义。上面两个
+       分支已经保证"有走法就一定有候选", 所以这个默认值不会再被误用。
+    */
     /*
        没有合法走法时不记分数 (getScoreValid() = false): 那种局面的"分值"是 ±value_infi
        量级, 拿去做回归目标会把 critic 一带带偏。
@@ -424,4 +446,161 @@ double ABAgent::maximizeBeta(int color, int depth, double alpha, double &totalRe
     }
     Steps::instance().put(steps);
     return beta;
+}
+
+/* ============================================================
+ *  自检报告
+ * ============================================================ */
+
+/*
+ * stepInMoveList: s 是否就是 legal 里的某一步 (决策合法性自检用)。
+ *
+ * 比对 (起点棋子 id, 起点格, 终点格) 三项, 不比对整个对象: 走法生成器给同一个走法
+ * 填的 reward 与搜索回填的不一定同源, 拿整对象比会出现"明明是这一步却说不相等"。
+ * `!s.valid` 直接算不在集合里 —— 默认构造的 Step (id=0, nextId=0, pos=(0,0)) 恰好
+ * 可能"等于"某个越界/占位对象, 只有 valid 位能区分"生成器产出的走法"与"没填过的
+ * 占位对象" (stone.h 里 valid 字段的存在理由就是这个)。
+ */
+static bool stepInMoveList(const Step &s, const std::vector<Step *> &legal)
+{
+    if (!s.valid) {
+        return false;
+    }
+    for (const Step *l : legal) {
+        if (l == nullptr || !l->valid) {
+            continue;
+        }
+        if (l->id == s.id && l->nextId == s.nextId
+            && l->pos.x == s.pos.x && l->pos.y == s.pos.y
+            && l->nextPos.x == s.nextPos.x && l->nextPos.y == s.nextPos.y) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------
+ *  selfCheckReport —— 界面"模型自检"面板的数据源
+ *
+ *  这里报的全是**结构 / 口径**事实, 一条棋力都没有。判读写在行尾, 因为面板的读者
+ *  是看训练曲线的人, 而这四行恰好回答四个"曲线答不了"的问题:
+ *
+ *    (1) 这个 agent 到底有没有可训练参数? ABAgent 没有 (叶子是手工 evaluate()):
+ *        所以它的损失曲线空着是**正确**状态, 不是训练挂了。
+ *    (2) **它还能不能返回合法走法**? 这是回归指示器, 钉的是 2026-09 用户报的 bug:
+ *        根节点上"每一步都必输"时, 所有根走法分值都是 ±Stone::value_infi, 而根节点
+ *        的窗口初值也是 ±value_infi, 于是严格不等号 (`r > beta` / `r < alpha`) 一次都
+ *        不成立 -> best 保持 nullptr -> findBestMove 返回默认构造的 Step (valid=false,
+ *        id=0, pos=(0,0))。arena 那边记的是
+ *          "[arena] agent(0) 返回无效走法 ... valid=0 id=0 pos=(0,0)->(0,0),
+ *           仍有 1 个合法走法, 已兜底"
+ *        也就是"还有棋可下却被读成无棋可走" -> GUI 可能直接判负。abagent.cpp 的
+ *        findBestMove 现在用 `best == nullptr || ...` 兜底修掉了, 这一行就是那笔修复
+ *        的**验收读数**: 一旦又打印"非法", 说明兜底被谁改回去了。
+ *    (3) 标准开局的两个确定性读数 (合法走法数 / evaluate()) —— 与训练进度、与当前
+ *        对局无关, 一打开面板就能看, 改走法生成或评估口径时会动, 当尺子用。
+ *    (4) 最近一次搜索的根分值 (黑方视角, 供价值头蒸馏) 和它有没有分数。
+ *
+ *  **只读**: 全程用 chess 的副本 + 一个临时局部 agent, 不碰 this->chess (GUI 线程
+ *  调用它时搜索线程可能正在用同一个棋盘), 不改任何成员 (本函数是 const)。
+ *  临时 agent 换来的是两件事: findBestMove() 非 const 也能跑; 而且它的搜索**不会**
+ *  覆盖本 agent 供蒸馏用的 m_lastScore —— 这正是下面第 4 行要读的那个值。
+ *  代价只有一次深度 1 搜索: 根上约 44 个走法 (确切值由报告里那一行打出), 每个叶子
+ *  进深度 3 静态搜索 (只搜吃子),
+ *  比界面上那一步 depth=4 便宜得多 (chessboard.cpp 里记的实测是 depth 3 = 63 ms,
+ *  depth 4 = 169 ms, depth 1 的根与叶子开销都在这之下一个数量级), 而且面板是
+ *  **每一手棋**刷新一次 (见 mainwindow 的 updateSelfCheckPanel 调用点), 不在搜索
+ *  热路径上调它, 所以这点开销可以接受。
+ * ------------------------------------------------------------------ */
+std::string ABAgent::selfCheckReport() const
+{
+    char buf[512];
+    std::string out;
+
+    /* ---- 1. 搜索配置与评估来源 (为什么"没有损失曲线") ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "搜索配置: 深度 %d (界面 AB_DEPTH = 4, 见 chessboard.cpp) | "
+                  "叶子评估 Chess::evaluate() = 材质 + 子力位置表 (手工, 无学习)\n",
+                  maxDepth);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "可学习权重: 0 个 (纯搜索 agent) -> getLastTrainLoss() 恒为 NaN, "
+                  "训练损失曲线对它永远是空的\n");
+    out += buf;
+
+    /* ---- 2+3. 决策合法性自检 + 标准开局"尺子"读数 ---- */
+    {
+        /* 棋盘副本 + 临时 agent: 见函数头注释 (不能碰 this->chess, 也不能改本 agent) */
+        Chess probe(chess);
+        probe.reset();                    /* 标准开局, sideToMove = 红 */
+        ABAgent tmp(probe, 1);            /* 深度 1: 只为验证"返回值在合法集里" */
+        Step s = tmp.findBestMove(Stone::COLOR_RED);
+        /*
+           评估读数取自同一个副本 (它已被 tmp 搜索过后完整回退, 仍是标准开局)。
+           另外用第二个副本取合法走法集: 走法集是 sample() 现生成的, 与 s 的来源无关,
+           两份副本互不影响。
+        */
+        const double evalBlack = probe.evaluate();
+
+        Chess probe2(chess);
+        probe2.reset();
+        std::vector<Step *> legal;
+        probe2.sample(Stone::COLOR_RED, legal);
+        const int legalCount = (int)legal.size();
+        const bool legalDecision = stepInMoveList(s, legal);
+
+        if (legalDecision) {
+            std::snprintf(buf, sizeof(buf),
+                          "决策合法性自检: 合法 (走法 (%d,%d)->(%d,%d))\n",
+                          s.pos.x, s.pos.y, s.nextPos.x, s.nextPos.y);
+            out += buf;
+        } else {
+            /*
+               走到这里说明兜底失效了 (或走法生成/合法集口径被改坏): 复现的是
+               "[arena] agent(0) 返回无效走法" 那类误判。把 valid 位也打出来,
+               因为 valid=false 与 "valid=true 但不在合法集里" 是两个不同的坏法。
+            */
+            std::snprintf(buf, sizeof(buf),
+                          "决策合法性自检: 非法 (返回了 valid=%d 的 Step: "
+                          "(%d,%d)->(%d,%d), 开局仍有 %d 个合法走法) "
+                          "<-- 回归! 见 findBestMove 的 best==nullptr 兜底\n",
+                          s.valid ? 1 : 0, s.pos.x, s.pos.y,
+                          s.nextPos.x, s.nextPos.y, legalCount);
+            out += buf;
+        }
+
+        std::snprintf(buf, sizeof(buf),
+                      "标准开局(红先): 合法走法 %d 个 | evaluate() = %.1f "
+                      "(黑方视角, 正 = 黑优)\n",
+                      legalCount,
+                      /* -0.0 会打成 "-0.0", 面板上看着像 bug: 标准开局是对称局面,
+                         分值本来就是 0, 所以把 "-0" 归一成 "0" */
+                      (evalBlack == 0.0) ? 0.0 : evalBlack);
+        out += buf;
+
+        /* 用完必须还回对象池, 否则池会碎片化 (sample 每次都从这里取) */
+        Steps::instance().put(legal);
+    }
+
+    /* ---- 4. 最近一次搜索的根分值 (价值头蒸馏的监督源) ---- */
+    if (getScoreValid()) {
+        std::snprintf(buf, sizeof(buf),
+                      "最近一次搜索根分值: %.1f (黑方视角, getScoreValid()=true)\n",
+                      getLastScore());
+        out += buf;
+    } else {
+        /*
+           面板上"0.0"与"没有分数"必须分开写: 默认构造的 m_lastScore 就是 0.0,
+           直接打 0 会被当成"这个局面绝对均势"。getScoreValid()=false 的语义是
+           那次搜索没有合法走法 (无分数可言), 或本对象还没搜过。
+        */
+        std::snprintf(buf, sizeof(buf),
+                      "最近一次搜索根分值: 无 (getScoreValid()=false —— 该次搜索无"
+                      "合法走法, 或本 agent 还没搜过)\n");
+        out += buf;
+    }
+
+    out += "以上是表示/口径事实, **不是棋力**; 棋力请用 bench_anchor 的锚点对局 "
+           "(给出 Elo 差与 95% 置信区间)\n";
+    return out;
 }

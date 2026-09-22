@@ -48,12 +48,49 @@ std::vector<RL::ISparseMoE*> sparseMoeLayers(RL::Net &net)
     return out;
 }
 
+/*
+   按骨干造那一层稀疏 MoE (actor 与 critic 各一份)。
+
+   为什么必须是这样一个工厂而不是"构造 PPO 时选一次类型": 专家类型与 (E, top-k) 都是
+   **模板参数**, 而 PPO 的其余部分 (损失/优化器/存盘/诊断) 完全不需要知道专家是什么 ——
+   它只通过 `ISparseMoE` 接口用它 (负载均衡辅助损失、专家使用直方图、读写权重都由虚函数
+   分派)。所以"两种骨干"的差别**只在这一个函数里**, 复制整个 ppo.cpp 才是真正的风险。
+
+   注意 withGrad 要透传: 多线程分身训练的 worker 用 withGrad=false (不分配梯度缓冲,
+   内存与构造时间约 1/4), 而这条路径必须在两种骨干下都能用。
+*/
+std::shared_ptr<RL::iLayer> makeMoeLayer(int stateDim, bool withGrad, int expertHidden,
+                                         RL::PPO::Backbone backbone)
+{
+    if (backbone == RL::PPO::Backbone::MlpExperts) {
+        return std::make_shared<RL::SparseMoE<RL::MlpExpert,
+                                              RL::PPO_MOE_MLP_EXPERTS,
+                                              RL::PPO_MOE_MLP_TOPK> >(
+            stateDim, withGrad, expertHidden);
+    }
+    return std::make_shared<RL::SparseMoE<RL::PPOExpert,
+                                          RL::PPO_MOE_EXPERTS,
+                                          RL::PPO_MOE_TOPK> >(
+        stateDim, withGrad, expertHidden);
+}
+
 } // namespace
 
+const char *RL::PPO::backboneName(Backbone b)
+{
+    switch (b) {
+    case Backbone::TbExperts:  return "稀疏MoE(TB专家)";
+    case Backbone::MlpExperts: return "稀疏MoE(MLP专家)";
+    }
+    return "?";
+}
+
 RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
-             int expertHidden_, float moeAuxCoef_, bool withGrad)
+             int expertHidden_, float moeAuxCoef_, bool withGrad,
+             Backbone backbone_)
     :stateDim(stateDim_), actionDim(actionDim_),
      expertHidden(expertHidden_ > 0 ? expertHidden_ : 64),
+     backbone(backbone_),
      gamma(0.99f), exploringRate(1.0f),
      moeAuxCoef(moeAuxCoef_), learningSteps(0)
 {
@@ -67,6 +104,13 @@ RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
        容量 2.15 M -> 38.0 M 参数, 代价是前向 0.139 -> 3.59 ms/次; 结构参数与
        理由 (含"为什么专家数同时从 8 降到 4") 见 ppo.h 顶部那一段。
 
+       2026-09 第三次 (本工程扩展): 那条 MlpExpert 骨干**没有被删掉**, 而是变成
+       `Backbone::MlpExperts` 这个可选项 (由界面上的 AGENT_PPOMCTS_MLP 使用) ——
+       两种骨干共用这一份 PPO 实现 (搜索/训练/存盘/诊断全一样), 于是可以直接对弈
+       比较。**默认值仍是 TbExperts**, 所以既有调用方的行为逐位不变。
+       两种专家**结构不同 ⇒ paramCount 不同**, 而权重文件带"元素总数 == paramCount"
+       的结构指纹, 所以交叉载入会当场失败, 不会静默串权重。
+
        expertHidden 只对 MlpExpert 有意义 (ExpertFactory 对 TransformerBlock 会忽略它),
        签名保留是为了不动一圈调用方 (PPOMCTSAgent / 测试 / bench)。
 
@@ -76,20 +120,14 @@ RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
        worker 从 ~600 MB 降到 ~150 MB)。
     */
     Net::Layers actorLayers;
-    actorLayers.push_back(std::make_shared<SparseMoE<PPOExpert,
-                                                     MOE_EXPERTS,
-                                                     MOE_TOPK> >(
-        stateDim, withGrad, expertHidden));
+    actorLayers.push_back(makeMoeLayer(stateDim, withGrad, expertHidden, backbone));
     actorLayers.push_back(Layer<Tanh>::_(stateDim, hiddenDim, true, withGrad));
     actorLayers.push_back(Layer<Softmax>::_(hiddenDim, actionDim, true, withGrad));
     actorP = Net(actorLayers);
 
     /* Critic: 同样的骨干 + Linear(1) 标量价值头 */
     Net::Layers criticLayers;
-    criticLayers.push_back(std::make_shared<SparseMoE<PPOExpert,
-                                                      MOE_EXPERTS,
-                                                      MOE_TOPK> >(
-        stateDim, withGrad, expertHidden));
+    criticLayers.push_back(makeMoeLayer(stateDim, withGrad, expertHidden, backbone));
     criticLayers.push_back(Layer<Tanh>::_(stateDim, hiddenDim, true, withGrad));
     criticLayers.push_back(Layer<Linear>::_(hiddenDim, 1, true, withGrad));
     critic = Net(criticLayers);
@@ -245,11 +283,14 @@ void RL::PPO::accumulateGrad(const Tensor &state,
     Tensor ceLoss = Loss::CrossEntropy::df(policy, actionTarget);
     actorP.backward(state, ceLoss);
 
-    /* ---- Critic: MSE loss ---- */
+    /* ---- Critic: MSE loss (目标按 clampValue 夹住, 见 ppo.h 的说明) ---- */
+    const double vt = (clampValue > 0.0f)
+                          ? (double)std::min(std::max(valueTarget, -clampValue), clampValue)
+                          : (double)valueTarget;
     Tensor &v = critic.forward(state);
-    const double err = (double)v[0] - (double)valueTarget;   /* backward 之前读 */
+    const double err = (double)v[0] - vt;   /* backward 之前读 */
     Tensor valueTargetTensor(1, 1);
-    valueTargetTensor[0] = valueTarget;
+    valueTargetTensor[0] = (float)vt;
     Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);
     critic.backward(state, mseLoss);
 
@@ -314,7 +355,8 @@ void RL::PPO::addReplay(const Tensor &state,
                         const std::vector<int> &actionIdx,
                         const std::vector<float> &actionProb,
                         float valueTarget,
-                        const std::vector<int> &legalIdx)
+                        const std::vector<int> &legalIdx,
+                        const std::vector<float> &oldProb)
 {
     if (actionIdx.empty()) {
         return;
@@ -324,6 +366,14 @@ void RL::PPO::addReplay(const Tensor &state,
     s.actionIdx = actionIdx;
     s.actionProb = actionProb;
     s.legalIdx = legalIdx;
+    /*
+       信任域样本: 只在"长度与 legalIdx 一致"时才收 —— 长度不符说明调用方给错了东西,
+       宁可不裁剪 (退化成纯交叉熵) 也不能拿错位的分母算 ratio (那会把梯度方向弄反,
+       而且不会报错)。见 ReplaySample::oldProb 的说明。
+    */
+    if (!oldProb.empty() && oldProb.size() == legalIdx.size()) {
+        s.oldProb = oldProb;
+    }
     s.valueTarget = valueTarget;
     replay.push_back(std::move(s));
     /* FIFO: 满了丢最老的一条 (deque 的 pop_front 是 O(1)) */
@@ -349,7 +399,8 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
                                    const std::vector<int> &legalIdx,
                                    const std::vector<int> &targetIdx,
                                    const std::vector<float> &targetProb,
-                                   float valueTarget)
+                                   float valueTarget,
+                                   const std::vector<float> &oldProb)
 {
     const std::size_t headIndex = actorP.size() - 1;
     RL::iFcLayer *head = (actorP.size() >= 2)
@@ -415,17 +466,94 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         }
     }
 
-    /* ---- 3) CE 与解析梯度 ---- */
+    /*
+       ---- 3) 策略项: 纯交叉熵 (旧口径) 或 PPO 裁剪代理目标 (给了 oldProb 时) ----
+
+       这里**直接算 dL/dlogit**, 不走"先算 dL/dπ 再乘 softmax 雅可比"那条路 ——
+       2026-09 踩过一次坑, 记下来免得再犯:
+         * 交叉熵对 logit 的梯度就是 **(p − t)** (这是 z 的函数, 不是常数);
+         * 而"先写 dL/dπ 再套雅可比"要求写的是 **dL/dπ = −t/p**, 不是 −t。
+           我第一版把 `g_i = −t_i` 当成 dL/dπ 套进雅可比, 结果梯度被整体缩小
+           `p_i` 倍 (正交性: 雅可比把常数向量投影掉了), test_grad 的 E 节用中心差分
+           当场抓到 (解析/差分 = 0.129 的常数倍)。
+       现在两种目标都直接给 logit 梯度, 形式统一:
+
+         CE 目标      : L = −Σ_a t_a·log p_a          ->  dL/dz_i = p_i − t_i
+         裁剪代理目标 : L = −Σ_a min(ρ_a·A_a, clip(ρ_a,1±ε)·A_a),  A_a = t_a − p_old,a
+                        对**单样本**策略梯度, ∂ρ_a/∂z_i = ρ_a(δ_ai − p_i), 于是
+                        dL/dz_i = −[未裁剪项]·ρ_i·A_i + p_i·Σ_a [未裁剪项]·ρ_a·A_a
+                                = Σ_a Σ_a' ... 化简后 = (p_i·Σ_a k_a) − k_i,
+                        其中 k_a = [未裁剪]·ρ_a·A_a。这一条由 test_grad/test_ppomcts
+                        的中心差分与"收紧裁剪位移更小"两条断言共同钉住。
+         熵奖励       : + entropyCoef·(−Σ_a p_a log p_a) 对 z 的梯度 =
+                        entropyCoef·( −p_i·(log p_i + 1) + p_i·Σ_a p_a(log p_a + 1) )
+                        = entropyCoef·p_i·(H̃ − log p_i − 1),  H̃ = Σ_a p_a(log p_a + 1)
+                        (写成"p_i 乘一个中心化项"是必须的: 熵对 z 的梯度天然与 z 的
+                         平移无关, 少掉那个中心化项就等价于给所有 logit 加了一个常数,
+                         对 softmax 无害但会让 dlogit 不满足 Σ dlogit = 0。)
+    */
+    std::vector<float> dlogit(n, 0.0f);
+    if (!degenerate) {
+        /* k_a: 每个动作在 logit 空间里的"有效优势权重" */
+        std::vector<float> k(n, 0.0f);
+        const bool useRatio = (clipEps > 0.0f) && (oldProb.size() == n);
+        if (useRatio) {
+            for (std::size_t i = 0; i < n; i++) {
+                const float po = (oldProb[i] > 1e-8f) ? oldProb[i] : 1e-8f;
+                const float rho = probs[i] / po;
+                const float adv = tgt[i] - oldProb[i];
+                const float rhoClipped = std::min(std::max(rho, 1.0f - clipEps),
+                                                  1.0f + clipEps);
+                /* 取 min 的那一支: 裁剪支更小时 (且继续朝原方向不会改善) 梯度记 0 */
+                const bool clipped = (rhoClipped * adv) < (rho * adv);
+                k[i] = clipped ? 0.0f : (rho * adv);
+            }
+        } else {
+            /* 纯交叉熵: dL/dz_i = p_i − t_i 正好是"k_i = t_i"这一支 */
+            for (std::size_t i = 0; i < n; i++) {
+                k[i] = tgt[i];
+            }
+        }
+
+        double kSum = 0.0;
+        for (std::size_t i = 0; i < n; i++) {
+            kSum += (double)k[i];
+        }
+        /* 熵项的中心化常数 */
+        double hTilde = 0.0;
+        if (entropyCoef > 0.0f) {
+            for (std::size_t i = 0; i < n; i++) {
+                hTilde += (double)probs[i] * (std::log((double)probs[i] + 1e-8) + 1.0);
+            }
+        }
+        for (std::size_t i = 0; i < n; i++) {
+            double d = (double)probs[i] * kSum - (double)k[i];
+            if (entropyCoef > 0.0f) {
+                d += (double)entropyCoef * (double)probs[i]
+                     * (hTilde - std::log((double)probs[i] + 1e-8) - 1.0);
+            }
+            dlogit[i] = (float)d;
+        }
+    }
+
+    /* CE 数值 (上报口径, 与改动前一致) */
     double ce = 0.0;
     for (std::size_t i = 0; i < n; i++) {
         if (tgt[i] > 0.0f) {
             ce -= (double)tgt[i] * std::log((double)probs[i] + 1e-8);
         }
     }
-    std::vector<float> dlogit(n, 0.0f);
-    if (!degenerate) {
+
+    /*
+       诊断钩子 (2026-09, 默认关闭): `test_grad` 的 E 节要确认"解析梯度是否等于
+       p − t"。把 (probs, dlogit) 暴露出去比在测试里重新推一遍可靠 ——
+       避免"用同一套公式证明自己"。
+    */
+    if (gradProbe != nullptr) {
+        gradProbe->clear();
         for (std::size_t i = 0; i < n; i++) {
-            dlogit[i] = probs[i] - tgt[i];
+            gradProbe->push_back(probs[i]);      /* [2i]   p_i */
+            gradProbe->push_back(dlogit[i]);     /* [2i+1] dL/dz_i */
         }
     }
 
@@ -464,11 +592,14 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         actorP.backwardFrom(headIndex - 1, state);
     }
 
-    /* ---- Critic: 与全量路径完全一致 ---- */
+    /* ---- Critic: 与全量路径完全一致 (只多一条值域约束, 见 ppo.h 的 clampValue) ---- */
+    const double vt = (clampValue > 0.0f)
+                          ? (double)std::min(std::max(valueTarget, -clampValue), clampValue)
+                          : (double)valueTarget;
     Tensor &v = critic.forward(state);
-    const double err = (double)v[0] - (double)valueTarget;
+    const double err = (double)v[0] - vt;
     Tensor valueTargetTensor(1, 1);
-    valueTargetTensor[0] = valueTarget;
+    valueTargetTensor[0] = (float)vt;
     Tensor mseLoss = Loss::MSE::df(v, valueTargetTensor);
     critic.backward(state, mseLoss);
 
@@ -507,7 +638,7 @@ bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)
             */
             if (maskedTrainHead && !s.legalIdx.empty()) {
                 accumulateGradSparse(state, s.legalIdx, s.actionIdx, s.actionProb,
-                                     s.valueTarget);
+                                     s.valueTarget, s.oldProb);
                 continue;
             }
             /* 稀疏目标 -> 稠密: 只填非零项, 其余清零 */

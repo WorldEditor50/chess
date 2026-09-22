@@ -1046,3 +1046,103 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
                     + std::to_string(blendBefore) + "->" + std::to_string(blend) + ")";
     return true;
 }
+
+/* ============================================================
+ *  selfCheckReport —— 界面"模型自检"面板的数据源
+ *
+ *  这里只报告**结构 / 口径**类事实, 判读写在各行末尾。EVAB 与别的 agent 不同的
+ *  两点, 也正是这个面板最该说清楚的两点:
+ *
+ *   (1) **动作不是网络输出的**。它没有 128 槽的哈希动作头 (DQN/PG/SAC+AZ 那套
+ *       编码在开局就会把几十个合法着法挤进更少的槽位), 走法由 alpha-beta 搜索
+ *       在合法着法集上直接选出 —— 动作层不存在别名, 这一项天生干净。
+ *   (2) **叶子评估是混合的**: blend=0 时叶子完全等于手工评估 (Chess::evaluate),
+ *       此时它的行为就是 "ABAgent + 置换表 + 迭代加深 + 更好的走法排序"; blend>0
+ *       时网络才参与。所以"网络到底有没有在起作用"要读 blend 与叶子评估次数,
+ *       而不是读损失 —— 这曾经是个真 bug: blend 初值 0 且**没有任何地方改它**,
+ *       界面上那个 "learned eval" 一次都没生效过 (见 evagent.h 里 blend 的注释)。
+ *
+ *  刻意**不**在这里跑搜索 (那是几百毫秒), 也**不**调 netHandGap() —— 后者会在
+ *  this->chess 上随机试走, 而本函数被约定为只读 (GUI 线程可能在搜索线程工作时
+ *  调用它, 见 aiagent.h 的契约)。
+ *
+ *  也不报"棋力": 损失只说明网络与自己的目标一致, 自对弈胜负里两边是同一份权重。
+ *  棋力只有带置信区间的锚点对局 (bench_anchor) 能回答。
+ * ============================================================ */
+std::string EVABAgent::selfCheckReport() const
+{
+    char buf[320];
+    std::string out;
+
+    /* ---- 1. 表示层: 状态编码 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "状态 %d 维 = %d 平面 x %d 格 (14 棋子平面 + 3 规则上下文)\n",
+                  STATE_DIM, PLANES, CELLS);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "规则上下文通道: 3 个 (无吃子进度 / 重复次数 / 被将) -> 三次重复、"
+                  "自然限着、将军都可观测\n");
+    out += buf;
+
+    /* ---- 2. 动作层: 由搜索给出, 没有动作头 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "动作层: alpha-beta 在**合法着法集**上直接选 (无 %d 槽哈希头), "
+                  "不存在动作别名\n", 128);
+    out += buf;
+
+    /* ---- 3. 叶子评估: 手工 / 网络的混合比例 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "叶子评估: blend=%.2f (0=纯手工评估, 1=网络接管), 上限 %.2f, "
+                  "每步 +%.2f, 手工尺度 %.1f\n",
+                  (double)blend, (double)blendMax, (double)blendStep, (double)EVAL_SCALE);
+    out += buf;
+    if (getLeafEvals() == 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "  blend=0 时网络前向一次都没发生 -> 这一支现在等价于"
+                      "\"AB + 置换表 + 迭代加深\"\n");
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "  本轮已发生网络叶子评估 %lld 次 (blend>0 的代价: 每次前向 "
+                      "1260->%d->1, 实测让 depth5 从 60 ms/步涨到 ~800 ms/步)\n",
+                      getLeafEvals(), m_hiddenDim);
+    }
+    out += buf;
+
+    /* ---- 4. 搜索预算与上一次搜索的规模 ---- */
+    const long long probes = getTTProbes();
+    const double hitRate = (probes > 0) ? (double)getTTHits() / (double)probes : 0.0;
+    std::snprintf(buf, sizeof(buf),
+                  "搜索: 深度上限 %d, 时间上限 %lld ms | 上次到达深度 %d, 节点 %lld\n",
+                  maxDepth, timeBudgetMs, getReachedDepth(), getNodes());
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "置换表: %zu 项 | 探测 %lld 次, 命中 %lld (%.1f%%), 写入 %lld\n",
+                  m_tt.size(), probes, getTTHits(), 100.0 * hitRate, getTTStores());
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "最近一次根评分 (走棋方视角, ±%.0f 为将杀): %.3f\n",
+                  MATE, m_lastRootScore);
+    out += buf;
+
+    /* ---- 5. 在线训练口径 ---- */
+    const float loss = getLastTrainLoss();
+    std::snprintf(buf, sizeof(buf),
+                  "在线训练: 学习率 %.4f, 结果标签权重 %.2f, 随机走子概率 %.2f, "
+                  "探索时间上限 %lld ms\n",
+                  (double)learningRate, (double)outcomeWeight, (double)exploreEps,
+                  exploreBudgetMs);
+    out += buf;
+    if (std::isfinite(loss)) {
+        std::snprintf(buf, sizeof(buf),
+                      "最近一次在线损失 (平均 |预测-标签|): %.4f | 参数量 %lld\n",
+                      (double)loss, valueNet.paramCount());
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "最近一次在线损失: 还没训练过 | 参数量 %lld\n",
+                      valueNet.paramCount());
+    }
+    out += buf;
+
+    out += "以上是表示/口径事实, **不是棋力**; 棋力请用 bench_anchor 的锚点对局\n";
+    return out;
+}

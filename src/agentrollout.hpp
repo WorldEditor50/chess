@@ -104,8 +104,12 @@ int rolloutFromCurrent(Agent &agent, Chess &chess, int color, int steps,
         const bool done = (gameResult != Chess::RESULT_ONGOING);
         float r = reward;
         if (done) {
-            /* 走子方视角的终局值 (胜 + / 负 - / 和 0), 与 stone.h 的 REWARD_TERMINAL 同源 */
-            r = outcomeForMover(gameResult, turn);
+            /*
+               走子方视角的终局值 (胜 + / 负 - / 和 0): 优先用 agent 自己的口径
+               (`terminalOutcomeOf`, 见文件末尾的说明), 没有这个成员的走共享的
+               outcomeForMover —— 与 stone.h 的 REWARD_TERMINAL 同源。
+            */
+            r = terminalOutcomeOf(agent, gameResult, turn, 0);
         }
         onTrans(recorded, selectedAction, state, nextState, r, done);
         collected++;
@@ -124,6 +128,29 @@ int rolloutFromCurrent(Agent &agent, Chess &chess, int color, int steps,
     }
     chess.sideToMove = savedSideToMove;
     return collected;
+}
+
+/*
+ * 终局值的**可选 agent 钩子** (2026-09)。
+ *
+ * 为什么要有它: 终局奖励本来统一走共享的 `outcomeForMover()` (胜 +1 / 负 -1 / 和 0),
+ * 但"依赖局面"的终局塑形 (例如 SACAZAgent 的 rewardShape=2: 败方兵力越完整地被将死
+ * 越值钱) 必须能读到棋盘。改 `outcomeForMover` 的签名会牵动全部 agent; 让每个 agent
+ * 都加一份成员又是 5 份可能漂移的实现。所以: **有 `terminalReward(result, mover)` 这个
+ * 成员的 agent 就用它, 没有的走共享口径** —— 用返回值类型重载分派 (int/long 惯用法),
+ * SFINAE 失败就落到第二支, 于是 PG / DQN / PPO / DQNAB 一行都不用改。
+ */
+template<typename Agent>
+inline auto terminalOutcomeOf(const Agent &a, int result, int mover, int)
+    -> decltype(a.terminalReward(result, mover))
+{
+    return a.terminalReward(result, mover);
+}
+
+template<typename Agent>
+inline float terminalOutcomeOf(const Agent &, int result, int mover, long)
+{
+    return outcomeForMover(result, mover);
 }
 
 #endif // AGENTROLLOUT_HPP

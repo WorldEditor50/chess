@@ -113,11 +113,17 @@ public:
     float gamma;
     float learningRate;
     float c_puct;                   /* PUCT exploration constant */
-    int expertHidden;               /* 稀疏 MoE 的 MLP 专家隐层宽度 (只在把
-                                       PPOExpert 换回 MlpExpert 时才有效;
+    int expertHidden;               /* 稀疏 MoE 的 MLP 专家隐层宽度 (只有
+                                       Backbone::MlpExperts 用它;
                                        TransformerBlock 专家的 FFN 宽度由
                                        PPO_MOE_TB_DFF 决定, 见 rl/ppo.h) */
     float moeAuxCoef;               /* 稀疏 MoE 负载均衡辅助损失系数 */
+    /*
+       本实例的骨干 (构造时定, 之后不要改: 网络已经按它建好了)。
+       公开是为了让自检面板与测试能读出来 —— 同一个类支撑两个界面 agent,
+       面板上不写清骨干就会张冠李戴 (与 SACAZAgent 的 backbone 同理)。
+    */
+    RL::PPO::Backbone backbone = RL::PPO::Backbone::TbExperts;
 
     /* Training statistics */
     int totalEpisodes;
@@ -308,8 +314,16 @@ public:
                          std::vector<Step*> &steps,
                          std::vector<int> &actionIndices,
                          RL::Tensor &actionMask);
-    /* Step -> 动作索引 (双射, 无碰撞; 必须在 color 的规范视角下算) */
-    int stepToActionIdx(const Step &s, int color);
+    /*
+       Step -> 动作索引 (双射, 无碰撞; 必须在 color 的规范视角下算)。
+
+       **const**: 它是它两个实参的纯函数 (只读 s 的坐标, 再走静态的 canonicalCell),
+       不读也不写任何成员。标上 const 是为了让 selfCheckReport() 这个 const 只读
+       自检能**直接调生产路径这一份公式**验证"双射" —— 在自检里重抄一遍公式等于
+       验证了个假的 (旧 DQN 的 probe 就是这么干的, 见 dqnmcts_agent.cpp 里那段
+       "改一处必须改两处"的注释)。
+    */
+    int stepToActionIdx(const Step &s, int color) const;
     float computeReward(const Step &s, int color);
 
     /* ----------------------------------------------------------------
@@ -555,6 +569,34 @@ public:
     void printSortedRoot(int limit = 10) const;
 
     /* ----------------------------------------------------------------
+     *  自检 (界面"模型自检"面板) —— 契约见 aiagent.h 的 selfCheckReport
+     *
+     *  报告三类**只读**事实 (一律用 `Chess` 的副本试算, 绝不碰 this->chess, 也不改
+     *  任何搜索状态):
+     *
+     *   1. **表示健康度** —— 状态平面布局、规则上下文到底可不可观测、动作编码是不是
+     *      双射。这一层是本 agent 与 90 维老编码的分水岭: 老编码下"同一盘面的第 2 次
+     *      与第 3 次出现 (第 3 次直接判和)"逐字节不可分 ⇒ V(s) 不是 s 的函数,
+     *      Bellman 备份的前提就破了。用"标准开局"这份**确定性**样本算一次, 于是它
+     *      与训练进度无关, 面板一打开就有数 (对照: DQN 的"动作别名"只能靠对局累计
+     *      统计, 训练期间一直显示 0)。
+     *
+     *   2. **根搜索判读** —— 根上的 孩子/ΣN/覆盖率/top1 份额/访问熵/KL(访问||先验)。
+     *      面板里最有用的一节: 模拟数不比分支数大多少时, 每个孩子恰好拿到 1 次访问,
+     *      策略目标退化成"我自己先验前 N 名上的均匀分布" ⇒ 搜索对目标的信息量是零
+     *      (推导与实测见 chessboard.cpp 的 BG_TRAIN_SIMS: 20 次模拟对 38.7 个分支)。
+     *      只在 `currentRoot() >= 0` 时读现有树的读数, **不起新搜索**。
+     *
+     *   3. **训练/规格口径** —— PUCT 常数/折扣/学习率/回放规模、PBRS 塑形与显式材质
+     *      奖励是否**重复计账**、根噪声在评测路径上是否关闭、树复用命中率、MoE 专家
+     *      负载 (路由塌陷)、最近一次 loss。参数量只报**容量**, 不报棋力。
+     *
+     *  刻意**不**报"棋力": 面板能回答的是"这个模型值不值得继续训", 而不是"它有多强"。
+     *  后者只有带 95% 区间的锚点对局 (bench_anchor) 能回答 —— 末行写明了这一点。
+     * ---------------------------------------------------------------- */
+    std::string selfCheckReport() const override;
+
+    /* ----------------------------------------------------------------
      *  自对弈 -> 回放池 -> 多 epoch 批量学习 (P3 + P4, 2026-09)
      *
      *  旧路径是"一整条轨迹做完折现回报, 然后逐步 trainStep" —— 每条样本恰好被用一次,
@@ -656,9 +698,26 @@ public:
                  /* false = 只做搜索/推理的网络 (供多线程分身训练的 worker 用,
                     见 rl/ppo.h 的同名参数)。worker 必须同时把 replayBatchSize 设成 0,
                     否则它会在没有梯度的网络上尝试学习。 */
-                 bool withGrad_ = true);
+                 bool withGrad_ = true,
+                 /*
+                    ---- 骨干 (2026-09) ----
+                    这一个类现在支撑**两个界面 agent**:
+                      AGENT_PPOMCTS     -> Backbone::TbExperts  (默认, E=4 top-1,
+                                           TransformerBlock<16,360> 专家)
+                      AGENT_PPOMCTS_MLP -> Backbone::MlpExperts (E=8 top-2, MlpExpert)
+                    与 SACAZAgent 支撑 AGENT_SACAZ / AGENT_SACAZ_MOE 是同一种做法:
+                    算法、搜索、训练、自检**一份代码**, 差别只在骨干 —— 于是两种骨干
+                    可以在界面上直接对弈比较, 而不必维护两份会漂移的实现。
+                    默认值是现役骨干, 所以既有调用方 (测试/bench/train_ppo) 行为不变。
+                 */
+                 RL::PPO::Backbone backbone_ = RL::PPO::Backbone::TbExperts);
 
     ~PPOMCTSAgent() = default;
+
+    /* 骨干别名与名字 (自检面板与界面显示用); 见 RL::PPO::Backbone */
+    using Backbone = RL::PPO::Backbone;
+    static const char *backboneName(Backbone b) { return RL::PPO::backboneName(b); }
+    Backbone getBackbone() const { return backbone; }
 
     /* AgentBase interface */
     Step getBestMove(int color) override;

@@ -1,12 +1,19 @@
 #include "chessboard.h"
 #include "rl/cpuinfo.hpp"
+/* AGENT_SACAZ_OLD 用的是这个**派生类** (不是 SACAZAgent + 开关), 见它的头注释 */
+#include "sacazlegacyagent.h"
 #include <QDebug>
 #include <QDir>
 #include <QFontMetrics>
+#include <QStringList>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>      /* 自检面板要报"权重文件在不在、多大" */
 #include <limits>
+#include <set>          /* backgroundTrainLoop: "没接后台训练"每种 agent 只报一次 */
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -25,7 +32,10 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
     case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
     case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
+    /* 59e5233 行为还原版 (派生类 SACAZLegacyAgent) */
+    case ChessBoard::AGENT_SACAZ_OLD: return QStringLiteral("SAC+AZ-59e5233");
     case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
+    case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
     }
     return QStringLiteral("agent");
 }
@@ -41,7 +51,9 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_DQNAB:
+    case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
     default:
         return false;
@@ -90,6 +102,18 @@ static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
  * 代价: 当前骨干约 8 ms/模拟 ⇒ 一步决策从 ~0.65 s 变成 ~3.2 s。
  */
 static constexpr int PPO_SIMS = 400;          /* PPO+MCTS 每次决策的模拟次数 */
+/*
+ * PPO+MCTS (MLP 专家骨干) 每次决策的模拟次数。
+ *
+ * 为什么比上面那个大 4 倍: 骨干便宜 ~25x (单网络前向实测 MlpExpert E=8 top-2
+ * 0.139 ms vs TB<16,360> E=4 top-1 3.59 ms, 见 rl/ppo.h 顶部那张表), 而"模拟次数 ≫
+ * 分支数(~39)"是 π 目标有没有信息量的分水岭 (见下面 BG_TRAIN_SIMS 的长注释)。
+ * 给 4 倍既是"用便宜的算力换更准的访问分布", 也仍然比 TB 那一支**快**得多:
+ * 实测本机 0.23 ~ 0.39 s/手 (test_match [2.14] 的两次 6 手小局; TB 那一支在 400 次
+ * 模拟下约 3.2 s/手, 见 test_match [2.7] 的思考耗时读数)。
+ * 想再换"更快"或"更准", 只需改这一个数 (成本线性)。
+ */
+static constexpr int PPO_MLP_SIMS = 1600;     /* PPO+MCTS (MLP 专家) 每次决策的模拟次数 */
 static constexpr int DQNMCTS_ITERATIONS = 200;/* DQN+MCTS 每次决策的迭代次数 */
 /*
  * SAC+AZ 每次决策的 MCTS 模拟次数。实测 (test_sacaz, 本机 AVX2): 64 次模拟约 3 ms,
@@ -164,17 +188,230 @@ static constexpr int DQNAB_HIDDEN = 64;    /* DQN+AB 的头隐层宽度 */
  * 关窗等待时间仍由单轮决定。
  */
 static constexpr int BG_TRAIN_EPISODES = 1;   /* 每轮训练局数 */
-static constexpr int BG_TRAIN_MAX_MOVES = 60; /* 每局步数上限 */
+/*
+ * 每局步数上限。
+ * ⚠️ **不要调到 32 以下**: SAC+AZ / DQN+AB 的 learnBatch 有"回放池 < batchSize(=32)
+ * 就直接返回、连 m_lastLoss 都不写"的门控 (sacazagent.cpp:857 / dqnabagent.cpp:1152),
+ * 而 clone 每轮都是从空池开始 —— 少于 32 手的一轮会**一次梯度更新都不做**, 却照样
+ * 把"没变过的权重"写回主 agent (损失曲线也不会上报, 因为 m_lastLoss 还是 NaN)。
+ * test_match [2.13] 的第一版给了 6 手, 正是这么失败的 (三个 agent 全部"上报 0 次")。
+ */
+static constexpr int BG_TRAIN_MAX_MOVES = 60; /* 每局步数上限 (必须 > 32, 见上) */
 static constexpr int BG_TRAIN_SIMS = 400;     /* MCTS 类 agent 每步的模拟次数 (须远大于分支数) */
+/*
+ * EVAB 后台训练的搜索深度。**不能照抄界面的 EVAB_DEPTH(6)**: 一轮是
+ * BG_TRAIN_EPISODES 局 x BG_TRAIN_MAX_MOVES 手, 而 EVAB 的每一手要搜两次
+ * (playDepth 选步 + labelDepth 生成 TD-leaf 标签, 见 evagent.h 的 trainSelfPlay)。
+ * 本机实测 (初始局面): depth 4 = 90 ms, depth 5 = 188 ms, depth 6 = 890 ms,
+ * 于是一轮 60 手在 3+4 下约 10 s、在 4+5 下约 17 s、照抄 6 就是分钟级 ——
+ * 而关窗要等整整一轮 (训练线程只在每轮开头看停止标志, 见 stopBackgroundTraining)。
+ * 取 3/4 是"一轮留在 10 s 量级"与"标签必须比选步更深"这两条的交点。
+ */
+static constexpr int BG_TRAIN_EVAB_PLAY_DEPTH = 3;
+static constexpr int BG_TRAIN_EVAB_LABEL_DEPTH = 4;
+/*
+ * SAC+AZ 后台训练每步的模拟次数。MLP 骨干实测 ~0.05 ms/模拟, 所以这里直接用
+ * BG_TRAIN_SIMS(400): 一轮 60 手约 1.2 s, 而且 400 远大于分支数 (~39), π 目标是
+ * 真搜索出来的 (与 C16 那条"20 次模拟 = 零深挖"同一个道理)。
+ */
+static constexpr int BG_TRAIN_SACAZ_SIMS = BG_TRAIN_SIMS;
+/*
+ * 稀疏 MoE 骨干那一个变体: 实测 ~10.9 ms/模拟, 所以**不能用 400**
+ * (400 x 60 手 ≈ 4.4 分钟/步…… 实际是 4.4 分钟一轮都不止)。
+ * 界面上的决策预算是 16 次 (175 ms/步, 见 SACAZ_MOE_SIMS), 但训练要的是 π 目标质量:
+ * 16 < 分支数 38.7 ⇒ **一次深挖都没有**, 目标退化成"把自己先验前 16 名抹平"(C16)。
+ * 给 64: 刚过分支数地板, 深挖余量约 25 次 (39%), 一轮 60 手约 42 s —— 与
+ * PPO+MCTS 那一档 (分钟级) 同一量级, 关窗等待可以接受。
+ */
+static constexpr int BG_TRAIN_SACAZ_MOE_SIMS = 64;
+
+/*
+ * 后台训练用的**临时权重路径** (前缀; 单文件 agent 就是文件本身)。
+ *
+ * 为什么每个多文件家族要给**不同的**前缀: 它们写出的文件名是
+ *   PPO+MCTS      -> <prefix>_actor / <prefix>_critic
+ *   PPO+MCTS-MLP  -> <prefix>_actor / <prefix>_critic   (与上一行**同名**, 所以前缀必须不同)
+ *   SAC+AZ        -> <prefix>_actor / _q1 / _q2
+ *   SAC+AZ-MoE    -> <prefix>_actor / _q1 / _q2
+ *   DQN+AB        -> <prefix>_trunk / _v / _a
+ * 而 `TMP_WEIGHTS` ("weights/_temp_train.dat") 是共用前缀 —— 于是 PPO 的 `_actor`
+ * 与 SAC+AZ 的 `_actor` **同名**。虽然结构指纹会让误读当场失败 (不会静默串权重),
+ * 但那是"靠断言兜住的设计", 不值得留着; 同一时刻只有一支在跑, 用不同前缀最省事,
+ * 也免得把上一支的残留文件读进来。
+ */
+static const char *TMP_WEIGHTS       = "weights/_temp_train.dat";        /* 单文件 + PPO(TB) */
+static const char *TMP_WEIGHTS_PPOMCTS_MLP = "weights/_temp_train_ppomcts_mlp";
+static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
+static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe";
+/*
+   行为还原版 SAC (AGENT_SACAZ_OLD = 派生类 SACAZLegacyAgent) 的临时前缀。
+   **必须有独立前缀**: 与 AGENT_SACAZ 共用会让两个 agent 的后台训练互相覆盖权重
+   (两者的训练口径不同, 覆盖之后是"棋力对不上训练量"这种没法归因的现象)。
+*/
+static const char *TMP_WEIGHTS_SACAZ_OLD = "weights/_temp_train_sacaz_old";
+static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab";
+
+/* 这个 agent 的后台训练临时前缀 (见上面那段注释) */
+static const char *tmpWeightsOf(ChessBoard::AgentType type)
+{
+    switch (type) {
+    case ChessBoard::AGENT_PPOMCTS_MLP: return TMP_WEIGHTS_PPOMCTS_MLP;
+    case ChessBoard::AGENT_SACAZ:     return TMP_WEIGHTS_SACAZ;
+    case ChessBoard::AGENT_SACAZ_MOE: return TMP_WEIGHTS_SACAZ_MOE;
+    case ChessBoard::AGENT_SACAZ_OLD: return TMP_WEIGHTS_SACAZ_OLD;
+    case ChessBoard::AGENT_DQNAB:     return TMP_WEIGHTS_DQNAB;
+    default:                          return TMP_WEIGHTS;
+    }
+}
+
+/*
+ * ================================================================
+ *  createSACAZAgent —— SAC 三支的**唯一**构造点
+ * ================================================================
+ * 为什么必须只有一处: 三支的**参数结构完全相同** (同一个类族, 都是 iFcLayer 的 w/b),
+ * 所以"构造错了哪一支 / 少传了哪个参数"不会让 save/load 失败 —— 它会**静默地**按另一套
+ * 口径跑 (AGENT_SACAZ_MOE 少传 backbone 就是 TB->MLP 的静默换骨干;
+ * AGENT_SACAZ_OLD 建成基类就是静默换成当前口径, 两者连参数量都一样)。
+ * 本文件已经因为"三处各写一遍构造参数"栽过一次 (见 weightFilesOf 的注释), 所以:
+ *   * 决策路径 (aiThinkRaw / aiThinkForAgentRaw)、启动预加载、后台训练的兜底建网、
+ *     以及每轮的训练 clone, 全部走这两个函数;
+ *   * AGENT_SACAZ_OLD 构造的是**派生类** SACAZLegacyAgent (口径写在那边的构造函数里),
+ *     界面这一层不手抄它的口径值。
+ *
+ * 返回 nullptr = 这个 agent 类型不是 SAC 家族 (调用方不该走到这里)。
+ */
+static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
+{
+    switch (type) {
+    case ChessBoard::AGENT_SACAZ: {
+        SACAZAgent *a = new SACAZAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+        return a;
+    }
+    case ChessBoard::AGENT_SACAZ_MOE: {
+        SACAZAgent *a = new SACAZAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                       SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX);
+        /*
+           ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
+           一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
+           32 条就是 **7.3 s/手** —— 加上界面本来就有的那一轮, 一步要十几秒。MLP 骨干那一支
+           是 0.95 ms/样本(32 条约 30 ms), 所以那条路径的开销可以忽略, 这一条不行。
+           等它有了便宜的头/批(见 docs 里的待办)再一起打开。
+        */
+        a->learnFromSearch = false;
+        return a;
+    }
+    case ChessBoard::AGENT_SACAZ_OLD:
+        /* 59e5233 行为还原版: 派生类, 口径固定在它自己的构造函数里 (learnFromSearch=false) */
+        return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+    default:
+        return nullptr;
+    }
+}
+
+/* 这个 agent 类型的后台训练每步给多少模拟次数 (见 BG_TRAIN_SACAZ* 的注释) */
+static int sacazTrainSims(ChessBoard::AgentType type)
+{
+    return (type == ChessBoard::AGENT_SACAZ_MOE) ? BG_TRAIN_SACAZ_MOE_SIMS
+                                                 : BG_TRAIN_SACAZ_SIMS;
+}
+
+/*
+ * trainSACRound —— SAC 三支共享的"一轮训练"往返
+ *   clone 载入种子权重 -> 自对弈 -> 写回临时文件
+ *
+ * 三支的这份往返**逐字相同** (只有模拟次数不同), 所以写成一处; 返回 false = 本轮不能
+ * 同步回主 agent (载入或写回失败)。诊断里带上 agent 名字: 三支共用前缀会让日志里的
+ * "SAC 载入失败"分不清是哪一支。
+ */
+static bool trainSACRound(SACAZAgent &clone,
+                          const char *tmpWeights,
+                          const QString &label,
+                          int episodes,
+                          int sims,
+                          int maxMoves,
+                          float &lossOut)
+{
+    if (!clone.loadModel(tmpWeights)) {
+        qWarning() << "[train]" << label << "clone 载入种子权重失败, 本轮丢弃"
+                   << "(临时文件与当前网络口径不匹配? 路径" << tmpWeights << ")";
+        return false;
+    }
+    clone.trainSelfPlay(episodes, sims, maxMoves, false);
+    lossOut = clone.getLastTrainLoss();
+    if (!clone.saveModel(tmpWeights)) {
+        qWarning() << "[train]" << label << "训练权重写回失败, 本轮丢弃";
+        return false;
+    }
+    return true;
+}
+
+/*
+ * ---- 有权重文件的 agent 名单 (单一来源) ----
+ * 顺序 = "启动加载顺序" = "自检面板的列举顺序": 大的/慢的放后面, 这样启动日志里
+ * 一眼能看出是哪一组在耗时 (稀疏 MoE 那一组是 3 x 146 MB)。
+ */
+static const ChessBoard::AgentType kWeightAgents[] = {
+    ChessBoard::AGENT_PG,
+    ChessBoard::AGENT_DQN,
+    ChessBoard::AGENT_EVAB,
+    ChessBoard::AGENT_PPOMCTS_MLP,
+    ChessBoard::AGENT_DQNMCTS,
+    ChessBoard::AGENT_PPOMCTS,
+    ChessBoard::AGENT_SACAZ,
+    ChessBoard::AGENT_DQNAB,
+    ChessBoard::AGENT_SACAZ_MOE,
+    /*
+       行为还原版 SAC 排在最后: 它与 AGENT_SACAZ 是"同一份代码 + 另一套口径",
+       启动日志里紧跟大的 MoE 那一组之后读起来最清楚。
+    */
+    ChessBoard::AGENT_SACAZ_OLD
+};
+
+/*
+ * weightFilesOf - 这个 agent 的 saveModel(prefix) 到底会写出哪些文件。
+ *
+ * 为什么要有它: "前缀"和"真实文件名"的关系原来散在三处
+ *   (a) 启动扫描权重的那张表, (b) defaultWeightPath(), (c) 各 agent 的 saveModel)。
+ * 三份知识一旦漂移就是**静默失效**: PPO+MCTS 的扫描表探测的是裸的
+ * `weights/ppomcts_agent.dat`, 而它写出的是 `..._actor` / `..._critic` ——
+ * 于是那 279 MB x 2 的权重从来没被载入过, 界面上一句报错都没有。
+ * 现在只有这一个函数知道命名规则, 启动扫描与自检面板都用它。
+ */
+static std::vector<std::string> weightFilesOf(ChessBoard::AgentType type)
+{
+    const std::string p = ChessBoard::defaultWeightPath(type);
+    if (p.empty()) {
+        return std::vector<std::string>();      /* 纯搜索 agent: 没有权重可存 */
+    }
+    switch (type) {
+    /* 一个模型两个文件: actor + critic (PPO 系的两个骨干都是这样) */
+    case ChessBoard::AGENT_PPOMCTS:
+    case ChessBoard::AGENT_PPOMCTS_MLP:
+        return { p + "_actor", p + "_critic" };
+    /* 一个模型三个文件: actor + 双 critic */
+    case ChessBoard::AGENT_SACAZ:
+    case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_OLD:
+        return { p + "_actor", p + "_q1", p + "_q2" };
+    /* 一个模型三个文件: 主干 + V 头 + A 头 */
+    case ChessBoard::AGENT_DQNAB:
+        return { p + "_trunk", p + "_v", p + "_a" };
+    /* 单文件 */
+    default:
+        return { p };
+    }
+}
 
 /* Static member initialization */
 PGEagent *ChessBoard::m_sfPG = nullptr;
 DQNAgent *ChessBoard::m_sfDQN = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTS = nullptr;
+PPOMCTSAgent *ChessBoard::m_sfPPOMCTSMLP = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
+SACAZAgent *ChessBoard::m_sfSACAZOld = nullptr;
 DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
@@ -210,40 +447,25 @@ void ChessBoard::startupLoad()
     GameDatabase::instance().open("chess_games.db");
 
     /* ---- 2. 扫描权重文件 ---- */
-    struct WeightEntry {
-        AgentType type;
-        std::string path;
-    };
-
-    std::vector<WeightEntry> weightFiles = {
-        {AGENT_PG,        "weights/pg_agent.dat"},
-        {AGENT_DQN,       "weights/dqn_agent.dat"},
-        {AGENT_PPOMCTS,   "weights/ppomcts_agent.dat"},
-        {AGENT_DQNMCTS,   "weights/dqnmcts_agent.dat"},
-        {AGENT_EVAB,      "weights/evab_agent.dat"},
-        /*
-           SAC+AZ 的一个模型是三个文件 (actor / q1 / q2), 所以这里的路径是**前缀**:
-           weights/sacaz_agent -> sacaz_agent_actor / _q1 / _q2。
-           判定"有没有已训练的权重"用 actor 那一个即可。
-        */
-        {AGENT_SACAZ,     "weights/sacaz_agent_actor"},
-        /* 稀疏 MoE 骨干的变体: 权重不能共用 —— 层结构完全不同 */
-        {AGENT_SACAZ_MOE, "weights/sacaz_moe_agent_actor"},
-        /*
-           DQN+AB 是三个文件 (主干 / V 头 / A 头), 所以这里的路径是**前缀**。
-           **探测字符串必须与实际写出的文件名一致**: DQNABAgent::saveModel(prefix)
-           写的是 `<prefix>_trunk` —— 而 RL::PPO 那一支就栽在这里 (探测的是裸的
-           `ppomcts_agent.dat`, 写出的却是 `..._actor`, 于是它的权重从来没被载入过,
-           见 docs/agents_design.md §18 的更正)。这里用 actor 对应的那个文件探测。
-        */
-        {AGENT_DQNAB,  "weights/dqnab_agent_trunk"}
-    };
-
-    for (const auto &we : weightFiles) {
-        std::ifstream f(we.path);
-        if (f.good()) {
-            f.close();
-            s_weightPaths[we.type] = we.path;
+    /*
+       ---- 这一段的教训 (2026-09): "写出来的文件名"必须只有**一个来源** ----
+       启动扫描的表、defaultWeightPath()、各 agent 的 saveModel(prefix) 原来是三份
+       各自维护的名字。PPO+MCTS 就栽在这里: saveModel(prefix) 写的是
+       `weights/ppomcts_agent.dat_actor` / `_critic`, 而扫描表里探测的是裸的
+       `weights/ppomcts_agent.dat` —— 于是它的权重**从来没在启动时被载入过**
+       (磁盘上确实有那 279 MB 的两个文件), 界面上却看不出任何异常。
+       现在扫描的名字由 weightFilesOf() 统一给出, 它就是"saveModel(prefix) 会写出
+       哪些文件"的同一份表述; 自检面板显示的也是这一份。
+    */
+    for (AgentType t : kWeightAgents) {
+        for (const std::string &f : weightFilesOf(t)) {
+            std::ifstream probe(f, std::ios::binary);
+            if (probe.good()) {
+                /* s_weightPaths 存的是**前缀** (单文件 agent 就是文件本身):
+                   下面 load*() 都按"前缀"用 (PPO 系再各自拼 _actor/_critic)。 */
+                s_weightPaths[t] = defaultWeightPath(t);
+                break;
+            }
         }
     }
 
@@ -332,6 +554,46 @@ void ChessBoard::startupLoad()
         m_sfSACAZMoe->loadModel(prefix);
         logLoad("SAC+AZ-MoE 读权重(3 x 146 MB)");
     }
+    if (s_weightPaths.count(AGENT_SACAZ_OLD)) {
+        /*
+           59e5233 行为还原版 (派生类 SACAZLegacyAgent)。权重是**独立前缀**
+           (weights/sacaz_old_agent_*), 与 AGENT_SACAZ 不共用 —— 见 sacazlegacyagent.h
+           的头注释 (两者参数结构相同, 结构指纹挡不住串权重, 而训练口径不同)。
+        */
+        emit busyMessage(QStringLiteral("正在载入 SAC+AZ (59e5233 行为还原版) 权重…"));
+        if (m_sfSACAZOld == nullptr) {
+            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+        }
+        std::string prefix = s_weightPaths[AGENT_SACAZ_OLD];
+        const std::string suffix = "_actor";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfSACAZOld->loadModel(prefix);
+        logLoad("SAC+AZ-59e5233");
+    }
+    if (s_weightPaths.count(AGENT_PPOMCTS_MLP)) {
+        /*
+           PPO+MCTS 的 MLP 专家变体 (2026-09)。它排在 TB 那一支**前面**: MLP 专家
+           的权重小得多 (约 3.6 M 参数, 几 MB), 读起来是毫秒级, 放在大的那组之前
+           能让启动日志的顺序更好读。
+        */
+        emit busyMessage(QStringLiteral("正在载入 PPO+MCTS (MLP专家) 权重…"));
+        if (m_sfPPOMCTSMLP == nullptr) {
+            /*
+               前 5 个参数与 TB 那一支的构造**逐字一致** (hidden 64 / gamma 0.99 /
+               lr 0.001 / c_puct 1.414), 后三个是 PPOMCTSAgent 的默认值
+               (expertHidden 64 / moeAuxCoef 0.1 / withGrad true) —— 它们必须写出来,
+               因为骨干是第 9 个参数。参数含 MoE 结构, 写错会让 save/load 的结构指纹
+               对不上 (每一轮都载入失败)。
+            */
+            m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                              true, RL::PPO::Backbone::MlpExperts);
+        }
+        m_sfPPOMCTSMLP->loadModel(s_weightPaths[AGENT_PPOMCTS_MLP]);
+        logLoad("PPO+MCTS (MLP专家)");
+    }
     if (s_weightPaths.count(AGENT_DQNAB)) {
         emit busyMessage(QStringLiteral("正在载入 DQN+AB 权重… (主干 146 MB + 两个头)"));
         if (m_sfDQNAB == nullptr) {
@@ -350,7 +612,35 @@ void ChessBoard::startupLoad()
         logLoad("DQN+AB 读权重(主干 + V 头 + A 头)");
     }
 
-    /* ---- 4. 启动后台训练 & 通知主线程加载完成 ---- */
+    /* ---- 4. 启动时给每个**已加载的模型**跑一遍自检 (2026-09) ---- */
+    /*
+       用户的要求是"所有模型都配上自检方法", 而自检的价值不只是"界面上有个面板":
+       它的契约是**只读、可重复调用、不动棋盘** (见 aiagent.h), 所以启动时把每个已
+       加载的模型都跑一遍非常便宜 (每个几十微秒, 大头是 alpha-beta 那一次 1 层搜索),
+       而且能立刻暴露"权重根本没载进来 / 结构与文件对不上"这类**静默失效**。
+       这里每个模型只打一行 (表示层摘要), 完整报告在界面右侧的"模型自检"面板
+       (以及那个"全部模型自检"按钮给的横向对照)。
+    */
+    {
+        QStringList checked;
+        for (AgentType t : kWeightAgents) {
+            if (!hasAgentInstance(t)) {
+                continue;
+            }
+            const QString firstLine =
+                QString::fromStdString(getAgentSelfCheck(t)).section(QLatin1Char('\n'), 0, 0);
+            qInfo().noquote() << QStringLiteral("[selfcheck] %1: %2")
+                                     .arg(agentDisplayName(t), firstLine);
+            checked << agentDisplayName(t);
+        }
+        if (checked.isEmpty()) {
+            qInfo().noquote()
+                << QStringLiteral("[selfcheck] 没有已加载的模型 (weights/ 下没有权重文件; "
+                                  "纯搜索 agent 的自检在界面上看)");
+        }
+    }
+
+    /* ---- 5. 启动后台训练 & 通知主线程加载完成 ---- */
     emit busyMessage(QStringLiteral("初始化完成"));
     emit busyFinished();
     m_startupComplete = true;
@@ -1050,6 +1340,24 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
     return info;
 }
 
+/*
+ * reportLearnedLoss - 决策里"从自己的搜索学了一次"之后上报损失 (见头文件说明)。
+ *
+ * 只有 learnSteps **前进**了才上报: 一次决策可能有两次更新 (rollout + 搜索样本),
+ * 无条件上报会让损失曲线一步出现两个点, 把"每手一个点"的口径弄乱。
+ */
+void ChessBoard::reportLearnedLoss(SACAZAgent *agent, int learnStepsBefore)
+{
+    if (agent == nullptr || agent->getLearnSteps() <= learnStepsBefore) {
+        return;      /* 这一步没发生更新 (例如 learnFromSearch 关着, 或池子还不够一个批) */
+    }
+    const float loss = agent->getLastTrainLoss();
+    if (std::isfinite(loss)) {
+        emit trainLossSample((double)loss, QString::fromStdString(agent->getName()),
+                             m_trainSampleNo.fetch_add(1) + 1);
+    }
+}
+
 std::string ChessBoard::getLastExploreInfo() const
 {
     QMutexLocker locker(&m_infoMutex);
@@ -1057,38 +1365,168 @@ std::string ChessBoard::getLastExploreInfo() const
 }
 
 /*
- * 当前 agent 的自检报告 (界面"模型自检"面板)。
+ * 指定 agent 的自检报告 (界面"模型自检"面板 / 启动日志)。
  *
- * 按**当前选中的 agent 类型**取对应的那一份实例 (s_ 系列的静态指针, 与
+ * 按**指定的 agent 类型**取对应的那一份实例 (s_ 系列的静态指针, 与
  * preTrainThenDecide 用的是同一批对象) —— 不能"遍历所有 agent 返回第一个非空的",
  * 那会在切到别的 agent 之后继续显示上一个的自检结果。
  *
- * 刻意**不**加锁: 报告函数被约定为只读且不动棋盘 (见 aiagent.h 的契约), 所以可以
- * 在 GUI 线程安全调用。指针可能为 nullptr (该 agent 的权重文件没找到 ⇒ 没建过网),
- * 此时返回空串, 由 GUI 显示"没有自检项"。
+ * 两条路径的差别值得写下来:
+ *   * PG / DQN / PPO+MCTS / DQN+MCTS / EVAB / SAC+AZ x2 / DQN+AB 都有**常驻实例**
+ *     (m_sfXXX), 直接转发它们自己的 selfCheckReport();
+ *   * Alpha-Beta / MCTS **没有常驻实例** —— 它们每一步都是现场构造一个 (见
+ *     aiThinkRaw), 所以这里也现场造一个, 棋盘用**副本** (只读契约不受影响)。
+ * 指针可能为 nullptr (该 agent 的权重文件没找到 ⇒ 没建过网), 此时返回空串,
+ * 由 GUI 显示"没有自检项"。
+ *
+ * 报告函数被约定为**只读、可重复调用、不动棋盘** (见 aiagent.h 的契约), 所以可以在
+ * GUI 线程直接调用。
+ *
+ * ---- 但"只读"不等于"可以并发" (2026-09, 用户报的崩溃) ----
+ * 报告读的是**常驻 agent 的内部状态** (搜索树、网络计数器、MoE 直方图), 而同一时刻
+ * 后台训练线程可能正在 `loadModel()` 把整份权重写进那个网络, AI/对弈线程也可能正在
+ * 搜索 (它会往 `nodes` 里 push_back —— 迭代器失效, 读到已释放的内存)。
+ * 所以只要是常驻实例, 一律取 `m_agentMutex` 再读: 这条锁与
+ * `aiThink*` 的决策、`backgroundTrainLoop` 的载入/保存是同一把。
+ * 代价是调用方可能等上几秒 (一次 PPO 决策 ~3.2 s, 一份 558 MB 权重的读写 ~9 s),
+ * 所以 **GUI 线程不能直接调它** —— 面板刷新走 MainWindow 的后台 worker
+ * (见 mainwindow.cpp 的 requestSelfCheckPanelUpdate)。
  *
  * 注意 (界面上也写明了, 否则 0 会被误读): 那些**对局累计**的计数来自主 agent,
  * 而 GUI 的后台训练跑在 clone 上、每轮才把权重同步回来 —— 训练期间这里的计数
- * 不会增长。所以面板同时给出"标准开局"那一份**确定性**读数 (与训练进度无关,
- * 一打开就能看)。
+ * 不会增长。所以各 agent 的报告里都同时给出"标准开局"那一份**确定性**读数
+ * (与训练进度无关, 一打开就能看)。
  */
 std::string ChessBoard::getAgentSelfCheck() const
 {
-    switch (m_agentType) {
+    return getAgentSelfCheck(m_agentType);
+}
+
+std::string ChessBoard::getAgentSelfCheck(AgentType type) const
+{
+    /*
+       Alpha-Beta / MCTS 没有常驻实例 (每一步现场构造一个), 它们只碰**棋盘副本**,
+       与 agent 锁无关, 所以先处理掉 —— 这样下面那段"常驻实例"的临界区里
+       不会同时持有 `mutex`(棋盘) 与 `m_agentMutex`, 两把锁的获取顺序只有一种。
+    */
+    if (type == AGENT_ALPHABETA || type == AGENT_MCTS) {
+        Chess probe;
+        {
+            /*
+               只在这一个地方对真棋盘取副本, 所以要上锁: 调用方 (GUI worker) 读自检时,
+               AI 工作线程可能正在走子 (其它 agent 的报告只碰自己的棋盘/网络)。
+            */
+            QMutexLocker locker(&mutex);
+            probe = chess;
+        }
+        if (type == AGENT_ALPHABETA) {
+            ABAgent ab(probe, AB_DEPTH);
+            return ab.selfCheckReport();
+        }
+        MCTS mcts(probe, 1.414f);
+        return mcts.selfCheckReport();
+    }
+
+    /* 常驻实例: 与决策/训练串行 (理由见函数头那段"只读不等于可以并发") */
+    std::lock_guard<std::mutex> agentLock(m_agentMutex);
+    switch (type) {
     case AGENT_DQNMCTS:
         if (m_sfDQNMCTS != nullptr) {
             return m_sfDQNMCTS->selfCheckReport();
         }
         break;
-    /*
-       其它 agent 的 selfCheckReport() 目前是默认实现 (返回空串)。以后要把 PPO 的
-       "和棋分桶 / priorKl"或 DQNAB 的"手工锚 gap/corr"接进来, 就在这里加一个分支,
-       再在对应 agent 里重写 —— 接口已经留在 AgentBase 上 (aiagent.h)。
-    */
+    case AGENT_PG:
+        if (m_sfPG != nullptr) {
+            return m_sfPG->selfCheckReport();
+        }
+        break;
+    case AGENT_DQN:
+        if (m_sfDQN != nullptr) {
+            return m_sfDQN->selfCheckReport();
+        }
+        break;
+    case AGENT_PPOMCTS:
+        if (m_sfPPOMCTS != nullptr) {
+            return m_sfPPOMCTS->selfCheckReport();
+        }
+        break;
+    case AGENT_EVAB:
+        if (m_sfEVAB != nullptr) {
+            return m_sfEVAB->selfCheckReport();
+        }
+        break;
+    case AGENT_SACAZ:
+        if (m_sfSACAZ != nullptr) {
+            return m_sfSACAZ->selfCheckReport();
+        }
+        break;
+    case AGENT_SACAZ_MOE:
+        if (m_sfSACAZMoe != nullptr) {
+            return m_sfSACAZMoe->selfCheckReport();
+        }
+        break;
+    case AGENT_SACAZ_OLD:
+        if (m_sfSACAZOld != nullptr) {
+            return m_sfSACAZOld->selfCheckReport();
+        }
+        break;
+    case AGENT_DQNAB:
+        if (m_sfDQNAB != nullptr) {
+            return m_sfDQNAB->selfCheckReport();
+        }
+        break;
+    case AGENT_PPOMCTS_MLP:
+        if (m_sfPPOMCTSMLP != nullptr) {
+            return m_sfPPOMCTSMLP->selfCheckReport();
+        }
+        break;
+    /* AGENT_ALPHABETA / AGENT_MCTS 在函数开头就返回了 (它们不碰常驻 agent) */
     default:
         break;
     }
     return std::string();
+}
+
+/*
+ * 权重文件在磁盘上的状态 (自检面板顶端那两行)。
+ *
+ * 判据只有一个: weightFilesOf() 给出的那些文件**在不在**、多大。文件名单一来源的
+ * 理由见 weightFilesOf 的注释 (PPO+MCTS 曾经因为三份名字漂移而从来没被载入过)。
+ * 这里刻意连"没找到"也报出来 —— "权重没载进来"的默认表现就是**静默地**从随机
+ * 初始化开始跑, 面板上必须能看见。
+ */
+std::string ChessBoard::getAgentWeightStatus(AgentType type) const
+{
+    const std::vector<std::string> files = weightFilesOf(type);
+    std::string out;
+    if (files.empty()) {
+        return out;      /* 纯搜索 agent: 没有权重, 不占版面 */
+    }
+    char buf[512];
+    /*
+       "启动加载有没有真的载上它"与"文件在不在"是两件事:
+       文件在、但 s_weightPaths 里没有这一项, 说明**扫描的名字与实际写出的名字
+       不一致** —— 那正是 PPO+MCTS 那个静默失效的形状, 所以两件事都报。
+    */
+    const bool loaded = (s_weightPaths.find(type) != s_weightPaths.end());
+    std::snprintf(buf, sizeof(buf), "权重文件: %s\n",
+                  loaded ? "启动时已载入 (扫描命中)" : "启动时**未**载入 (扫描没命中)");
+    out += buf;
+    for (const std::string &f : files) {
+        std::ifstream in(f, std::ios::binary | std::ios::ate);
+        if (!in.good()) {
+            std::snprintf(buf, sizeof(buf), "  %s : 不存在\n", f.c_str());
+        } else {
+            const long long bytes = (long long)in.tellg();
+            std::snprintf(buf, sizeof(buf), "  %s : %lld KB\n", f.c_str(), bytes / 1024);
+        }
+        out += buf;
+    }
+    if (!loaded) {
+        out += "  -> 扫描没命中时, 这个 agent 跑的是随机初始化的网络"
+               " (名字对不上就是静默失效, 见 weightFilesOf 的注释)\n";
+    }
+    return out;
 }
 
 QString ChessBoard::stagePrefix() const
@@ -1117,11 +1555,92 @@ void ChessBoard::emitStage(const QString &stage)
     emit aiThinkingStage(stagePrefix() + stage);
 }
 
+/* ================================================================
+ *  aiThink - 使用当前选中的 agent 类型决策
+ *
+ *  这里是"决策 -> 合法性闸门"两步里的第一步: 那个大 switch 现在在 aiThinkRaw 里,
+ *  结果统一过一遍 legalStepOrFallback (见它的注释)。
+ * ================================================================ */
 Step ChessBoard::aiThink(int color)
 {
-    /* Copy current game state to env so agents can mutate env freely
-     * during search (moveForward/moveBack) without touching the main board. */
-    env = chess;
+    const Step step = aiThinkRaw(color);
+    return legalStepOrFallback(color, step, agentDisplayName(m_agentType));
+}
+
+/* ================================================================
+ *  legalStepOrFallback - 决策输出的合法性闸门
+ *
+ *  为什么要有它: agent 的搜索在若干局面下会返回**默认构造**的 Step
+ *  (valid=false, id=0, pos=(0,0)), 而调用方一律把 valid=false 读成"这一步真无棋
+ *  可走" -> 直接判走棋方负。用户 2026-09 的报障就是这么来的:
+ *      [arena] agent(0) 返回无效走法 (第 6 局第 55 手): valid=0 id=0 pos=(0,0)->(0,0),
+ *              仍有 1 个合法走法, 已兜底
+ *  根因已修在源头 (ABAgent 在"每一步都输"时不再丢掉候选; MCTS 系在"根有合法走法
+ *  但一个孩子都没展开"时不再返回空 Step), 但这类错误的**形状**会在每个 agent、
+ *  每个新分支里重复出现, 而后果 (无中生有地判负) 比"走一步不理想的棋"严重得多。
+ *  所以在这里再加一道统一闸门:
+ *    * 无效走法 + 棋盘上还有合法走法 -> 取第一个合法走法兜底, 并打一行日志,
+ *      **带上是谁返回的** (原来那条日志只报 agent 编号, 排查时要回去数枚举);
+ *    * 真的无棋可走 -> 原样返回无效 Step, 由调用方判负 (这是唯一正确的语义)。
+ *
+ *  时机刻意选在"决策之后、落子之前", 所以它不能改棋盘: 只做一次 sample() (纯读),
+ *  用完立刻把 Step 还回对象池。
+ * ================================================================ */
+Step ChessBoard::legalStepOrFallback(int color, const Step &step, const QString &who)
+{
+    if (step.valid) {
+        return step;
+    }
+    std::vector<Step *> legal;
+    {
+        QMutexLocker locker(&mutex);
+        chess.sample(color, legal);
+    }
+    Step fallback;
+    if (!legal.empty()) {
+        qWarning().noquote()
+            << QStringLiteral("[gate] %1 返回无效走法 (id=%2 pos=(%3,%4)->(%5,%6)), "
+                              "棋盘上仍有 %7 个合法走法, 已用第一手兜底")
+                   .arg(who)
+                   .arg(step.id)
+                   .arg(step.pos.x).arg(step.pos.y)
+                   .arg(step.nextPos.x).arg(step.nextPos.y)
+                   .arg((int)legal.size());
+        fallback = *legal[0];
+    }
+    Steps::instance().put(legal);
+    return fallback;
+}
+
+Step ChessBoard::aiThinkRaw(int color)
+{
+    /*
+       Copy current game state to env so agents can mutate env freely
+       during search (moveForward/moveBack) without touching the main board.
+
+       ================================================================
+        ---- env 归 `m_agentMutex` 管, 不是 `mutex` (2026-09, 崩溃修复) ----
+       ================================================================
+       `env` 是**所有 agent 共用的那张试走棋盘** (每个 agent 构造时都拿了它的引用),
+       而这一行是**写**它: `history` 会被整份替换掉。原来它写在锁外, 于是
+       "对弈线程在搜 (env.history 一路 push_back)" 与 "另一条线程在读 env" 可以同时发生
+       —— 后者包括: 界面自检 worker 的 `Chess probe(agent->chess)` (走 getAgentSelfCheck,
+       是**加锁**的)、AI 工作线程的决策、以及另一场对弈。
+       加锁的读者挡不住不加锁的写者: ASan 实测抓到的是
+         `Chess::Chess(const Chess&)` (chess.cpp:526 的 `history(other.history)`)
+         **堆越界写** —— 拷贝构造按撕裂的 size/capacity 分配, 再按另一个数字搬元素,
+         与 Windows 事件日志里的 0xC0000374 (堆损坏) 完全对应。
+       所以规则统一成一句: **凡是碰 `env` 的地方都拿 `m_agentMutex`**
+       (它同时也是"主 agent 的网络"那把锁, 见 chessboard.h 的成员注释)。
+
+       锁的粒度: 这里只包住"复制"这一步; 紧接着的决策在各自的 case 里再拿同一把锁
+       (RL 分支本来就拿了, AB/MCTS 这两支以前**没拿** —— 它们也在 env 上搜索, 同样补上)。
+       中途不会有人插进来改 env: 所有 env 的写者都在这把锁上排队。
+    */
+    {
+        std::lock_guard<std::mutex> envLock(m_agentMutex);
+        env = chess;
+    }
 
     switch (m_agentType) {
     case AGENT_ALPHABETA: {
@@ -1130,13 +1649,19 @@ Step ChessBoard::aiThink(int color)
            在"当时那个 env" 上 —— 一旦出现第二个 ChessBoard (或 env 先被销毁),
            就是悬垂引用。ABAgent 本身只是一个引用 + 一个深度整数, 每步新建的代价
            可以忽略。
+
+           锁: Alpha-Beta 与 MCTS 没有"网络"可保护, 但它们**在这张共用的 env 上
+           搜索** (moveForward/moveBack 会改 env.history), 所以同样要持锁 ——
+           否则与上面那段注释里说的读者/写者撞在一起。
         */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
         ABAgent abAI(env, AB_DEPTH);
         return abAI.getBestMove(color);
     }
     case AGENT_MCTS: {
-        /* 蒙特卡洛树搜索 */
+        /* 蒙特卡洛树搜索 (同样在共用的 env 上搜索, 见 AB 分支的说明) */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         emitStage(QStringLiteral("① 搜索 / 决策 (MCTS %1 次模拟)").arg(MCTS_SIMS));
         MCTS mctsAI(env, 1.414f);
         return mctsAI.findBestMove(color, MCTS_SIMS);
@@ -1177,6 +1702,19 @@ Step ChessBoard::aiThink(int color)
         }
         preTrainThenDecide(m_sfPPOMCTS, color);
         return m_sfPPOMCTS->selectMove(color, PPO_SIMS, 0.0f);
+    }
+    case AGENT_PPOMCTS_MLP: {
+        /* 同一个算法, 骨干 = 稀疏 MoE + MLP 专家 (E=8 top-2); 见 aiThinkRaw 的同一支 */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfPPOMCTSMLP == nullptr) {
+            m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                              true, RL::PPO::Backbone::MlpExperts);
+            auto it = s_weightPaths.find(AGENT_PPOMCTS_MLP);
+            if (it != s_weightPaths.end())
+                m_sfPPOMCTSMLP->loadModel(it->second);
+        }
+        preTrainThenDecide(m_sfPPOMCTSMLP, color);
+        return m_sfPPOMCTSMLP->selectMove(color, PPO_MLP_SIMS, 0.0f);
     }
     case AGENT_DQNMCTS: {
         /*
@@ -1226,7 +1764,13 @@ Step ChessBoard::aiThink(int color)
         }
         preTrainThenDecide(m_sfSACAZ, color);
         /* temp = 0: 取访问数最多的走法 (确定性) */
-        return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+        {
+            /* selectMove 里会用自己的搜索样本学一次 (learnFromSearch), 那次损失也要上曲线 */
+            const int stepsBefore = m_sfSACAZ->getLearnSteps();
+            const Step s = m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZ, stepsBefore);
+            return s;
+        }
     }
     case AGENT_SACAZ_MOE: {
         /*
@@ -1265,7 +1809,42 @@ Step ChessBoard::aiThink(int color)
             }
         }
         preTrainThenDecide(m_sfSACAZMoe, color);
-        return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+{
+            const int stepsBefore = m_sfSACAZMoe->getLearnSteps();
+            const Step s = m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZMoe, stepsBefore);
+            return s;
+        }
+    }
+    case AGENT_SACAZ_OLD: {
+        /*
+           SAC + MCTS + AlphaZero 的 59e5233 行为还原版: 同一份搜索/训练代码, 另一套口径
+           (熵比 0.98 / alpha lr 1e-3 / critic 不钳位+纯 MSE / 叶子全量估值), 见
+           src/sacazlegacyagent.h。模拟次数与 AGENT_SACAZ 相同 (256): 两者是同一骨干、
+           同一表示, 给的预算不同就没法把差别归给口径。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZOld == nullptr) {
+            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+            auto it = s_weightPaths.find(AGENT_SACAZ_OLD);
+            if (it != s_weightPaths.end()) {
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZOld->loadModel(prefix);
+            }
+        }
+        preTrainThenDecide(m_sfSACAZOld, color);
+        /* temp = 0: 取访问数最多的走法 (确定性), 与 AGENT_SACAZ 同一口径 */
+{
+            const int stepsBefore = m_sfSACAZOld->getLearnSteps();
+            const Step s = m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZOld, stepsBefore);
+            return s;
+        }
     }
     case AGENT_DQNAB: {
         /*
@@ -1319,17 +1898,33 @@ Step ChessBoard::aiThink(int color)
  * ================================================================ */
 Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
 {
-    /* Copy current game state to env so agents can mutate env freely
-     * during search without touching the main board. */
-    env = chess;
+    const Step step = aiThinkForAgentRaw(color, agentType);
+    return legalStepOrFallback(color, step, agentDisplayName(agentType));
+}
+
+Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
+{
+    /*
+       Copy current game state to env so agents can mutate env freely
+       during search without touching the main board.
+       **这一步与下面的 AB/MCTS 分支都要拿 `m_agentMutex`** —— 理由见
+       aiThinkRaw 顶部那段长注释 (env 是所有 agent 共用的试走棋盘, ASan 实测:
+       不加锁的 `env = chess` 与加锁的读者相撞, 在 Chess 的拷贝构造里堆越界写)。
+    */
+    {
+        std::lock_guard<std::mutex> envLock(m_agentMutex);
+        env = chess;
+    }
 
     switch (agentType) {
     case AGENT_ALPHABETA: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
         ABAgent abAIForAgent(env, AB_DEPTH);
         return abAIForAgent.getBestMove(color);
     }
     case AGENT_MCTS: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         emitStage(QStringLiteral("① 搜索 / 决策 (MCTS %1 次模拟)").arg(MCTS_SIMS));
         MCTS mctsAI(env, 1.414f);
         return mctsAI.findBestMove(color, MCTS_SIMS);
@@ -1381,7 +1976,13 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
             m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
         }
         preTrainThenDecide(m_sfSACAZ, color);
-        return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+        {
+            /* 决策里会用自己的搜索样本学一次 (learnFromSearch), 那次损失也要上曲线 */
+            const int stepsBefore = m_sfSACAZ->getLearnSteps();
+            const Step s = m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZ, stepsBefore);
+            return s;
+        }
     }
     case AGENT_SACAZ_MOE: {
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
@@ -1411,7 +2012,41 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
             }
         }
         preTrainThenDecide(m_sfSACAZMoe, color);
-        return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+{
+            const int stepsBefore = m_sfSACAZMoe->getLearnSteps();
+            const Step s = m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZMoe, stepsBefore);
+            return s;
+        }
+    }
+    case AGENT_SACAZ_OLD: {
+        /*
+           59e5233 行为还原版: 与上面 AGENT_SACAZ 那一支同一条兜底约定
+           (建了对象就把权重载上), 但构造的是**派生类** SACAZLegacyAgent ——
+           口径不同, 所以权重前缀也独立 (weights/sacaz_old_agent*)。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZOld == nullptr) {
+            m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+            auto it = s_weightPaths.find(AGENT_SACAZ_OLD);
+            if (it != s_weightPaths.end()) {
+                std::string prefix = it->second;
+                const std::string suffix = "_actor";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZOld->loadModel(prefix);
+            }
+        }
+        preTrainThenDecide(m_sfSACAZOld, color);
+{
+            /* 决策里可能用自己的搜索样本学了一次 (learnFromSearch), 那次损失也要上曲线 */
+            const int stepsBefore = m_sfSACAZOld->getLearnSteps();
+            const Step s = m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
+            reportLearnedLoss(m_sfSACAZOld, stepsBefore);
+            return s;
+        }
     }
     case AGENT_DQNAB: {
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
@@ -1436,6 +2071,25 @@ Step ChessBoard::aiThinkForAgent(int color, AgentType agentType)
         m_sfDQNAB->nodeBudget = DQNAB_NODES;
         preTrainThenDecide(m_sfDQNAB, color);
         return m_sfDQNAB->selectMove(color, 0.0f);
+    }
+    case AGENT_PPOMCTS_MLP: {
+        /*
+           PPO+MCTS+AlphaZero, 骨干 = 稀疏 MoE + **MLP 专家** (E=8 top-2): 与
+           AGENT_PPOMCTS 共享同一份实现, 只有骨干这一项不同 (见 chessboard.h 的枚举注释)。
+           模拟次数给 PPO_MLP_SIMS —— 远比 TB 那一支多, 因为一次模拟便宜 ~25x。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfPPOMCTSMLP == nullptr) {
+            m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                              true, RL::PPO::Backbone::MlpExperts);
+            /* 与上面 DQNAB / SACAZ_MOE 同一条约定: 建了对象就把权重载上 */
+            auto it = s_weightPaths.find(AGENT_PPOMCTS_MLP);
+            if (it != s_weightPaths.end()) {
+                m_sfPPOMCTSMLP->loadModel(it->second);
+            }
+        }
+        preTrainThenDecide(m_sfPPOMCTSMLP, color);
+        return m_sfPPOMCTSMLP->selectMove(color, PPO_MLP_SIMS, 0.0f);
     }
     default:
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
@@ -1785,12 +2439,21 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     switch (agentType) {
     case AGENT_PG:        return "weights/pg_agent.dat";
     case AGENT_DQN:       return "weights/dqn_agent.dat";
+    /* PPO+MCTS 系: 前缀 -> <prefix>_actor / _critic (两种骨干各一个文件前缀) */
     case AGENT_PPOMCTS:   return "weights/ppomcts_agent.dat";
+    case AGENT_PPOMCTS_MLP: return "weights/ppomcts_mlp_agent.dat";
     case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
     case AGENT_EVAB:      return "weights/evab_agent.dat";
     /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 */
-    case AGENT_SACAZ:     return "weights/sacaz_agent";
+    case AGENT_SACAZ:     return SACAZAgent::defaultWeightPrefix();
     case AGENT_SACAZ_MOE: return "weights/sacaz_moe_agent";
+    /*
+       59e5233 行为还原版: **独立前缀**, 由派生类自己给出 (weights/sacaz_old_agent)。
+       绝不能用 SACAZAgent::defaultWeightPrefix() —— 那是"当前口径"那一支的文件,
+       两者参数结构相同, 结构指纹挡不住, 于是错误只会在训练很多轮之后以
+       "棋力对不上训练量"的形式出现。见 sacazlegacyagent.h 的头注释。
+    */
+    case AGENT_SACAZ_OLD: return SACAZLegacyAgent::defaultWeightPrefix();
     /* DQN+AB: 前缀 -> <prefix>_trunk / _v / _a */
     case AGENT_DQNAB:  return "weights/dqnab_agent";
     default:              return std::string();
@@ -1807,7 +2470,9 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     case AGENT_EVAB:      return m_sfEVAB != nullptr;
     case AGENT_SACAZ:     return m_sfSACAZ != nullptr;
     case AGENT_SACAZ_MOE: return m_sfSACAZMoe != nullptr;
+    case AGENT_SACAZ_OLD: return m_sfSACAZOld != nullptr;
     case AGENT_DQNAB:  return m_sfDQNAB != nullptr;
+    case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP != nullptr;
     default:              return false;
     }
 }
@@ -1829,6 +2494,24 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     } guard(this, QStringLiteral("写出 %1 的权重…")
                        .arg(agentDisplayName(agentType)));
 
+    /*
+       ================================================================
+        ---- 必须与"决策"和"后台训练"串行 (2026-09, 用户报的崩溃) ----
+       ================================================================
+       这条路径原来是**裸的**: 它直接从调用方的线程去序列化主 agent 的网络。
+       而同时对同一个网络动手的还有两处, 都规规矩矩拿着 `m_agentMutex`:
+         * AI / 对弈线程: aiThink* 的 RL 分支 (整段决策都在锁内);
+         * 后台训练线程: 每轮开头的 `saveModel(_temp_train*)` 与结尾的
+           `loadModel(_temp_train*)` 同步回主 agent。
+       于是"对弈结束 → 静默保存权重"正好撞上"后台训练正在把新权重写进同一个网络":
+       一个是 `Net::save` 在遍历层、逐个张量编码, 另一个是 `Net::load` 在往那些张量里
+       写 —— 数据竞争, 表现就是**保存到一半崩掉** (用户报的就是这个)。
+       现在这条路径也进同一把锁: 保存期间决策与训练会等它 (一次 558 MB 权重的写入
+       约 9 s, 这在"对局刚结束"的时刻不挡任何人的操作), 但谁都别想同时改那张网。
+       调用方 (MainWindow 的保存线程 / shutdownSave) 都不持有这把锁, 所以不会自锁。
+    */
+    std::lock_guard<std::mutex> agentLock(m_agentMutex);
+
     switch (agentType) {
     case AGENT_PG: {
         if (m_sfPG == nullptr) return false;
@@ -1841,6 +2524,11 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     case AGENT_PPOMCTS: {
         if (m_sfPPOMCTS == nullptr) return false;
         return m_sfPPOMCTS->saveModel(filepath);
+    }
+    case AGENT_PPOMCTS_MLP: {
+        if (m_sfPPOMCTSMLP == nullptr) return false;
+        /* 与 TB 那一支同样的两个文件 (前缀 -> _actor / _critic), 但前缀不同 */
+        return m_sfPPOMCTSMLP->saveModel(filepath);
     }
     case AGENT_DQNMCTS: {
         if (m_sfDQNMCTS == nullptr) return false;
@@ -1858,6 +2546,12 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     case AGENT_SACAZ_MOE: {
         if (m_sfSACAZMoe == nullptr) return false;
         return m_sfSACAZMoe->saveModel(filepath);
+    }
+    case AGENT_SACAZ_OLD: {
+        if (m_sfSACAZOld == nullptr) return false;
+        /* 与 AGENT_SACAZ 同样的三个文件, 但 filepath 是**另一个前缀**
+           (weights/sacaz_old_agent), 见 defaultWeightPath */
+        return m_sfSACAZOld->saveModel(filepath);
     }
     case AGENT_DQNAB: {
         if (m_sfDQNAB == nullptr) return false;
@@ -1892,21 +2586,75 @@ void ChessBoard::stopBackgroundTraining()
            注意: 训练线程只在**每轮**开始时检查 m_bgTraining, 而一轮是"克隆权重 ->
            训练 BG_TRAIN_EPISODES 局", 所以关窗的等待时间由单轮时长决定。
            轮次规模就是按这个约束选的 (见 BG_TRAIN_* 常量), 不要随手调大。
+           想亲自量这个等待时间, 用 setBackgroundTrainRound() 把一轮缩小即可。
         */
         m_bgTrainThread.join();
     }
 }
 
+void ChessBoard::setBackgroundTrainRound(int episodes, int maxMoves)
+{
+    m_bgTrainEpisodes = (episodes > 0) ? episodes : 1;
+    m_bgTrainMaxMoves = (maxMoves > 0) ? maxMoves : 1;
+}
+
 void ChessBoard::backgroundTrainLoop()
 {
-    static const char *TMP_WEIGHTS = "weights/_temp_train.dat";
     QDir().mkpath("weights");
+    /*
+       "这一支没接后台训练"的消息**每种 agent 只报一次**:
+       这个循环是每 2 秒重试一次的, 每轮都报的话就会看到一行警告每 2 秒刷一次 ——
+       警告刷屏之后就不再是警告了 (EVAB 没接的那段时间正是这样: 那条"种子权重写入
+       失败"每 2 秒刷一次, 反倒把真实原因淹掉了)。切到别的 agent 再切回来也不重报。
+    */
+    std::set<AgentType> notWiredWarned;
 
     while (m_bgTraining) {
         AgentType type = m_agentType;
+        /* 本轮的规模 (默认 = BG_TRAIN_*, 测试可以调小, 见 setBackgroundTrainRound) */
+        const int roundEpisodes = m_bgTrainEpisodes.load();
+        const int roundMaxMoves = m_bgTrainMaxMoves.load();
 
-        /* Alpha-Beta 和 MCTS 没有可训练的权重, 休眠后重试 */
-        if (type == AGENT_ALPHABETA || type == AGENT_MCTS) {
+        /*
+           ---- 这一步的后台训练接没接? (2026-09) ----
+           原来这里只写了一句"Alpha-Beta / MCTS 没有可训练权重就跳过", 而真正的分支
+           判断散在下面三个 switch 里。于是 EVAB (界面上可选、也确实有在线训练) 在
+           **三个 switch 里都没有 case**: seeded 永远是 false, 日志报的却是
+           "[train] 种子权重写入失败 ... 路径 weights/_temp_train.dat" ——
+           一条把"这一支根本没接"说成"文件写不出去"的误导性诊断 (用户报障)。
+           现在把"有没有接入"和"写盘成不成功"分成两件事报:
+             * 没接入 (还没为它写训练分支的 agent) -> 明说"尚未接入";
+             * 接入了但写盘失败 -> 保留原来那条"种子权重写入失败"。
+        */
+        bool trainable = false;
+        switch (type) {
+        case AGENT_PG:
+        case AGENT_DQN:
+        case AGENT_PPOMCTS:
+        case AGENT_DQNMCTS:
+        case AGENT_EVAB:
+        /* 2026-09: 补齐剩下三个有可训练权重的 agent —— 至此**十个 agent 里所有
+           "有权重可训"的都接上了** (AB / MCTS 没有权重, 不在此列)。 */
+        case AGENT_SACAZ:
+        case AGENT_SACAZ_MOE:
+        case AGENT_SACAZ_OLD:
+        case AGENT_DQNAB:
+        case AGENT_PPOMCTS_MLP:
+            trainable = true;
+            break;
+        default:
+            break;
+        }
+        if (!trainable) {
+            if (type != AGENT_ALPHABETA && type != AGENT_MCTS
+                && notWiredWarned.insert(type).second) {
+                /* 现在十个 agent 里"有权重可训"的**全部**接上了, 所以这一支只有在
+                   以后新增 agent 类型而忘了接线时才会响 —— 留着它就是为了那一天:
+                   这条消息以前被"种子权重写入失败"顶替, 结果 EVAB 空转了很多轮而
+                   没人发现。 */
+                qWarning() << "[train] 该 agent 的后台训练尚未接入, 跳过本轮:"
+                           << agentDisplayName(type);
+            }
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
@@ -1927,30 +2675,99 @@ void ChessBoard::backgroundTrainLoop()
                 if (m_sfPPOMCTS == nullptr)
                     m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
                 break;
+            case AGENT_PPOMCTS_MLP:
+                /* 构造参数必须与 aiThinkRaw / aiThinkForAgentRaw 那一支逐字一致
+                   (含骨干), 否则训练 clone 与主 agent 的结构指纹对不上, 每轮都载入失败 */
+                if (m_sfPPOMCTSMLP == nullptr)
+                    m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64,
+                                                      0.1f, true,
+                                                      RL::PPO::Backbone::MlpExperts);
+                break;
             case AGENT_DQNMCTS:
                 if (m_sfDQNMCTS == nullptr)
                     m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
+                break;
+            case AGENT_EVAB:
+                /* 与 aiThink/aiThinkForAgent 用同一组构造参数 (宽度/深度/时间预算),
+                   否则"主 agent 的权重"和"训练 clone 的网络"结构会对不上, load 直接失败 */
+                if (m_sfEVAB == nullptr)
+                    m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
+                break;
+            /*
+               ---- 这三个的构造参数同样必须与 aiThinkRaw 那一支逐字一致 ----
+               (宽度 / 骨干 / c_puct / 专家宽度 / 辅助系数)。任何一个不同, 主 agent 与
+               训练 clone 的网络结构就对不上, 而 save/load 的结构指纹会让整轮 load 失败
+               —— 表现是"每轮都在报载入失败", 不是静默错误, 但也白跑。
+               权重已经在 startupLoad() 里载好了 (正常路径下这里不会是 nullptr); 这一支
+               只是兜底: 没扫到权重文件时也建一个能训的实例。
+            */
+            case AGENT_SACAZ:
+                if (m_sfSACAZ == nullptr)
+                    m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+                break;
+            case AGENT_SACAZ_MOE:
+                if (m_sfSACAZMoe == nullptr)
+                    m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                                  SACAZAgent::Backbone::SparseMoeTb,
+                                                  64, SACAZ_MOE_AUX);
+                break;
+            /*
+               ---- 59e5233 行为还原版 ----
+               构造必须走 createSACAZAgent(): 这一支用的是**派生类** SACAZLegacyAgent,
+               在这里手写 `new SACAZAgent(...)` 会静默退回当前口径 (两者参数结构完全
+               相同, 连 save/load 都不会报错)。
+            */
+            case AGENT_SACAZ_OLD:
+                if (m_sfSACAZOld == nullptr)
+                    m_sfSACAZOld = createSACAZAgent(env, AGENT_SACAZ_OLD);
+                break;
+            case AGENT_DQNAB:
+                if (m_sfDQNAB == nullptr) {
+                    m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                               DQNABAgent::Backbone::SparseMoeTb);
+                    m_sfDQNAB->nodeBudget = DQNAB_NODES;   /* 与 aiThinkRaw 同一预算 */
+                }
                 break;
             default: break;
             }
         }
 
         /* ---- 克隆主agent权重到临时文件 ---- */
+        const char *tmpWeights = tmpWeightsOf(type);
         bool seeded = false;
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
             switch (type) {
             case AGENT_PG:
-                if (m_sfPG) seeded = m_sfPG->savePolicy(TMP_WEIGHTS);
+                if (m_sfPG) seeded = m_sfPG->savePolicy(tmpWeights);
                 break;
             case AGENT_DQN:
-                if (m_sfDQN) seeded = m_sfDQN->saveModel(TMP_WEIGHTS);
+                if (m_sfDQN) seeded = m_sfDQN->saveModel(tmpWeights);
                 break;
             case AGENT_PPOMCTS:
-                if (m_sfPPOMCTS) seeded = m_sfPPOMCTS->saveModel(TMP_WEIGHTS);
+                if (m_sfPPOMCTS) seeded = m_sfPPOMCTS->saveModel(tmpWeights);
+                break;
+            case AGENT_PPOMCTS_MLP:
+                if (m_sfPPOMCTSMLP) seeded = m_sfPPOMCTSMLP->saveModel(tmpWeights);
                 break;
             case AGENT_DQNMCTS:
-                if (m_sfDQNMCTS) seeded = m_sfDQNMCTS->saveModel(TMP_WEIGHTS);
+                if (m_sfDQNMCTS) seeded = m_sfDQNMCTS->saveModel(tmpWeights);
+                break;
+            case AGENT_EVAB:
+                if (m_sfEVAB) seeded = m_sfEVAB->saveModel(tmpWeights);
+                break;
+            /* 多文件家族: 路径是**前缀** -> <prefix>_actor/_q1/_q2 或 _trunk/_v/_a */
+            case AGENT_SACAZ:
+                if (m_sfSACAZ) seeded = m_sfSACAZ->saveModel(tmpWeights);
+                break;
+            case AGENT_SACAZ_MOE:
+                if (m_sfSACAZMoe) seeded = m_sfSACAZMoe->saveModel(tmpWeights);
+                break;
+            case AGENT_SACAZ_OLD:
+                if (m_sfSACAZOld) seeded = m_sfSACAZOld->saveModel(tmpWeights);
+                break;
+            case AGENT_DQNAB:
+                if (m_sfDQNAB) seeded = m_sfDQNAB->saveModel(tmpWeights);
                 break;
             default: break;
             }
@@ -1965,10 +2782,14 @@ void ChessBoard::backgroundTrainLoop()
            表现就是"跑了很多轮完全没有效果"。
            所以这里把写失败当成硬失败: 报出来、睡 2 秒重试 (与上面"没有可训练权重"那条
            同样的节奏, 避免忙等), 绝不带着"随机权重"继续。
+
+           注意这条消息**只**表示"写盘失败"这一个意思 —— "这一支还没接入训练" 由上面
+           的 trainable 分支单独报 (以前两者共用这条消息, 于是 EVAB 那种"没写"被读成
+           "写不出去", 排查方向完全错了)。
         */
         if (!seeded) {
             qWarning() << "[train] 种子权重写入失败, 跳过本轮训练: agent"
-                       << agentDisplayName(type) << "路径" << TMP_WEIGHTS;
+                       << agentDisplayName(type) << "路径" << tmpWeights;
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
@@ -1993,13 +2814,13 @@ void ChessBoard::backgroundTrainLoop()
             switch (type) {
             case AGENT_PG: {
                 PGEagent clone(trainChess, 64, 0.9f, 0.01f, 1.0f);
-                if (!clone.loadPolicy(TMP_WEIGHTS)) {
+                if (!clone.loadPolicy(tmpWeights)) {
                     qWarning() << "[train] PG clone 载入种子权重失败, 本轮丢弃";
                     break;
                 }
-                clone.train(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, true, false);
+                clone.train(roundEpisodes, roundMaxMoves, true, false);
                 roundLoss = clone.getLastTrainLoss();
-                if (!clone.savePolicy(TMP_WEIGHTS)) {
+                if (!clone.savePolicy(tmpWeights)) {
                     qWarning() << "[train] PG 训练权重写回失败, 本轮丢弃";
                     break;
                 }
@@ -2008,13 +2829,13 @@ void ChessBoard::backgroundTrainLoop()
             }
             case AGENT_DQN: {
                 DQNAgent clone(trainChess, 64, 0.99f, 0.001f, 1.0f);
-                if (!clone.loadModel(TMP_WEIGHTS)) {
+                if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN clone 载入种子权重失败, 本轮丢弃";
                     break;
                 }
-                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_MAX_MOVES, false);
+                clone.trainSelfPlay(roundEpisodes, roundMaxMoves, false);
                 roundLoss = clone.getLastTrainLoss();
-                if (!clone.saveModel(TMP_WEIGHTS)) {
+                if (!clone.saveModel(tmpWeights)) {
                     qWarning() << "[train] DQN 训练权重写回失败, 本轮丢弃";
                     break;
                 }
@@ -2023,16 +2844,41 @@ void ChessBoard::backgroundTrainLoop()
             }
             case AGENT_PPOMCTS: {
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f);
-                if (!clone.loadModel(TMP_WEIGHTS)) {
+                if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS clone 载入种子权重失败, 本轮丢弃"
-                               << "(临时文件与当前网络架构不匹配? 路径" << TMP_WEIGHTS << ")";
+                               << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
                     break;
                 }
-                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
-                                    BG_TRAIN_MAX_MOVES, false);
+                clone.trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
+                                    roundMaxMoves, false);
                 roundLoss = clone.getLastTrainLoss();
-                if (!clone.saveModel(TMP_WEIGHTS)) {
+                if (!clone.saveModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
+                break;
+            }
+            case AGENT_PPOMCTS_MLP: {
+                /*
+                   MLP 专家骨干的同一套往返。模拟次数用 PPO_MLP_SIMS (与界面同一预算):
+                   一轮 60 手在 MLP 专家上约 12 s (一次模拟便宜 ~25x), 而 TB 那一支
+                   同规模要分钟级 —— 这正是这条支路值得接的原因。
+                   骨干必须显式传: 默认是 TB, 传漏了 clone 的结构就与主 agent 不一致,
+                   loadModel 会因结构指纹不匹配而每一轮都失败。
+                */
+                PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                   true, RL::PPO::Backbone::MlpExperts);
+                if (!clone.loadModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS-MLP clone 载入种子权重失败, 本轮丢弃"
+                               << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
+                    break;
+                }
+                clone.trainSelfPlay(roundEpisodes, PPO_MLP_SIMS,
+                                    roundMaxMoves, false);
+                roundLoss = clone.getLastTrainLoss();
+                if (!clone.saveModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS-MLP 训练权重写回失败, 本轮丢弃";
                     break;
                 }
                 roundApplied = true;
@@ -2040,15 +2886,98 @@ void ChessBoard::backgroundTrainLoop()
             }
             case AGENT_DQNMCTS: {
                 DQNMCTSAgent clone(trainChess, 128, 0.99f, 0.001f, 1.0f, 1.414f);
-                if (!clone.loadModel(TMP_WEIGHTS)) {
+                if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN+MCTS clone 载入种子权重失败, 本轮丢弃";
                     break;
                 }
-                clone.trainSelfPlay(BG_TRAIN_EPISODES, BG_TRAIN_SIMS,
-                                    BG_TRAIN_MAX_MOVES, false);
+                clone.trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
+                                    roundMaxMoves, false);
                 roundLoss = clone.getLastTrainLoss();
-                if (!clone.saveModel(TMP_WEIGHTS)) {
+                if (!clone.saveModel(tmpWeights)) {
                     qWarning() << "[train] DQN+MCTS 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
+                break;
+            }
+            case AGENT_EVAB: {
+                /*
+                   EVAB 的"训练"是 TD-leaf 自对弈蒸馏 (见 evagent.h):
+                     trainSelfPlay(games, playDepth, labelDepth, maxMoves, verbose, batch)
+                   选步用 playDepth (便宜), 标签用 labelDepth 的根评分 (更准) ——
+                   参数取值见 BG_TRAIN_EVAB_* 的注释。
+                */
+                EVABAgent clone(trainChess, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
+                if (!clone.loadModel(tmpWeights)) {
+                    qWarning() << "[train] EVAB clone 载入种子权重失败, 本轮丢弃"
+                               << "(临时文件与当前网络结构不匹配? 路径" << tmpWeights << ")";
+                    break;
+                }
+                clone.trainSelfPlay(roundEpisodes, BG_TRAIN_EVAB_PLAY_DEPTH,
+                                    BG_TRAIN_EVAB_LABEL_DEPTH, roundMaxMoves, false);
+                roundLoss = clone.getLastTrainLoss();
+                if (!clone.saveModel(tmpWeights)) {
+                    qWarning() << "[train] EVAB 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
+                break;
+            }
+            /*
+               ---- SAC+AZ / SAC+AZ-MoE / SAC+AZ-59e5233 (2026-09 补齐) ----
+               与 SAC+AZ 的其它入口同一条往返: clone 用**独立棋盘** trainChess 自对弈
+               (trainSelfPlay 内部自己 reset 棋盘), 模拟次数按骨干分开给 (见
+               BG_TRAIN_SACAZ_SIMS / BG_TRAIN_SACAZ_MOE_SIMS 的注释)。
+               损失是 critic 的 MSE (getLastTrainLoss), 上界面那条"训练损失曲线"。
+
+               **clone 必须与主 agent 同一支**: 三支的参数结构完全相同 (都是 iFcLayer
+               的 w/b), 所以建成另一支不会让 loadModel 失败 —— 它只会静默地按另一套口径
+               训练 (熵比/alpha 学习率/critic 约束/叶子估值口径不同)。AGENT_SACAZ_OLD
+               因此在这里构造**派生类** SACAZLegacyAgent; 共享的往返写成 trainSACRound()。
+            */
+            case AGENT_SACAZ: {
+                SACAZAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+                roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
+                                             roundEpisodes, sacazTrainSims(type),
+                                             roundMaxMoves, roundLoss);
+                break;
+            }
+            case AGENT_SACAZ_MOE: {
+                SACAZAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                 SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX);
+                roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
+                                             roundEpisodes, sacazTrainSims(type),
+                                             roundMaxMoves, roundLoss);
+                break;
+            }
+            case AGENT_SACAZ_OLD: {
+                SACAZLegacyAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+                roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
+                                             roundEpisodes, sacazTrainSims(type),
+                                             roundMaxMoves, roundLoss);
+                break;
+            }
+            /*
+               ---- DQN+AB (2026-09 补齐) ----
+               trainSelfPlay(episodes, maxMoves, verbose, tempRoot, tempFinal) 内部按
+               nodeBudget 搜 (与界面同一预算 DQNAB_NODES), 标签来自 Planned 目标。
+               注意它的主干是 37.5 M 参数的稀疏 MoE: 一次临时文件的往返是 ~276 MB 写 +
+               两次读 (实测启动读一次 3.8 s, 见 [weights] DQN+AB 那两行), 所以这一支的
+               一轮明显比 PG/DQN 贵 —— 仍然远小于它自己那 60 手的搜索开销。
+            */
+            case AGENT_DQNAB: {
+                DQNABAgent clone(trainChess, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                 DQNABAgent::Backbone::SparseMoeTb);
+                clone.nodeBudget = DQNAB_NODES;      /* 与主 agent / 界面同一预算 */
+                if (!clone.loadModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+AB clone 载入种子权重失败, 本轮丢弃"
+                               << "(临时文件与当前网络结构不匹配? 路径" << tmpWeights << ")";
+                    break;
+                }
+                clone.trainSelfPlay(roundEpisodes, roundMaxMoves, false);
+                roundLoss = clone.getLastTrainLoss();
+                if (!clone.saveModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+AB 训练权重写回失败, 本轮丢弃";
                     break;
                 }
                 roundApplied = true;
@@ -2077,23 +3006,59 @@ void ChessBoard::backgroundTrainLoop()
             std::lock_guard<std::mutex> lock(m_agentMutex);
             switch (type) {
             case AGENT_PG:
-                if (m_sfPG && !m_sfPG->loadPolicy(TMP_WEIGHTS)) {
+                if (m_sfPG && !m_sfPG->loadPolicy(tmpWeights)) {
                     qWarning() << "[train] PG 权重同步回主 agent 失败";
                 }
                 break;
             case AGENT_DQN:
-                if (m_sfDQN && !m_sfDQN->loadModel(TMP_WEIGHTS)) {
+                if (m_sfDQN && !m_sfDQN->loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN 权重同步回主 agent 失败";
                 }
                 break;
             case AGENT_PPOMCTS:
-                if (m_sfPPOMCTS && !m_sfPPOMCTS->loadModel(TMP_WEIGHTS)) {
+                if (m_sfPPOMCTS && !m_sfPPOMCTS->loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS 权重同步回主 agent 失败";
                 }
                 break;
+            case AGENT_PPOMCTS_MLP:
+                if (m_sfPPOMCTSMLP && !m_sfPPOMCTSMLP->loadModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS-MLP 权重同步回主 agent 失败";
+                }
+                break;
             case AGENT_DQNMCTS:
-                if (m_sfDQNMCTS && !m_sfDQNMCTS->loadModel(TMP_WEIGHTS)) {
+                if (m_sfDQNMCTS && !m_sfDQNMCTS->loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN+MCTS 权重同步回主 agent 失败";
+                }
+                break;
+            case AGENT_EVAB:
+                if (m_sfEVAB && !m_sfEVAB->loadModel(tmpWeights)) {
+                    qWarning() << "[train] EVAB 权重同步回主 agent 失败";
+                }
+                break;
+            /* 这三个是 2026-09 补齐的 (多文件模型: 路径是前缀, 与写种子用的是同一个) */
+            case AGENT_SACAZ:
+                if (m_sfSACAZ && !m_sfSACAZ->loadModel(tmpWeights)) {
+                    qWarning() << "[train] SAC+AZ 权重同步回主 agent 失败";
+                }
+                break;
+            case AGENT_SACAZ_MOE:
+                if (m_sfSACAZMoe && !m_sfSACAZMoe->loadModel(tmpWeights)) {
+                    qWarning() << "[train] SAC+AZ-MoE 权重同步回主 agent 失败";
+                }
+                break;
+            case AGENT_SACAZ_OLD:
+                /*
+                   注意 loadModel 只看**参数结构**, 两支完全相同 ⇒ 它不会替我们发现
+                   "同步错了哪一支"。错误的防线在构造处 (createSACAZAgent) 与
+                   tmpWeightsOf (独立前缀), 不在这里。
+                */
+                if (m_sfSACAZOld && !m_sfSACAZOld->loadModel(tmpWeights)) {
+                    qWarning() << "[train] SAC+AZ-59e5233 权重同步回主 agent 失败";
+                }
+                break;
+            case AGENT_DQNAB:
+                if (m_sfDQNAB && !m_sfDQNAB->loadModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+AB 权重同步回主 agent 失败";
                 }
                 break;
             default: break;
@@ -2121,7 +3086,8 @@ void ChessBoard::shutdownSave()
         于是每次启动都从随机价值网络重新开始, 上一局学到的东西全丢。)
     */
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
-                              AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB };
+                              AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB,
+                              AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD };
     for (AgentType t : all) {
         if (hasAgentInstance(t)) {
             saveCurrentAgentModel(t, defaultWeightPath(t));

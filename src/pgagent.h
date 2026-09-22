@@ -71,8 +71,16 @@ public:
                          std::vector<int> &actionIndices,
                          RL::Tensor &actionMask);
 
-    /* Step → action index (deterministic hash) */
-    int stepToActionIdx(const Step &s);
+    /*
+     * Step → action index (deterministic hash)
+     *
+     * 加 const 是为了让 selfCheckReport() (它是 const 的) 能用**同一份**公式算动作
+     * 别名 —— 否则报告里只能抄一份局部哈希, 那样"面板的读数"与"训练时真正用的下标"
+     * 就有了两个会各自漂移的来源 (dqnmcts_agent.cpp 的 aliasActionIdxOf 就是被逼抄的
+     * 那一份)。这个函数**不改任何成员**, 只是一次整数哈希, const 化不改变任何行为;
+     * 调用方全部是非 const 对象, 所以这一改动逐字兼容。
+     */
+    int stepToActionIdx(const Step &s) const;
 
     /* Step → one-hot reward (for RL::Step in reinforce) */
     static inline float pieceTypeValue(int type) {
@@ -134,6 +142,31 @@ public:
         int idx = (color == Stone::COLOR_BLACK) ? 1 : 0;
         return totalEpisodes > 0 ? (float)totalWins[idx] / totalEpisodes : 0.0f;
     }
+
+    /* ----------------------------------------------------------------
+     *  自检 (界面"模型自检"面板) —— 口径说明见 aiagent.h 的 selfCheckReport
+     *
+     *  报告的是**结构 / 口径**类事实, **不是棋力**:
+     *   1. 表示健康度 (本 agent 的表示就是本工程的已知弱点 "表示闸门"):
+     *      * 规则上下文通道 **0 个** —— 90 维状态只有"每格是什么子", 没有走子方、
+     *        没有重复进度、没有无吃子进度、没有被将标记。于是"三次重复判和"
+     *        "60 回合无吃子判和""被将/将杀"这些**决定终局与回报**的规则, 网络读不到。
+     *      * 动作别名 —— `stepToActionIdx` 是 128 槽位的哈希, 而真实走法空间是
+     *        8100 = 90×90。同一个局面里互不相同的合法着法会挤进同一个策略槽位,
+     *        策略头因此**表达不出**它们的区别 (两个着法的梯度被平均), 这是**表示层
+     *        的天花板**, 再训多久也不会消失。
+     *      这一份读数用"标准开局"这一份**确定性**样本算 —— 与当前棋盘、训练进度
+     *      都无关, 所以打开界面就能看到。
+     *   2. 训练侧口径读数: 超参 / 网络规模 / 总对局数 / 自对弈胜率 / 最近一次
+     *      reinforce 的 surrogate 损失。后两个都**不是棋力**: 自对弈里赢家与输家是
+     *      同一份权重; surrogate 的量级只反映信噪比 (advantage 已被标准化), 跨 agent
+     *      不可比较。
+     *
+     *  **只读**: 全部走**局部**棋盘与局部解码 (连 this->chess 都不读), 不改任何
+     *  成员、不动棋盘 —— 它会在 GUI 线程上被调, 而搜索线程可能正在使用同一个
+     *  `chess`。
+     * ---------------------------------------------------------------- */
+    std::string selfCheckReport() const override;
 };
 
 #endif // PGAGENT_H

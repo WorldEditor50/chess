@@ -166,6 +166,8 @@ void CurveChart::addPoint(int series, double value)
     }
     Series &s = m_series[series];
     s.pts.push_back(value);
+    /* 全部采样点另存一份 (不受窗口限制) —— 导出/分析用, 见头文件 Series 的说明 */
+    s.history.push_back(value);
 
     /*
        窗口满时淘汰最老的点。**必须把它从统计量里减掉** ——
@@ -245,6 +247,7 @@ void CurveChart::setPoints(int series, const QVector<double> &values)
     }
     Series &s = m_series[series];
     s.pts = values;
+    s.history = values;      /* history 也整体替换 (导入/重建曲线的语义) */
     if (m_maxPoints > 0 && s.pts.size() > m_maxPoints) {
         s.pts.remove(0, s.pts.size() - m_maxPoints);
     }
@@ -278,6 +281,7 @@ void CurveChart::clearData()
 {
     for (int i = 0; i < m_series.size(); ++i) {
         m_series[i].pts.clear();
+        m_series[i].history.clear();     /* 清空 = 连历史也清 (否则导出会带回旧数据) */
         m_series[i].valid = false;
         m_series[i].last = 0.0;
         m_series[i].mn = 0.0;
@@ -297,6 +301,54 @@ int CurveChart::sampleCount() const
     int n = 0;
     for (int i = 0; i < m_series.size(); ++i) {
         n = qMax(n, m_series[i].pts.size());
+    }
+    return n;
+}
+
+/*
+   一行文字读数: "SAC+AZ: 最新 -1, 均值 -1.15, 2 点  |  EVAB: ..."
+   界面标签、放大窗口、无障碍描述都用它, 免得三处各写一份格式化 (以前就有这个重复,
+   导致"均值"的口径不一致)。
+*/
+QString CurveChart::toCsv(const QString &comment) const
+{
+    QString out;
+    out += QStringLiteral("# ") + comment + QStringLiteral("\n");
+    out += QStringLiteral("sample");
+    for (int s = 0; s < m_series.size(); ++s) {
+        out += QStringLiteral(",") + m_series[s].name;
+    }
+    out += QStringLiteral("\n");
+    /*
+       导出的是 **全部采样点** (history), 不是屏幕窗口 (pts): 屏幕窗口默认只有 2000 点
+       (setWindow), 而用户会把导出的文件当成"整场对弈"来分析 —— 那时早期数据其实已经
+       被窗口挤掉了 (实测踩过: 一个 75 的损失尖峰在导出文件里根本不存在)。窗口口径只
+       影响"画什么/读数怎么算", 不该影响"导出什么"。
+    */
+    const int maxN = historyCount();
+    for (int i = 0; i < maxN; ++i) {
+        out += QString::number(i + 1);
+        for (int s = 0; s < m_series.size(); ++s) {
+            out += QStringLiteral(",");
+            const Series &sr = m_series[s];
+            /*
+               短的那条曲线**留空**, 不补 0: 补 0 会被读成"那个采样点上损失是 0",
+               而真相是"这条曲线还没到那么多个点"(不同 agent 的训练次数不同)。
+            */
+            if (i < sr.history.size()) {
+                out += QString::number(sr.history[i], 'g', 8);
+            }
+        }
+        out += QStringLiteral("\n");
+    }
+    return out;
+}
+
+int CurveChart::historyCount() const
+{
+    int n = 0;
+    for (int i = 0; i < m_series.size(); ++i) {
+        n = qMax(n, m_series[i].history.size());
     }
     return n;
 }

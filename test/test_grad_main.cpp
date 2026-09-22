@@ -501,6 +501,15 @@ static void partE()
     const std::size_t HID = 32;
     /* moeAuxCoef = 0: 关掉辅助损失, 免得它混进梯度 (它由 applyGradients 注入, 这里也不调) */
     PPO ppo(SDIM, HID, ACT, 16, 0.0f, true);
+    /*
+       熵奖励必须关掉 (2026-09): 本节的有限差分复算的是**纯交叉熵**那一项
+       (`maskedCE`), 而 `accumulateGradSparse` 在 entropyCoef>0 时还会加一项熵奖励的
+       梯度。两者不同目标时差分当然对不上 —— 这不是梯度算错, 是"用错了目标函数"。
+       熵项自己的正确性由 `test_ppomcts` 的 [13d] 那一节管 (它比的是"给了 p_old /
+       收紧裁剪之后位移怎么变")。
+    */
+    ppo.entropyCoef = 0.0f;
+    ppo.clipEps = 0.0f;    /* 同理: 本节不喂 p_old, 走的就是纯 CE 那一支 */
 
     const int legalArr[] = { 11, 222, 3333, 7000, 8099, 5, 77, 1234 };
     std::vector<int> legalIdx(legalArr, legalArr + 8);
@@ -540,7 +549,11 @@ static void partE()
         return ce;
     };
 
-    /* ---- 解析梯度: 清梯度 (RMSProp lr=0 只清 g, 不动权重) 再累积一条 ---- */
+    /* ---- 解析梯度: 清梯度 (RMSProp lr=0 只清 g, 不动权重) 再累积一条 ----
+       注意: 熵奖励与裁剪都必须关掉 (上面已设 entropyCoef=0 / clipEps=0) —— 本节
+       复算的是**纯交叉熵**那一项; 熵/裁剪两条目标由 test_ppomcts 的 [13d] 管。
+       这两条一起构成"解析梯度 = 中心差分"的完整证据链 (2026-09 我在这里写过一版
+       错公式: 把 dL/dπ 当成 dL/dlogit 用, 整条梯度被缩小 p_i 倍, 就是这条断言抓到的)。 */
     ppo.actorP.RMSProp(0.0f, 0.9f, 0.0f, false);
     ppo.accumulateGradSparse(state, legalIdx, tgtIdx, tgtProb, 0.0f);
 

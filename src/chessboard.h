@@ -63,7 +63,43 @@ public:
            用它当叶子; TD 目标来自"从 s' 展开若干层后的值"。搜索与训练细节见
            src/dqnabagent.h 顶部的长注释。
         */
-        AGENT_DQNAB
+        AGENT_DQNAB,
+        /*
+           PPO+MCTS+AlphaZero 的**另一个骨干**: 稀疏 MoE + **MLP 专家** (E=8 top-2),
+           也就是 2026-09 那次改版之前的配置 (当时它是唯一骨干, 见 rl/ppo.h 顶部)。
+           与 AGENT_PPOMCTS (TransformerBlock<16,360> 专家, E=4 top-1) 的关系:
+             * **算法、搜索、训练、自检是同一份代码** (同一个 PPOMCTSAgent 类, 只是
+               构造时传的 Backbone 不同) —— 与 AGENT_SACAZ / AGENT_SACAZ_MOE 同一种
+               做法, 所以两者能在界面上直接对弈比较, 而不是两份会漂移的实现;
+             * 差别只在骨干: MlpExpert 便宜 ~25x (前向 0.139 ms vs 3.59 ms)、容量小
+               ~18x (2.15 M vs 38.0 M 参数), 所以同一时间预算下它能跑更多模拟
+               (界面预算见 chessboard.cpp 的 PPO_MLP_SIMS);
+             * **权重文件不同** (weights/ppomcts_mlp_agent.dat): 两种骨干参数量不同,
+               权重格式的结构指纹也保证交叉载入当场失败, 不会静默串权重。
+           **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
+           (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
+        */
+        AGENT_PPOMCTS_MLP,
+        /*
+           SAC+MCTS+AlphaZero 的**行为还原版**: 复现提交 59e5233 的那一支。
+           它是一个**独立的 C++ 类** SACAZLegacyAgent (src/sacazlegacyagent.h),
+           不是同一个类里的运行时开关 —— 用户口径 (2026-09): "用不同的 C++ 类把新旧
+           SAC agent 区分开"。与 AGENT_SACAZ 的关系:
+             * **算法/搜索/训练/自检是同一份代码** (SACAZLegacyAgent 派生自
+               SACAZAgent, 只钉住真正不同的那几项) —— 与 AGENT_SACAZ / AGENT_SACAZ_MOE
+               靠 Backbone 区分是同一种做法: 一份实现、两个可对弈的界面类型;
+             * 差别用 `git show 59e5233:src/sacazagent.cpp` 逐项核对过: 目标熵 0.98
+               (当前 0.5) / alpha 学习率 1e-3 (当前 5e-3) / critic 目标不钳位且纯 MSE
+               (当前夹 ±2 + Huber δ=1) / 叶子估值走全量 (当前稀疏头) / 隐层激活用
+               `TanhNorm<Linear>` 且 r=1 把 59e5233 的那一层显式钉住 (与 Layer<Tanh>
+               逐项相同)。完整表见 sacazlegacyagent.h 的头注释;
+             * **权重文件独立** (`weights/sacaz_old_agent_*`): 两者参数结构完全相同
+               (都是 iFcLayer 的 w/b), 结构指纹挡不住串权重; 而训练口径不同 ⇒ 共用
+               前缀会让两边**静默**互相覆盖 (用户口径: 新旧权重必须用不同名字)。
+           **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
+           (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
+        */
+        AGENT_SACAZ_OLD
     };
 
 public:
@@ -161,12 +197,47 @@ public:
      */
     std::string getAgentSelfCheck() const;
 
+    /*
+     * 指定 agent 类型的自检报告 (同上, 但可以查"不是当前选中"的那一个)。
+     * 面板上的"全部模型自检"与启动日志都用它 —— 自检的价值在于**横向对比**:
+     * 哪几个 agent 的动作编码有别名、哪几个能看见规则上下文, 一眼就能排出来。
+     */
+    std::string getAgentSelfCheck(AgentType type) const;
+
+    /*
+     * 这个 agent 的权重文件在磁盘上长什么样 (存不存在、多大)。
+     *
+     * 为什么要放进面板: "权重到底载进来了没有"是**静默失效**的高发区 ——
+     * PPO+MCTS 就曾经因为"扫描的名字与实际写出的名字不一致"而从来没被载入过,
+     * 界面上却看不出任何异常 (见 weightFilesOf 的注释)。把这几个文件的存在性
+     * 与大小直接打在自检面板上, 这类问题就不再需要靠猜。
+     */
+    std::string getAgentWeightStatus(AgentType type) const;
+
     /* 程序退出时保存所有已初始化的agent权重 */
     void shutdownSave();
 
     /* 后台持续训练: 克隆agent在后台自我对弈, 每4轮同步权重回主agent */
     void startBackgroundTraining();
     void stopBackgroundTraining();
+
+    /*
+     * 后台训练**一轮**的规模 (默认 1 局 x 60 手, 见 chessboard.cpp 的 BG_TRAIN_*)。
+     *
+     * 为什么要有这个开关: 一轮的时长直接决定"关窗要等多久" (训练线程只在每轮开头看
+     * 停止标志), 而不同 agent 的一轮成本差两三个数量级 —— PPO+MCTS / DQN+MCTS 是
+     * 分钟级, SAC+AZ-MoE 几十秒, PG/DQN 秒级。把它做成可调的, 测试就能把一轮缩到
+     * 几手, 在秒级验证"某个 agent 的训练往返到底接没接上" (EVAB 曾经因为支路根本
+     * 不存在而空转了很多轮, 正是缺这样一条断言)。
+     * 参数会被夹到 >= 1; 下一轮开始时生效 (不会打断正在跑的那一轮)。
+     *
+     * ⚠️ maxMoves 低于 **32** 时, SAC+AZ / DQN+AB 这一轮会一次梯度更新都不做
+     * (它们的 learnBatch 在"回放池 < batchSize(32)"时直接返回), 损失曲线也不会上报
+     * —— 表现是"训练在跑但什么都没发生"。缩短轮次只适合验证**接线**是否通。
+     */
+    void setBackgroundTrainRound(int episodes, int maxMoves);
+    int getBackgroundTrainEpisodes() const { return m_bgTrainEpisodes.load(); }
+    int getBackgroundTrainMaxMoves() const { return m_bgTrainMaxMoves.load(); }
 
 signals:
     /*
@@ -261,6 +332,20 @@ private:
 
     /* Self Play 内部: 使用指定agent决策 */
     Step aiThinkForAgent(int color, AgentType agentType);
+
+    /*
+     * 上面两个函数的"纯决策"部分 (不带合法性闸门)。
+     * 拆出来的理由: 决策结果必须先过一遍 legalStepOrFallback() —— 直接在两个大
+     * switch 的每个 return 上套一层的话, 以后新增 agent 分支时必然漏掉几个。
+     */
+    Step aiThinkRaw(int color);
+    Step aiThinkForAgentRaw(int color, AgentType agentType);
+    /*
+     * 决策输出的合法性闸门 (见 chessboard.cpp 的实现注释):
+     * agent 返回无效走法、而棋盘上还有合法走法时, 用第一个合法走法兜底并报警。
+     * 真的无棋可走 (将杀/困毙/和棋前的终局) 时把无效 Step 原样返回。
+     */
+    Step legalStepOrFallback(int color, const Step &step, const QString &who);
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -274,7 +359,12 @@ private:
     int selectID;
     int color;
     std::atomic<State> state;
-    QMutex mutex;
+    /*
+     * mutex 声明成 mutable: 自检 (const 方法) 要对真棋盘取一份**副本**再交给 agent,
+     * 所以它必须能在 const 里上锁 (见 ChessBoard::getAgentSelfCheck 的说明)。
+     * 保护的仍然是同一批数据 (chess / env / state), 语义没变。
+     */
+    mutable QMutex mutex;
     QWaitCondition condit;
     std::thread processThread;
     /* Self-Play 期间为 true: 只用于屏蔽玩家点击 (AI 工作线程不看它) */
@@ -294,15 +384,17 @@ private:
     static PGEagent *m_sfPG;
     static DQNAgent *m_sfDQN;
     static PPOMCTSAgent *m_sfPPOMCTS;
+    /* PPO+MCTS 的 MLP 专家骨干那一个变体 (AGENT_PPOMCTS_MLP): 同一个类, 不同 Backbone */
+    static PPOMCTSAgent *m_sfPPOMCTSMLP;
     static DQNMCTSAgent *m_sfDQNMCTS;
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
     static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
+    static SACAZAgent *m_sfSACAZOld;   /* 行为还原版: 派生类 SACAZLegacyAgent (59e5233) */
     static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */
-    std::atomic<bool> m_preTrainEnabled{true};
-    std::atomic<int> m_preTrainSteps{64};
+    std::atomic<bool> m_preTrainEnabled{true};    std::atomic<int> m_preTrainSteps{64};
     /* 训练损失样本的序号 (背景线程与 AI 线程都会 +1, 故用 atomic) */
     std::atomic<int> m_trainSampleNo{0};
     std::string m_lastExploreInfo;
@@ -313,6 +405,20 @@ private:
      * 返回探索出来的说明文字 (给界面用)。
      */
     std::string preTrainThenDecide(AgentBase *agent, int color);
+
+    /*
+     * [2026-09 新] 决策里"从自己的搜索学了一次"之后, 把损失送上损失曲线。
+     *
+     * 为什么需要它: 界面的 per-move 学习原来**只**由 preTrainThenDecide 驱动 ——
+     * 关掉"探索+预训练"勾选框就完全不训练, 损失曲线也永远是空的 (用户实测报的现象)。
+     * SAC 现在在 selectMove 里会把自己的搜索样本学一次 (SACAZAgent::learnFromSearch),
+     * 但那一次更新发生在 preTrainThenDecide **之外**, 没人上报 —— 于是"都在学, 曲线
+     * 却不动"就又出现了。这个方法把那条路径补上。
+     *
+     * 判据是 **learnSteps 是否前进** (不是"每手无条件上报"): 一次决策最多可能有两次
+     * 更新 (rollout 一次 + 搜索样本一次), 无条件上报会把"每手一个点"的口径弄乱。
+     */
+    void reportLearnedLoss(SACAZAgent *agent, int teachStepsBefore);
 
     /* ---- 思考过程可视化 (全部只在 GUI 线程读写, 除了 m_thinkGeneration) ---- */
     void initThinkVisuals();
@@ -361,7 +467,19 @@ private:
     /* 后台训练 */
     std::thread m_bgTrainThread;
     std::atomic<bool> m_bgTraining{false};
-    std::mutex m_agentMutex;               /* 保护主agent权重读写 */
+    /*
+     * 一轮的规模 (见 setBackgroundTrainRound)。用 atomic: GUI/测试线程写、训练线程
+     * 每轮开头读, 两边不需要更强的同步 (读到的是"上一轮或这一轮"的规模, 都合法)。
+     * 初值 = chessboard.cpp 里的 BG_TRAIN_EPISODES / BG_TRAIN_MAX_MOVES。
+     */
+    std::atomic<int> m_bgTrainEpisodes{1};
+    std::atomic<int> m_bgTrainMaxMoves{60};
+    /*
+     * mutable: 自检 (const 方法) 要读常驻 agent 的内部状态, 而那与"决策中的搜索"和
+     * "后台训练的载入/保存"是同一批数据 —— 必须进同一把锁
+     * (见 ChessBoard::getAgentSelfCheck 的说明)。
+     */
+    mutable std::mutex m_agentMutex;       /* 保护主agent权重读写 */
     void backgroundTrainLoop();            /* 训练线程主循环 */
 };
 

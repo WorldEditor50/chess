@@ -509,6 +509,16 @@ Step DQNMCTSAgent::selectMove(int color, int iterations, bool training)
         return nodes[bestChildID].step;
     }
 
+    /*
+       根有合法走法、却一个孩子都没展开 (iterations <= 0 等): 以前直接返回 Step()
+       (valid=false), 调用方会把它读成"真无棋可走" -> 判负。与 ABAgent "全负时
+       不返回走法" 属于同一类错误, 兜底取根节点未展开列表的第一手 (合法集里的副本)。
+    */
+    if (!nodes[rootID].untriedSteps.empty()) {
+        return nodes[rootID].untriedSteps.front();
+    }
+
+    /* 确实没有合法走法 (将杀 / 困毙) */
     return Step();
 }
 

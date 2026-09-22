@@ -34,7 +34,24 @@ const AgentChoice kAgents[] = {
     { "MCTS (800次模拟)",            ChessBoard::AGENT_MCTS },
     { "Policy Gradient (PGEagent)",  ChessBoard::AGENT_PG },
     { "Deep Q-Network (DQN)",        ChessBoard::AGENT_DQN },
+    /*
+       ---- "同一算法, 两种骨干" 的两组, 刻意**成对排列** ----
+       界面上把它们挨着放, 就是为了能直接选中互相对弈比较:
+         PPO+MCTS    (稀疏MoE + TB 专家, E=4 top-1, 现役)
+         PPO+MCTS    (稀疏MoE + MLP 专家, E=8 top-2, 便宜 ~25x / 容量小 ~18x)
+         SAC+MCTS+AZ (MLP 骨干, 最大熵搜索)
+         SAC+MCTS+AZ (稀疏MoE + TB 专家)
+       两组各自是"同一份实现 + 不同 Backbone" (见 chessboard.h 的枚举注释与 rl/ppo.h)。
+    */
     { "PPO+MCTS (AlphaZero)",        ChessBoard::AGENT_PPOMCTS },
+    /*
+       PPO+MCTS 的另一个骨干: 稀疏 MoE + **MLP 专家** (E=8 top-2) —— 也就是 2026-09
+       那次改版之前 PPO 用的配置 (见 rl/ppo.h 顶部那张实测表)。
+       与上面那一项**算法/搜索/训练完全是同一份代码**, 差别只有骨干:
+         MlpExpert 便宜 ~25x (前向 0.139 ms vs TB 3.59 ms)、容量小 ~18x
+         (2.15 M vs 38.0 M 参数), 所以同一时间预算下它能跑更多模拟 (PPO_MLP_SIMS=1600)。
+    */
+    { "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)", ChessBoard::AGENT_PPOMCTS_MLP },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
     { "EVAB (学会评估的 Alpha-Beta)", ChessBoard::AGENT_EVAB },
     { "SAC+MCTS+AlphaZero (最大熵搜索)", ChessBoard::AGENT_SACAZ },
@@ -42,9 +59,18 @@ const AgentChoice kAgents[] = {
        同一个算法, 骨干换成"稀疏路由 MoE + TransformerBlock 专家" (E=4, top-1)。
        与上一项相比: 参数量大 ~4 倍 (4 个 TB 专家), 算力只算 1 个专家 —— 实测
        10.9 ms/模拟 (MLP 骨干 0.07), 所以每次走子只给 16 次模拟 (约 175 ms)。
-       界面上把它单独列出来, 就是为了能直接和 MLP 骨干的版本对弈比较。
     */
     { "SAC+MCTS+AlphaZero (稀疏MoE+TB专家)", ChessBoard::AGENT_SACAZ_MOE },
+    /*
+       SAC+MCTS+AlphaZero 的**行为还原版** (提交 59e5233)。它是一个**独立的 C++ 类**
+       (SACAZLegacyAgent, src/sacazlegacyagent.h), 不是同一个类里的运行时开关 ——
+       与上面两项放在一起是为了能直接对弈比较"当前口径 vs 59e5233 口径"。
+       差别只有四项 (目标熵 0.98 / alpha lr 1e-3 / critic 不钳位+纯 MSE / 叶子全量估值)
+       加一处等价的激活写法, 完整表见那个头文件; **权重文件独立**
+       (weights/sacaz_old_agent_*), 与上面的 weights/sacaz_agent 不共用 ——
+       两者参数结构相同, 结构指纹挡不住串权重, 而训练口径不同会让共用变成静默覆盖。
+    */
+    { "SAC+MCTS+AlphaZero (59e5233 行为还原版)", ChessBoard::AGENT_SACAZ_OLD },
     /*
        DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
        网络 (稀疏 MoE + TB 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
@@ -55,15 +81,27 @@ const AgentChoice kAgents[] = {
     { "DQN+AB (AB+DuelingDQN, 稀疏MoE+TB专家)", ChessBoard::AGENT_DQNAB },
 };
 
-void fillAgentCombo(QComboBox *combo, int defaultIndex)
+/*
+   ---- 下拉框: 整份列表都要**看得见** (2026-09) ----
+   Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表已经有 11 项 —— 第 11 项
+   (当时正是新加的 "PPO+MCTS (...MLP专家)") 会被折叠在滚动区里, 打开下拉框只看到 10 行。
+   表现就是"明明加进列表了, 界面上却找不到" (UIA 实测: 展开后只有 10 行可见).
+   所以这里按条数放宽: 全部条目一次性可见, 不需要滚动。
+*/
+void fillAgentCombo(QComboBox *combo, ChessBoard::AgentType defaultType)
 {
     combo->clear();
     for (const AgentChoice &c : kAgents) {
         combo->addItem(QString::fromUtf8(c.name), static_cast<int>(c.type));
     }
-    if (defaultIndex >= 0 && defaultIndex < combo->count()) {
-        combo->setCurrentIndex(defaultIndex);
-    }
+    combo->setMaxVisibleItems((int)(sizeof(kAgents) / sizeof(kAgents[0])) + 2);
+    /*
+       默认项按**类型**选, 而不是按下标: 这个列表是会被插入/重排的
+       (上面就把新 agent 插进了 PPO+MCTS 后面), 而写死的下标会**静默**指到别的 agent
+       —— 原来 matchB 用的是 `fillAgentCombo(..., 6)`, 插入一项之后就会变成 DQN+MCTS。
+    */
+    const int idx = combo->findData(static_cast<int>(defaultType));
+    combo->setCurrentIndex(idx >= 0 ? idx : 0);
 }
 
 /* 只有带参数的 agent 才有权重可存 (Alpha-Beta / MCTS 是纯搜索) */
@@ -77,7 +115,9 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_DQNAB:
+    case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
     default:
         return false;
@@ -339,10 +379,10 @@ MainWindow::MainWindow(QWidget *parent)
        ---- 模型自检面板 ----
        时机刻意选在这里: 预训练做完 = 棋盘上又走了一步、训练又更新过一轮权重,
        于是"对局累计"那一类读数会跟着走。报告本身是只读的, 随时可以再刷 (见
-       updateSelfCheckPanel 的说明)。
+       requestSelfCheckPanelUpdate 的说明)。
     */
     connect(ui->gameWidget, &ChessBoard::aiExploreInfo, this,
-        [this](const QString &) { updateSelfCheckPanel(); });
+        [this](const QString &) { requestSelfCheckPanelUpdate(false); });
 
     /* 棋盘回放状态信号 */
     connect(ui->gameWidget, &ChessBoard::replayIndexChanged,
@@ -367,7 +407,7 @@ MainWindow::MainWindow(QWidget *parent)
             ui->thinkIndicator->resetToIdle();
             ui->gameWidget->setEnabled(true);
             /* 启动加载完成: 现在才有 agent 可以自检 (之前都是 nullptr) */
-            updateSelfCheckPanel();
+            requestSelfCheckPanelUpdate(false);
             refreshGameList();
         });
 
@@ -457,12 +497,37 @@ MainWindow::~MainWindow()
         m_selfPlayThread.join();
     }
     /*
-       存权重也可能在后台跑 (见 offerSaveWeights: 保存放到线程里, 好让沙漏能转)。
-       它同样访问 ui->gameWidget, 所以必须先 join 再 delete ui。
+       存权重线程 (常驻) 也访问 ui->gameWidget, 所以必须先停掉再 delete ui。
     */
+    {
+        std::lock_guard<std::mutex> lk(m_saveMutex);
+        m_saveStop = true;
+    }
+    m_saveCv.notify_all();
     if (m_saveThread.joinable()) {
         m_saveThread.join();
     }
+    /*
+       自检面板的 worker 同理: 它会调 getAgentSelfCheck() (要在 agent 锁上等),
+       必须先停掉再 delete ui —— 否则 worker 醒来时 ui 已经没了。
+    */
+    {
+        std::lock_guard<std::mutex> lk(m_selfCheckMutex);
+        m_selfCheckStop = true;
+    }
+    m_selfCheckCv.notify_all();
+    if (m_selfCheckThread.joinable()) {
+        m_selfCheckThread.join();
+    }
+    /*
+       ---- 退出保存前先停后台训练 (2026-09) ----
+       原来这里的顺序是"先 shutdownSave(), 再 delete ui (那时才停训练线程)" ——
+       于是退出保存与后台训练的一轮**同时**在动同一张网 (正是用户报的崩溃那类竞争),
+       而且保存还要排队等训练写那 558 MB。停掉训练再存, 既没有竞争, 存下去的也正好是
+       "跑完最后一轮"的权重。stopBackgroundTraining() 会等当前这一轮结束 (关窗的等待
+       时间由它决定, 与 ~ChessBoard 里那次是同一个代价; 重复调用安全)。
+    */
+    ui->gameWidget->stopBackgroundTraining();
     /* 程序退出前保存所有已训练的agent权重 */
     ui->gameWidget->shutdownSave();
     delete ui;
@@ -558,14 +623,15 @@ void MainWindow::onReplayModeExited()
 void MainWindow::populateAgentComboBox()
 {
     /* 与你对战的AI: 默认 Alpha-Beta */
-    fillAgentCombo(ui->agentComboBox, 0);
+    fillAgentCombo(ui->agentComboBox, ChessBoard::AGENT_ALPHABETA);
     /*
        Agent 对弈的双方。默认 A=Alpha-Beta, B=EVAB: 两个都快 (每手 ~150 ms),
        而且正好是"纯搜索"对"学会评估的搜索", 是这套 agent 里最有意义的一组对照。
        注意 A/B 不是红黑 —— 每局交换先后手, 见 ChessBoard::matchAgents。
+       (默认项按**类型**给; 以前写的是下标 6, 而列表一旦插入新 agent 就会静默指错。)
     */
-    fillAgentCombo(ui->matchAComboBox, 0);
-    fillAgentCombo(ui->matchBComboBox, 6);
+    fillAgentCombo(ui->matchAComboBox, ChessBoard::AGENT_ALPHABETA);
+    fillAgentCombo(ui->matchBComboBox, ChessBoard::AGENT_EVAB);
 }
 
 void MainWindow::onAgentSelected(int index)
@@ -580,7 +646,7 @@ void MainWindow::onAgentSelected(int index)
     qDebug("AI Agent switched to: %s", qPrintable(name));
 
     /* 换了 agent 就换一份自检报告 (不支持的 agent 显示"没有自检项") */
-    updateSelfCheckPanel();
+    requestSelfCheckPanelUpdate(false);
 }
 
 /* ================================================================
@@ -719,6 +785,12 @@ void MainWindow::setupMetricsPanel()
     });
     connect(ui->exportMetricsBtn, &QPushButton::clicked,
             this, &MainWindow::exportMetricsCsv);
+    /* 单独的"导出损失曲线"按钮 (2026-09 用户要求): 只写损失那一段, 见 exportLossCsv */
+    connect(ui->exportLossBtn, &QPushButton::clicked,
+            this, &MainWindow::exportLossCsv);
+    /* "全部模型自检": 一次性快照, 下一手棋的自检刷新会切回当前 agent (见它的注释) */
+    connect(ui->selfCheckAllBtn, &QPushButton::clicked,
+            this, &MainWindow::showAllAgentsSelfCheck);
 
     ui->scoreLabel->setText(QStringLiteral("当前比分: -"));
     ui->gameListWidget->addItem(QStringLiteral("(还没有对局)"));
@@ -781,7 +853,7 @@ void MainWindow::updateMetricsLabels()
 }
 
 /*
- * updateSelfCheckPanel - 把当前 agent 的自检报告写进右侧面板
+ * requestSelfCheckPanelUpdate - 请求把当前 agent 的自检报告写进右侧面板
  *
  * 为什么要有这个面板 (这一节的全部理由):
  *   面板上原来只有两条曲线 + 一个"逐局明细"列表。而**这两样都不能判断"这个模型
@@ -797,26 +869,151 @@ void MainWindow::updateMetricsLabels()
  *
  * 线程与时机:
  *   * 数据源是 `ChessBoard::getAgentSelfCheck()`, 它转发到 agent 的
- *     `selfCheckReport()`; 那个函数被约定为**只读且不动棋盘**, 所以可以在 GUI
- *     线程调 (见 aiagent.h 的契约)。
+ *     `selfCheckReport()`。那个函数**只读**, 但它读的是常驻 agent 的内部状态, 而
+ *     ChessBoard 那一层要等 `m_agentMutex` (后台训练正在 loadModel 时能等上几秒;
+ *     2026-09 用户报的"自动保存权重时崩溃"就是这条路径与保存抢同一个网络, 见
+ *     chessboard.cpp 的 saveCurrentAgentModel)。
+ *   * **所以刷新走后台 worker**: `requestSelfCheckPanelUpdate()` 只置一个标志,
+ *     worker 去算 (它可以安心地等锁), 算完用队列信号回调 `applySelfCheckPanel()`
+ *     上屏。同步做的话, 面板每一手刷新一次就会把 GUI 线程按在锁上几秒
+ *     ("界面卡死"), 那是另一个已经被记过的老问题。
  *   * 调用时机: 选中 agent 时、每一手"探索+预训练"之后、以及启动加载完成时。
  *     这些都是"棋盘状态刚变过"的点, 于是对局累计读数会跟着走。
  *   * 报告里那些**对局累计**的计数来自主 agent, 而后台训练跑在 clone 上 ——
  *     面板里写明了这一点, 否则显示 0 会被读成"没训练过"。
  */
-void MainWindow::updateSelfCheckPanel()
+void MainWindow::requestSelfCheckPanelUpdate(bool allAgents)
 {
-    const QString report = QString::fromStdString(
-        ui->gameWidget->getAgentSelfCheck());
-    if (report.isEmpty()) {
-        ui->selfCheckView->setPlainText(QStringLiteral(
-            "当前 agent 没有可报告的自检项。\n"
-            "(已实现自检的: DQN+MCTS —— 表示健康度 + 终局通道计数)\n"
-            "注意: 自检报告的是**结构与口径**, 不是棋力。\n"
-            "要判断棋力用 bench_anchor 的锚点对局 (带 95% 区间的 Elo 差)。"));
-        return;
+    {
+        std::lock_guard<std::mutex> lk(m_selfCheckMutex);
+        /*
+           请求合并: 面板可能在一手棋里被请求多次 (选 agent + 探索完成), 而 worker
+           算一份要等锁 —— 只保留"最新一次的意图", 中间那些没有意义的中间态。
+        */
+        m_selfCheckPending = true;
+        m_selfCheckAll = allAgents;
+        m_selfCheckType = ui->gameWidget->getAgentType();
     }
-    ui->selfCheckView->setPlainText(report);
+    if (!m_selfCheckThread.joinable()) {
+        m_selfCheckThread = std::thread(&MainWindow::selfCheckWorkerLoop, this);
+    }
+    m_selfCheckCv.notify_one();
+}
+
+void MainWindow::selfCheckWorkerLoop()
+{
+    for (;;) {
+        bool all = false;
+        ChessBoard::AgentType type = ChessBoard::AGENT_ALPHABETA;
+        {
+            std::unique_lock<std::mutex> lk(m_selfCheckMutex);
+            m_selfCheckCv.wait(lk, [this] { return m_selfCheckStop || m_selfCheckPending; });
+            if (m_selfCheckStop) {
+                return;
+            }
+            m_selfCheckPending = false;
+            all = m_selfCheckAll;
+            type = m_selfCheckType;
+        }
+
+        /* ---- 这里可能等 m_agentMutex 几秒: 这是 worker 线程, 界面不受影响 ---- */
+        QString text;
+        static const ChessBoard::AgentType kAll[] = {
+            ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_MCTS,
+            ChessBoard::AGENT_PG,        ChessBoard::AGENT_DQN,
+            ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
+            ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
+            ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
+            ChessBoard::AGENT_PPOMCTS_MLP, ChessBoard::AGENT_SACAZ_OLD
+        };
+        if (all) {
+            text = QStringLiteral(
+                "=== 全部模型自检 (快照; 下一手棋会自动刷回当前 agent) ===\n"
+                "读法: 先看\"动作别名\"与\"规则上下文通道\"两行 —— 它们决定这个模型"
+                "**能不能**学到某些东西; 再看权重文件那两行 —— 它决定这份权重"
+                "**有没有**被载进来。\n");
+            for (ChessBoard::AgentType t : kAll) {
+                text += QStringLiteral("\n");
+                const std::string w = ui->gameWidget->getAgentWeightStatus(t);
+                if (!w.empty()) {
+                    text += QString::fromStdString(w);
+                }
+                const std::string r = ui->gameWidget->getAgentSelfCheck(t);
+                if (r.empty()) {
+                    text += QStringLiteral("(没有实例/没有自检项: 该 agent 尚未被创建)\n");
+                } else {
+                    text += QString::fromStdString(r);
+                    if (text.right(1) != QLatin1String("\n")) {
+                        text += QStringLiteral("\n");
+                    }
+                }
+                text += QStringLiteral("--------------------------------------------------\n");
+            }
+        } else {
+            /*
+               面板顶端几行是**权重文件状态** (启动时有没有扫到、文件在不在、多大),
+               下面才是 agent 自己的结构/口径读数。
+               为什么把前者也放进来: "权重没载进来"的默认表现是**静默**地从随机初始化
+               开始跑 —— PPO+MCTS 就曾经因为"启动扫描的名字与实际写出的名字不一致"而
+               从来没被载入过 (那 279 MB x 2 的文件一直躺在盘上), 界面上一点异常都没有。
+            */
+            const std::string weightStatus = ui->gameWidget->getAgentWeightStatus(type);
+            const std::string report = ui->gameWidget->getAgentSelfCheck(type);
+            if (!weightStatus.empty()) {
+                text += QString::fromStdString(weightStatus);
+                text += QStringLiteral("\n");
+            }
+            if (report.empty()) {
+                text += QStringLiteral(
+                    "当前 agent 没有可报告的自检项。\n"
+                    "(十个 agent 都已实现自检; 空串一般表示这个 agent 还没有实例 ——\n"
+                    " 常见原因是它的权重文件没被扫到, 见上面那几行)\n"
+                    "注意: 自检报告的是**结构与口径**, 不是棋力。\n"
+                    "要判断棋力用 bench_anchor 的锚点对局 (带 95% 区间的 Elo 差)。");
+            } else {
+                text += QString::fromStdString(report);
+                text += QStringLiteral("\n(点\"全部模型自检\"可以把十个 agent 排在一起对比)");
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_selfCheckMutex);
+            m_selfCheckText = text;
+            m_selfCheckReady = true;
+        }
+        /* 上屏必须在 GUI 线程: 队列投递 (worker 不碰控件) */
+        QMetaObject::invokeMethod(this, [this]() { applySelfCheckPanel(); },
+                                  Qt::QueuedConnection);
+    }
+}
+
+void MainWindow::applySelfCheckPanel()
+{
+    QString text;
+    {
+        std::lock_guard<std::mutex> lk(m_selfCheckMutex);
+        if (!m_selfCheckReady) {
+            return;
+        }
+        m_selfCheckReady = false;
+        text = m_selfCheckText;
+    }
+    ui->selfCheckView->setPlainText(text);
+}
+
+/*
+ * showAllAgentsSelfCheck - 十个 agent 的自检报告排在一起 (一次性快照)
+ *
+ * 为什么要横向对比: 单个 agent 的报告只能说明"我这个模型有没有表示/口径问题",
+ * 而设计上的差别 (谁的动作编码是 128 槽哈希、谁能看见规则上下文、谁的权重文件
+ * 根本没被扫到) 只有**排在一起**才看得出来。这一份就是那张对照表。
+ *
+ * 刻意不做成"常驻视图": 自检会在每手棋之后自动刷新 (见 requestSelfCheckPanelUpdate
+ * 的调用点), 那才是面板的默认语义。所以按钮的提示里写明了"之后会刷回当前 agent"。
+ */
+void MainWindow::showAllAgentsSelfCheck()
+{
+    requestSelfCheckPanelUpdate(true);
 }
 
 /*
@@ -859,6 +1056,70 @@ int MainWindow::lossSeriesFor(const QString &agentName)
     return idx;
 }
 
+/*
+ * writeChartCsv - 把**一张**曲线的数据写成 CSV (2026-09)。
+ *
+ * 为什么要抽出来: 原来只有"导出 CSV"一个按钮, 它把损失与奖励**两段**拼在同一个文件里。
+ * 两张曲线的行数口径不同 (损失 = 每完成一次在线训练一个点; 奖励 = 每手一个点), 于是
+ * 想单独看损失就得先手工切段, 而"从哪一行开始是奖励"只靠一行注释区分 —— 很容易切错。
+ * 现在损失曲线有自己的按钮 (`exportLossBtn`), 走的就是这个函数。
+ *
+ * 文件格式 (与合并导出里的同一段逐字相同):
+ *   # <注释行>
+ *   sample,<曲线名 1>,<曲线名 2>,...
+ *   1,<v>,<v>,...
+ *   ...
+ * 某条曲线比别的短时后面的列留空 (不是补 0 —— 补 0 会被读成"当时损失是 0")。
+ */
+bool MainWindow::writeChartCsv(CurveChart *chart, const QString &what,
+                               const QString &sectionComment, const QString &defaultName)
+{
+    if (chart == nullptr || chart->seriesCount() <= 0) {
+        QMessageBox::information(this, QStringLiteral("没有数据可导出"),
+                                 QStringLiteral("%1还没有任何数据点 (先跑一局或等后台训练上报)。")
+                                     .arg(what));
+        return false;
+    }
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("导出%1").arg(what),
+        QStringLiteral("%1_%2.csv").arg(defaultName,
+                                       QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")),
+        QStringLiteral("CSV (*.csv);;所有文件 (*.*)"));
+    if (path.isEmpty()) {
+        return false;      /* 用户取消 */
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"),
+                             QStringLiteral("打不开文件: %1").arg(f.errorString()));
+        return false;
+    }
+    QTextStream out(&f);
+    /* 文本由 CurveChart::toCsv() 生成 —— 与"导出 CSV"里的那一段逐字相同 (格式单一来源) */
+    out << chart->toCsv(sectionComment);
+    f.close();
+    QMessageBox::information(this, QStringLiteral("导出完成"),
+                             QStringLiteral("已写出: %1\n(%2: %3 个采样点, %4 条曲线)")
+                                 .arg(path).arg(what)
+                                 .arg(chart->sampleCount()).arg(chart->seriesCount()));
+    return true;
+}
+
+/*
+ * exportLossCsv - "导出损失曲线"按钮 (2026-09 用户要求增加的控件)。
+ *
+ * 只写损失那一张图的数据。分析训练时最常要的就是这一段: 每个 agent 一条线, 每条线的
+ * 点数 = 它完成在线训练的次数。**注意它不是"每手一个点"** —— 池子没攒够 batchSize 时
+ * learnBatch 故意不更新 (见 SACAZAgent::learnBatch 的说明), 所以曲线的密度本身就是
+ * "有没有真的在学"的读数 (用户就是这么发现两个 SAC 的损失曲线疏密不同的)。
+ */
+void MainWindow::exportLossCsv()
+{
+    writeChartCsv(ui->lossChart, QStringLiteral("训练损失曲线"),
+                  QStringLiteral("训练损失 (每完成一次在线训练一个点; 每个 agent 一列)"),
+                  QStringLiteral("loss"));
+}
+
 /* 把当前曲线导出成 CSV (两列不同长度, 所以分两段写, 带表头) */
 void MainWindow::exportMetricsCsv()
 {
@@ -877,46 +1138,20 @@ void MainWindow::exportMetricsCsv()
         return;
     }
     QTextStream out(&f);
-    out << "# 训练损失\n";
-    out << "sample";
-    for (int s = 0; s < ui->lossChart->seriesCount(); ++s) {
-        out << "," << ui->lossChart->series(s).name;
-    }
-    out << "\n";
-    int maxN = ui->lossChart->sampleCount();
-    for (int i = 0; i < maxN; ++i) {
-        out << (i + 1);
-        for (int s = 0; s < ui->lossChart->seriesCount(); ++s) {
-            const CurveChart::Series &sr = ui->lossChart->series(s);
-            out << ",";
-            if (i < sr.pts.size()) {
-                out << QString::number(sr.pts[i], 'g', 8);
-            }
-        }
-        out << "\n";
-    }
+    /*
+       两段的文本由 CurveChart::toCsv() 生成 —— 与"导出损失曲线"按钮用的是**同一份**
+       格式化 (格式放在控件里, 写文件/选路径留在这里; 于是格式本身能被 test_match
+       的 [2.9] 节断言, 而不用去驱动文件对话框)。
+    */
+    out << ui->lossChart->toCsv(
+        QStringLiteral("训练损失 (每完成一次在线训练一个点; 每个 agent 一列)"));
     /*
        奖励这一段的行号是**采样序号**(每手一个点), 不是局数 —— 表头写清楚,
        否则导出的 CSV 很容易被当成"每行一局"来解读 (那是修复前的口径)。
     */
-    out << "\n# 环境奖励 (每手一个点; 值是本局累计, 局末那点含终局 +-1)\n";
-    out << "sample";
-    for (int s = 0; s < ui->rewardChart->seriesCount(); ++s) {
-        out << "," << ui->rewardChart->series(s).name;
-    }
     out << "\n";
-    maxN = ui->rewardChart->sampleCount();
-    for (int i = 0; i < maxN; ++i) {
-        out << (i + 1);
-        for (int s = 0; s < ui->rewardChart->seriesCount(); ++s) {
-            const CurveChart::Series &sr = ui->rewardChart->series(s);
-            out << ",";
-            if (i < sr.pts.size()) {
-                out << QString::number(sr.pts[i], 'g', 8);
-            }
-        }
-        out << "\n";
-    }
+    out << ui->rewardChart->toCsv(
+        QStringLiteral("环境奖励 (每手一个点; 值是本局累计, 局末那点含终局 +-1)"));
     f.close();
     QMessageBox::information(this, QStringLiteral("导出完成"),
                              QStringLiteral("已写出: %1").arg(path));
@@ -930,11 +1165,19 @@ void MainWindow::exportMetricsCsv()
  *    * 目标路径 = ChessBoard::defaultWeightPath() —— 与启动加载/退出保存同一条路径,
  *      下次启动自然读到这次训练的结果;
  *    * 只在**确实实例化过**的 agent 上存 (没跑过的 agent 没有权重可存);
- *    * 放到后台线程 (m_saveThread) 做: GUI 线程同步写盘会把事件循环堵住, 而权重
- *      可能有几百 MB; 读写期间 ChessBoard 会发 busyStarted/busyFinished, "请稍候"
- *      沙漏弹窗由那两个信号驱动, 这里不用管;
+ *    * 放到**常驻后台线程** (m_saveThread) 做: GUI 线程同步写盘会把事件循环堵住,
+ *      而权重可能有几百 MB; 读写期间 ChessBoard 会发 busyStarted/busyFinished,
+ *      "请稍候"沙漏弹窗由那两个信号驱动, 这里不用管;
  *    * 结果用**界面上的文字**汇报 (逐局明细列表里加一行 + 结果标签的 tooltip),
  *      不用模态框打断用户 —— 失败也看得到, 但不会挡住操作。
+ *
+ *  ---- 为什么是"常驻线程 + 请求" 而不是"每次起一个线程再 join" (2026-09) ----
+ *  原来是每场对弈结束就 `m_saveThread = std::thread(...)`, 而下一场结束时先
+ *  `join()` 上一个再起新的。那个 `join()` 在 **GUI 线程**上 —— 于是"上一场正在写
+ *  558 MB (约 9 s)"就会把界面冻住 9 秒 (用户点不动、曲线也不动, 正是这个仓库反复
+ *  记过的"界面像死了")。短对局连续跑时这个问题每一场都发生。
+ *  现在保存线程常驻, 请求 (待保存的 agent 列表) 通过标志交给它, GUI 线程只置标志,
+ *  一秒都不等; 多个请求会合并成一次 (去重)。
  * ================================================================ */
 void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &types)
 {
@@ -954,17 +1197,45 @@ void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &typ
         return;
     }
 
-    /* 上一次保存若还没结束, 先收回来 (同一时刻只允许一个保存任务) */
-    if (m_saveThread.joinable()) {
-        m_saveThread.join();
+    {
+        std::lock_guard<std::mutex> lk(m_saveMutex);
+        for (ChessBoard::AgentType t : todo) {
+            if (!m_saveQueue.contains(t)) {
+                m_saveQueue.append(t);
+            }
+        }
+        m_savePending = true;
     }
+    if (!m_saveThread.joinable()) {
+        m_saveThread = std::thread(&MainWindow::saveWorkerLoop, this);
+    }
+    m_saveCv.notify_one();
+}
 
-    m_saveThread = std::thread([this, todo]() {
+void MainWindow::saveWorkerLoop()
+{
+    for (;;) {
+        QVector<ChessBoard::AgentType> todo;
+        {
+            std::unique_lock<std::mutex> lk(m_saveMutex);
+            m_saveCv.wait(lk, [this] { return m_saveStop || m_savePending; });
+            if (m_saveStop) {
+                return;
+            }
+            m_savePending = false;
+            todo = m_saveQueue;
+            m_saveQueue.clear();
+        }
+
         QStringList lines;
         bool allOk = true;
         for (ChessBoard::AgentType t : todo) {
             const std::string path = ChessBoard::defaultWeightPath(t);
             const auto t0 = std::chrono::steady_clock::now();
+            /*
+               注意 saveCurrentAgentModel 内部会取 agent 锁 (见 chessboard.cpp):
+               保存期间后台训练/决策会排队等它, 但那都在**别的线程**上, 界面不受影响。
+            */
             const bool ok = ui->gameWidget->saveCurrentAgentModel(t, path);
             const long long ms =
                 (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -993,5 +1264,5 @@ void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &typ
             }
             ui->gameListWidget->scrollToBottom();
         }, Qt::QueuedConnection);
-    });
+    }
 }

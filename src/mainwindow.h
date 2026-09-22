@@ -5,6 +5,8 @@
 #include <QVector>
 #include <QHash>
 #include <QTimer>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include "gamedb.h"
 #include "chessboard.h"
@@ -51,14 +53,40 @@ private:
     void resetMetricsForMatch(const QString &agentA, const QString &agentB);
     int  lossSeriesFor(const QString &agentName);
     void exportMetricsCsv();
+    /*
+     * 只导出**训练损失曲线** (2026-09 用户要求"增加 loss 曲线导出控件")。
+     * 为什么单列一个而不是让用户自己去切那个合并 CSV: 两张曲线的采样序号口径不同
+     * (损失 = 每完成一次在线训练一个点; 奖励 = 每手一个点, 长度不同), 合并导出后
+     * 想单独分析损失就得先手工切段; 而"哪一段是损失"靠的是注释行, 很容易切错。
+     */
+    void exportLossCsv();
+    /* 导出实现 (两个按钮共用): 一条曲线一段, 带表头与注释行 */
+    bool writeChartCsv(class CurveChart *chart, const QString &what,
+                       const QString &sectionComment, const QString &defaultName);
     /* 把曲线的"最新值/均值/样本数"写进图下面的标签 (见 .cpp 的注释) */
     void updateMetricsLabels();
     /*
-     * 把当前 agent 的自检报告写进右侧"模型自检"面板。
+     * ---- 模型自检面板 (异步) ----
      * 数据源 ChessBoard::getAgentSelfCheck() -> AgentBase::selfCheckReport()。
      * 为什么需要它 (损失与自对弈胜率都答不了"值不值得继续训") 见 .cpp 里的长注释。
+     *
+     * **为什么必须异步**: 报告读的是常驻 agent 的内部状态, 而 ChessBoard 里那条
+     * 路径会等 `m_agentMutex` —— 一次 PPO 决策约 3.2 s、一份 558 MB 权重的读写
+     * 约 9 s。同步调用等于把这些秒数直接搬到 GUI 线程上 (面板每一手都要刷新一次),
+     * 表现就是"界面卡死"。所以请求交给 m_selfCheckThread, 算完再用队列信号贴回面板。
      */
-    void updateSelfCheckPanel();
+    void requestSelfCheckPanelUpdate(bool allAgents);
+    /* worker 算完后的"上屏"步骤 (只在 GUI 线程执行) */
+    void applySelfCheckPanel();
+    /*
+     * "全部模型自检": 把十个 agent 的自检报告**一次性**拼到一起写进同一个面板
+     * (走的也是上面那个 worker, 因为十份报告要依次过 agent 锁)。
+     * 为什么需要它: 单个 agent 的报告只能回答"我这一个模型有没有表示/口径问题",
+     * 而真正好用的是**横向对比** —— 谁的动作编码有别名、谁能看见规则上下文、
+     * 谁的权重文件没扫到, 排在一起一眼就分得出来。
+     * 这是一次性快照: 下一手棋的自检刷新会切回"当前 agent"的视图。
+     */
+    void showAllAgentsSelfCheck();
     /*
      * 双击曲线 -> 弹一个放大的独立窗口 (见 metricsview.h 的 CurveChartDialog)。
      * 同一个源控件只保留一个窗口: 已经开着就抬到前面, 不再新开一个。
@@ -96,8 +124,34 @@ private:
      */
     std::thread m_loadThread;
     std::thread m_selfPlayThread;
-    /* 保存权重 (放在后台线程做, 见 saveWeightsAfterMatch) */
+    /*
+     * 保存权重 (常驻后台线程, 见 saveWeightsAfterMatch 的说明: 原来每场起一个线程再
+     * 在 GUI 线程 join, 上一场还在写 558 MB 时界面会冻住).
+     */
     std::thread m_saveThread;
+    std::mutex m_saveMutex;
+    std::condition_variable m_saveCv;
+    bool m_saveStop = false;
+    bool m_savePending = false;
+    QVector<ChessBoard::AgentType> m_saveQueue;
+    void saveWorkerLoop();
+
+    /*
+     * 自检面板的 worker (见 requestSelfCheckPanelUpdate 的说明)。
+     * 它只有一个任务队列深度: "有没有新请求" + "最新一份算好的文本"。
+     * 析构时必须 stop + join, 再 delete ui (worker 会访问 ui->gameWidget)。
+     */
+    std::thread m_selfCheckThread;
+    std::mutex m_selfCheckMutex;
+    std::condition_variable m_selfCheckCv;
+    bool m_selfCheckStop = false;
+    bool m_selfCheckPending = false;      /* 有新请求待处理 */
+    bool m_selfCheckAll = false;          /* 这一份请求是"全部模型"还是"当前 agent" */
+    ChessBoard::AgentType m_selfCheckType = ChessBoard::AGENT_ALPHABETA;
+    /* worker 的产出 (上屏前暂存) */
+    QString m_selfCheckText;
+    bool m_selfCheckReady = false;
+    void selfCheckWorkerLoop();
 
     /* Agent 对弈状态 (只在 GUI 线程读写) */
     bool m_matchRunning = false;

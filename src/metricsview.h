@@ -38,7 +38,19 @@ public:
     struct Series {
         QString name;
         QColor color;
+        /*
+           `pts` = 画出来的那条曲线 (受 setWindow 限制, 默认 2000 点);
+           `history` = **全部**采样点 (不受窗口限制)。
+           为什么要两份 (2026-09, 用户在分析导出数据时踩到): 窗口是为了"画得动", 但导出
+           是给人**分析**的 —— 用户拿导出的 CSV 当"整场 100 局"来解读, 而那个文件其实只是
+           最后 2000 个点 (约十几局), 早期那个 75 的损失尖峰根本不在文件里。两份数据的
+           代价很小 (一个 double 8 字节, 十万点 = 800 KB), 而"分析文件缺了一半时间线"
+           这种坑会直接导致结论错。
+           `toCsv()` 导出的是 **history**; 屏幕上的曲线与"均值/最小/最大"读数仍然按
+           **窗口**算 (那是"最近怎么样"的口径, 语义不动)。
+        */
         QVector<double> pts;
+        QVector<double> history;
         bool valid = false;      /* 是否已经有数据 */
         double last = 0.0;
         double mn = 0.0;
@@ -81,6 +93,23 @@ public:
     int sampleCount() const;
     /* 一行"最新/均值/点数"的文字读数 (界面标签与放大窗口共用同一份格式化) */
     QString readoutText(const QString &prefix = QString()) const;
+
+    /*
+       本图的数据导出成 CSV **文本** (2026-09)。
+       为什么把"文本生成"放在控件里、把"写文件/选路径"留在窗口里:
+         * 导出按钮要弹文件对话框 (自动化脚本点不动), 但格式本身是**可以测的** ——
+           放进 CurveChart 之后 test_match 的 [2.9] 节能直接断言格式 (含"短的那条曲线
+           后面的列留空而不是补 0"这条容易写错的规则);
+         * 合并导出 (损失 + 奖励两段) 也就只需把两次 toCsv() 拼起来, 不必再抄一遍循环。
+       格式:
+           # <comment>
+           sample,<名 1>,<名 2>,...
+           1,<v>,<v>,...
+       导出的样本数是 **history (全部采样点)**, 不是屏幕窗口里的点数 —— 见 Series 的说明。
+    */
+    QString toCsv(const QString &comment) const;
+    /* 全部采样点的条数 (导出/分析用; 与 sampleCount() 的窗口口径不同) */
+    int historyCount() const;
 
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;

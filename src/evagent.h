@@ -118,6 +118,14 @@ public:
     std::string getName() const override;
 
     /*
+     * 自检报告 (界面"模型自检"面板的数据源)。
+     * 契约见 aiagent.h: **只读、可重复调用、不动棋盘** —— 所以这里只报静态结构
+     * 与搜索/训练计数, 不跑搜索、不调 netHandGap() (那个函数会在 this->chess 上
+     * 随机试走, 违反只读契约)。
+     */
+    std::string selfCheckReport() const override;
+
+    /*
      * EVAB 版的"先探索环境 + 预训练再决策"。
      *
      * 它的"探索"本来就是搜索 (迭代加深会把当前局面看到第 maxDepth 层), 所以这里

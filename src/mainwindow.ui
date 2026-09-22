@@ -298,6 +298,16 @@
           </widget>
          </item>
          <item>
+          <widget class="QPushButton" name="exportLossBtn">
+           <property name="toolTip">
+            <string>只导出"训练损失"这一张曲线的数据 (每个 agent 一列; 每完成一次在线训练一个点)。想要奖励曲线就用右边的"导出 CSV"。</string>
+           </property>
+           <property name="text">
+            <string>导出损失曲线</string>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QPushButton" name="exportMetricsBtn">
            <property name="text">
             <string>导出 CSV</string>
@@ -314,11 +324,25 @@
         </widget>
        </item>
        <item>
-        <widget class="QLabel" name="selfCheckTitleLabel">
-         <property name="text">
-          <string>模型自检 (自动更新)</string>
-         </property>
-        </widget>
+        <layout class="QHBoxLayout" name="selfCheckTitleRow">
+         <item>
+          <widget class="QLabel" name="selfCheckTitleLabel">
+           <property name="text">
+            <string>模型自检 (自动更新)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="selfCheckAllBtn">
+           <property name="toolTip">
+            <string>把九个 agent 的自检报告排在一起 (横向对比编码/口径/权重文件); 之后每手会自动刷回当前 agent</string>
+           </property>
+           <property name="text">
+            <string>全部模型自检</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
        <item>
         <widget class="QPlainTextEdit" name="selfCheckView">
@@ -331,7 +355,7 @@
          <property name="maximumSize">
           <size>
            <width>16777215</width>
-           <height>150</height>
+           <height>260</height>
           </size>
          </property>
          <property name="readOnly">

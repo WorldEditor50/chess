@@ -1,5 +1,8 @@
 # cmake
 build
+# ASan 版构建目录 (2026-09: 查"对弈 x 后台训练"的堆损坏时建的, 见 issues_review C24)。
+# 保留它可以让 repro_concurrency 随时复跑而不必重新编译 (~10 分钟), 但二进制不该进仓库。
+build-asan
 .qt
 .vscode
 .claude

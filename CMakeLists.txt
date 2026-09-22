@@ -582,9 +582,47 @@ if(CHESS_BUILD_TESTS)
     # ';' 分隔的, 直接塞进 ENVIRONMENT 会被当成多条环境设置。
     set(_qt_bin_dir "${Qt6_DIR}/../../../bin")
     cmake_path(NORMAL_PATH _qt_bin_dir)
-    set_tests_properties(test_match PROPERTIES TIMEOUT 600
+    # TIMEOUT 600 -> 900 (2026-09): test_match 现在还会逐个 agent 跑一轮**后台训练**
+    # ([2.12] EVAB + [2.13] SAC+AZ / SAC+AZ-MoE / DQN+AB), 而其中两个 agent 的一轮
+    # 本身是分钟级 (稀疏 MoE 的前向 + ~276 MB 权重的临时文件往返)。实测本机 250 s,
+    # 原来的 600 s 在慢一点的机器上会擦边。
+    set_tests_properties(test_match PROPERTIES TIMEOUT 900
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir}")
+
+    # ------------------------------------------- "对弈 x 后台训练"并发崩溃的最小复现
+    # 2026-09 用户报的 0xC0000374 (堆损坏): 只在对弈的某一方 == 后台训练的目标时出现,
+    # 而且必须"对弈在另一个线程 + 面板在刷自检"才稳定复现 (见该文件的顶部注释)。
+    # **故意不进 ctest**: 它压的是时序相关的堆损坏, 属于"改完并发代码后手工压一下"的
+    # 工具; 计时与调度变了它可能一时不复现, 那就不要拿它当门禁。
+    add_executable(repro_concurrency
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/repro_concurrency_main.cpp
+        ${SRC_DIR}/chessboard.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/evagent.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/dqnagent.cpp
+        ${SRC_DIR}/pgagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/dqnmcts_agent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/dqnabagent.cpp)
+    target_include_directories(repro_concurrency PRIVATE ${SRC_DIR})
+    target_link_libraries(repro_concurrency PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(repro_concurrency PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(repro_concurrency PROPERTIES
+        AUTOMOC ON
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(repro_concurrency)
 
     # ------------------------------------------- 梯度传播正确性 (SIMD 之后)
     # 用中心差分核对 Net::backward 填出来的解析梯度, 覆盖普通 MLP 与 DQN 的
@@ -875,6 +913,202 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_sacaz_vs_ab)
 
+    # ------------------------------------------- PPO 稀疏输出口径的核对与代价拆解
+    # 用户要求: PPO 保持 8100 双射, 但输出走"只对合法动作动态打分"的稀疏口径。
+    # 这条路径 PPO 已有 (`sparsePolicyHead` -> `actionMasked` -> `forwardTrunk` +
+    # `sparseLogits` + 合法集 softmax), 这个工具把它**钉住**并拆开代价:
+    #   1) 稀疏 vs 全量在合法集上逐元素一致 (证明没有静默回退);
+    #   2) 头权重的读取字节数 (确定性事实, 不随机器抖动);
+    #   3) 骨干 / 稀疏头 / 全量头 / 值头各自的单价与在一次决策里的占比。
+    add_executable(bench_ppo_sparse
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_sparse_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_ppo_sparse PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_sparse PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_sparse PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_sparse PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_sparse)
+
+    # ------------------------------------------- 跨版本对照的最小工具
+    # 与 bench_agent_arena 的区别: 只用**两个 commit 都有**的最小接口, 于是同一份源码
+    # 能编到改前那棵树 (worktree) 上, 用来回答"现在的 SAC 是不是比改前弱"。
+    # 协议与 arena 一致: 交换先后手 / 同一随机开局 / 同一模拟预算 / 逐手合法性校验 /
+    # 得分率 + Wilson 区间。
+    add_executable(bench_sac_mcts_min
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sac_mcts_min_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_include_directories(bench_sac_mcts_min PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sac_mcts_min PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sac_mcts_min PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sac_mcts_min PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sac_mcts_min)
+
+    # ---- bench_sac_learn: "SAC 边下边学" 的受控复现 + 奖励塑形 A/B (2026-09) ----
+    # 与上面那个的区别: 这个工具**每手都调 exploreAndTrain** (界面 preTrainThenDecide 的
+    # 那一步) 并统计胜负和的成因/奖励累计/损失曲线/critic 尺度 —— 也就是用户报的
+    # "奖励两倍但 300 手和棋" 那组现象。协议逐条对齐 ChessBoard::playMatchGame。
+    add_executable(bench_sac_learn
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sac_learn_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_include_directories(bench_sac_learn PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sac_learn PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sac_learn PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sac_learn PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sac_learn)
+
+    # 同一份源码 + `SACAZ_ALIGNED_REPR=1` -> 对齐表示 (19 平面 / 8100 双射) 的副本。
+    # 表示是**编译期**开关 (STATE_DIM / ACTION_DIM 决定网络形状), 所以要两个二进制才
+    # 能在同一次会话里对跑。默认那个是改前表示 (实测更强, 见 sacazagent.h 的说明)。
+    add_executable(bench_sac_mcts_min_aligned
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sac_mcts_min_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_compile_definitions(bench_sac_mcts_min_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
+    target_include_directories(bench_sac_mcts_min_aligned PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sac_mcts_min_aligned PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sac_mcts_min_aligned PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sac_mcts_min_aligned PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sac_mcts_min_aligned)
+
+    # ------------------------------------------- 策略头梯度不变量探针
+    # 量"非法动作的头部权重是否逐位不变" —— 掩码 softmax 的契约 (dz 在非法列恒为 0)。
+    # test_sacaz [11] 钉的是同一条; 这个探针用来**定位**它为什么坏 (熵项/裁剪/动作空间)。
+    add_executable(probe_sac_head_grad
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_sac_head_grad_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(probe_sac_head_grad PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_sac_head_grad PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(probe_sac_head_grad PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_sac_head_grad PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(probe_sac_head_grad)
+
+    # ------------------------------------------- 受控对局竞技场 (三方对照)
+    # 为什么需要它: "哪个算法更强"是**三方**问题 (两个学习 agent 互打 + 各自对同一个
+    # 无学习基线), 而 bench_sacaz_vs_ab / bench_ppo_vs_ab 各自只测"一个 agent 对 AB",
+    # 两次运行之间的随机开局/种子/模拟预算无法保证一致。这里把三方装进一个二进制,
+    # 共用同一套协议 (交换先后手 + 同一随机开局 + 同一模拟预算 + 逐手合法性校验),
+    # 并输出得分率的 Wilson 95% 区间 —— 小样本下"5 胜 0 负"必须配区间才读得对。
+    # **不进 ctest**: 跑真实对局/自对弈, 耗时以分钟计。
+    #   cmake --build <build> --target bench_agent_arena
+    #   <build>/bench_agent_arena --mode=train --a=sac --b=ppo --games=200 --sims=64 \
+    #                             --save-prefix=weights/arena
+    #   <build>/bench_agent_arena --mode=match --a=sac --b=ppo --games=60 --sims=64 \
+    #                             --load-a=weights/arena_sac --load-b=weights/arena_ppo
+    add_executable(bench_agent_arena
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_agent_arena_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_agent_arena PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_agent_arena PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_agent_arena PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    # PDB: 生成符号以便把崩溃地址翻译成函数名 (`cdb -c "sxe av; g; kb"`)。
+    # 这个目标存在的意义就是**定位缺陷**, 没有符号时一次访问违例只能看到偏移量
+    # (2026-09 实际吃过这个亏)。只影响产物大小, 不影响任何行为。
+    target_link_options(bench_agent_arena PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/DEBUG:FULL>)
+    set_target_properties(bench_agent_arena PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_agent_arena)
+
+    # ------------------------------------------- 同源副本 (数值对照用)
+    # 与 bench_agent_arena 是**同一份源码**, 只换产物名。
+    # 为什么需要它: 长时训练/对局进程会一直占住 bench_agent_arena.exe (Windows 不允许
+    # 覆盖正在运行的可执行文件), 于是"想改一个旋钮再跑一轮对照"会被链接失败挡住。
+    # 有了这个副本名, 迭代时链接 `bench_agent_arena_ab`, 正在进行的长跑不受影响。
+    # **临时目标**: 只服务于 2026-09 的 SAC/PPO 对照实验, 实验归档后可删。
+    add_executable(bench_agent_arena_ab
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_agent_arena_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_agent_arena_ab PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_agent_arena_ab PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_agent_arena_ab PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_agent_arena_ab PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_agent_arena_ab)
+
     # ------------------------------------------- PPO+MCTS 多线程分身训练吞吐
     # **不进 ctest**: 同 bench_ppo_vs_ab —— 跑真实自对弈、依赖线程调度与随机开局,
     # 耗时以分钟计。手动跑:
@@ -1053,6 +1287,30 @@ if(CHESS_BUILD_TESTS)
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。
+    # 对齐表示那一支的编译+自洽验证: 同一份源码 + SACAZ_ALIGNED_REPR=1。
+    # 两种表示都必须在断言下自洽 (STATE_DIM/ACTION_DIM/上下文槽位置都不同),
+    # 否则"开关"就成了"两个会漂移的实现"。
+    add_executable(test_sacaz_aligned
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sacaz_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_compile_definitions(test_sacaz_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
+    target_include_directories(test_sacaz_aligned PRIVATE ${SRC_DIR})
+    target_link_libraries(test_sacaz_aligned PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_sacaz_aligned PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_sacaz_aligned PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_sacaz_aligned)
     add_executable(test_sacaz
         ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sacaz_main.cpp
         ${SRC_DIR}/chess.cpp

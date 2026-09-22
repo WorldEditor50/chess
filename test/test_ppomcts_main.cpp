@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 #include <algorithm>
 #include <cstdlib>
 #include <ctime>
@@ -1718,12 +1718,85 @@ static bool testSparsePolicyHead()
                headBytes / 1048576.0, sparseBytes / 1024.0,
                (unsigned long long)legalIdx.size());
 
-        const bool faster = (sparseUs > 0.0) && (sparseUs < denseUs);
-        if (!faster) { printf("      **EXPECTED \xe7\xa8\x80\xe7\x96\x8f\xe8\xb7\xaf\xe5\xbe\x84\xe6\x9b\xb4\xe5\xbf\xab**\n"); }
-        ok = ok && faster;
+        /*
+           判据 (2026-09 调整): 原来要求"稀疏的墙钟时间**严格**小于全量", 这在
+           **骨干占绝对大头**的网络上是靠不住的 —— 头的权重读取从 1.98 MB 降到 11 KB
+           (180 倍), 但一次 forwardTrunk (~5.2 ms) 把两者都盖住了, 于是实测比值在
+           0.95~1.05 随机器负载抖动, 断言会随机变红/变绿。
+
+           改成钉**确定性事实** + 给时间留余量:
+             (1) 稀疏路径确实被走通 (不是回退到全量口径) —— 由"与全量逐元素一致"加上
+                 头权重读取字节数之比给出;
+             (2) 时间上"不更慢" (允许 10% 抖动) —— 方向性读数, 不是性能断言。
+           稀疏头真正要赢回来的地方是**搜索叶子估值** (每次两套 Q: 8100 列 vs 合法
+           44 列), 不是这里的单词策略前向。
+        */
+        const bool ranSparse = !probs.empty() && (sparseUs > 0.0) && (headBytes > 0.0)
+                               && (sparseBytes * 10.0 < headBytes);
+        const bool notSlower = (denseUs <= 0.0) || (sparseUs < denseUs * 1.10);
+        if (!ranSparse) { printf("      **EXPECTED 稀疏路径真的走通了**\n"); }
+        if (!notSlower) { printf("      **EXPECTED 稀疏路径不应该比全量慢**\n"); }
+        ok = ok && ranSparse && notSlower;
+
+        /*
+           ---- [e] "只对合法动作动态打分" 这条口径本身 (2026-09 补) ----
+           用户口径: PPO 保持 8100 双射动作空间, 但输出**只对当前局面的合法动作**打分
+           (非法槽位不参与计算, 也不占权重读取)。钉三个事实, 否则它可能被"看起来
+           一样"的改动悄悄退回全量:
+             (1) 生产开关是开的 (`sparsePolicyHead` 默认 true);
+             (2) 实际被打分的**动作数** = 该局面的合法着法数, 远小于 8100;
+             (3) 打分集合**随局面变化** (动态算出来), 不是写死的表。
+        */
+        const bool headOn = agent.sparsePolicyHead;
+        /*
+           取样用本文件已有的 `makeRandomPosition` (与 bench_agent_arena 的
+           randomOpening 同源): 深度不同的局面机动性确实不同 (实测 opening=4/20/40
+           -> 合法数 32/30/27)。
+           **别在这里自己写内层走子循环**: 第一版用"偏好吃子"的挑法走 40 手, 结果
+           40 个局面的合法数恒为 44 (那个走法族会来回循环) —— 排查了一轮才发现是
+           **测试取样方式的问题**, 不是产品代码。
+        */
+        std::vector<int> sizes;
+        const int plies[5] = { 0, 6, 14, 24, 36 };
+        for (int k = 0; k < 5; k++) {
+            Chess cc;
+            makeRandomPosition(cc, (unsigned)(31 + k * 17), plies[k]);
+            if (cc.getResult(cc.sideToMove) != Chess::RESULT_ONGOING) { continue; }
+            std::vector<Step*> lg2;
+            std::vector<int> li2;
+            RL::Tensor mk2(A::ACTION_DIM, 1);
+            mk2.zero();
+            agent.getLegalActions(cc.sideToMove, lg2, li2, mk2);
+            Steps::instance().put(lg2);
+            if (!li2.empty()) { sizes.push_back((int)li2.size()); }
+        }
+        const int maxScored = sizes.empty()
+                                  ? 0
+                                  : *std::max_element(sizes.begin(), sizes.end());
+        const int minScored = sizes.empty()
+                                  ? 0
+                                  : *std::min_element(sizes.begin(), sizes.end());
+        bool varies = false;
+        for (std::size_t i = 1; i < sizes.size(); i++) {
+            if (sizes[i] != sizes[0]) { varies = true; }
+        }
+        printf("  [e] dynamic-scoring: %zu positions, legal-in [%d, %d] (varies=%d), "
+               "action space %d => at most %.2f%% of columns scored\n",
+               sizes.size(), minScored, maxScored, (int)varies,
+               A::ACTION_DIM, 100.0 * (double)maxScored / (double)A::ACTION_DIM);
+        const bool allSmall = (maxScored > 0) && (maxScored < A::ACTION_DIM / 10);
+        if (!headOn) { printf("      **EXPECTED sparsePolicyHead to be ON in production**\n"); }
+        if (!allSmall) { printf("      **EXPECTED only legal actions to be scored**\n"); }
+        /*
+           只断言"**打分集合 = 合法着法数, 且远小于动作空间**" (这就是本口径的定义),
+           不断言"每两个局面的合法数都不同": 象棋里若干局面机动性恰好相同是正常的,
+           `varies` 只作为诊断量打印。"随局面变化"由 bench_ppo_sparse 的 [1] 段证明
+           (25 个局面、合法集 39~44, 每次都重新算)。
+        */
+        ok = ok && headOn && allSmall;
     }
 
-    printf("  -> %s\n", ok ? "sparse policy head verified (equivalent + faster)"
+    printf("  -> %s\n", ok ? "sparse policy head verified (equivalent + far fewer weight reads)"
                            : "**R1 BUG**");
     return ok;
 }
@@ -2100,6 +2173,90 @@ static bool testMaskedTrainHead()
         if (!fullNonZero) { printf("      **EXPECTED \u5168\u91cf\u53e3\u5f84\u4e0b\u975e\u6cd5\u884c\u6709\u68af\u5ea6**\n"); }
         if (!decayOnly) { printf("      **EXPECTED \u7a00\u758f\u53e3\u5f84\u4e0b\u975e\u6cd5\u884c\u53ea\u53d7 decay \u5f71\u54cd**\n"); }
         ok = ok && maskedZero && fullNonZero && decayOnly;
+    }
+
+    /*
+       ---- [d] 信任域 (2026-09): ratio + clip 真的在起作用 ----
+       改版前 `rl/ppo.h` 自己写着"**无 clip、无 KL 惩罚**": 策略项就是
+       `cross-entropy(actor, MCTS 访问分布)` —— 那是行为克隆, 不是 PPO。实测
+       (docs/arena_sac_vs_ppo_report.md §5.4) 它训练 150/400 局后对同一个 MCTS 基线的
+       得分率是 56.7% / 50.0%, 区间全部跨 50%, 棋力没有任何可测变化。
+
+       ratio 的分母必须是**入库时存下的** p_old (ReplaySample::oldProb): 训练时重算出来
+       的只能是新策略, 拿它当分母等于恒等比值 1, 裁剪项直接失效。
+
+       这条钉两件事:
+         (1) 给出了 oldProb 的样本确实让策略项换成了裁剪代理目标 (位移与纯交叉熵不同);
+         (2) 裁剪是**刹车**: eps 收紧后的总位移不应大于放松时。
+    */
+    {
+        auto trainOnce = [](float clipEps, bool withOldProb) {
+            Chess env;
+            A agent(env, 32, 0.99f, 0.005f, 1.414f, 32, 0.1f, true);
+            agent.replayBatchSize = 0;
+            agent.ppo.clipEps = clipEps;
+            agent.ppo.entropyCoef = 0.0f;      /* 隔离出策略项本身 */
+            env.reset();
+            env.sideToMove = Stone::COLOR_RED;
+            RL::Tensor s(A::STATE_DIM, 1);
+            s.zero();
+            agent.encodeState(s);
+
+            std::vector<Step*> legal;
+            std::vector<int> legalIdx;
+            RL::Tensor mask(A::ACTION_DIM, 1);
+            mask.zero();
+            agent.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
+            Steps::instance().put(legal);
+            if (legalIdx.size() < 2) { return 0.0; }
+
+            std::vector<int> tgt;
+            std::vector<float> tp;
+            tgt.push_back(legalIdx[0]); tp.push_back(0.7f);
+            tgt.push_back(legalIdx[1]); tp.push_back(0.3f);
+
+            std::vector<float> oldProb;
+            agent.ppo.actionMasked(s, legalIdx, oldProb);
+            const std::vector<float> empty;
+            for (int n = 0; n < 256; n++) {
+                agent.ppo.addReplay(s, tgt, tp, 0.5f, legalIdx,
+                                    withOldProb ? oldProb : empty);
+            }
+
+            RL::iFcLayer *head = dynamic_cast<RL::iFcLayer *>(
+                agent.ppo.actorP[agent.ppo.actorP.size() - 1]);
+            if (head == nullptr) { return 0.0; }
+            const std::size_t rs = (std::size_t)head->w.sizes[0];
+            std::vector<float> before;
+            for (int a = 0; a < A::ACTION_DIM; a++) {
+                const float *row = head->w.val.data() + (std::size_t)a * rs;
+                for (std::size_t k = 0; k < rs; k++) { before.push_back(row[k]); }
+            }
+            for (int r = 0; r < 5; r++) { agent.ppo.learnFromReplay(64, 1, 0.005f); }
+            double moved = 0.0;
+            std::size_t p = 0;
+            for (int a = 0; a < A::ACTION_DIM; a++) {
+                const float *row = head->w.val.data() + (std::size_t)a * rs;
+                for (std::size_t k = 0; k < rs; k++) {
+                    moved += std::fabs((double)before[p++] - (double)row[k]);
+                }
+            }
+            return moved;
+        };
+
+        const double movedTight = trainOnce(0.05f, true);    /* 强裁剪 + 有 p_old */
+        const double movedLoose = trainOnce(1.00f, true);    /* 近无裁剪 + 有 p_old */
+        const double movedNoOld = trainOnce(0.05f, false);   /* 强裁剪但**没有** p_old */
+        printf("  [d] \u4fe1\u4efb\u57df: \u603b\u4f4d\u79fb(eps=0.05)=%.4f, (eps=1.0)=%.4f, "
+               "(\u65e0 p_old, eps=0.05)=%.4f\n", movedTight, movedLoose, movedNoOld);
+
+        const bool ratioChanges = (std::fabs(movedTight - movedNoOld) > 1e-4);
+        const bool clipBrakes = (movedTight <= movedLoose * 1.05 + 1e-6);
+        const bool bothMove = (movedTight > 0.0) && (movedLoose > 0.0);
+        if (!bothMove) { printf("      **EXPECTED \u4e24\u79cd\u914d\u7f6e\u90fd\u5e94\u8be5\u6709\u66f4\u65b0**\n"); }
+        if (!ratioChanges) { printf("      **EXPECTED \u7ed9\u51fa p_old \u540e\u7b56\u7565\u9879\u5e94\u8be5\u6362\u6210\u88c1\u526a\u4ee3\u7406\u76ee\u6807**\n"); }
+        if (!clipBrakes) { printf("      **EXPECTED \u6536\u7d27\u88c1\u526a\u7684\u4f4d\u79fb\u4e0d\u5e94\u5927\u4e8e\u653e\u677e\u88c1\u526a**\n"); }
+        ok = ok && bothMove && ratioChanges && clipBrakes;
     }
 
     printf("  -> %s\n", ok ? "masked training head verified (learns on legal set, illegal rows untouched)"

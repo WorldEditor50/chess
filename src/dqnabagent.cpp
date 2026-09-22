@@ -1436,3 +1436,295 @@ void DQNABAgent::resetMoeUsage()
         l[i]->resetUsage();
     }
 }
+
+/* ============================================================================
+ *  自检报告 (界面"模型自检"面板的数据源)
+ * ============================================================================ */
+
+/* ------------------------------------------------------------------
+ *  selfCheckReport
+ *
+ *  为什么要有这些读数: 面板要回答的是"这个模型**值不值得继续训**", 而损失曲线与
+ *  自对弈胜率都回答不了 —— 损失只说明网络与自己的目标一致 (实测 DQN+MCTS 报 22、
+ *  PPO 报 0.003, 两个数量纲不同、都不可比), 自对弈的赢家和输家是**同一份权重**。
+ *  本 agent 的前置判据落在前两处 (表示层与值门控), 第三处是规格/成本读数。
+ *
+ *    (1) **表示层**: 状态 1710 维 = 19 平面 x 90 格, 5 个规则/阶段平面 (剩余子力 /
+ *        总手数 / 无吃子进度 / 重复次数 / 被将) 直接进状态, 于是 V(s) 真的是 s 的
+ *        函数、Bellman 备份成立。老编码 (DQN/PG/DQN+MCTS/SACAZ 的 90 维哈希) 里
+ *        走子方 / 重复进度 / 无吃子 / 被将**逐字节不可分** (probe_dqnmcts_aliasing [2]),
+ *        而"三次重复判和"这类规则决定的正是终局与回报。动作侧同理: `规范from*90 +
+ *        规范to` 是 8100 上的双射, 老编码的 128 槽哈希平均把 22 个着法挤进一槽 ——
+ *        互不相同的着法拿不到各自的 Q 列。这两条是"模型值不值得继续训"的**前置**
+ *        判据 (表示错了, 再训也不会好), 所以它们在报告的最前面。
+ *
+ *    (2) **值门控**: 每次批更新前后各测一次 `netHandGap` (固定探针上的 |V − 手工锚|),
+ *        单次更新把它顶高超过容忍度就回滚权重 (见头文件那一节)。这里报上一条读数:
+ *        gap 前 -> 后、有没有回滚, 以及探针上的完整 HandStats。**只看 gap 会骗人**:
+ *        tanh(evaluate()/3) 的典型幅度只有 ±0.2, 于是"V 恒等于 0"的未训练网络也能拿到
+ *        好看的数字 (TB 骨干随机初始化实测 0.0410) —— 而 corr 对常数 V 恒为 0,
+ *        是尺度无关的判据; 锚自身的标准差则告诉你**这把尺子还剩多少信号**。
+ *
+ *    (3) **搜索/训练规格**: 节点预算是真正的成本控制量, 单位是**网络前向次数**
+ *        (不是 MCTS 的模拟次数) —— GUI 每步传 `DQNAB_NODES=256`
+ *        (src/chessboard.cpp:141, TB 骨干约 0.8 s/步), 深度只是这个预算的函数。
+ *        连同回放池/超参/参数个数一起报, 是为了让"曲线好看"与"规格"能被分开读。
+ *
+ *  只读契约 (aiagent.h 的口径):
+ *    * 全程**不碰 `this->chess`** —— 面板会在对局中途被 GUI 线程调用, 而搜索线程
+ *      正在用它 moveForward/moveBack。动作双射那一段用**新构造的**标准开局棋盘,
+ *      于是那份读数与本实例的棋局无关, 每次打开面板都是同一个确定性结果 (可以当
+ *      回归指示器用)。
+ *    * **不做任何前向**: TB 骨干一次前向 3.6 ms (docs/agents_design.md §18.1),
+ *      而本函数每手"探索+预训练"之后都会被调一次; 所以 HandStats 一律读**已有缓存**
+ *      (netHandStats 不是 const, 也不该在这里跑)。
+ *    * 不改任何成员 (函数是 const), 借用 `Steps` 池的 Step* 全部还回去。
+ *
+ *  刻意**不**在这里报棋力: 棋力只有 bench_anchor 那种带 95% 区间的锚点对局能回答。
+ * ------------------------------------------------------------------ */
+std::string DQNABAgent::selfCheckReport() const
+{
+    char buf[640];
+    std::string out;
+
+    /* ---- 1. 表示: 平面布局 + 规则上下文是否真的可观测 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "状态 %d 维 = %d 平面 x %d 格: 14 棋子平面(规范视角) + [%d]剩余子力 "
+                  "+ [%d]总手数 + [%d]无吃子 + [%d]重复 + [%d]被将\n",
+                  STATE_DIM, PLANES, CELLS, PLANE_MATERIAL, PLANE_TEMPO,
+                  PLANE_HALFMOVE, PLANE_REPEAT, PLANE_CHECK);
+    out += buf;
+
+    /* 这一行是本 agent 与老 agent 在**表示层**上最重要的区别, 值得单独一行 */
+    out += "规则上下文: 可观测 (上一行那 5 个通道都在状态里) —— 本 agent 用的是"
+           "**完备 Markov 状态**那一份编码; DQN/PG/DQN+MCTS/SACAZ 的 90 维哈希编码里"
+           "一个都没有 (逐字节不可分)\n";
+
+    std::snprintf(buf, sizeof(buf),
+                  "规则平面开关: %s (encodeRulePlanes=%s) —— 关掉只是把 5 个平面清零: "
+                  "输入维度与随机初始化都不变, 所以是干净的消融\n",
+                  encodeRulePlanes ? "开" : "关",
+                  encodeRulePlanes ? "true" : "false");
+    out += buf;
+
+    /*
+       动作双射的确定性验证。用**新构造**的标准开局棋盘, 完全不碰 this->chess。
+       合法着法数在运行期数出来 (写死一个数字迟早与走法生成脱节)。
+    */
+    int openLegal = 0, openIdx = 0;
+    {
+        Chess probe;
+        std::vector<Step *> legal;
+        probe.sample(probe.sideToMove, legal);
+        std::vector<int> idx;
+        idx.reserve(legal.size());
+        for (std::size_t i = 0; i < legal.size(); i++) {
+            idx.push_back(actionIdxOf(*legal[i], probe.sideToMove));
+        }
+        openLegal = (int)legal.size();
+        Steps::instance().put(legal);   /* Step* 借自线程本地池, 必须还回去 */
+        std::sort(idx.begin(), idx.end());
+        openIdx = (int)(std::unique(idx.begin(), idx.end()) - idx.begin());
+    }
+    if (openLegal == openIdx) {
+        std::snprintf(buf, sizeof(buf),
+                      "动作编码: 双射 (开局 %d 个合法着法 -> %d 个动作下标, 无别名)\n",
+                      openLegal, openIdx);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "动作编码: **非双射** (开局 %d 个合法着法只映射到 %d 个动作下标, "
+                      "撞掉 %d 个 —— 这些着法拿不到各自的 Q 列)\n",
+                      openLegal, openIdx, openLegal - openIdx);
+    }
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "  下标 = 规范 from*%d + 规范 to, 全空间 ACTION_DIM = %d x %d = %d; "
+                  "镜像 x->9-x 是单射, 所以红黑两边都成立 (老编码的 128 槽哈希: 开局 44 个"
+                  "合法着法就只落在 38 个槽位上, 挤掉 6 个 —— 见 DQN+MCTS 的自检)\n",
+                  CELLS, CELLS, CELLS, ACTION_DIM);
+    out += buf;
+
+    /* ---- 2. 搜索 / 规划规格 (真正的成本控制量是节点预算, 不是深度) ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "搜索/规划: 深度上限 %d | 节点预算 %d 节点 (= 网络前向次数, 不是模拟次数; "
+                  "GUI 每步传 DQNAB_NODES=256, src/chessboard.cpp:141) | 选择性分支 %d..%d "
+                  "(按合法着法数/8 自适应)\n",
+                  searchDepth, nodeBudget, branchMin, branchMax);
+    out += buf;
+
+    std::snprintf(buf, sizeof(buf),
+                  "  标签/表格: trainPlanDepth %d 层 | labelPlanBudget %d 节点 | "
+                  "TT 容量 %d | 叶子口径=%s | 目标口径=%s\n",
+                  trainPlanDepth, labelPlanBudget, ttCapacity,
+                  (leafEval == LeafEval::MaxQ) ? "maxQ" : "V",
+                  (targetMode == TargetMode::OneStepDouble) ? "OneStepDouble" : "Planned");
+    out += buf;
+
+    if (m_lastNodes > 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "  上次搜索: 深度 %d | 节点 %lld | TT 命中 %lld | 叶子前向 %lld "
+                      "(自上次 selectMove 起, 含标签展开) | 根值 %.4f\n",
+                      m_lastDepth, m_lastNodes, m_ttHits, m_leafEvals, lastRootValue());
+        out += buf;
+    } else {
+        out += "  上次搜索: 没有记录 (这个实例还没跑过 selectMove)\n";
+    }
+
+    /* ---- 3. 值门控 (本 agent 的 headline 安全机制) ---- */
+    char tolNote[64];
+    tolNote[0] = '\0';
+    if (std::fabs(gateToleranceNow() - (double)valueGateTolerance) > 1e-9) {
+        /* 阈值按 lr 放大过 (见头文件): 不报出来, "容差 0.25"就不是实际判据 */
+        std::snprintf(tolNote, sizeof(tolNote), ", lr 放大后 %.3f", gateToleranceNow());
+    }
+    if (!valueGateEnabled) {
+        std::snprintf(buf, sizeof(buf),
+                      "值门控: **关** (容差 %.2f%s) —— 批更新不测 gap、不回滚: "
+                      "毒化更新一次就能把 gap 从 0.03 顶到 0.63 (test_dqnab [9] 的对照段)\n",
+                      (double)valueGateTolerance, tolNote);
+    } else if (learnSteps() <= 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "值门控: 开 (容差 %.2f%s) | 还没有批更新, gap 前/后未测\n",
+                      (double)valueGateTolerance, tolNote);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "值门控: 开 (容差 %.2f%s) | 上次更新 gap %.4f -> %.4f, 回滚=%s%s\n",
+                      (double)valueGateTolerance, tolNote,
+                      lastGapBefore(), lastGapAfter(),
+                      lastUpdateRolledBack() ? "是" : "否",
+                      lastUpdateRolledBack() ? " (这次更新被判为毒化, 权重已回滚)" : "");
+    }
+    out += buf;
+
+    out += "  语义: \"**单次**更新不许把 V 打飞\", 不是\"V 不许离开手工锚\" (否则 V 永远"
+           "不可能变得比手工锚更好); 阈值按 lr 缩放, 因为 RMSProp 把每个张量的位移"
+           "整成 ≈ lr —— 固定 0.25 在 lr=0.02 时曾把 60 次正常更新回滚掉 59 次\n";
+
+    if (probeCount() <= 0) {
+        out += "手工锚: 还没有探针 (rebuildProbes 未跑)\n";
+    } else {
+        const HandStats &ha = pretrainStatsAfter();
+        if (ha.n > 0) {
+            std::snprintf(buf, sizeof(buf),
+                          "手工锚 (上次预训练测得: %d 个探针, 门控每次用 %d): |V-锚| %.4f | "
+                          "corr %.3f | 锚标准差 %.4f | V 标准差 %.4f\n",
+                          ha.n, valueGateProbeCount, ha.gap, ha.corr, ha.anchorStd, ha.vStd);
+            out += buf;
+            out += "  corr 才是尺度无关判据 (常数 V 恒为 0); gap 会因 V 恰好接近 0 而虚低 "
+                   "—— 随机初始化 TB 实测 0.0410, 其实什么都没学到\n";
+            std::snprintf(buf, sizeof(buf),
+                          "  锚标准差 %.4f = 这把尺子带的信号量: 它接近 0 时\"gap 降了\"是"
+                          "在常数上判的 (纯随机、不吃子的探针实测只有 0.0074; 现在 "
+                          "probeCaptureBias %.2f)\n",
+                          ha.anchorStd, (double)probeCaptureBias);
+            out += buf;
+        } else if (learnSteps() > 0) {
+            std::snprintf(buf, sizeof(buf),
+                          "手工锚 (缓存 %d 个探针, 门控每次用 %d): 只有门控测过 gap "
+                          "(上次 %.4f -> %.4f); corr/锚标准差要跑过一次 "
+                          "pretrainValueFromHand 才有\n",
+                          probeCount(), valueGateProbeCount,
+                          lastGapBefore(), lastGapAfter());
+            out += buf;
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "手工锚 (缓存 %d 个探针): 还没测过 (既没有批更新也没有预训练)\n",
+                          probeCount());
+            out += buf;
+        }
+    }
+
+    if (pretrainStatsBefore().n > 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "预训练 (手工锚当稠密标签): gap %.4f -> %.4f | 回滚=%s | 容忍度 %.3f "
+                      "| 耗时 %.0f ms\n",
+                      lastPretrainGapBefore(), pretrainStatsAfter().gap,
+                      lastPretrainRolledBack() ? "是" : "否",
+                      (double)pretrainTolerance, lastPretrainMs());
+        out += buf;
+        if (lastPretrainRolledBack() && pretrainStatsRejected().n > 0) {
+            /* after 已被回滚复原成 before, "它到底试成什么样"只剩这个数能回答 */
+            const HandStats &hr = pretrainStatsRejected();
+            std::snprintf(buf, sizeof(buf),
+                          "  被回滚前那一次的尝试: |V-锚| %.4f | corr %.3f | V 标准差 "
+                          "%.4f —— 这往往是\"样本量不够\", 不是\"网络不行\"\n",
+                          hr.gap, hr.corr, hr.vStd);
+            out += buf;
+        }
+    } else {
+        out += "预训练: 还没有跑过 (手工锚 gap 的 before/after 只在跑过之后才有)\n";
+    }
+
+    /* ---- 4. 训练 / 回放规格 ---- */
+    std::snprintf(buf, sizeof(buf),
+                  "训练/回放: 回放池 %zu/%zu 条 | 已批更新 %d 次 | batch %d x %d 遍 | "
+                  "每 %d 手学一次 | 目标网每 %d 次硬拷贝\n",
+                  replaySize(), replayCapacity, learnSteps(), batchSize, replayEpochs,
+                  learnEveryMoves, targetSyncEvery);
+    out += buf;
+
+    std::snprintf(buf, sizeof(buf),
+                  "  超参: gamma %.3f | lr %.5f | MoE 辅助系数 %.2f\n",
+                  (double)gamma, (double)learningRate, (double)moeAuxCoef);
+    out += buf;
+
+    /*
+       这两个成员在本工程里**只声明、没有任何读取点** (线上探索 exploreAndTrain
+       写死 /0.7, trainSelfPlay 用调用方传的 tempRoot/tempFinal) —— 面板把"配置里
+       有这个旋钮"和"它真的在起作用"分开写, 免得读成"温度退火正在被使用"。
+    */
+    std::snprintf(buf, sizeof(buf),
+                  "  探索温度成员: 根 %.2f -> 终 %.2f —— 注意这两个成员在本工程里"
+                  "**没有读取点** (exploreAndTrain 写死 0.7, trainSelfPlay 用传参)\n",
+                  (double)exploringTempRoot, (double)exploringTempFinal);
+    out += buf;
+
+    const int experts = moeExpertCount();
+    if (experts > 0) {
+        std::vector<long long> usage;
+        moeUsage(usage);
+        long long mx = 0, sum = 0;
+        for (std::size_t i = 0; i < usage.size(); i++) {
+            mx = std::max(mx, usage[i]);
+            sum += usage[i];
+        }
+        if (sum > 0) {
+            const double mean = (double)sum / (double)usage.size();
+            const double ratio = (mean > 0.0) ? (double)mx / mean : 0.0;
+            /* 路由偏斜是**规格**读数: 坍缩到少数专家时"专家数"等于白给 (靠辅助损失拉) */
+            std::snprintf(buf, sizeof(buf),
+                          "  MoE: %d 专家 topK=%d | 路由累计 最大 %lld / 均值 %.1f = %.2fx%s\n",
+                          experts, moeTopK(), mx, mean, ratio,
+                          (ratio > 2.0) ? " (偏斜: 靠 moeAuxCoef 的均衡损失往回拉)" : "");
+            out += buf;
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "  MoE: %d 专家 topK=%d | 还没有前向统计 (usage 全 0)\n",
+                          experts, moeTopK());
+            out += buf;
+        }
+    } else {
+        out += "  MoE: 无 (MLP 骨干: 没有路由, moeAuxCoef 不起作用)\n";
+    }
+
+    std::snprintf(buf, sizeof(buf),
+                  "  容量: 主干 %s / hidden %d = %lld 参数 + 双头 %lld 参数 "
+                  "(参数多只说明容量, 与棋力无关)\n",
+                  backboneName(backbone), hiddenDim,
+                  trunkParamCount(), headParamCount());
+    out += buf;
+
+    const float loss = getLastTrainLoss();
+    if (std::isfinite(loss)) {
+        std::snprintf(buf, sizeof(buf),
+                      "  最近训练损失: %.5f (TD 的 MSE: 只说明网络与自己的目标一致; "
+                      "与别的 agent 量纲不同、不可比, 更不是棋力)\n",
+                      (double)loss);
+    } else {
+        out += "  最近训练损失: 未上报 (NaN: 还没做过一次批更新)\n";
+    }
+
+    out += "以上是表示/口径事实, **不是棋力**; 棋力请用 bench_anchor 的锚点对局 "
+           "(Elo 差带 95% 区间)\n";
+    return out;
+}

@@ -74,29 +74,67 @@ class ISparseMoE;
 class SACAZAgent : public AgentBase
 {
 public:
-    /* ---- 状态编码 ----
-       17 个平面 = 14 棋子平面 + 3 规则上下文 (无吃子进度 / 重复次数 / 将军)。
-       规则上下文是本轮从 DQNAB 推广过来的 (见 src/chessstate.h): 象棋是双人零和、
-       完全信息、交替行动的 Markov Game, 而**裸棋盘 + 轮到谁不是 Markov 状态** ——
-       三次重复判和、60 回合无吃子判和都依赖历史, 而它们决定终局。
-       只喂棋子平面时「同一局面的第 2 次与第 3 次出现」编码成同一个向量, V(s) 就不是
-       s 的函数。 */
+    /* ================================================================
+     *  状态/动作表示: **编译期二选一** (2026-09 回归排查的结论)
+     * ================================================================
+     *
+     *  `SACAZ_ALIGNED_REPR` 未定义 (默认) = **改前表示**: 17 平面 + 128 槽哈希动作。
+     *  定义它 (= 1) = **与 PPOMCTSAgent 对齐的表示**: 19 平面 + 8100 双射动作。
+     *
+     *  为什么默认是"退回去": 两套表示在**同一套工具、同一协议、同一随机种子、
+     *  同一个 moe-mlp 骨干**下量出来的差距是决定性的 (随机权重, 对 MCTS 80 局):
+     *
+     *      改前 1263 / 128 槽 :  72.5%  [61.9, 81.1]   (另一颗种子复核 68.8%)
+     *      对齐 1710 / 8100   :  45.0%  [34.6, 55.9]
+     *
+     *  两个区间不重叠 ⇒ 对齐在**当前数据量**下净亏约 200 Elo。逐项消融排除了
+     *  用户最初怀疑的三项 (奖励塑形 / 温度 α / 抑制 critic), 也排除了"隐藏层不足"
+     *  (§4: 加宽隐藏层在两种表示下都更差)。真正的机制是**动作头宽度**:
+     *  策略头参数从 8,192 涨到 518,400 (63 倍) 而瓶颈 h=64 不动 ⇒ 参数/数据比失衡,
+     *  106 局自对弈的数据撑不起 8100 路输出的策略头。
+     *
+     *  所以:
+     *    * **默认**用改前表示 (实测更强, 也是界面一直的默认);
+     *    * 对齐表示保留为**可编译进来的选项**, 供"数据量足够时重新评估"用;
+     *    * 两边都保留 critic 值域约束与 Huber —— 它们在**两种**表示下都不损失棋力
+     *      (改前表示 + 钳位 = 73.1%, 与不加钳位的 72.5% 同水平)。
+     *
+     *  完整数据与复现命令见 docs/sac_regression_2026_09.md。
+     * ================================================================ */
     static constexpr int CELLS = 90;                  /* 10x9 */
-    static constexpr int PLANES = 17;                 /* 14 棋子 + 3 规则上下文 */
-    static constexpr int PLANE_HALFMOVE = 14;
-    static constexpr int PLANE_REPEAT   = 15;
-    static constexpr int PLANE_CHECK    = 16;
-    /*
-       **为什么这里不用"整平面铺满"的写法**: 本 agent 的状态在回放池里是**稀疏格列表**
-       (cells, 见 Transition), 只有"某格上有子"这类 1 才进得去。规则上下文是全局标量,
-       "铺满 90 格"等于凭空塞进 270 个非零格。所以它们跟在 14 个平面**之后**,
-       占 3 个标量槽 (通道), 由 Transition 的 ctx[3] 随身携带 —— 语义完全一样,
-       只是布局对稀疏表示友好。
-    */
-    static constexpr int CTX_BASE = 14 * CELLS;       /* 1260 */
-    static constexpr int STATE_DIM = CTX_BASE + 3;    /* 1263 */
+    static constexpr int PIECE_PLANES = 14;           /* 7 类棋子 x {己方, 对方} */
+
+#if defined(SACAZ_ALIGNED_REPR) && SACAZ_ALIGNED_REPR
+    static constexpr bool ALIGNED_REPR = true;
+#else
+    static constexpr bool ALIGNED_REPR = false;
+#endif
+
+    /* ---- 上下文个数: 对齐 = 5 (与 PPOMCTS 同), 改前 = 3 (无吃子/重复/将军) ---- */
+    static constexpr int CTX_COUNT = ALIGNED_REPR ? 5 : 3;
+    /* ---- 平面数 / 状态维 ---- */
+    static constexpr int PLANES = PIECE_PLANES + CTX_COUNT;   /* 19 或 17 */
+    static constexpr int CTX_BASE = PIECE_PLANES * CELLS;     /* 1260: 棋子区之后是上下文 */
+    /* 对齐: 上下文铺成整平面 (与 PPOMCTS 逐位相同) -> 14..18 平面
+       改前: 上下文只占尾部 3 个标量槽 (稀疏回放友好)      -> 1260..1262 */
+    static constexpr int STATE_DIM = ALIGNED_REPR ? (PLANES * CELLS) : (CTX_BASE + CTX_COUNT);
+    /* 上下文平面序号 (只在 ALIGNED_REPR 下有意义) */
+    static constexpr int PLANE_MATERIAL = 14;         /* CTX_MATERIAL: 子力阶段 */
+    static constexpr int PLANE_TEMPO    = 15;         /* CTX_TEMPO:    总手数阶段 */
+    static constexpr int PLANE_HALFMOVE = ALIGNED_REPR ? 16 : 14;   /* 无吃子进度 */
+    static constexpr int PLANE_REPEAT   = ALIGNED_REPR ? 17 : 15;   /* 重复次数 */
+    static constexpr int PLANE_CHECK    = ALIGNED_REPR ? 18 : 16;   /* 是否被将 */
+
     /* ---- 动作编码 ---- */
-    static constexpr int ACTION_DIM = 128;
+    static constexpr int LEGACY_ACTION_DIM = 128;
+    static constexpr int ALIGNED_ACTION_DIM = CELLS * CELLS;        /* 8100 */
+    static constexpr int ACTION_DIM = ALIGNED_REPR ? ALIGNED_ACTION_DIM : LEGACY_ACTION_DIM;
+
+    /*
+       运行时消融开关 (只在**对齐**表示下有意义): 把动作退回 128 槽哈希, 用来单独
+       隔离"动作空间"这个变量。ALIGNED_REPR=1 编译进来时可用, 否则恒为 false。
+    */
+    bool legacyHashAction = false;
 
     /* ----------------------------------------------------------------
      *  骨干 (backbone): 决定 actor / critic 的中间层长什么样
@@ -122,6 +160,61 @@ public:
     };
     static const char *backboneName(Backbone b);
 
+    /*
+       ================================================================
+       隐层激活: 59e5233 用的是 `Layer<Tanh>`, 而**不能**用 TanhNorm 去"复现"它
+       ================================================================
+       背景: 这一层激活在**未提交的工作区改动**里被从 `RL::Layer<RL::Tanh>` 换成了
+       `RL::TanhNorm<RL::Sigmoid>`, 后者让随机权重下的棋力掉 26 个点 (对 MCTS 70%
+       -> 44%)。改回 `Layer<Tanh>` 之后当前 agent 与 59e5233 逐手等价
+       (tools/verify_sac_equiv_59e5233.ps1)。**现在 buildNet 与 59e5233 是逐字相同的
+       代码**, 所以"复现那一层"靠的是"同一行代码", 不需要任何开关。
+
+       ---- 一条被实测否掉的"等价写法" (留在这里, 省得下次再想一遍) ----
+       曾经试过用 `RL::TanhNorm<RL::Linear>` 且 `r = 1` 来"复现"那一层, 理由是
+       "tanh 套在外面、Fn = 恒等、r = 1 ⇒ 就是 tanh(Wx+b)"。**这个推理是错的**:
+       `TanhNorm::forward` 把偏置加在 tanh **外面**
+           o1 = W·x;  o1 *= r;  o2 = tanh(o1);  o = Fn::f(o2 + b)
+       即 `tanh(r·Wx) + b`; 而 `Layer<Tanh>::forward` 是 `tanh(W·x + b)`。
+       两者只在 b ≡ 0 时相同, 偏置非零时**不是同一个函数**。
+       实测 (test_sacaz 的 [14] 节, 同权重同局面, 稀疏 MLP 专家骨干):
+       max|Δπ| = 1.8e-07, **max|ΔQ| = 8.9e-06** —— 既不逐位, 也不是"浮点噪声级"。
+       而且这个错误当时**测不出来**: 那个开关写成了普通成员, 赋值发生在构造函数建网
+       **之后** ⇒ 静默空操作, 于是"两个变体是否等价"的检查永远通过。
+       教训与 docs/sac_regression_2026_09.md §7 第 2 条同源: **"数学上看着等价"不算数,
+       要拿同一输入比输出**。结论: 需要 59e5233 的那一层, 就用 `Layer<RL::Tanh>` 这一行
+       本身。
+
+       `hiddenActivationName()` 保留下来当**回归指示器**: 它读的是 actor 第 2 层的
+       真实类型, 以后谁再动这一层 (换成 Sigmoid / TanhNorm / 加一层), 自检面板上会直接
+       显示出来 —— 上一轮那个 26 个点的回归, 面板上原本一个字都看不出来。
+    */
+    const char *hiddenActivationName() const;
+
+    /*
+       ---- "我是界面上的哪一支" ----
+       自检面板第一行必须能回答这个问题。基类里它是**虚函数**而不是写死的字符串,
+       因为 59e5233 复现版是**派生类** (SACAZLegacyAgent, 见 src/sacazlegacyagent.h),
+       它复用同一份算法但口径不同 —— 若第一行还印"AGENT_SACAZ", 看面板的人会把
+       两套口径的读数混成一个 agent (本文件顶部那条"一个类背着两个界面类型"的教训
+       是同一个坑的第一次)。
+    */
+    virtual const char *guiAgentLabel() const;
+
+    /*
+       ---- 权重文件前缀 (把"是哪一个类"与"写到哪个文件"绑在一起) ----
+       用户口径 (2026-09): **新旧 SAC 的权重文件必须用不同名字**。
+       为什么不能共用一个前缀:
+         * 两者可训练的口径不同 (见 SACAZLegacyAgent 的头注释: 熵比 / alpha 学习率 /
+           critic 值域约束 / 叶子估值口径), 同一局面对弈会被训成两组不同的权重;
+           共用一个前缀 = 后训练的那一支**静默覆盖**另一支, 而界面上一切正常;
+         * 载入也一样: 载进来的权重看起来"能用" (结构指纹相同), 于是错的那一份会被
+           当成对的那一份用。
+       所以前缀跟着**类**走 (基类一个、派生类一个), 界面按 agent 类型取默认值,
+       不靠各处手抄字符串。派生类的返回值见 SACAZLegacyAgent。
+    */
+    static const char *defaultWeightPrefix();
+
     /* 各骨干的固定结构 (模板参数必须编译期确定, 所以不做成运行时成员) */
     static constexpr int MOE_MLP_EXPERTS = 8;
     static constexpr int MOE_MLP_TOPK = 2;
@@ -141,17 +234,25 @@ public:
         std::vector<std::uint16_t> cells;      /* 当前局面: plane*CELLS + cell */
         std::vector<std::uint16_t> nextCells;  /* 下一局面 (同一编码) */
         /*
-           规则上下文 (无吃子进度 / 重复次数 / 将军) —— 它们**不是**"某个格子上的 1",
-           所以进不了上面的稀疏格列表, 必须单独随身携带: 否则训练时 expandSparse()
-           重建出来的状态会丢掉规则上下文, 编码就退回成"裸棋盘" (静默失效)。
+           规则/阶段上下文 (5 个, 与 PPOMCTS 的 plane 14..18 同值) —— 它们**不是**
+           "某个格子上的 1", 所以进不了上面的稀疏格列表, 必须单独随身携带:
+           否则训练时 expandSparse() 重建出来的状态会丢掉上下文, 编码就退回成
+           "裸棋盘" (静默失效)。
         */
-        float ctx[3] = { 0.0f, 0.0f, 0.0f };
-        float nextCtx[3] = { 0.0f, 0.0f, 0.0f };
+        /*
+           上下文用**值初始化** `{}` 而不是写死 5 个 0 —— CTX_COUNT 会随表示开关变
+           (对齐 5 / 改前 3), 写死个数在另一个表示下就是"初始化项太多"的编译错误。
+        */
+        float ctx[CTX_COUNT] = {};
+        float nextCtx[CTX_COUNT] = {};
         float pi[ACTION_DIM];                  /* 策略目标 (MCTS 访问分布) */
-        std::uint64_t curMaskLo = 0;           /* 当前局面合法走法掩码 (策略损失要用) */
-        std::uint64_t curMaskHi = 0;
-        std::uint64_t nextMaskLo = 0;          /* 下一局面合法走法掩码 (软备份要用) */
-        std::uint64_t nextMaskHi = 0;
+        /*
+           合法走法掩码: 8100 位 -> 两个 uint64 (`mask[0]` = 动作 0..63)。
+           为什么不是 128 个 bool: 回放池里条目数上万, 128B/条只是为掩码就多占几 MB,
+           而位图只要 16B (与改动前 128 槽时用 16B 位图的成本完全一样)。
+        */
+        std::uint64_t curMask[2] = { 0, 0 };   /* 当前局面合法走法掩码 (策略损失要用) */
+        std::uint64_t nextMask[2] = { 0, 0 };  /* 下一局面合法走法掩码 (软备份要用) */
         int action = 0;                        /* 实际走的动作索引 */
         int legalCount = 1;                    /* 当前局面合法走法数 (目标熵用) */
         float reward = 0.0f;
@@ -244,6 +345,192 @@ public:
     int replayEpochs = 1;
 
     /*
+       [诊断/对照] 搜索期软价值的缩放因子 (默认 1.0 = 与改动前逐位一致)。
+       只作用于**搜索**的叶子估值 (`searchValueFrom`), 不动学习侧的目标
+       (`softValueFrom` 仍然照原样给 critic 的软备份用)。
+
+       为什么需要它: 训练后的 critic 尺度会漂到 |Q|≈13 且几乎无区分度, 而搜索用的是
+       PUCT `Q + c_puct·P·√N/(1+n)` —— Q 的量级一旦远大于探索项, 搜索就退化成
+       "按 Q 排序", 丢掉先验与访问计数的信息。把 Q 缩回初始量级可以**单独**检验
+       "是 critic 的尺度把搜索弄坏了" 这个假设 (见 docs/arena_sac_vs_ppo_report.md §7)。
+    */
+    float valueScale = 1.0f;
+
+    /* 搜索用: valueScale · softValueFrom(...) */
+    float searchValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
+                          const RL::Tensor &q1In, const RL::Tensor &q2In) const
+    {
+        return valueScale * softValueFrom(pi, mask, q1In, q2In);
+    }
+
+    /*
+       ================================================================
+       稀疏头推理 (R1 同款, 2026-09 对齐 8100 动作时必须补上)
+       ================================================================
+       为什么必须补: 动作空间从 128 槽换成 8100 双射之后, 每次叶子估值都要算 8100 个
+       Q 值, 而一个局面只有 ~44 个合法着法 —— 实测每步从 55 ms 涨到 **216 ms**
+       (同一个 MCTS 预算下)。这不是算法变贵, 是**算了一大堆永远不会被走到的列**。
+
+       `qValuesSparse` / `policySparse` 只算 legalIdx 那几列:
+         * 骨干 (forwardTrunk) 照常跑一次;
+         * 头用 `iFcLayer::sparseLogits` 只算这几行 (PPO 的 R1 已经验证过它与全量前向
+           逐元素一致, test_ppomcts 的 R1 一节);
+         * 策略在**合法集上**归一化 (与 maskedSoftmax 的 Z≡1 口径等价, 因为非法列
+           本来就恒为 0)。
+
+       返回 false = 走不了稀疏路径 (头不支持 / 下标越界), 调用方**必须**回退全量口径 ——
+       与 `RL::PPO` 的做法完全一致 (那条判据在 ilayer.h 里有详细说明, 包括"加了新层类型
+       却忘了实现时行为是慢而不是错")。
+    */
+    bool policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                      std::vector<float> &piOut);
+    bool qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                       std::vector<float> &q1Out, std::vector<float> &q2Out);
+    /* legalIdx 上的软价值: E_π[min Q − α log π] (π 是合法集上的策略, 由本函数内部算) */
+    bool softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                         double &valueOut);
+
+    /*
+       [消融] 搜索的叶子估值是否走稀疏头 (默认 true)。
+       为什么留这个开关 (2026-09 回归排查): 动作空间从 128 变成 8100 时, 全量叶子估值
+       要算 8100 列 Q (实测 216 ms/步), 所以加了稀疏路径。但**在改前表示 (128 槽) 下**
+       全量只需要算 128 列, 稀疏路径省不了什么, 反而多走了 `forwardTrunk` + 稀疏头这条
+       与训练路径不同的代码 —— 于是两个口径之间任何一点差异都会被放大成棋力差。
+       关掉它就退回"与改动前逐位相同"的求值方式。
+    */
+    bool sparseLeafEval = true;
+
+    /*
+       ================================================================
+       critic 值域约束 (2026-09 新增, 修的是实测到的**发散**)
+       ================================================================
+       实测 (docs/arena_sac_vs_ppo_report.md §5.2, 工具 --mode=probe):
+
+           权重         |Q| 均值      Q 区间
+           随机初始化     0.063      [-0.14, 0.10]
+           自对弈 40 局   4.146      [-4.41, -3.63]
+           自对弈 150 局 13.381      [-14.06, -11.94]
+
+       单调发散, 而且**所有动作一起变负** ⇒ 不是在学更好的排序, 而是在整体漂移。
+       后果不是"数值不好看", 而是**搜索坏掉**: 叶子估值就是 softValueFrom(...),
+       而 PUCT 是 `Q + c_puct·P·√N/(1+n)` —— Q 的量级一旦压过探索项, 先验与访问
+       计数提供的信息被淹没, 于是对 MCTS 的得分率从 73.3% 掉到 32.5%。
+
+       为什么会发散: 即时奖励上界只有 0.35 (REWARD_MATERIAL_COEF × 一方满子),
+       终局 ±1, 所以**真实 Q 必然落在 [-1.5, 1.5] 量级内**; 但软备份
+       `y = r − γ(1−done)·V(s')` 把 V 反复回代, 而优化器 (RMSProp + clipGrad,
+       按向量归一) 没有任何把 V 拉回该区间的机制 ⇒ 正反馈发散。
+
+       修法 (两条, 都要, 因为它们的**性质不同**):
+         1. `clampTarget` —— **结构性**: 目标 y 直接夹到 [−2, 2]。这不是启发式,
+            而是把"这个游戏的 Q 值域"写进目标 (与 DQN 的 reward clipping 同一思路,
+            但更弱: 只夹目标、不夹奖励, 所以不改变 MDP 的排序, 只挡住发散);
+         2. `huberDelta` —— **鲁棒性**: |err| > δ 时损失从平方变成线性 (Huber),
+            单个离群样本不会再把 32 条样本的批平均方向带跑。
+        `clampTarget <= 0` 可以把第 1 条关掉 (A/B 对照用, 用来证明"发散就是主因")。
+    */
+    float clampTarget = 2.0f;    /* <=0 表示不夹 (对照用) */
+    float huberDelta = 1.0f;     /* <=0 表示用纯 MSE (对照用) */
+
+    /*
+       [诊断/消融] 即时奖励的整体缩放 (默认 1.0 = 与改动前逐位一致)。
+       为什么需要它: 奖励 = 材质(0.1 x 子力) + 每步代价, 而终局是 ±1 —— 也就是说
+       **即时奖励只占终局奖励的百分之几**。把它整体放大/缩小可以单独检验
+       "奖励塑形的尺度是不是在帮忙"。只缩放即时项, **不动终局 ±1**
+       (终局是环境的真值, 缩放它等于换一个游戏)。
+    */
+    float rewardScale = 1.0f;
+
+    /*
+       ================================================================
+       终局/材质塑形方案 (2026-09, 用户提议的实验旋钮)
+       ================================================================
+       背景 (用户实测): "59e5233 还原版" 对 MCTS 的**奖励累计**能到对手的 2 倍, 但很多局
+       在 300 手判和 —— 吃着子却赢不了, 怀疑是奖励结构把"吃子"抬得太高、把"将死"压得
+       太低。这个旋钮把它变成可测量的问题:
+
+         rewardShape = 0 (默认) : 现状。即时 = 材质 x REWARD_MATERIAL_COEF + 每步代价;
+                                  终局 = ±1 (REWARD_TERMINAL)
+         rewardShape = 1        : **去掉材质**。即时只留每步代价 (-0.001) -> 终局 ±1 成为
+                                  唯一的学习信号 (纯胜负/和棋)
+         rewardShape = 2        : **终局放大**: |终局| x (1 + 败方剩余材质/满材质),
+                                  取值 [1, 2) —— "对方兵力越完整就被将死 = 越值钱"
+                                  (即快杀 > 磨死)
+
+       用户原话是"环境奖励乘以 (1 + 最终棋子数/总棋子数)"。两点必须说清楚 (见 docs):
+         * "**最终**棋子数"在**即时奖励**上不可实现 —— 在线 TD 里落子时并不知道结局;
+         * 所以这个量只能落在**终局**上, 那是唯一"结局已确定"的时刻。本旋钮就是这么做
+           的 (方案 2), 而且把它同时用于**搜索叶子**与**训练目标**, 两者不许分叉。
+         * "整个 episode 的奖励乘一个系数"这种写法在本算法里**做不到**: SAC 是
+           off-policy 回放, 一条经验可能在局终之前就被学过好几次, 事后改它的 reward
+           等于改历史 (对已更新过的权重无效, 对没学到的又是另一套口径)。要做这种缩放
+           只能换成蒙特卡洛回报 —— 那是换个算法, 不是调奖励。
+
+       **只有一个出口**: 终局值有**三**个产生点 (搜索叶子 `terminalValue` / 自对弈
+       `resultValue` / rollout 的 `outcomeForMover`), 三者口径不一致的话, 搜索估的与
+       训练学的就是两个游戏 —— 所以三个点全部走 `terminalReward()`, 由它一家说了算。
+       (`agentrollout.hpp` 用 SFINAE 检测这个可选成员: 有就用, 没有就退回共享的
+       `outcomeForMover`, 于是其它 agent 一行都不用改。)
+    */
+    int rewardShape = 0;
+
+    /*
+       终局值 —— 塑形方案的**唯一**出口。
+       `perspective` = 视角方 (语义与 chess.h 的 `outcomeForMover` 一致: 返回 +1 表示
+       这个颜色赢了); 三个调用点传的都是"该视角的颜色": rollout 里是**刚走子**的一方
+       (他可能就是赢家), 搜索里是**轮到走**的一方 (终局节点上他是被将死的那一方)。
+    */
+    float terminalReward(int chessResult, int perspective) const;
+
+    /*
+       ================================================================
+        [2026-09 新] 每次真实决策都从**自己的搜索**学一次 (AlphaZero 的核心信号)
+       ================================================================
+       用户实测报的现象: "界面对弈里只有勾上 rollout(探索+预训练) 才有损失曲线、
+       对弈过程才会训练"。代码上确实如此 ——
+
+         * 界面的 per-move 学习**完全**由 ChessBoard::preTrainThenDecide 驱动, 而那个
+           函数被 `preTrainCheck` 直接短路 (`m_preTrainEnabled` 关掉就直接返回);
+         * 而 SAC 在整局里唯一的学习来源就是 exploreAndTrain 的 rollout, 那条路径写进
+           去的样本是 `hasSearch=false` —— 也就是**搜索算出来的 π_MCTS 被丢掉了**。
+           AlphaZero 的监督项在对弈中一次都没用上 (只有后台训练 trainSelfPlay 用它)。
+
+       结果: 关掉 rollout 就完全不学; 开着也只是"从自己策略滚 64 步 + 更新一次",
+       而那个 256 次模拟的搜索成果直接扔掉。
+
+       本开关把这一步补上: **选完真实走法之后**, 把 (s, π_MCTS, a, r, s', done) 存进
+       回放池 (hasSearch=true), 并做一次 learnBatch。于是
+         * 对弈中**总会**训练 (不再依赖 rollout 勾选框);
+         * 策略终于收到自己的搜索结果当监督 —— 那正是它比自身策略更准的地方;
+         * 代价只有一次棋盘试走/回退 + 一次已经存在的 learnBatch (搜索本身早已付过)。
+       `learnFromSearch = false` 恢复改动前的行为 (只在 rollout / 自对弈里学)。
+       **派生类 SACAZLegacyAgent 固定为 false**: 59e5233 没有这条路径, 它的口径要钉住。
+    */
+    bool learnFromSearch = true;
+
+    /*
+       把这一步的真实决策存成一条 AlphaZero 样本 (hasSearch=true) 并按需更新一次。
+       返回 true = 做过一次 learnBatch (界面据此上报损失曲线的点)。
+       `piVisit` = 根节点的访问分布 (visitDistribution), `actionIdx` = 树里那一步的下标
+       (父节点的 parentAction, 与 π 的下标同一套编码)。
+    */
+    bool learnFromSearchStep(int color, int actionIdx, const Step &step,
+                             const RL::Tensor &piVisit);
+
+    /*
+       诊断 (只读上界面/自检, 不参与任何计算): 最近一次 learnBatch 里
+         m_maxAbsTarget : 夹过之后 |TD 目标| 的最大值 —— 它应当稳定在 ~1 附近
+                          (终局 ±1 + 即时奖励 0.35 的量级)。持续上涨 = 又在发散。
+         m_maxAbsTdErr  : |Q(s,a) − y| 的最大值 —— 发散时这个数会先于 loss 爆掉。
+       这两个读数是为了让"critic 是否发散"**当场可看**, 而不是只能靠离线探针
+       (--mode=probe) 事后发现。见 docs/arena_sac_vs_ppo_report.md §5.2。
+    */
+    double m_maxAbsTarget = 0.0;
+    double m_maxAbsTdErr = 0.0;
+    double getMaxAbsTarget() const { return m_maxAbsTarget; }
+    double getMaxAbsTdErr() const { return m_maxAbsTdErr; }
+
+    /*
        [R2] **本 agent 的 R2 口径是结构性的, 不是一个开关**: 掩码 softmax
        (maskedSoftmax) 决定了非法动作 π ≡ 0, 而策略梯度的 g 在非法列上恒为 0 + 掩码
        雅可比也给出 dz ≡ 0, 于是非法列的头部权重梯度**恰好为 0** —— 与 RL::PPO 的
@@ -271,8 +558,7 @@ private:
     RL::Tensor m_q1, m_q2;    /* critic 输出副本 */
     /* pick 回调算出来的掩码, 供紧接其后的 onTrans 复用 (同一步之内有效) */
     int m_pendingLegalCount = 1;
-    std::uint64_t m_pendingMaskLo = 0;
-    std::uint64_t m_pendingMaskHi = 0;
+    std::uint64_t m_pendingMask[2] = { 0, 0 };
 
 public:
     /* ----------------------------------------------------------------
@@ -286,16 +572,22 @@ public:
     void encodeSparse(int color, std::vector<std::uint16_t> &cells) const;
     static void expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state);
     static void denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells);
-    /* 规则上下文的读写 (放在平面之后的那 3 个槽; 见 STATE_DIM 的说明) */
-    static void contextOf(Chess &c, int color, float out[3]);
-    static void writeContext(RL::Tensor &state, const float ctx[3]);
-    static void readContext(const RL::Tensor &state, float out[3]);
+    /* 规则/阶段上下文的读写 (放在 plane 14..18; 与 PPOMCTS 同值同序) */
+    static void contextOf(Chess &c, int color, float out[CTX_COUNT]);
+    static void writeContext(RL::Tensor &state, const float ctx[CTX_COUNT]);
+    static void readContext(const RL::Tensor &state, float out[CTX_COUNT]);
 
     void getLegalActions(int color,
                          std::vector<Step*> &steps,
                          std::vector<int> &actionIndices,
                          RL::Tensor &actionMask);
-    int stepToActionIdx(const Step &s);
+    /*
+       动作索引是 `Step` + 走棋方的**纯函数**, 所以是 const。
+       为什么要带 color: 与状态一样要按**规范视角**镜像 (黑方 x->9-x), 红黑双方的
+       "同一步棋"才会共享同一个动作槽位 —— 这是"一套权重服务双方"的另一半
+       (状态镜像在本文件, 动作镜像必须同一口径; PPOMCTS 的 stepToActionIdx 同签名)。
+    */
+    int stepToActionIdx(const Step &s, int color) const;
     float computeReward(const Step &s, int color);
 
     /* ----------------------------------------------------------------
@@ -313,9 +605,9 @@ public:
      */
     static void maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
                                       RL::Tensor &dz);
-    /* 合法掩码 <-> 位图 */
-    static void maskToBits(const RL::Tensor &mask, std::uint64_t &lo, std::uint64_t &hi);
-    static void bitsToMask(std::uint64_t lo, std::uint64_t hi, RL::Tensor &mask);
+    /* 合法掩码 <-> 位图 (8100 位 = 2 x uint64; `bits[0]` 是动作 0..63) */
+    static void maskToBits(const RL::Tensor &mask, std::uint64_t bits[2]);
+    static void bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask);
 
     /* ----------------------------------------------------------------
      *  网络前向 / 软价值
@@ -376,8 +668,12 @@ public:
        是同一条机制。
     */
     void resetMoeBatchStats();
-    /* 把 getResult 的返回值换算成 color 视角的 ±1/0; 未结束返回 false */
-    static bool resultValue(int result, int color, float &out);
+    /*
+       把 getResult 的返回值换算成 color 视角的终局值; 未结束返回 false。
+       **不再是 static**: 它要经过 `terminalReward()` (塑形方案的唯一出口), 而那个
+       需要读棋盘 (rewardShape=2 要看败方剩余兵力)。见 rewardShape 的说明。
+    */
+    bool resultValue(int result, int color, float &out);
     void trainSelfPlay(int episodes, int simulations_, int maxMoves = 200,
                        bool verbose = true, float tempRoot = 1.0f,
                        float tempFinal = 0.25f, int learnEveryMoves = 4);
@@ -403,6 +699,36 @@ public:
     Step getBestMove(int color) override;
     std::string getName() const override;
     bool exploreAndTrain(int color, int rolloutSteps) override;
+
+    /* ----------------------------------------------------------------
+     *  自检 (界面"模型自检"面板) —— 契约与口径见 aiagent.h 的 selfCheckReport
+     *
+     *  为什么这个类特别需要它: **一个类背着两个界面 agent 类型** ——
+     *  AGENT_SACAZ (backbone = Mlp) 与 AGENT_SACAZ_MOE (backbone = SparseMoeTb,
+     *  GUI 标签 SAC+AZ-MoE)。两者的参数量、每次前向的耗时、有没有路由都完全不同,
+     *  所以报告**第一行**就报 backboneName(backbone) 与它对应的界面类型: 没有这一行,
+     *  看面板的人会把两个骨干的差别记到错的账上 (例如把 TB 专家贵 3 ms/前向 读成
+     *  "这个 agent 就是慢", 而同一份代码配 MLP 骨干并不慢)。
+     *
+     *  报告三类事实 (全是**结构 / 口径**, 一条棋力结论都没有):
+     *    1. **表示健康度**: 状态 = 14 棋子平面 x 90 格 + 3 个规则上下文标量
+     *       (规则历史在本编码里**可观测**, 与 PGE/DQN 的 90 维相反); 动作 = 128
+     *       槽位哈希, 而真实走法空间是 8100 个 (from,to) 对 —— 所以在**标准开局**
+     *       (确定性参照点) 与**当前局面**上各报一份别名读数。别名是策略精度的
+     *       结构性上限, 不是训练量的问题。
+     *    2. **算法 / 口径**: 双 critic + 目标网 + Polyak 同步周期、最大熵叶子价值
+     *       min_i Q_i − α·log π、α / 熵比 / azWeight / c_puct / 模拟数 / 学习率,
+     *       以及**终局取真实胜负而不是自举** (这是局末价值目标可信的原因)。
+     *    3. **骨干与训练进度**: 参数量、专家数 / topK、MoE 使用直方图与均衡判读
+     *       (某专家计数为 0 = 路由坍缩)、learnSteps / 批大小 / epochs / 池 /
+     *       叶子评估次数 / 最近一次 critic MSE (NaN = 还没上报)。
+     *
+     *  **只读、可重复、不动棋盘**: 全部走 `chess` 的副本 (`Chess probe(chess)`),
+     *  绝不碰 `this->chess` (面板会在对局中途被 GUI 线程调用, 而那一刻搜索线程可能
+     *  正拿着同一个棋盘)。不跑搜索、不跑前向、不读写权重 —— 只读现成的计数器,
+     *  预算几毫秒。
+     * ---------------------------------------------------------------- */
+    std::string selfCheckReport() const override;
 
     /* 统计 */
     long long getLeafEvals() const { return m_leafEvals; }

@@ -44,6 +44,25 @@ constexpr int PPO_MOE_TOPK     = 1;
 using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
 
 /*
+ * ================================================================
+ *  MLP 专家配置 (2026-09: 从"唯一骨干"变成"两个骨干之一")
+ * ================================================================
+ * 上面那套 TB 专家是现役骨干, 而 E=8 / top-2 的 **MlpExpert** 配置并没有被删掉 ——
+ * 它现在由**另一个 agent** 使用 (界面上的 "PPO+MCTS (AlphaZero, MLP专家)",
+ * ChessBoard::AGENT_PPOMCTS_MLP), 于是可以在同一个算法下直接对弈比较两种骨干:
+ *
+ *   配置                        参数量     前向       前向+反向
+ *   MlpExpert        E=8 top-2   2.15 M   0.139 ms    1.94 ms
+ *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms
+ *
+ * (数字来自 ppo.h 上面那张实测表; MLP 专家便宜 ~25×、容量小 ~18×。)
+ * 选择方式见 `PPO::Backbone` —— 运行时参数, 默认仍是 TB 专家, 所以现役 agent、
+ * 测试与 bench 的行为**逐位不变**。
+ */
+constexpr int PPO_MOE_MLP_EXPERTS = 8;
+constexpr int PPO_MOE_MLP_TOPK    = 2;
+
+/*
  * Simplified PPO for AlphaZero-style Chinese Chess.
  *
  * 骨干 (2026-09 第二次改版): **专家从 MlpExpert 换成 TransformerBlock**。
@@ -105,6 +124,28 @@ public:
     static constexpr int MOE_TOPK     = PPO_MOE_TOPK;
     static constexpr int MOE_TB_HEADS = PPO_MOE_TB_HEADS;
     static constexpr int MOE_TB_DFF   = PPO_MOE_TB_DFF;
+    /* MLP 专家那一套的别名 (E=8 / top-2) */
+    static constexpr int MOE_MLP_EXPERTS = PPO_MOE_MLP_EXPERTS;
+    static constexpr int MOE_MLP_TOPK    = PPO_MOE_MLP_TOPK;
+
+    /*
+     * ---- 骨干选择 (本工程的扩展, 2026-09) ----
+     * 上游 snakeAI 只有一种编译期骨干 (PPOExpert), 而"MLP 专家"这条配置在本工程里
+     * 已经被 SACAZAgent 用作对照骨干 (见它的 Backbone::SparseMoeMlp)。把它做成
+     * **构造参数**之后, 同一个 PPO 实现 (搜索、训练、存盘、诊断全部共用) 就能带两种
+     * 专家, 而不必复制一份 rl/ppo.cpp —— 复制才是真正的风险 (三份拷贝迟早漂移,
+     * 见 expert.hpp 顶部的教训)。
+     *
+     * 两种骨干的**结构差异只有 MoE 层里的专家类型与 (E, top-k)**; 其余层
+     * (Tanh(h) / Softmax / Linear 头)、损失、优化器、权重格式全部相同。
+     * 权重文件带结构指纹 (张量元素总数 == paramCount()), 所以两种骨干的检查点
+     * **互相拒绝载入**而不是静默串权重。
+     */
+    enum class Backbone {
+        TbExperts = 0,   /* TransformerBlock<16,360> 专家, E=4 top-1 (现役) */
+        MlpExperts       /* MlpExpert 专家, E=8 top-2 (便宜 ~25x, 容量小 ~18x) */
+    };
+    static const char *backboneName(Backbone b);
 
     PPO(){}
     explicit PPO(int stateDim, int hiddenDim, int actionDim,
@@ -114,7 +155,10 @@ public:
                  float moeAuxCoef = 0.1f,
                  /* false = 只推理 (不分配 g/v/m 梯度缓冲, 内存与构造时间约 1/4)。
                     多线程分身训练的 worker 用这个形态 —— 它们只做搜索不做反向。 */
-                 bool withGrad = true);
+                 bool withGrad = true,
+                 /* 骨干 (见上面的 Backbone)。**默认值 = 现役的 TB 专家**, 所以所有
+                    既有调用方 (agent / 测试 / bench / train_ppo) 行为逐位不变。 */
+                 Backbone backbone = Backbone::TbExperts);
     virtual ~PPO(){}
 
     /* Forward - returns policy (Softmax) probabilities */
@@ -234,6 +278,16 @@ public:
            (更糟的) 学习问题。空 = 不知道 -> 退回全量 8100 维口径 (旧行为)。
         */
         std::vector<int>   legalIdx;
+        /*
+          信任域 (2026-09): **采集这条样本时**的策略在该样本 legalIdx 上的概率
+          (`oldProb[k]` 对应 `legalIdx[k]`, 与 targetProb 同一子集空间)。
+          为什么要在**入库时**存: PPO 的 ratio 只能对"旧策略"取 —— 训练时 actor
+          已经被更新过若干次, 现场重算出来的 p 是**新策略**, 用它当分母等于恒等
+          比值 1, 裁剪项直接失效 (那是本仓库改版前的状态: 只有交叉熵, 完全没有
+          信任域, 见 rl/ppo.h 顶部"无 clip、无 KL 惩罚"那段自述)。
+          为空 = 旧口径 (没有信任域, 行为与改版前逐位相同)。
+        */
+        std::vector<float> oldProb;
         float valueTarget;
     };
 
@@ -272,7 +326,15 @@ public:
                               const std::vector<int> &legalIdx,
                               const std::vector<int> &targetIdx,
                               const std::vector<float> &targetProb,
-                              float valueTarget);
+                              float valueTarget,
+                              /*
+                                信任域 (可省): 与 legalIdx 等长的**旧策略**概率。
+                                给出时策略项从"纯交叉熵"换成 PPO 的裁剪代理目标
+                                  L = -min(rho*A, clip(rho,1±eps)*A),  rho = p_new/p_old
+                                再加上熵奖励项 (entropyCoef)。
+                                省略时行为与改版前逐位相同 (纯交叉熵)。
+                              */
+                              const std::vector<float> &oldProb = std::vector<float>());
 
     /*
        R2 总开关 (默认开)。关掉就退回"全量 8100 维 softmax + 全量目标"的旧学习问题 ——
@@ -287,7 +349,12 @@ public:
                    const std::vector<float> &actionProb,
                    float valueTarget,
                    /* R2: 该局面的完整合法着法 (可省; 省了就是旧的全量口径) */
-                   const std::vector<int> &legalIdx = std::vector<int>());
+                   const std::vector<int> &legalIdx = std::vector<int>(),
+                   /*
+                     信任域: 采集时策略在 legalIdx 上的概率 (与 legalIdx 等长, 可省)。
+                     省略 = 这一条不参与 ratio 裁剪 (退化成纯交叉熵), 调用方应尽量给。
+                   */
+                   const std::vector<float> &oldProb = std::vector<float>());
     /*
        从回放池随机采样 batchSize 条、过 epochs 遍, 累积梯度后做**一次**优化器更新。
        返回 false 表示池子不够大或 epochs<=0 (什么都没做)。
@@ -338,11 +405,51 @@ public:
 public:
     int stateDim;
     int actionDim;
-    int expertHidden;      /* MLP 专家的隐层宽度 (换回 MlpExpert 时才有意义) */
+    int expertHidden;      /* MLP 专家的隐层宽度 (只有 MlpExperts 骨干用它) */
+    /* 本实例的骨干 (构造时定, 之后不要改: 网络结构已经按它建好了) */
+    Backbone backbone = Backbone::TbExperts;
     float gamma;
     float exploringRate;
     /* 负载均衡辅助损失系数, <=0 关闭。与 SACAZAgent 的默认值一致 (0.1) */
     float moeAuxCoef;
+
+    /*
+       ================================================================
+       信任域 + 值域约束 (2026-09 新增, 修的是"名字叫 PPO 但没有 PPO 的机制")
+       ================================================================
+       本文件顶部原来自己写着"**无 clip、无 KL 惩罚、无 actorQ**" —— 也就是说策略项
+       就是 `cross-entropy(actor, MCTS 访问分布)`, 那是**行为克隆**, 不是 PPO。
+       实测 (docs/arena_sac_vs_ppo_report.md §5.4): 这个 agent 训练 150 局 / 400 局后
+       对同一个 MCTS 基线的得分率是 48.3% / 56.7% / 50.0%, **区间全部跨 50%**
+       (inconclusive) —— 策略确实在变尖 (熵 0.999 -> 0.906 -> 0.828), 但棋力没有
+       任何可测的变化, 和棋率极高 (PPO400 对 MCTS 是 2 胜 2 负 36 和)。
+
+       三个旋钮, 各自对应一条已知缺陷:
+         clipEps    : ratio 裁剪。ρ = p_new/p_old, 目标
+                      `L = -min(ρ·A, clip(ρ,1±ε)·A)`, A = t_a - p_old(a)。
+                      旧策略概率在**入库时**随样本存下 (见 ReplaySample::oldProb) ——
+                      训练时重算出来的只能是新策略, 拿它当分母等于没有信任域。
+                      `clipEps <= 0` 关掉 (退回纯交叉熵, 与改版前逐位一致)。
+         entropyCoef: 熵奖励。改版前策略**没有任何熵项**, 只能被搜索目标推着走,
+                      于是很容易收敛到"求稳/求循环"(和棋率 87% 就是这么来的)。
+         clampValue : critic 目标夹到 [-clampValue, +clampValue]。价值目标本身是
+                      折扣回报 (|r|<=1 + 势能塑形), 越界只可能来自自举发散;
+                      与 SACAZAgent 的 clampTarget 同一思路 (那边实测 |Q| 从 0.063
+                      漂到 13.4, 直接把搜索的 PUCT 打坏)。
+                       `clampValue <= 0` 关掉。
+    */
+    float clipEps = 0.2f;
+    float entropyCoef = 0.01f;
+    float clampValue = 2.0f;
+
+    /*
+       诊断钩子 (默认 nullptr = 零开销): 非空时 `accumulateGradSparse` 会把
+       (probs, g, dlogit) 三组各 n 个数按序 push 进去 —— 供 `test_grad` 直接核对
+       "解析梯度是否等于 p − t", 而不是在测试里用同一套公式重推一遍
+       (那样是"自己证明自己")。只在测试里挂, 生产路径不碰。
+    */
+    std::vector<float> *gradProbe = nullptr;
+
     int learningSteps;
     /*
      * 最近一次 trainStep 的标量损失 (界面"训练损失曲线"用, **不参与任何计算**):

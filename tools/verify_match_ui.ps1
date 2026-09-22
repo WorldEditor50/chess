@@ -18,16 +18,21 @@
 #   powershell -ExecutionPolicy Bypass -File tools/verify_match_ui.ps1
 #   powershell ... -File tools/verify_match_ui.ps1 -Games 2 -Full
 #   powershell ... -File tools/verify_match_ui.ps1 -AIndex 7 -BIndex 0 -Full
-#   powershell ... -File tools/verify_match_ui.ps1 -AIndex 8 -BIndex 0 -Full `
+#   powershell ... -File tools/verify_match_ui.ps1 -AIndex 9 -BIndex 0 -Full `
 #       -LogFile build\match_ui_app.log     # 顺便核对 "[weights] 保存" 的计时行
+#   :: 复现"对弈结束的静默保存 x 后台训练"那个崩溃场景 (2026-09 用户报的):
+#   powershell ... -File tools/verify_match_ui.ps1 -TrainIndex 5 -AIndex 5 -BIndex 0 `
+#       -Games 1 -Full -LogFile build\match_ui_crash.log
 #
 # Combo order in the window: 0 = 对战AI, 1 = A方, 2 = B方, 3 = 历史对局.
-# Agent order inside each agent combo: 0 Alpha-Beta, 1 MCTS, 2 PG, 3 DQN,
-# 4 PPO+MCTS, 5 DQN+MCTS, 6 EVAB, 7 SAC+MCTS+AlphaZero,
-# 8 SAC+MCTS+AlphaZero with the sparse-MoE / TransformerBlock-expert backbone
-# (short name "SAC+AZ-MoE"; 16 simulations per move is ~175 ms of *search* only --
-# a full move also runs one online learnBatch, and the measured end-to-end cost is
-# ~2.3 s/move, see docs/agents_design.md 13.6).
+# Agent order inside each agent combo (= MainWindow::kAgents, 2026-09 起):
+#   0 Alpha-Beta, 1 MCTS, 2 PG, 3 DQN, 4 PPO+MCTS (TB 专家),
+#   5 PPO+MCTS (MLP 专家), 6 DQN+MCTS, 7 EVAB, 8 SAC+MCTS+AlphaZero,
+#   9 SAC+MCTS+AlphaZero (稀疏 MoE + TransformerBlock 专家), 10 DQN+AB.
+#   第 5 项是"同一套 PPO+MCTS 实现 + 另一种骨干", 所以 4 与 5 可以直接对弈比较。
+#   **插入新 agent 时必须同步改这里的 $shortName 表**(它是按下标取短名的)。
+#   注: 9 = SAC+AZ-MoE 每步 16 次模拟只是**搜索**约 175 ms, 一手还要跑一次在线
+#   learnBatch, 端到端实测 ~2.3 s/手 (docs/agents_design.md 13.6)。
 #
 # ASCII only in code; the Chinese literals below are matched against the UI, so
 # this file must be saved as UTF-8 **with BOM** for Windows PowerShell to
@@ -46,6 +51,10 @@ param(
     [int]$TimeoutSec = 300,
     [int]$AIndex = -1,       # agent index for side A (-1 = leave the default)
     [int]$BIndex = -1,       # agent index for side B
+    # "对战AI" 组合框 (0) 选哪个 agent —— 它决定**后台训练的目标**。
+    # 设成与 A/B 同一个 agent 就能复现"对弈结束的静默保存 × 后台训练"那个崩溃场景
+    # (2026-09 用户报的), 所以它是这个脚本里唯一一个"为了压竞态"而存在的参数。
+    [int]$TrainIndex = -1,
     [switch]$KeepOpen,
     # 把 chess.exe 的 qInfo/qWarning 输出重定向到这里 (stdout 会写到 "<LogFile>.out")。
     # 默认不重定向: 保持和以前完全一样的启动方式, 免得改了这个脚本的行为。
@@ -256,11 +265,23 @@ try {
     if (-not $ready) { throw "start button never became enabled (startup load failed?)" }
     Write-Output ("start button rect = {0}" -f $btn.Current.BoundingRectangle)
 
-    # 每个 agent 在下拉框里的序号 -> 结果标签里会出现的短名 (见 ChessBoard::agentDisplayName)
+    # 每个 agent 在下拉框里的序号 -> 结果标签里会出现的短名 (见 ChessBoard::agentDisplayName)。
+    # 顺序 = MainWindow::kAgents 的顺序 (2026-09 起 PPO+MCTS 的 MLP 专家骨干插在第 5 位):
+    #   0 Alpha-Beta, 1 MCTS, 2 Policy Gradient, 3 DQN,
+    #   4 PPO+MCTS (TB 专家), 5 PPO+MCTS (MLP 专家), 6 DQN+MCTS, 7 EVAB,
+    #   8 SAC+AZ, 9 SAC+AZ-MoE, 10 DQN+AB
     $shortName = @("Alpha-Beta", "MCTS", "Policy Gradient", "DQN",
-                   "PPO+MCTS", "DQN+MCTS", "EVAB", "SAC+AZ", "SAC+AZ-MoE")
+                   "PPO+MCTS", "PPO+MCTS-MLP", "DQN+MCTS", "EVAB",
+                   "SAC+AZ", "SAC+AZ-MoE", "DQN+AB")
     $wantA = ""
     $wantB = ""
+    if ($TrainIndex -ge 0) {
+        # 组合框 0 = "对战AI": 它决定的不是对弈参赛者, 而是**后台训练的目标**
+        # (backgroundTrainLoop 训的是 m_agentType)。把它设成与 A/B 相同的 agent,
+        # 就是"对弈结束的静默保存"与"后台训练那一轮"抢同一张网的现场 ——
+        # 2026-09 用户报的崩溃正是这个组合 (修复见 ChessBoard::saveCurrentAgentModel)。
+        Write-Output ("training target (对战AI) = {0}" -f (Select-ComboItem 0 $TrainIndex))
+    }
     if ($AIndex -ge 0) {
         $wantA = $shortName[$AIndex]
         Write-Output ("A side agent = {0}" -f (Select-ComboItem 1 $AIndex))
