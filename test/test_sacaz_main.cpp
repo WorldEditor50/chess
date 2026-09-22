@@ -1678,6 +1678,65 @@ static void testLegacyAgentClass()
               && SACAZLegacyAgent::LEGACY_ALPHA_LR == 1e-3f,
           "目标熵 0.98 / alpha 学习率 1e-3 (59e5233 的值)");
 
+    /* ---- (b2) 身份标签与权重前缀对**四个**骨干全都要成立 ----
+       为什么要有这一段 (2026-09 的真实失败): 上一版 guiAgentLabel() 只给 Mlp 与
+       SparseMoeTb 写了分支, 其余骨干返回 `bench/测试构造 (界面不为它建实例)` ——
+       那句里**没有 59e5233**, 于是"这是 59e5233 还原版"这个身份在 SparseMoeMlp 上丢了,
+       下面循环里那条断言如实失败。身份是**口径**的属性, 不该随骨干消失 ⇒ 修的是实现
+       (标签一律保留 59e5233, 骨干只决定后缀), 而这里把"四种骨干都要成立"变成机器可查的。
+
+       用**静态**版本 guiAgentLabelFor() 查: 界面上的 TB 那一支 (SparseMoeTb) 建网 + 拷贝
+       权重很贵 (一个 net ~2.9e7 参数, 本节要建 6 个), 为了查一句标签去构造 TB 实例不划算;
+       而实例版本只是转发到静态版本, 所以下面循环里再用实例对一次表 (两处口径同一来源)。
+    */
+    {
+        const SACAZLegacyAgent::Backbone bbs[] = {
+            SACAZLegacyAgent::Backbone::Mlp,
+            SACAZLegacyAgent::Backbone::SparseMoeMlp,
+            SACAZLegacyAgent::Backbone::SparseMoeTb,
+            SACAZLegacyAgent::Backbone::DenseMoeTb
+        };
+        const int n = (int)(sizeof(bbs) / sizeof(bbs[0]));
+        int withId = 0;      /* 标签里带 59e5233 的个数 */
+        int distinct = 0;    /* 与前面所有标签都不相同的个数 (即标签是否随骨干变) */
+        for (int i = 0; i < n; i++) {
+            const std::string li = SACAZLegacyAgent::guiAgentLabelFor(bbs[i]);
+            if (li.find("59e5233") != std::string::npos) {
+                withId++;
+            }
+            bool dup = false;
+            for (int j = 0; j < i; j++) {
+                if (li == std::string(SACAZLegacyAgent::guiAgentLabelFor(bbs[j]))) {
+                    dup = true;
+                }
+            }
+            if (!dup) {
+                distinct++;
+            }
+            std::printf("  骨干 %-22s 标签 '%s'\n",
+                        SACAZLegacyAgent::backboneName(bbs[i]), li.c_str());
+        }
+        CHECK(withId == n,
+              "**每个**骨干的标签都带 59e5233 (还原口径的身份不随骨干消失)");
+        CHECK(distinct == n,
+              "四个骨干的标签两两不同 (面板上分得清是哪一支, 读数不会记到同一本账)");
+        /* 界面上的两支: 标签里必须带各自的**界面类型名** (面板第一行要能对上界面选择) */
+        const std::string lMlp =
+            SACAZLegacyAgent::guiAgentLabelFor(SACAZLegacyAgent::Backbone::Mlp);
+        const std::string lTb =
+            SACAZLegacyAgent::guiAgentLabelFor(SACAZLegacyAgent::Backbone::SparseMoeTb);
+        CHECK(lMlp.find("AGENT_SACAZ_OLD") != std::string::npos
+                  && lMlp.find("AGENT_SACAZ_OLD_MOE") == std::string::npos,
+              "MLP 那一支的标签写明界面类型 AGENT_SACAZ_OLD (**不**是 _MOE 那支)");
+        CHECK(lTb.find("AGENT_SACAZ_OLD_MOE") != std::string::npos,
+              "TB 那一支的标签写明界面类型 AGENT_SACAZ_OLD_MOE (与 MLP 那支可区分)");
+        /* 两个界面骨干的权重前缀也必须不同 (同名文件会让后训练的那支静默覆盖另一支) */
+        CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix(SACAZLegacyAgent::Backbone::Mlp))
+                  != std::string(SACAZLegacyAgent::defaultWeightPrefix(
+                         SACAZLegacyAgent::Backbone::SparseMoeTb)),
+              "两个界面骨干的权重前缀不同 (MLP 与 TB 的权重文件不会互相覆盖)");
+    }
+
     struct Case { const char *name; int backbone; };   /* 0 = Mlp, 1 = SparseMoeMlp */
     const Case cases[] = {
         /* Mlp: 界面上的两个 SAC 用的骨干 */
@@ -1746,14 +1805,51 @@ static void testLegacyAgentClass()
               "**权重前缀不同** (用户口径: 新旧 SAC 的权重文件必须用不同名字)");
         CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix()).find("sacaz_old") != std::string::npos,
               "还原版前缀是 weights/sacaz_old_agent*");
+        /*
+           ---- 身份标签: 每个骨干都要有 59e5233, 且要说出**本实例**的骨干 ----
+           这两条原来只有"标签里有 59e5233"一句, 而实现当时只认 Mlp / SparseMoeTb 两个骨干,
+           其余返回 `bench/测试构造 (界面不为它建实例)` ⇒ 本节构造的 moe-mlp 实例上如实失败。
+           用户口径是"两支 GUI agent 都要能看出 (a) 是 59e5233 还原口径 + (b) 是哪个骨干" ,
+           所以修的是**实现** (标签按骨干给各自的变体后缀, 但一律保留 59e5233), 断言改成
+           对**每个构造出来的骨干**分别查这两件事。
+        */
         CHECK(std::string(old.guiAgentLabel()).find("59e5233") != std::string::npos,
-              "自检面板能认出这是哪一支 (标签里有 59e5233)");
+              "自检面板能认出这是哪一支 (每个骨干的标签里都有 59e5233)");
+        CHECK(std::string(old.guiAgentLabel())
+                  == std::string(SACAZLegacyAgent::guiAgentLabelFor(oldB)),
+              "实例报的标签就是**本实例骨干**那一句 (标签与骨干同一来源, 不会各说各话)");
+        /*
+           把这两件验收读数**原样打出来** (标签 + 报告里那一行权重文件名): 断言只说明
+           "成不成立", 人读的时候要能直接看到这一支在面板上到底显示成什么 ——
+           上一版标签在三支骨干上是同一句"bench/测试构造", 只有把原文打出来才一眼看得出。
+        */
+        std::printf("      面板标签: %s\n", old.guiAgentLabel());
         {
             const std::string rep = old.selfCheckReport();
             CHECK(rep.find("59e5233") != std::string::npos,
                   "自检报告开头带 59e5233 差异说明");
-            CHECK(rep.find("sacaz_old_agent") != std::string::npos,
-                  "自检报告写明独立的权重文件名");
+            const std::string key = "权重文件独立";
+            const std::size_t kp = rep.find(key);
+            if (kp != std::string::npos) {
+                const std::size_t ke = rep.find('\n', kp);
+                std::printf("      报告: %s\n",
+                            rep.substr(kp, (ke == std::string::npos ? rep.size() : ke)
+                                               - kp).c_str());
+            } else {
+                std::printf("      报告: (**没有** '权重文件独立' 那一行)\n");
+            }
+            /*
+               报告里的权重前缀必须是**这个实例自己的骨干**那一个
+               (= defaultWeightPrefix(this->backbone)): 原来这里写死查 "sacaz_old_agent",
+               那是单骨干时代的写法 —— moe-mlp 骨干的实例实际会写
+               weights/sacaz_old_moemlp_agent, 报告里也确实是它 (断言如实失败)。
+               判据改成"报告里出现该骨干自己的前缀", 于是这条断言在**任何**骨干上都成立,
+               而且仍然能把"报告写的是别的骨干的前缀"这种错钉住。
+            */
+            CHECK(rep.find(SACAZLegacyAgent::defaultWeightPrefix(oldB)) != std::string::npos,
+                  "自检报告写明**本骨干**实际会用的权重文件名 (与 defaultWeightPrefix 一致)");
+            CHECK(rep.find(SACAZLegacyAgent::backboneName(oldB)) != std::string::npos,
+                  "自检报告第二行写明本实例的骨干 (读数归到哪一支一目了然)");
         }
 
         /* ---- (b) 同权重同局面 -> 逐位相同 ---- */

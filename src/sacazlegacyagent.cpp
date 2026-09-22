@@ -180,16 +180,48 @@ const char *SACAZLegacyAgent::hiddenActivationName() const
  * 账上会让"哪一支更强"这种结论直接错)。
  * (2026-09 之前这里是 virtual 覆写: 那一版是 SACAZAgent 的派生类, 基类也要报自己的
  * 身份; 现在两个类没有继承关系, 各自的标签各写各的。)
+ *
+ * [2026-09 修正] 两条**不许退化的性质** (test_sacaz [14] 逐条钉住):
+ *   1. **每个**骨干的标签都含 `59e5233` —— 第一版给其余骨干返回的是一句
+ *      `bench/测试构造 (界面不为它建实例)`, 那句里没有 59e5233, 于是"还原版的身份"
+ *      在非界面骨干上**丢了** (test_sacaz [14] 用 Mlp / SparseMoeMlp 两个骨干构造实例,
+ *      这条断言在 SparseMoeMlp 上如实失败)。身份是**口径**的属性, 不是骨干的属性 ⇒
+ *      59e5233 一律保留, 骨干只决定**后缀**。
+ *   2. 四个骨干的标签**两两不同**, 且界面上的两个骨干各自带自己的**界面类型名**
+ *      (AGENT_SACAZ_OLD / AGENT_SACAZ_OLD_MOE) —— 面板第一行要能同时回答
+ *      "是不是 59e5233 口径"与"是哪一支"。
+ * 非界面骨干在标签里**明说**"只在 test/bench 构造": 面板上选不到它, 不明说就会有人
+ * 拿它的读数当界面读数用。
+ * 判据只有这一处: 实例版本 guiAgentLabel() 只是转发到 guiAgentLabelFor(backbone),
+ * 所以测试可以对**四个**骨干全查一遍, 而不用构造一个 TB 实例 (建网 + 拷贝权重很贵)。
  */
 const char *SACAZLegacyAgent::guiAgentLabel() const
 {
-    if (backbone == Backbone::SparseMoeTb) {
-        return "SAC+AZ-59e5233-MoE (AGENT_SACAZ_OLD_MOE, 还原口径 + 稀疏MoE/TB专家)";
-    }
-    if (backbone == Backbone::Mlp) {
+    return guiAgentLabelFor(backbone);
+}
+
+const char *SACAZLegacyAgent::guiAgentLabelFor(Backbone b)
+{
+    switch (b) {
+    case Backbone::Mlp:
+        /* 界面类型 AGENT_SACAZ_OLD (与 AGENT_SACAZ 同骨干) */
         return "SAC+AZ-59e5233 (AGENT_SACAZ_OLD, 行为还原版)";
+    case Backbone::SparseMoeTb:
+        /* 界面类型 AGENT_SACAZ_OLD_MOE (与 AGENT_SACAZ_MOE 同骨干) */
+        return "SAC+AZ-59e5233-MoE (AGENT_SACAZ_OLD_MOE, 还原口径 + 稀疏MoE/TB专家)";
+    case Backbone::SparseMoeMlp:
+        /*
+           不是界面类型: 这一支只在 test/bench 里构造 (test_sacaz [14] 就是它 ——
+           "TanhNorm 顶替那一层"的回归检验发生在这个骨干上)。
+        */
+        return "SAC+AZ-59e5233-MoE-MLP (非界面骨干: 稀疏MoE(MLP专家), 只在 test/bench 构造)";
+    case Backbone::DenseMoeTb:
+        /* 不是界面类型: "等参数不等算力"的对照组, 也只在 test/bench 构造 */
+        return "SAC+AZ-59e5233-DenseTB (非界面骨干: 稠密MoE(TB专家)对照, 只在 test/bench 构造)";
+    default:
+        /* 兜底也保留 59e5233: 以后再加骨干时, "身份丢失"不会以这种方式静默发生 */
+        return "SAC+AZ-59e5233-? (未知骨干; 口径仍是 59e5233 还原版)";
     }
-    return "bench/测试构造 (界面不为它建实例)";
 }
 
 /*
