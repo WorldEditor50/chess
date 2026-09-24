@@ -24,8 +24,11 @@
 #include "abagent.h"      /* [2.10] "必输局面"下 ABAgent 必须仍返回合法走法 */
 #include "dqnagent.h"
 #include "sacazagent.h"   /* [2.19] 学习口径 == agent 自己的 computeReward/terminalReward */
+#include "ppomcts_agent.h" /* [2.7c] 与 AB 对弈的"会学习"那一侧 */
+#include "rl/util.hpp"     /* [2.7c] RL::Random::setSeed: 换对手时钉住随机流 */
 #include "metricsview.h"
 #include <cmath>
+#include <limits>      /* [2.7c] quiet_NaN: "这一次有没有产生可比的损失" */
 #include <algorithm>   /* std::count: 数自检报告有几行 */
 #include <QVector>
 #include <QMetaObject>
@@ -424,6 +427,195 @@ int main(int argc, char *argv[])
                       .contains(QStringLiteral("引擎口径")),
                   "AB 的奖励曲线口径标成引擎口径 (不是学习口径)");
         }
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+    }
+
+    /* ================================================================
+     *  [2.7c] 对弈时的"训练"到底归谁 —— 行为刻画 (2026-09, dev-selfplay)
+     * ================================================================
+     *
+     * 起因 (用户提问): "界面里对弈的 A/B 双方都是自己实现 (自对弈), 是否合理?"
+     *
+     * 先把**事实**钉住, 再谈合不合理。三条事实全部由可观测信号给出 (不靠读注释):
+     *
+     *   (1) 对弈时**双方各自走一遍 exploreAndTrain**: 界面每一手都调
+     *       aiThinkForAgent -> preTrainThenDecide -> agent->exploreAndTrain(color, steps),
+     *       所以两边都在学, 而且**每一手**一次更新。
+     *   (2) 决定"这是训练还是纯对弈"的是界面上的**探索步数**旋钮, **不是**选了哪个
+     *       agent。关掉它, 对弈就退化成"只对弈不学习"的纯对照 —— 而旋钮的名字
+     *       没在说这件事 (仓库里 docs/agents_design.md §10.3 第 7 条写过同一件事:
+     *       "棋力结论只能来自'预训练 = 0'的对照")。
+     *   (3) `AgentBase::exploreAndTrain(int color, int rolloutSteps)` **没有对手参数**
+     *       (src/aiagent.h): 共用实现 agentrollout.hpp 从当前局面用**本 agent 自己的**
+     *       探索策略滚 N 步。PPO+MCTS 的 trainSelfPlay 同样是 chess.reset() 起手、
+     *       自己把双方都下完 (src/ppomcts_agent.cpp)。⇒ **对手的棋不进训练数据**。
+     *
+     * ⚠ 这是**行为刻画**测试 (characterization test), 不是"现状正确"的背书。
+     *   它把现状写成可执行断言, 于是:
+     *     * 以后谁把对手接进训练数据 (P1), (3) 那一条会**当场变红** —— 那时应当连
+     *       注释一起改成新口径, 而不是把断言删掉;
+     *     * 谁误删了"每手都在学"这件事 (1), 也会红。
+     *
+     * ⚠ 手数上限必须 **> 32** (这里 40): PPO+MCTS / SAC+AZ / DQN+AB 的 learnBatch 在
+     *   "回放池 < batchSize(32)" 时**一次更新都不做**, 而探索每局重新开始 ——
+     *   给 12 手会得到"0 次更新"的假读数 (同一个坑见 [2.7] 与 BG_TRAIN_MAX_MOVES)。
+     */
+    std::printf("\n[2.7c] 对弈时的训练归属 (行为刻画: 双方各自自对弈)\n");
+    {
+        struct Counts {
+            int ppo = 0;
+            int other = 0;
+            QStringList otherNames;
+        };
+        auto countLosses = [&board](ChessBoard::AgentType a, ChessBoard::AgentType b,
+                                    int games) -> Counts {
+            Counts c;
+            QMetaObject::Connection conn = QObject::connect(
+                &board, &ChessBoard::trainLossSample,
+                [&c](double loss, const QString &agent, int step) {
+                    (void)loss;
+                    (void)step;
+                    if (agent.contains(QStringLiteral("PPO"))) {
+                        c.ppo++;
+                    } else {
+                        c.other++;
+                        if (!c.otherNames.contains(agent)) {
+                            c.otherNames.append(agent);
+                        }
+                    }
+                });
+            board.matchAgents(a, b, games);
+            QObject::disconnect(conn);
+            return c;
+        };
+
+        board.setMaxPliesPerGame(40);
+
+        /* ---- 实验 1: 探索开着 -> 学习型那些支路每手都在更新 ---- */
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        {
+            const Counts c = countLosses(ChessBoard::AGENT_PPOMCTS,
+                                         ChessBoard::AGENT_AB_L2, 1);
+            std::printf("    实验1  (探索 32 步开, PPO vs AB-L2): PPO 侧上报 %d 次, "
+                        "非 PPO 侧 %d 次 [%s]\n",
+                        c.ppo, c.other, c.otherNames.join(", ").toUtf8().constData());
+            CHECK(c.ppo > 0,
+                  "探索开着时: 学习型一侧在对弈过程中确实每手在更新 (训练真的在发生)");
+            CHECK(c.other == 0,
+                  "固定参照物 (AB L2) 一侧不产生任何更新 (纯搜索, 没有可训练参数)");
+
+            /* 两个都会学的: 这一对才说明"双方各自都在学" */
+            const Counts c2 = countLosses(ChessBoard::AGENT_PPOMCTS,
+                                          ChessBoard::AGENT_SACAZ, 1);
+            std::printf("    实验1b (PPO vs SAC+AZ, 双方都会学): PPO 侧 %d 次, "
+                        "非 PPO 侧 %d 次 [%s]\n",
+                        c2.ppo, c2.other, c2.otherNames.join(", ").toUtf8().constData());
+            CHECK(c2.ppo > 0 && c2.other > 0,
+                  "双方都是学习型 agent 时, **两边各自都在更新** —— 这就是"
+                  " '对弈训练' 的确切形态 (各自自对弈, 不是互相学)");
+        }
+
+        /* ---- 实验 2: 关掉"探索+预训练"之后, 谁还在学? ---- */
+        /*
+            这一条原来是**假设**"关掉它就不学了", 实测**被推翻**, 而且推翻得有价值:
+              * PPO+MCTS: 0 次更新 —— 它的唯一学习入口就是 preTrainThenDecide;
+              * SAC+AZ  : **仍然有更新** —— 它在 selectMove 里还有第二条路径
+                `learnFromSearch`(src/sacazagent.cpp 的 "从自己的搜索学一次"),
+                **完全不经过那个勾选框**(界面也没有任何开关能关掉它)。
+            也就是说: "关掉探索 = 纯对弈" 这个心智模型**只对一部分 agent 成立**。
+            这正好是 [2.7c] 要钉的东西: 界面上那个勾选框**不是** "训练/评估" 的权威开关。
+        */
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        {
+            const Counts c = countLosses(ChessBoard::AGENT_PPOMCTS,
+                                         ChessBoard::AGENT_PPOMCTS, 1);
+            std::printf("    实验2a (探索关闭, PPO vs PPO): 两侧各 %d / %d 次更新\n",
+                        c.ppo, c.other);
+            CHECK(c.ppo == 0 && c.other == 0,
+                  "关掉探索步数后, **PPO+MCTS 侧一次更新都不做** (它的唯一入口是"
+                  " preTrainThenDecide) ⇒ 对 PPO 而言这个旋钮确实等价于'训练/评估'开关");
+
+            const Counts c2 = countLosses(ChessBoard::AGENT_SACAZ,
+                                          ChessBoard::AGENT_AB_L2, 1);
+            std::printf("    实验2b (探索关闭, SAC+AZ vs AB-L2): SAC 侧 %d 次, "
+                        "AB 侧 %d 次\n",
+                        c2.other, c2.ppo);
+            CHECK(c2.other > 0,
+                  "**SAC+AZ 在探索关闭时照样每手更新** —— 它走的是 selectMove 里的"
+                  " learnFromSearch, 不受'探索+预训练'勾选框控制 ⇒ 那个勾选框不是"
+                  " '训练/评估' 的权威开关 (要想真的'只看不下', 界面目前**做不到**)");
+        }
+
+        /* ---- 实验 3: 学习信号与对手无关 (机制的直接后果) ---- */
+        /*
+            同一个学习型 agent、同一份起始权重、同一个作用域, 只换对手 (AB 深度 1 vs 3)。
+            如果对手的棋**没有**进训练数据, 那么"第一次探索"产生的训练损失必须相同:
+            那一刻棋盘在**标准开局**(playMatchGame 每局 chess.reset() 起手),
+            而探索从头到尾不看对手。
+
+            ⚠ 两场之间**必须还原权重**: matchAgents 会让常驻 agent 就地更新, 连跑两场
+              的话第二场是在"第一场训练过的权重"上开始的 —— 那样比出来的是训练历史,
+              不是对手的影响 (第一版就是这么假失败的)。所以这里用 saveModel/loadModel
+              在两次之间做一次快照还原。
+        */
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        {
+            /* 先跑一小局把 PPO 的常驻实例建出来 (没有实例就没有权重可存) */
+            board.setMaxPliesPerGame(4);
+            board.matchAgents(ChessBoard::AGENT_PPOMCTS, ChessBoard::AGENT_AB_L1, 1);
+
+            const std::string ppoW = "weights/_temp_match_selfplay_probe_ppo";
+            const bool saved = board.saveCurrentAgentModel(ChessBoard::AGENT_PPOMCTS, ppoW);
+            std::printf("    实验3 前置: 快照 PPO 起始权重 = %s\n", saved ? "成功" : "失败");
+            CHECK(saved, "能把 PPO 的起始权重快照下来 (还原两次实验的同一出发点)");
+
+            board.setMaxPliesPerGame(40);
+            auto firstLoss = [&board](ChessBoard::AgentType opponent) -> double {
+                double first = std::numeric_limits<double>::quiet_NaN();
+                bool got = false;
+                QMetaObject::Connection conn = QObject::connect(
+                    &board, &ChessBoard::trainLossSample,
+                    [&first, &got](double loss, const QString &agent, int step) {
+                        (void)agent;
+                        (void)step;
+                        if (!got) { first = loss; got = true; }
+                    });
+                board.matchAgents(ChessBoard::AGENT_PPOMCTS, opponent, 1);
+                QObject::disconnect(conn);
+                return got ? first : std::numeric_limits<double>::quiet_NaN();
+            };
+
+            RL::Random::setSeed(20240901u);
+            const double lossVsL1 = firstLoss(ChessBoard::AGENT_AB_L1);
+
+            /* 还原到同一份起始权重, 再换对手跑一遍 */
+            const bool restored = board.loadAgentModel(ChessBoard::AGENT_PPOMCTS, ppoW);
+            std::printf("    实验3 还原权重 = %s\n", restored ? "成功" : "失败");
+            CHECK(restored, "能把权重还原回快照 (两场实验的唯二差别只剩对手)");
+
+            RL::Random::setSeed(20240901u);
+            const double lossVsL3 = firstLoss(ChessBoard::AGENT_AB_L3);
+
+            std::printf("    实验3: 第一次训练损失  对手=AB-L1 %.9g | 对手=AB-L3 %.9g\n",
+                        lossVsL1, lossVsL3);
+            if (std::isfinite(lossVsL1) && std::isfinite(lossVsL3)) {
+                std::printf("    → 两者%s\n",
+                            (lossVsL1 == lossVsL3)
+                                ? "**逐位相同** ⇒ 对手没有进入训练数据"
+                                : "不同 ⇒ 需要查清 (是权重没还原干净, 还是对手真的进了数据)");
+                CHECK(lossVsL1 == lossVsL3,
+                      "学习信号与对手无关: 同一份起始权重 + 同一标准开局下, 换对手"
+                      " (AB L1 -> L3) **不改变**第一次训练损失 ⇒ 对手的着法没有进入"
+                      " 训练数据 (这是 [2.7c] 的核心判据)");
+            } else {
+                std::printf("    [注意] 本次没有产生可比的第一次损失, 该判据未生效\n");
+            }
+        }
+
         board.setPreTrainEnabled(false);
         board.setPreTrainSteps(0);
     }

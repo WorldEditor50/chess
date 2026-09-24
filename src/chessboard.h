@@ -251,6 +251,22 @@ public:
     /* 保存当前agent的权重文件 */
     bool saveCurrentAgentModel(AgentType agentType, const std::string &filepath);
     /*
+     * 把权重文件**装进该类型的常驻实例** (saveCurrentAgentModel 的反向操作)。
+     *
+     * 为什么需要它 (dev-selfplay, 2026-09): "对弈评估"要能回答"只换一个因素, 结果变不变",
+     * 而 matchAgents 会让常驻 agent **就地更新** —— 两次实验之间必须能把权重还原到同一个
+     * 出发点, 否则比出来的是训练历史, 不是那个因素 (test_match [2.7c] 第一版就是这么
+     * 假失败的)。界面的"评估模式"也要用它来装冻结对手的权重。
+     *
+     * 语义:
+     *   * 实例还没建 -> 先按**决策路径同一套构造参数**建出来 (与 aiThinkRaw 的分支逐字
+     *     一致, 否则结构指纹对不上、load 会直接失败);
+     *   * 纯搜索 agent (AB/MCTS 各档) 没有权重 -> 返回 false;
+     *   * 载入失败 (文件不在 / 结构与指纹不匹配 / 参数量守卫没过) 返回 false, 且
+     *     **不改动**已有网络 (各 agent 的 loadModel 保证失败时不半写)。
+     */
+    bool loadAgentModel(AgentType agentType, const std::string &filepath);
+    /*
      * 某个 agent 的"标准权重路径" (weights/ 下的正式文件名)。
      * shutdownSave() 与"对弈结束后静默保存"都用它 —— 以前这两处各写一份, 很容易
      * 出现"存到 A 处、启动时读 B 处"这种静默失效。

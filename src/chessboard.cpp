@@ -3118,6 +3118,103 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
     }
 }
 
+/*
+ * loadAgentModel - 把权重装进常驻实例 (saveCurrentAgentModel 的反向操作)
+ *
+ * 用途见 chessboard.h 的说明: "评估对局"要求两次实验之间能还原到同一个出发点,
+ * 因为 matchAgents 会让常驻 agent 就地更新。
+ *
+ * 三条约定, 每条都是为了不留下静默失效:
+ *   1. **实例不存在就先建**: 用与 aiThinkRaw / aiThinkForAgentRaw 的分支**逐字相同**的
+ *      构造参数。写错一个参数 (骨干/宽度) 不会报错, 而是让 load 因结构指纹失败 ——
+ *      那时本函数返回 false, 调用方必须当失败处理 (绝不"当作成功继续跑")。
+ *   2. **纯搜索 agent 返回 false**: AB 各档 / MCTS 没有权重可装。用 abDepthOf() 判,
+ *      这样以后再加 AB 档位也不会漏 (与 backgroundTrainLoop 同一判据)。
+ *   3. 与"决策/训练/保存"共用 `m_agentMutex`: loadModel 会往网络里写整份权重,
+ *      与搜索/保存抢同一批张量就会崩 (2026-09 用户报的那个崩溃, 见 saveCurrentAgentModel)。
+ */
+bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath)
+{
+    if (abDepthOf(agentType) > 0 || agentType == AGENT_MCTS) {
+        return false;      /* 纯搜索 agent: 没有参数可载 */
+    }
+    std::lock_guard<std::mutex> agentLock(m_agentMutex);
+    switch (agentType) {
+    case AGENT_PG: {
+        if (m_sfPG == nullptr) { m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f); }
+        return m_sfPG->loadPolicy(filepath);
+    }
+    case AGENT_DQN: {
+        if (m_sfDQN == nullptr) { m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f); }
+        return m_sfDQN->loadModel(filepath);
+    }
+    case AGENT_PPOMCTS: {
+        if (m_sfPPOMCTS == nullptr) {
+            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+        }
+        return m_sfPPOMCTS->loadModel(filepath);
+    }
+    case AGENT_PPOMCTS_MLP: {
+        /* 构造参数必须与 aiThinkRaw 那一支逐字一致 (含骨干), 否则结构指纹对不上 */
+        if (m_sfPPOMCTSMLP == nullptr) {
+            m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                              true, RL::PPO::Backbone::MlpExperts);
+        }
+        return m_sfPPOMCTSMLP->loadModel(filepath);
+    }
+    case AGENT_DQNMCTS: {
+        if (m_sfDQNMCTS == nullptr) {
+            m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
+        }
+        return m_sfDQNMCTS->loadModel(filepath);
+    }
+    case AGENT_EVAB: {
+        if (m_sfEVAB == nullptr) {
+            m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
+        }
+        return m_sfEVAB->loadModel(filepath);
+    }
+    case AGENT_SACAZ: {
+        if (m_sfSACAZ == nullptr) {
+            m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+        }
+        /* filepath 是前缀 -> _actor / _q1 / _q2 */
+        return m_sfSACAZ->loadModel(filepath);
+    }
+    case AGENT_SACAZ_MOE: {
+        if (m_sfSACAZMoe == nullptr) {
+            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                          SACAZAgent::Backbone::SparseMoeTb,
+                                          64, SACAZ_MOE_AUX);
+        }
+        return m_sfSACAZMoe->loadModel(filepath);
+    }
+    case AGENT_SACAZ_OLD: {
+        /* 必须走 createSACAZLegacyAgent: 手写 new SACAZAgent 会静默退回当前口径 */
+        if (m_sfSACAZOld == nullptr) {
+            m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
+        }
+        return m_sfSACAZOld->loadModel(filepath);
+    }
+    case AGENT_SACAZ_OLD_MOE: {
+        if (m_sfSACAZOldMoe == nullptr) {
+            m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+        }
+        return m_sfSACAZOldMoe->loadModel(filepath);
+    }
+    case AGENT_DQNAB: {
+        if (m_sfDQNAB == nullptr) {
+            m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                       DQNABAgent::Backbone::SparseMoeTb);
+            m_sfDQNAB->nodeBudget = DQNAB_NODES;
+        }
+        return m_sfDQNAB->loadModel(filepath);
+    }
+    default:
+        return false;
+    }
+}
+
 /* ================================================================
  *  后台训练线程
  *
