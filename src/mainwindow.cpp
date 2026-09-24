@@ -31,6 +31,20 @@ struct AgentChoice {
 
 const AgentChoice kAgents[] = {
     { "Alpha-Beta Pruning (深度=4)", ChessBoard::AGENT_ALPHABETA },
+    /*
+       ---- Alpha-Beta 的三档弱等级 (2026-09, 用户口径: "1 到 3 level 加入下拉框") ----
+       同一个搜索 (ABAgent), **只有深度不同**: L1=1 / L2=2 / L3=3。
+       【实测 2026-09 · test_ab benchmark · 本机 · 初始局面】每步 0 / 3 / 34 ms
+       (上面那一档深度 4 = 90 ms, 深度 5 = 1920 ms; 常量见 chessboard.cpp 的 AB_*_DEPTH)。
+       放在最前面, 是因为它们是这套列表里**最弱、最快**的对手 —— 当"陪练/标尺"用,
+       在对弈里跟学习型 agent 交手 (对弈双方共用一个下拉框清单, 见 fillAgentCombo)。
+       ⚠ 它们是**纯搜索、没有任何可训练权重**: 叶子价值来自 Chess::evaluate()。
+       "轮到它走"时不会训练, 也不上报训练损失 (损失曲线上没有它的点, 这是正确行为);
+       在自检面板里会写明这一句, 免得"没有曲线"被读成"训练没跑起来"。
+    */
+    { "Alpha-Beta L1 (深度=1, 最弱)", ChessBoard::AGENT_AB_L1 },
+    { "Alpha-Beta L2 (深度=2)",       ChessBoard::AGENT_AB_L2 },
+    { "Alpha-Beta L3 (深度=3)",       ChessBoard::AGENT_AB_L3 },
     { "MCTS (800次模拟)",            ChessBoard::AGENT_MCTS },
     { "Policy Gradient (PGEagent)",  ChessBoard::AGENT_PG },
     { "Deep Q-Network (DQN)",        ChessBoard::AGENT_DQN },
@@ -92,12 +106,13 @@ const AgentChoice kAgents[] = {
 
 /*
    ---- 下拉框: 整份列表都要**看得见** (2026-09) ----
-   Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表已经比这多 (加
-   "PPO+MCTS (...MLP专家)" 那次是 11 项, 现在是 **13 项**) —— 第 11 项及以后会被
-   折叠在滚动区里, 打开下拉框只看到 10 行。
+   Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表比这多 (加
+   "PPO+MCTS (...MLP专家)" 那次是 11 项, 加 Alpha-Beta 三档弱等级之后是 **16 项**) ——
+   第 11 项及以后会被折叠在滚动区里, 打开下拉框只看到 10 行。
    表现就是"明明加进列表了, 界面上却找不到" (UIA 实测: 展开后只有 10 行可见).
    所以这里按条数放宽: 全部条目一次性可见, 不需要滚动。
-   (这一行**不要**写死数字: 它读的是表的真实条数, 以后再加 agent 也不会忘。)
+   (这一行**不要**写死数字: 它读的是表的真实条数, 以后再加 agent 也不会忘 ——
+    上面那个"16 项"只是当时的读数, 会过期, 而这一行代码不会。)
 */
 void fillAgentCombo(QComboBox *combo, ChessBoard::AgentType defaultType)
 {
@@ -944,7 +959,11 @@ void MainWindow::selfCheckWorkerLoop()
         /* ---- 这里可能等 m_agentMutex 几秒: 这是 worker 线程, 界面不受影响 ---- */
         QString text;
         static const ChessBoard::AgentType kAll[] = {
-            ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_MCTS,
+            ChessBoard::AGENT_ALPHABETA,
+            /* Alpha-Beta 三档弱等级: 与上面那一档并列列出, 自检报告里会各自印出
+               **实际搜索深度**, 一眼能核"L1/L2/L3 到底是不是 1/2/3 层" */
+            ChessBoard::AGENT_AB_L1, ChessBoard::AGENT_AB_L2, ChessBoard::AGENT_AB_L3,
+            ChessBoard::AGENT_MCTS,
             ChessBoard::AGENT_PG,        ChessBoard::AGENT_DQN,
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,

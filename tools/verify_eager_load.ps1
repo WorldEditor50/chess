@@ -193,10 +193,33 @@ $startupOk = ($null -ne $busySeenAt) -and ($null -ne $busyGoneAt)
 Write-Output ("startup hourglass seen and closed = {0}" -f $startupOk)
 
 # ---------------------------------------------------- [2]/[3] first use of MoE
-# A = agent index 8 (SAC+AZ with the sparse-MoE backbone), B = 0 (Alpha-Beta).
-Write-Output ("A side = " + (Select-ComboItem 1 8))
+# A = SAC+AZ with the sparse-MoE backbone, B = 0 (Alpha-Beta).
+#
+# [2026-09 修复] A 原来是**写死的下标 8**。给下拉框加了 Alpha-Beta 三档弱等级
+# (kAgents 的第 1~3 位) 之后, 下标 8 变成了 PPO+MCTS (MLP 专家) —— 这个脚本会去
+# "验证"另一个 agent 的首次使用不弹沙漏, 而这句话对那个 agent 根本不成立
+# (它是本脚本最想抓的那类静默错位: 断言还在跑、指向的对象已经不是它说的那个)。
+# 现在按**枚举名**从 src/mainwindow.cpp 的 kAgents 里解析出下标, 顺序变了下标自己会跟着走。
+$kAgentsSrc = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot "..\src\mainwindow.cpp")
+$kAgentsBody = [regex]::Match($kAgentsSrc,
+    'const AgentChoice kAgents\[\]\s*=\s*\{(?<body>.*?)\n\};',
+    [System.Text.RegularExpressions.RegexOptions]::Singleline)
+if (-not $kAgentsBody.Success) { throw "kAgents[] not found in src/mainwindow.cpp" }
+$comboTypes = @()
+# 字符类必须含数字: 枚举名里有 AGENT_AB_L1 这样的名字 ([A-Z_] 会静默漏掉它们)
+foreach ($mm in [regex]::Matches($kAgentsBody.Groups['body'].Value,
+        'ChessBoard::(?<type>AGENT_[A-Z0-9_]+)')) {
+    $comboTypes += $mm.Groups['type'].Value
+}
+$idxMoe = [array]::IndexOf($comboTypes, "AGENT_SACAZ_MOE")
+$idxAb  = [array]::IndexOf($comboTypes, "AGENT_ALPHABETA")
+if ($idxMoe -lt 0) { throw "AGENT_SACAZ_MOE not found in kAgents" }
+if ($idxAb -lt 0)  { throw "AGENT_ALPHABETA not found in kAgents" }
+Write-Output ("combo index from source: SAC+AZ-MoE = {0}, Alpha-Beta = {1} (of {2} entries)" -f
+              $idxMoe, $idxAb, $comboTypes.Count)
+Write-Output ("A side = " + (Select-ComboItem 1 $idxMoe))
 Start-Sleep -Milliseconds 400
-Write-Output ("B side = " + (Select-ComboItem 2 0))
+Write-Output ("B side = " + (Select-ComboItem 2 $idxAb))
 Start-Sleep -Milliseconds 400
 
 $btn = Find-ByName $startMatch

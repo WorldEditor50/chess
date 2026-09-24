@@ -255,6 +255,179 @@ int main(int argc, char *argv[])
         board.setPreTrainSteps(0);
     }
 
+    /* ---------------------------- 2.7b Alpha-Beta 三档弱等级 (L1/L2/L3) */
+    /*
+       用户口径: "把 alpha beta 的 1 到 3 level 也加进来, 下拉框可选择, 用于对弈训练"。
+
+       这一节钉住三件事 (都是"错了不会报错"的那一类):
+         (1) **深度真的按类型分档**: abDepthOf() 是决策/状态条/自检共用的单一来源。
+             没有它的话, 选了 L1 而下的是深度 4 的棋, 界面上一点异常都没有 ——
+             而且状态条会照旧印 "深度 4" (旧代码三处都写死 AB_DEPTH)。
+         (2) 它们**能被对弈引擎接受** (matchAgents 走得到决策分支、能打完一局),
+             且**不上报训练损失** (纯搜索 agent 没有可训练参数)。
+         (3) 与一个学习型 agent 对局时, 学习型那一方**照常上报损失** —— 这一条是
+             "对弈训练"的名义判据: AB 当陪练时, 学的是学习型 agent 自己的经验
+             (AB 没有可训练权重; 对手的棋要不要进它的回放池是另一件事, 见
+             chessboard.h 里 AGENT_AB_L* 的注释)。
+       ⚠ 本节**不测棋力**。深度 1 应该弱于深度 4, 但那是"棋力"问题 —— 按本仓库的
+         既定口径, 那只能由带置信区间的锚点对局 (bench_anchor) 回答, 不在单元测试里
+         用几局棋去下结论 (见 test_match [2.19] 与 rl/diag.h 的判读说明)。
+    */
+    std::printf("\n[2.7b] Alpha-Beta 三档弱等级 (L1/L2/L3): 深度口径 + 对弈可用性\n");
+    {
+        struct LevelCase {
+            ChessBoard::AgentType type;
+            int expectDepth;
+            const char *label;
+        };
+        const LevelCase levels[] = {
+            { ChessBoard::AGENT_AB_L1, 1, "L1" },
+            { ChessBoard::AGENT_AB_L2, 2, "L2" },
+            { ChessBoard::AGENT_AB_L3, 3, "L3" }
+        };
+        for (const LevelCase &lc : levels) {
+            const int d = ChessBoard::abDepthOf(lc.type);
+            std::printf("    %s -> abDepthOf = %d (期望 %d)\n", lc.label, d, lc.expectDepth);
+            CHECK(d == lc.expectDepth, "该等级的搜索深度就是它的档位");
+        }
+        /* 既有的那一档必须**没被动过**: 三档弱等级是新增类型, 不许改对照组的基准 */
+        CHECK(ChessBoard::abDepthOf(ChessBoard::AGENT_ALPHABETA) == 4,
+              "AGENT_ALPHABETA 仍然是深度 4 (新增等级没有动既有口径)");
+        /* 不是 Alpha-Beta 的类型返回 0: 调用方靠这个判"要不要按 AB 走" */
+        CHECK(ChessBoard::abDepthOf(ChessBoard::AGENT_MCTS) == 0,
+              "非 Alpha-Beta 类型返回 0 (而不是某个默认深度)");
+        CHECK(ChessBoard::abDepthOf(ChessBoard::AGENT_SACAZ_MOE) == 0,
+              "非 Alpha-Beta 类型返回 0 (SAC+AZ-MoE)");
+        /* 三档都是"纯搜索、无学习口径、无权重" —— 界面上的标签与曲线口径都靠这三条 */
+        for (const LevelCase &lc : levels) {
+            CHECK(!ChessBoard::agentHasLearningReward(lc.type),
+                  "纯搜索 agent 没有'学习口径'的奖励 (曲线走引擎口径)");
+            /*
+               注意 hasAgentInstance 是**非静态成员函数** (它读静态指针 m_sfXXX,
+               但签名是 const 成员) —— 必须用对象调, 写 ChessBoard::hasAgentInstance(...)
+               是编译错误 C2352。
+            */
+            CHECK(!board.hasAgentInstance(lc.type),
+                  "纯搜索 agent 没有常驻实例 (也就没有权重可存)");
+        }
+
+        /* ---- 真打一局: 学习型 agent (PG, 最快的那一支) 对 AB L2 ---- */
+        /*
+           手数上限 32 而不是 12: PG 的在线训练是**按回放池攒够一个批**才发生的
+           (池不够时 learn() 里直接返回, getLastTrainLoss() 还是 NaN), 而它每局都会
+           重新来过。12 手时实测上报 0 次 —— 那不是 bug, 是"这一局太短"。
+           这里要用够长的局, 才能让"学习型一方**确实**在跟 AB 下棋的过程中训练"这件事
+           成为一个有内容的判据 (否则这条断言会因为分段口径而时真时假)。
+        */
+        board.setMaxPliesPerGame(32);
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        {
+            /*
+               分桶口径: `trainLossSample` 的 `agent` 参数只有一个来源 —— 发信号那一方的
+               `agent->getName()` (见 chessboard.cpp 的 preTrainThenDecide /
+               reportLearnedLossOf)。所以**不能**假设"AB 侧会发一个名字含 Alpha-Beta 的
+               信号" —— AB 分支根本不会走到 preTrainThenDecide, 它也没有 AgentBase 实例。
+               那样写出来的 `abSamples.isEmpty()` 是**恒真**的 (永远测不到任何东西)。
+
+               正确做法: 按"是不是 PG"分桶, 并**断言另一个桶恰好是空的** —— 于是
+               "谁在发信号"这件事本身被钉住了 (多出第三方发信号 = 当场失败),
+               而不是靠一个永远成立的等式蒙过去。
+            */
+            QVector<double> pgSamples;
+            QStringList otherSamples;      /* 非 PG 来源的名字 (应当恰好为空) */
+            QMetaObject::Connection conn = QObject::connect(
+                &board, &ChessBoard::trainLossSample,
+                [&pgSamples, &otherSamples](double loss, const QString &agent, int step) {
+                    (void)step;
+                    if (agent.startsWith(QStringLiteral("Policy Gradient"))) {
+                        pgSamples.append(loss);
+                    } else {
+                        otherSamples.append(agent);
+                    }
+                });
+            /*
+               同时抓状态条文字: 这是**唯一**能发现"abDepthOf 说 2、实际却按别的深度在下"
+               的地方 —— 只断言 abDepthOf() 的返回值是测不到决策路径的 (状态条那三处
+               以前正是写死 AB_DEPTH 的)。
+            */
+            QStringList stages;
+            QMetaObject::Connection stageConn = QObject::connect(
+                &board, &ChessBoard::aiThinkingStage,
+                [&stages](const QString &s) { stages.append(s); });
+
+            const ChessBoard::MatchStats st =
+                board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_AB_L2, 1);
+            QObject::disconnect(conn);
+            QObject::disconnect(stageConn);
+
+            std::printf("    PG vs AB-L2: %d 局 / %d 手 | PG 上报 %d 次, "
+                        "其它来源 %d 次 | 无效走法兜底 %d 次\n",
+                        st.games, st.plies, (int)pgSamples.size(),
+                        (int)otherSamples.size(), st.agentErrors);
+            CHECK(st.games == 1, "PG vs AB-L2 这一局正常打完 (对弈引擎接受新类型)");
+            CHECK(st.plies > 0, "这一局真的走了棋 (不是 0 手就结束)");
+            CHECK(st.agentErrors == 0, "对弈全程没有出现无效走法兜底");
+            /*
+               32 手这一档下, 学习型一方**必须**已经上报过损失 (池子够一个批了)。
+               这一条同时是"AB 陪练不改变学习通路"的正面证据: 与 AB 对弈时,
+               学习型 agent 的探索+训练一切照常 —— 只是 AB 自己的棋不进它的数据。
+
+               ⚠ **这条断言是已知会偶发失败的, 而且不是本测试自身的问题** (2026-09 实测,
+               见 docs/issues_review.md 零之二点二十九 §7)。实测同一份二进制连跑三次,
+               这一局分别打出 **32 手 / 8 手 / 32 手** —— 随机流与**墙上时钟**有关
+               (`mcts.cpp` 在进程内第一次构造时 `std::srand(time(nullptr))`,
+               `ppomcts_agent.cpp` / `dqnmcts_agent.cpp` 更是**每次构造**都播),
+               于是学习型 agent 的初始权重每次不同。三次里失败两次, 且**形状一致**:
+               失败那两次都是"走满 32 手 (PG 有 16 次决策、每次预训练 32 步) 却上报 0 次",
+               通过那次只走 8 手却上报 4 次。
+               上报判据是 `std::isfinite(agent->getLastTrainLoss())` (见
+               ChessBoard::preTrainThenDecide), 而 PG 的那份是 `dpg.lastLoss` ——
+               待查假设是"某次 reinforce 之后它变成非有限值且此后再不复位", 那样之后
+               所有上报都会被永久静默吞掉 (用户看到的正是"损失曲线不动")。
+               所以**不要**把这条断言删掉或改成警告 —— 它红的时候可能真的抓到了东西;
+               要做的是先把随机流钉住 (提议见 §7)。
+            */
+            if (pgSamples.isEmpty()) {
+                /* 只在失败时打诊断: 绿的时候一个字都不多印 */
+                std::printf("    **诊断**: 这一局 %d 手, PG 上报 0 次 (其它来源 %d 次)。"
+                            "逐局的损失一次都没有有限过 ⇒ 查 dpg.lastLoss 是不是已经"
+                            "变成 NaN/Inf 且不再复位 (见本节的注释与 issues_review §7)\n",
+                            st.plies, (int)otherSamples.size());
+            }
+            CHECK(!pgSamples.isEmpty(),
+                  "学习型 agent 在跟 AB 陪练时照常上报训练损失 (32 手足够攒满一个批)");
+            /*
+               **本节的主判据**: 除了学习型那一方, 没有任何来源上报损失 ——
+               AB 侧不发信号 (它没有可训练参数, 也不走 preTrainThenDecide),
+               所以损失曲线上不会有它的点。分桶是**穷尽**的 (else 落 other),
+               于是"多出第三个发信号的人"会当场失败, 而不是被一个恒真的等式蒙过去。
+            */
+            CHECK(otherSamples.isEmpty(),
+                  "损失上报方只有学习型 agent (纯搜索的 AB 不上报任何损失)");
+
+            /* ---- 状态条必须印**实际用于搜索的深度** (L2 -> 深度 2) ---- */
+            QString abStage;
+            for (const QString &s : stages) {
+                if (s.contains(QStringLiteral("Alpha-Beta"))) {
+                    abStage = s;
+                    break;
+                }
+            }
+            std::printf("    AB-L2 那一方的状态条文字: %s\n",
+                        abStage.isEmpty() ? "(没抓到)" : qPrintable(abStage));
+            CHECK(!abStage.isEmpty(), "对弈过程中抓到 AB 侧的状态条文字");
+            CHECK(abStage.contains(QStringLiteral("深度 2")),
+                  "状态条印的是该等级的真实深度 (不是写死的深度 4)");
+
+            CHECK(ChessBoard::agentRewardCaliperLabel(ChessBoard::AGENT_AB_L2)
+                      .contains(QStringLiteral("引擎口径")),
+                  "AB 的奖励曲线口径标成引擎口径 (不是学习口径)");
+        }
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+    }
+
     /* ------------------------------------------------- 2.8 对局过程中的奖励曲线 */
     /*
        用户反馈"对弈时奖励曲线没有更新"。原因不是信号断了, 而是**采样太稀**:
@@ -566,10 +739,16 @@ int main(int argc, char *argv[])
        Alpha-Beta / MCTS 没有常驻实例 (每一步现场构造一个), 所以它们能报出来本身
        就是"现场造一个 + 棋盘用副本"这条路径通了。
     */
-    std::printf("\n[2.11] 模型自检 (十个 agent)\n");
+    std::printf("\n[2.11] 模型自检 (每个 agent 都要有一份, 且可重复)\n");
     {
         const ChessBoard::AgentType all[] = {
-            ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_MCTS,
+            ChessBoard::AGENT_ALPHABETA,
+            /* Alpha-Beta 三档弱等级 (2026-09): 它们也必须有一份自检报告, 而且报告里
+               印的深度必须是**该档位的**深度 —— 这一条专门抓"自检文字写着深度 4、
+               实际按别的深度在下"那类假读数 (abagent.cpp 里原来那句手抄的
+               "(界面 AB_DEPTH = 4)" 正是这么来的)。 */
+            ChessBoard::AGENT_AB_L1, ChessBoard::AGENT_AB_L2, ChessBoard::AGENT_AB_L3,
+            ChessBoard::AGENT_MCTS,
             ChessBoard::AGENT_PG,        ChessBoard::AGENT_DQN,
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
@@ -594,6 +773,29 @@ int main(int argc, char *argv[])
             CHECK(a == b, "自检可重复调用 (两次结果逐字节相同)");
             CHECK(a.find("不是棋力") != std::string::npos,
                   "报告里写明'这不是棋力'的口径");
+            /*
+               Alpha-Beta 各档: 报告必须体现**本档的深度**, 而且**不许**出现"界面
+               AB_DEPTH = 4"这种手抄常量 —— 三档加进来之后, 那句话会在同一行里
+               自相矛盾 (深度 2 与 AB_DEPTH = 4 并排)。纯搜索这一支的自检必然非空
+               (它每次现场构造一个 ABAgent, 不依赖权重文件), 所以这里的 CHECK 是
+               实打实会跑的, 不是"没有实例就跳过"。
+            */
+            const int d = ChessBoard::abDepthOf(t);
+            if (d > 0) {
+                char want[32];
+                std::snprintf(want, sizeof(want), "深度 %d", d);
+                CHECK(a.find(want) != std::string::npos,
+                      "自检报告里印的是本档的实际搜索深度");
+                CHECK(a.find("AB_DEPTH") == std::string::npos,
+                      "自检报告里不再手抄 chessboard.cpp 的 AB_DEPTH 常量");
+            }
+        }
+        /* Alpha-Beta 四档 (含对照组) 都必然有报告: 深度是构造参数, 不依赖权重 */
+        for (ChessBoard::AgentType t : all) {
+            if (ChessBoard::abDepthOf(t) > 0) {
+                CHECK(!board.getAgentSelfCheck(t).empty(),
+                      "Alpha-Beta 各档都有自检报告 (纯搜索, 不需要权重文件)");
+            }
         }
 
         /*
@@ -1233,7 +1435,72 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---------------------------------------------------------------- 3. 中止 */    std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");
+    /*
+       ================================================================
+       [2.20] 吃子行为: "该吃的时候吃了吗" (O1, 2026-09)
+       ================================================================
+       为什么这条要进单测: 界面上"吃子无动于衷"这句话**只有这一个读数**能回答
+       (奖励曲线不是合适的仪器 —— 单次吃一个車在学习口径下只占纵轴 1.3 px, 换引擎口径
+       也只是 3.9 px, 而终局会从 26 px 缩到 8 px)。读数一旦数错, 用户看到的结论就会反过来,
+       而它在界面上长得完全正常 —— 这正是本工程反复吃亏的那一类错误。
+
+       分两段钉:
+         (1) **格式化**(纯函数, 不跑棋局): 分母为 0 必须说"无机会"而不是印 0.0%,
+             因为"一次机会都没遇到"与"有机会一次都没吃"是两件完全不同的事;
+         (2) **端到端**: 真打一局, 断言计数不变量 (chosen <= avail) 与"每局明细里有这一项"。
+    */
+    std::printf("\n[2.20] 吃子行为: 该吃的时候吃了吗 (界面比分行/逐局明细的数据源)\n");
+    {
+        /* ---- (1) 格式化: 三个分支 (无机会 / 有机会吃到了 / 有机会没吃) ---- */
+        ChessBoard::MatchStats ms;
+        ms.agentA = QStringLiteral("A");
+        ms.agentB = QStringLiteral("B");
+        /* 一个样本都没有: 两边都必须是"无机会", 而且**不许**出现 0.0% */
+        const QString noSample = ms.captureLine();
+        std::printf("    无样本 : %s\n", noSample.toUtf8().constData());
+        CHECK(noSample.contains(QStringLiteral("无机会")), "分母为 0 -> 说\"无机会\"");
+        CHECK(!noSample.contains(QStringLiteral("0.0%")),
+              "分母为 0 时**不印 0.0%** (\"没机会\"与\"有机会不吃\"不是同一件事)");
+        /* A 4 次机会吃到 1 次; B 一次都没碰上 */
+        ms.capAvailA = 4;
+        ms.capChosenA = 1;
+        const QString oneSide = ms.captureLine();
+        std::printf("    A 1/4  : %s\n", oneSide.toUtf8().constData());
+        CHECK(oneSide.contains(QStringLiteral("A 1/4=25.0%")), "分子/分母与百分比都印出来");
+        CHECK(oneSide.contains(QStringLiteral("B 无机会")), "只有 B 无机会时只对 B 说无机会");
+        /* 比分那一行在没有样本时**不附**吃子段 (免得每一场都挂一句无信息的话) */
+        ChessBoard::MatchStats empty;
+        empty.agentA = QStringLiteral("A");
+        empty.agentB = QStringLiteral("B");
+        CHECK(!empty.summary().contains(QStringLiteral("该吃时吃到")),
+              "一个吃子样本都没有时, 比分行不附吃子段");
+        CHECK(ms.summary().contains(QStringLiteral("该吃时吃到")),
+              "有样本时比分行**带上**这一项 (用户在对弈过程中就盯着这一行)");
+
+        /* ---- (2) 端到端: 真打一局, 计数必须自洽 ---- */
+        board.setMaxPliesPerGame(60);
+        const ChessBoard::MatchStats stc =
+            board.matchAgents(ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_ALPHABETA, 2);
+        std::printf("    两局: %s\n", stc.summary().toUtf8().constData());
+        std::printf("          吃到手 vs 对手: %.2f / %.2f  (材质原值, 不含将)\n",
+                    stc.matGainedA, stc.matGainedB);
+        CHECK(stc.capChosenA <= stc.capAvailA && stc.capChosenB <= stc.capAvailB,
+              "分子不可能超过分母 (chosen <= avail, 两边都要成立)");
+        CHECK(stc.capAvailA >= 0 && stc.capAvailB >= 0, "计数非负");
+        CHECK(stc.matGainedA >= 0.0 && stc.matGainedB >= 0.0,
+              "吃到的材质非负 (吃将不计入: value_jiang=1000 会把这个数顶爆)");
+        /*
+           两局 AB vs AB 必然出现吃子机会 (开局几步就有兑现交换), 所以这一条不是空断言;
+           若真的一次都没出现, 那也是**值得当场知道**的事 (说明这个读数的分母口径写错了)。
+        */
+        CHECK(stc.capAvailA + stc.capAvailB > 0,
+              "两局里至少出现过一次吃子机会 (否则这个读数等于没测到东西)");
+        CHECK(stc.log.contains(QStringLiteral("该吃时吃到")),
+              "每局明细那一行里带上本局的吃子数 (逐局才能看出它是不是均匀分布)");
+    }
+
+    /* ---------------------------------------------------------------- 3. 中止 */
+    std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");
     board.setMaxPliesPerGame(300);
     ChessBoard::MatchStats aborted;
     std::thread worker([&board, &aborted]() {

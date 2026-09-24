@@ -49,6 +49,10 @@ param(
     [int]$Games = 1,
     [switch]$Full,           # wait for the whole match instead of aborting early
     [int]$TimeoutSec = 300,
+    # 等"开始对弈"按钮变 enabled (= startupLoad 完成) 的上限, 秒。默认 30。
+    # 启动耗时取决于 weights/ 里有什么 (大权重越多越慢), 环境慢就调大 —— 见下面
+    # 那段注释: 写死 30 s 会把"还没加载完"误报成"加载失败"。
+    [int]$StartupTimeoutSec = 30,
     [int]$AIndex = -1,       # agent index for side A (-1 = leave the default)
     [int]$BIndex = -1,       # agent index for side B
     # "对战AI" 组合框 (0) 选哪个 agent —— 它决定**后台训练的目标**。
@@ -70,6 +74,16 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
+# ---- [2026-09] [W32.MU] 的定义必须放在**顶层** ----
+# mouse_event 的定义原来写在 Select-ComboItem() **函数体里**, 而它在别处 (双击放大
+# 那一节) 也被用到 —— 于是"不给 -AIndex/-BIndex、让脚本用默认对局"这条**默认路径**
+# 从来没调用过那个函数, 类型就不存在, 脚本在跑完全部断言之后抛
+#    Unable to find type [W32.MU]
+# 并把退出码变成 1 —— 前面所有断言其实都通过了, 却看起来像整次验证失败。
+# 放到顶层就与调用顺序无关了。
+Add-Type -MemberDefinition @'
+[DllImport("user32.dll")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,int e);
+'@ -Name MU -Namespace W32 -PassThru | Out-Null
 
 if ($Exe -eq "") {
     $Exe = Join-Path $PSScriptRoot "..\build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release\chess.exe"
@@ -178,9 +192,6 @@ function Set-Games([double]$v) {
 # to test SAC+AZ. So now the item is clicked with the mouse and the combo's own
 # current value is verified before returning.
 function Select-ComboItem([int]$comboIndex, [int]$itemIndex) {
-    Add-Type -MemberDefinition @'
-[DllImport("user32.dll")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,int e);
-'@ -Name MU -Namespace W32 -PassThru | Out-Null
 
     $cond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -271,24 +282,80 @@ try {
     # 窗口出现 != 可以交互: startupLoad() 完成之前所有控件都是 disabled 的
     # (这时 SetValue 会抛 "operation is not allowed on a nonenabled element")。
     # 所以等到按钮真的 enabled 再往下走。
+    #
+    # [2026-09] 等待上限从写死的 30 s 改成可配的 $StartupTimeoutSec (默认仍是 30)。
+    # 为什么要放开: 启动耗时**取决于 weights/ 里有什么** —— 留下的临时权重越多越慢。
+    # 实测本机 (Qt 6.9.2 / Release): 只有几个小权重时 ~2 s, 而 weights/ 里存着
+    # SAC+AZ-MoE 的 3 x 146 MB + 59e5233-MoE 的 TB 专家时, 光"建网 + 读权重"就
+    # PPO 9.0 s + SAC-MoE 5.1+6.4 s + 59e5233-MoE 5.0 s ⇒ **30 s 不够**,
+    # 而那时的表现是"start button never became enabled (startup load failed?)" ——
+    # 一句把"还没加载完"误报成"加载失败"的话 (脚本从此处 throw, 应用被关掉,
+    # 日志里其实还在正常打印 [weights] 行)。
+    # 所以超时不再是常量: 环境慢就调大它, 而**不是**去删权重或放宽断言。
+    $startupWaitSec = if ($StartupTimeoutSec -gt 0) { $StartupTimeoutSec } else { 30 }
     $ready = $false
     $k = 0
-    for ($k = 0; $k -lt 60; $k++) {
+    $maxTicks = [int]($startupWaitSec * 2)
+    for ($k = 0; $k -lt $maxTicks; $k++) {
         if ($btn.Current.IsEnabled) { $ready = $true; break }
         Start-Sleep -Milliseconds 500
     }
-    Write-Output ("start button enabled = {0} (waited ~{1:N1} s)" -f $ready, ($k * 0.5))
-    if (-not $ready) { throw "start button never became enabled (startup load failed?)" }
+    Write-Output ("start button enabled = {0} (waited ~{1:N1} s, 上限 {2} s)" -f `
+        $ready, ($k * 0.5), $startupWaitSec)
+    if (-not $ready) { throw "start button never became enabled within $startupWaitSec s (startup load failed? 若是环境慢, 用 -StartupTimeoutSec 调大)" }
     Write-Output ("start button rect = {0}" -f $btn.Current.BoundingRectangle)
 
-    # 每个 agent 在下拉框里的序号 -> 结果标签里会出现的短名 (见 ChessBoard::agentDisplayName)。
-    # 顺序 = MainWindow::kAgents 的顺序 (2026-09 起 PPO+MCTS 的 MLP 专家骨干插在第 5 位):
-    #   0 Alpha-Beta, 1 MCTS, 2 Policy Gradient, 3 DQN,
-    #   4 PPO+MCTS (TB 专家), 5 PPO+MCTS (MLP 专家), 6 DQN+MCTS, 7 EVAB,
-    #   8 SAC+AZ, 9 SAC+AZ-MoE, 10 DQN+AB
-    $shortName = @("Alpha-Beta", "MCTS", "Policy Gradient", "DQN",
-                   "PPO+MCTS", "PPO+MCTS-MLP", "DQN+MCTS", "EVAB",
-                   "SAC+AZ", "SAC+AZ-MoE", "DQN+AB")
+    # 每个 agent 在下拉框里的序号 -> 结果标签里会出现的短名。
+    #
+    # [2026-09 修复] 这里原来是**手抄的下标表**, 文件头还写着"插入新 agent 时必须同步改
+    # 它"。加了 Alpha-Beta 三档弱等级 (AGENT_AB_L1/L2/L3, 插在 kAgents 的第 1~3 位)
+    # 之后, 手抄的表整体错位 3 位: 序号 1 被当成 MCTS (实际是 AB L1)、序号 7 被当成
+    # EVAB (实际是 PPO+MCTS) …… 于是 $wantA/$wantB 与实际参赛方对不上, 结果标签断言
+    # 开始**误报** (把对的 agent 报成错的, 或反过来把错的当真的), 而 $expectSave 也跟着错。
+    #
+    # 现在改成**从源码解析**, 不再手抄任何下标:
+    #   * 序号 -> 枚举: MainWindow::kAgents 的顺序 (它就是下拉框的顺序);
+    #   * 枚举 -> 短名: ChessBoard::agentDisplayName() 里的 QStringLiteral 字面量
+    #     (对弈结果标签用的就是这个名字, 见 MatchStats::summary)。
+    # 再交叉校验两张表**逐个类型对得上** —— 任何一边新增/改名而另一边没跟上, 这里当场
+    # 抛错, 而不是安静地把断言指向别的 agent。
+    $kAgentsSrc = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot "..\src\mainwindow.cpp")
+    $kAgentsBody = [regex]::Match($kAgentsSrc,
+        'const AgentChoice kAgents\[\]\s*=\s*\{(?<body>.*?)\n\};',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $kAgentsBody.Success) { throw "kAgents[] not found in src/mainwindow.cpp" }
+    $comboTypes = @()
+    # 注意字符类是 [A-Z0-9_]: 枚举名里有数字 (AGENT_AB_L1) —— 写成 [A-Z_] 会**静默漏掉**
+    # 带数字的枚举名 (tools/verify_agent_combo.ps1 正是踩过这个坑)。
+    foreach ($mm in [regex]::Matches($kAgentsBody.Groups['body'].Value,
+            'ChessBoard::(?<type>AGENT_[A-Z0-9_]+)')) {
+        $comboTypes += $mm.Groups['type'].Value
+    }
+    $dispSrc = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot "..\src\chessboard.cpp")
+    $dispBody = [regex]::Match($dispSrc,
+        'QString agentDisplayName\(ChessBoard::AgentType type\)\s*\{(?<body>.*?)\n\}',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $dispBody.Success) { throw "agentDisplayName() not found in src/chessboard.cpp" }
+    $dispMap = @{}
+    foreach ($mm in [regex]::Matches($dispBody.Groups['body'].Value,
+            'case\s+ChessBoard::(?<type>AGENT_[A-Z0-9_]+):\s*return\s+QStringLiteral\("(?<name>[^"]+)"\)')) {
+        $dispMap[$mm.Groups['type'].Value] = $mm.Groups['name'].Value
+    }
+    $shortName = @()
+    foreach ($t in $comboTypes) {
+        if (-not $dispMap.ContainsKey($t)) {
+            throw ("no agentDisplayName entry for $t -- 结果标签断言没有可比对的短名 " +
+                   "(两张表已经漂移, 先修好再跑)")
+        }
+        $nm = $dispMap[$t]
+        # 短名可能是带 .arg() 的格式串 (Alpha-Beta 三档就写成 "Alpha-Beta L2(深%1)"),
+        # 那种情况下源码里读不到确定的数字 —— 这里退回到**不带括号的那一段**
+        # ("Alpha-Beta L2"), 它既是实际标签的前缀, 又与同族的其它档位可区分。
+        $nm = ($nm -split '\(')[0]
+        $shortName += $nm
+    }
+    Write-Output ("combo order parsed from source: {0} entries -> {1}" -f
+                  $shortName.Count, ($shortName -join ", "))
     $wantA = ""
     $wantB = ""
     if ($TrainIndex -ge 0) {
@@ -609,12 +676,23 @@ try {
     # 选择是否真的生效: 用结果标签里的 agent 名字核对 (这是唯一可靠的证据)。
     # 必须按**完整词**匹配: "SAC+AZ" 是 "SAC+AZ-MoE" 的前缀, 用 -like "*$want*"
     # 会让 "想选 SAC+AZ、实际选了 SAC+AZ-MoE" 这种情况假通过。
+    #
+    # [2026-09] 起始处从 "(^|\s)" 改成 "^\s*": 结果标签的第一行是
+    #     MatchStats::summary() = "A名称 A分 : B分 B名称 (和 n) ..."
+    # 也就是**A 出现在行首** —— 而 $wantA 现在是从 agentDisplayName 解析出来的
+    # ("Alpha-Beta", "PPO+MCTS", ...), 行首前面没有空白字符, 旧的 "(^|\s)" 要求
+    # "名称前必须有空白或行首"其实成立, 但一旦有人把 summary 的格式改成
+    # "  名字 ..." 就会假失败。^\s* 同时接受这两种写法。
+    # 结尾仍然要求空白/行尾 (挡 "SAC+AZ" 误配 "SAC+AZ-MoE"), 而带 .arg() 的档位
+    # ("Alpha-Beta L2") 由解析处退化成不带括号的前缀, 实际标签是 "Alpha-Beta L2(深2)",
+    # 中间有空格 -> 结尾那一段天然匹配。
     if ($wantA -ne "") {
-        $hitA = ($final -match ("(^|\s)" + [regex]::Escape($wantA) + "(\s|$)"))
+        $hitA = ($final -match ("^\s*" + [regex]::Escape($wantA) + "(\s|$)"))
         Write-Output ("A side in result = {0} (want '{1}')" -f $hitA, $wantA)
         $ok = $ok -and $hitA
     }
     if ($wantB -ne "") {
+        # B 在 "A分 : B分 B名称" 里出现, 前面必有空白 -> "(^|\s)" 对它是对的; 保留。
         $hitB = ($final -match ("(^|\s)" + [regex]::Escape($wantB) + "(\s|$)"))
         Write-Output ("B side in result = {0} (want '{1}')" -f $hitB, $wantB)
         $ok = $ok -and $hitB

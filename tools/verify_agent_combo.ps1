@@ -20,6 +20,21 @@
 # Row visibility is exactly what the bug was about, so "present in the model" is NOT
 # what this script checks.
 #
+# [2026-09 FIX] The kAgents pattern used to be 'AGENT_[A-Z_]+' -- which does NOT match
+# enum names that contain digits. So the newly added AGENT_AB_L1 / L2 / L3 were
+# silently skipped (the script reported "13 entries" while kAgents actually had 16),
+# and catching exactly that ("added to the list but not visible in the UI") is the one
+# job this script has. Now:
+#   * the pattern is AGENT_[A-Z0-9_]+;
+#   * plus a cross-check "parsed count == number of entry-shaped lines in the source",
+#     so if the pattern ever regresses into missing entries again this fails loudly
+#     instead of quietly testing one agent less.
+#   (Same lesson as the script itself: a check whose purpose is catching silent
+#    omissions can silently omit things too.)
+# NOTE: keep this file ASCII-only (see the header) -- a non-ASCII comment here is
+# decoded as ANSI by Windows PowerShell and can corrupt the parse of the very
+# regex below it. That is not hypothetical: the first version of this fix did it.
+#
 # ASCII only, no BOM: Windows PowerShell decodes a BOM-less .ps1 as ANSI, so a Chinese
 # comment (or literal) can break the parser. All Chinese strings are read from the
 # source file at run time instead of being written here.
@@ -47,12 +62,22 @@ $m = [regex]::Match($src, 'const AgentChoice kAgents\[\]\s*=\s*\{(?<body>.*?)\n\
 if (-not $m.Success) { throw "kAgents[] not found in $srcFile" }
 $expected = @()
 foreach ($mm in [regex]::Matches($m.Groups['body'].Value,
-                                 '\{\s*"(?<name>[^"]+)"\s*,\s*ChessBoard::(?<type>AGENT_[A-Z_]+)\s*\}')) {
+                                 '\{\s*"(?<name>[^"]+)"\s*,\s*ChessBoard::(?<type>AGENT_[A-Z0-9_]+)\s*\}')) {
     $expected += [pscustomobject]@{ Name = $mm.Groups['name'].Value; Type = $mm.Groups['type'].Value }
 }
+# Cross-check: every kAgents entry starts with `{ "`, so counting that shape gives the
+# number of entries the source really has. If the regex above ever misses some (say a
+# future enum name uses a character the class does not cover), the two counts differ
+# and this fails right here -- instead of silently testing fewer agents.
+$entryCount = [regex]::Matches($m.Groups['body'].Value, '\{\s*"').Count
 Write-Output ("kAgents entries found in source: {0}" -f $expected.Count)
 foreach ($e in $expected) { Write-Output ("  {0,-22} {1}" -f $e.Type, $e.Name) }
 if ($expected.Count -lt 2) { throw "parsed too few kAgents entries" }
+if ($expected.Count -ne $entryCount) {
+    throw ("kAgents parse mismatch: regex matched $($expected.Count) entries but the " +
+           "source has $($entryCount) entry-shaped lines -- the pattern is silently " +
+           "skipping entries (see the note in the header about AGENT_[A-Z0-9_]+)")
+}
 
 # ---- 2. Qt DLLs must be findable from a plain shell (same block as the other checks) ----
 $qtFound = $false

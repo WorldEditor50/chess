@@ -518,8 +518,18 @@ std::string ABAgent::selfCheckReport() const
     std::string out;
 
     /* ---- 1. 搜索配置与评估来源 (为什么"没有损失曲线") ---- */
+    /*
+       ⚠ 这里**不许**再写"(界面 AB_DEPTH = 4)"。原来那句是手抄的常量: 界面加了三档
+       弱等级 (AGENT_AB_L1/L2/L3) 之后, 选 L2 会在同一行印出
+           "搜索配置: 深度 2 (界面 AB_DEPTH = 4, 见 chessboard.cpp)"
+       —— 自相矛盾, 而且 AB_DEPTH 是 chessboard.cpp 的 file-static, 本文件根本看不到它,
+       抄过来的数字没有任何机制保证它与那边一致 (本工程把这类现象叫"假状态文字")。
+       档位与深度的**单一来源**是 ChessBoard::abDepthOf(); 界面上的下拉框标签与状态条
+       都从那里取数, 所以这里只报**实际生效的深度**就够了。
+    */
     std::snprintf(buf, sizeof(buf),
-                  "搜索配置: 深度 %d (界面 AB_DEPTH = 4, 见 chessboard.cpp) | "
+                  "搜索配置: 深度 %d (本次搜索实际使用的深度; 界面上的档位由 "
+                  "ChessBoard::abDepthOf() 给出) | "
                   "叶子评估 Chess::evaluate() = 材质 + 子力位置表 (手工, 无学习)\n",
                   maxDepth);
     out += buf;

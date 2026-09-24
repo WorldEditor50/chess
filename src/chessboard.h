@@ -131,7 +131,39 @@ public:
            **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
            (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
         */
-        AGENT_SACAZ_OLD_MOE
+        AGENT_SACAZ_OLD_MOE,
+        /*
+           ================================================================
+           ---- Alpha-Beta 的三档弱等级 (2026-09, 用户口径: "1 到 3 level 加进下拉框") ----
+           ================================================================
+           AGENT_ALPHABETA 是同一个搜索、深度 AB_DEPTH(=4)。这三档**只是深度不同**:
+               AGENT_AB_L1 -> 深度 1
+               AGENT_AB_L2 -> 深度 2
+               AGENT_AB_L3 -> 深度 3
+           【实测 2026-09 · `test_ab benchmark` · 本机 · 初始局面】每步 0 / 3 / 34 ms
+           (对照: 深度 4 = 90 ms, 深度 5 = 1920 ms)。
+
+           用途: **当陪练与标尺**。它们是"棋力可调、且完全不随训练漂移"的对手 ——
+           既要跟它下 (对弈), 也要拿它当"模型有没有变强"的参照。
+
+           ⚠ **它们没有任何可训练的权重**: 叶子价值全部来自 Chess::evaluate()
+           (材质 + 子力位置表, 常量写死在 chess.cpp), 所以:
+             * exploreAndTrain() 走 AgentBase 的默认空实现 (aiagent.h:108),
+               即"轮到它走"时**不会**训练, 也不可能被训练;
+             * getLastTrainLoss() 恒为 NaN -> 损失曲线上没有它的点 (这是正确行为,
+               不是"训练没跑起来"); selfCheckReport 里写明了这一句;
+             * 与它下棋时, 学习型 agent 学的是**它自己滚出来的经验** —— 对手是谁
+               不进入它的训练数据。要"照着 AB 的棋学"必须另接一条对手条件化的
+               采样路径 (本轮未做, 见 docs 里的待办)。
+           这一条不是可以靠"多跑几轮"绕过的: 本工程对"纯搜索 agent"的口径一直是
+           "有棋力、没有学习" (见 aiagent.h 的 hasLearningReward / AB 的自检报告)。
+
+           **必须追加在枚举末尾**: 同上面几条 —— 值会经 GUI 下拉框的 userData 传出去。
+           **不要**把它们插到 AGENT_ALPHABETA 旁边去"排得好看"。
+        */
+        AGENT_AB_L1,
+        AGENT_AB_L2,
+        AGENT_AB_L3
     };
 
 public:
@@ -174,8 +206,32 @@ public:
         long long maxThinkMs = 0;   /* 单步最长思考时间 */
         QString log;                /* 每局一行 */
         bool aborted = false;
+        /*
+           ================================================================
+           [O1, 2026-09] 吃子行为 —— "该吃的时候吃了吗"（整场累计）
+           ================================================================
+           用户报的现象是"杀将棋有一定的效果, 但吃其他棋子又变得无动于衷"。这句话在界面上
+           原来**没有任何读数**能回答: 奖励曲线不是合适的仪器 —— 实测 (见
+           docs/capture_readings_2026_09.md) 单次吃一个車, 学习口径下只占纵轴 1.3 px
+           (118 px 高的图), 换成引擎口径也只是 3.9 px, **而终局会从 26 px 缩到 8 px**:
+           换口径是拆东墙补西墙, 不是修好。所以这件事只能靠**数字**回答, 就放在这里。
+
+           口径 (与 rl/diag.h 的 isCaptureStep、bench_sac_learn 的"吃子行为"一节一致):
+             * capAvail  : 轮到自己**且有**吃子着法可选的手数 (条件比例的分母);
+             * capChosen : 真走了吃子着法的手数;
+             * nextId != ID_NONE 就是吃子 (见 stone.h 的 Step 说明);
+             * matGained : 吃到的材质**原值**, **不含将** (吃将必然是终局,
+               value_jiang=1000 会把这一个数顶爆)。
+           分母为 0 时 captureLine() 会说"无机会"而不是印 0.0% ——
+           "一次机会都没遇到"与"有机会一次都没吃"是两件完全不同的事。
+        */
+        int capAvailA = 0, capChosenA = 0;
+        int capAvailB = 0, capChosenB = 0;
+        double matGainedA = 0.0, matGainedB = 0.0;
         QString summary() const;    /* 一行比分 */
         QString detail() const;     /* 比分 + 每局明细 + 耗时 */
+        /* 一行"该吃的时候吃了吗" (A/B 各一个条件比例); 三处显示共用这一份格式化 */
+        QString captureLine() const;
     };
 
     /* 让两个 agent 互相对弈 games 局 (每局交换先后手), 阻塞直到结束或被中止 */
@@ -576,6 +632,27 @@ public:
 
     /* 该 agent 类型有没有"学习口径"的奖励 (纯搜索 agent: 没有) */
     static bool agentHasLearningReward(AgentType type);
+
+    /*
+     * ---- Alpha-Beta 的等级口径 (单一来源) ----
+     *
+     * 返回这个 agent 类型的 AB 搜索深度; 返回 0 = **这个类型不是 Alpha-Beta**。
+     *
+     * 为什么要有它: 深度原来写死在各决策分支里 (HEAD 上是 5 处
+     * `ABAgent abAI(env, AB_DEPTH)` + 5 处 `emitStage(... AB_DEPTH)`), 一加等级就
+     * 必然出现"某一支还印着深度 4、实际按别的深度在下"这种假状态文字 (本工程已经栽过
+     * 好几次同类问题: 注释写深度 8 / 标签写深度 4 / 实际 5)。现在"谁是多少级"只有
+     * 这一个地方知道。
+     *
+     * ⚠ 两个 `default:` 兜底分支 (`aiThinkRaw` / `aiThinkForAgentRaw`) **仍然**用
+     *   AB_DEPTH —— 那是"这个类型没有自己的决策 case"的兜底, 不是任何一档等级的深度,
+     *   所以它**故意**不查这张表 (并且会打一条 qWarning, 免得降级是静默的)。
+     *   也就是说"仍然写死 AB_DEPTH"的地方只剩这两处兜底, 它们是刻意的。
+     *
+     * `AGENT_ALPHABETA` 保持**原有深度 AB_DEPTH(=4) 不变** —— 它是对照组的既有口径,
+     * 老读数/老脚本可比性不能被这次新增改动破坏。
+     */
+    static int abDepthOf(AgentType type);
     /*
      * 奖励曲线的口径标签 (界面用, 挂在曲线名后面):
      *   有学习口径 -> "学习口径(材质x0.1+每步代价+终局±1)"

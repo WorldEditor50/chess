@@ -24,6 +24,17 @@ QString agentDisplayName(ChessBoard::AgentType type)
 {
     switch (type) {
     case ChessBoard::AGENT_ALPHABETA: return QStringLiteral("Alpha-Beta");
+    /*
+       Alpha-Beta 的三档弱等级: 名字里**必须**带上深度 —— 对弈日志/奖励曲线/比分表上
+       只用 "Alpha-Beta" 的话, "L1 对 L3" 这种对局两个参赛方同名, 读数就没法读了。
+       深度值来自 abDepthOf() (单一来源), 不在这里手抄数字。
+    */
+    case ChessBoard::AGENT_AB_L1:
+        return QStringLiteral("Alpha-Beta L1(深%1)").arg(ChessBoard::abDepthOf(type));
+    case ChessBoard::AGENT_AB_L2:
+        return QStringLiteral("Alpha-Beta L2(深%1)").arg(ChessBoard::abDepthOf(type));
+    case ChessBoard::AGENT_AB_L3:
+        return QStringLiteral("Alpha-Beta L3(深%1)").arg(ChessBoard::abDepthOf(type));
     case ChessBoard::AGENT_MCTS:      return QStringLiteral("MCTS");
     case ChessBoard::AGENT_PG:        return QStringLiteral("Policy Gradient");
     case ChessBoard::AGENT_DQN:       return QStringLiteral("DQN");
@@ -124,7 +135,28 @@ QString shortElapsed(long long ms)
  * 搜索"都会增加节点成本, 深度 5 在 GUI 里已经是 3.6 秒一步。需要更强棋力时把
  * 这里调大即可。
  */
+/*
+ * AGENT_ALPHABETA 的搜索深度 (= 界面上那一档"Alpha-Beta Pruning (深度=4)")。
+ * ⚠ 这里是**既有对照组的基准深度, 不要改**: 三档弱等级 (AGENT_AB_L1/L2/L3) 是
+ *   另外三个类型、另外三个数字 (见下面 AB_L2_DEPTH / AB_L3_DEPTH), 它们**不**动这一个。
+ */
 static constexpr int AB_DEPTH = 4;            /* Alpha-Beta 搜索深度 */
+/*
+ * ---- Alpha-Beta 三档弱等级的深度 (2026-09) ----
+ * 深度 1 / 2 / 3。**只改这三个常量就能调等级**: 决策路径、状态条、自检都从
+ * ChessBoard::abDepthOf() 取数, 不会再出现"某一支还印着别的深度"。
+ *
+ * 【实测 2026-09 · `test_ab benchmark` · 本机 Release/AVX2 · 初始局面】
+ *     深度 1 = 0 ms | 深度 2 = 3 ms | 深度 3 = 34 ms | 深度 4 = 90 ms | 深度 5 = 1920 ms
+ *   (同一份基线的历史读数在 docs/issues_review.md:179-180 记成 3≈57/4≈148/5≈3.1 s,
+ *    与本次实测有出入 —— 那份是旧机器/旧构建, 两者都不是"错", 但**不要**把两份数字
+ *    混着引用。要用就把命令与日期一起抄下来, 与 docs/mcts_sims_scaling.md 的惯例一致。)
+ * 结论: L1~L3 每步都是 0~34 ms 量级 —— 便宜到可以拿来当"每局都要打的陪练",
+ * 而它们与 AGENT_ALPHABETA (深度 4, ~90 ms) 一起构成一条**不随训练漂移**的棋力阶梯。
+ */
+static constexpr int AB_L1_DEPTH = 1;
+static constexpr int AB_L2_DEPTH = 2;
+static constexpr int AB_L3_DEPTH = 3;
 static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
 /*
  * PPO+MCTS 每次决策的模拟次数。**必须远大于中局分支数 (~38.7)**, 理由见下面
@@ -1396,11 +1428,15 @@ void ChessBoard::setAgentType(AgentType type)
  *  aiThink - 根据当前选中的agent类型选择走法
  *
  *  AI Agent 类型:
- *    AGENT_ALPHABETA : Alpha-Beta 剪枝 (默认深度 5, 见 AB_DEPTH)
+ *    AGENT_ALPHABETA : Alpha-Beta 剪枝 (深度 AB_DEPTH=4 —— 这一行原文写"深度 5",
+ *                      与实际常量不符, 2026-09 一并改正)
+ *    AGENT_AB_L1/L2/L3 : 同一搜索的三档弱等级 (深度 1/2/3)。**纯搜索、无权重**:
+ *                      深度由 ChessBoard::abDepthOf() 单一来源给出。
  *    AGENT_MCTS      : 蒙特卡洛树搜索 (800次模拟)
  *    AGENT_PG        : Policy Gradient (PGEagent)
  *    AGENT_DQN       : Deep Q-Network (DQNAgent)
- *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (默认 80 次模拟, 见 PPO_SIMS)
+ *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (默认 400 次模拟, 见 PPO_SIMS ——
+ *                      这一行原文写"80", 与实际常量不符, 一并改正)
  *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
  *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
  * ================================================================ */
@@ -1499,6 +1535,25 @@ QString ChessBoard::agentRewardCaliperLabel(AgentType type)
     return QStringLiteral("学习口径(材质x0.1+每步代价+终局±1)");
 }
 
+/*
+ * abDepthOf - "这个 agent 类型用多深的 Alpha-Beta" (单一来源)
+ *
+ * 返回 0 = **不是 Alpha-Beta**, 调用方不该拿它去构造 ABAgent。判 0 而不是判
+ * ">= 1", 是为了让"忘了给新类型登记深度"变成**当场可见**的行为 (走到 default 兜底,
+ * 而不是静默按某个深度下棋)。AGENT_ALPHABETA 保持在 AB_DEPTH(=4), 与新增的
+ * 三档无关 —— 见 chessboard.h 里那个函数的注释。
+ */
+int ChessBoard::abDepthOf(AgentType type)
+{
+    switch (type) {
+    case AGENT_ALPHABETA: return AB_DEPTH;
+    case AGENT_AB_L1:     return AB_L1_DEPTH;
+    case AGENT_AB_L2:     return AB_L2_DEPTH;
+    case AGENT_AB_L3:     return AB_L3_DEPTH;
+    default:              return 0;      /* 不是 Alpha-Beta */
+    }
+}
+
 AgentBase *ChessBoard::agentInstance(AgentType type) const
 {
     /* 静态成员: 与 aiThinkForAgentRaw 里按需 new 出来的是**同一批对象** (单一来源)。 */
@@ -1595,11 +1650,11 @@ std::string ChessBoard::getAgentSelfCheck() const
 std::string ChessBoard::getAgentSelfCheck(AgentType type) const
 {
     /*
-       Alpha-Beta / MCTS 没有常驻实例 (每一步现场构造一个), 它们只碰**棋盘副本**,
-       与 agent 锁无关, 所以先处理掉 —— 这样下面那段"常驻实例"的临界区里
+       Alpha-Beta (含三档弱等级) / MCTS 没有常驻实例 (每一步现场构造一个), 它们只碰
+       **棋盘副本**, 与 agent 锁无关, 所以先处理掉 —— 这样下面那段"常驻实例"的临界区里
        不会同时持有 `mutex`(棋盘) 与 `m_agentMutex`, 两把锁的获取顺序只有一种。
     */
-    if (type == AGENT_ALPHABETA || type == AGENT_MCTS) {
+    if (abDepthOf(type) > 0 || type == AGENT_MCTS) {
         Chess probe;
         {
             /*
@@ -1609,8 +1664,9 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
             QMutexLocker locker(&mutex);
             probe = chess;
         }
-        if (type == AGENT_ALPHABETA) {
-            ABAgent ab(probe, AB_DEPTH);
+        if (type != AGENT_MCTS) {
+            /* 深度按**类型**取 (三档弱等级各自一份报告), 不写死 AB_DEPTH */
+            ABAgent ab(probe, abDepthOf(type));
             return ab.selfCheckReport();
         }
         MCTS mcts(probe, 1.414f);
@@ -1838,7 +1894,10 @@ Step ChessBoard::aiThinkRaw(int color)
     }
 
     switch (m_agentType) {
-    case AGENT_ALPHABETA: {
+    case AGENT_ALPHABETA:
+    case AGENT_AB_L1:
+    case AGENT_AB_L2:
+    case AGENT_AB_L3: {
         /*
            Agent 以前声明成函数内的 static, 于是它只在第一次调用时构造, 永远绑定
            在"当时那个 env" 上 —— 一旦出现第二个 ChessBoard (或 env 先被销毁),
@@ -1848,10 +1907,15 @@ Step ChessBoard::aiThinkRaw(int color)
            锁: Alpha-Beta 与 MCTS 没有"网络"可保护, 但它们**在这张共用的 env 上
            搜索** (moveForward/moveBack 会改 env.history), 所以同样要持锁 ——
            否则与上面那段注释里说的读者/写者撞在一起。
+
+           深度按**类型**取 (三档弱等级 = 深度 1/2/3, AGENT_ALPHABETA = AB_DEPTH):
+           状态条上印的必须是**实际用于搜索的那个深度** —— 以前三处都写死 AB_DEPTH,
+           于是选了别的等级时状态条会报一个假数字。
         */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
-        ABAgent abAI(env, AB_DEPTH);
+        const int depth = abDepthOf(m_agentType);
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(depth));
+        ABAgent abAI(env, depth);
         return abAI.getBestMove(color);
     }
     case AGENT_MCTS: {
@@ -2111,6 +2175,14 @@ Step ChessBoard::aiThinkRaw(int color)
         return m_sfDQNAB->selectMove(color, 0.0f);
     }
     default: {
+        /*
+           兜底: 走到这里说明**这个 agent 类型没有自己的决策 case** (新增类型忘了接线),
+           于是退回 Alpha-Beta 默认深度。以前这里连一句日志都没有 —— 表现是"选中的
+           agent 像 Alpha-Beta"而界面上看不出原因。加一行 warning 让它当场可见
+           (与 backgroundTrainLoop 里那条"该 agent 的后台训练尚未接入"同一个思路)。
+        */
+        qWarning() << "[aiThink] 该 agent 类型没有决策分支, 回退 Alpha-Beta:"
+                   << agentDisplayName(m_agentType);
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
         ABAgent abAIDefault(env, AB_DEPTH);
         return abAIDefault.getBestMove(color);
@@ -2148,10 +2220,14 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
     }
 
     switch (agentType) {
-    case AGENT_ALPHABETA: {
+    case AGENT_ALPHABETA:
+    case AGENT_AB_L1:
+    case AGENT_AB_L2:
+    case AGENT_AB_L3: {
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
-        ABAgent abAIForAgent(env, AB_DEPTH);
+        const int depth = abDepthOf(agentType);     /* 同上: 深度按类型取, 不写死 */
+        emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(depth));
+        ABAgent abAIForAgent(env, depth);
         return abAIForAgent.getBestMove(color);
     }
     case AGENT_MCTS: {
@@ -2355,6 +2431,9 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
         return m_sfPPOMCTSMLP->selectMove(color, PPO_MLP_SIMS, 0.0f);
     }
     default:
+        /* 兜底: 同 aiThinkRaw 的 default (加一行 warning, 让它不是静默的降级) */
+        qWarning() << "[aiThinkForAgent] 该 agent 类型没有决策分支, 回退 Alpha-Beta:"
+                   << agentDisplayName(agentType);
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(AB_DEPTH));
         ABAgent abAIForAgentDef(env, AB_DEPTH);
         return abAIForAgentDef.getBestMove(color);
@@ -2375,6 +2454,35 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
  *      逐局列出明细 (谁执红、谁胜、多少手)。
  * ================================================================ */
 
+/*
+ * captureLine - "该吃的时候吃了吗" 的一行读数 (2026-09, O1)
+ *
+ * 为什么单独一个函数: 它要出现在**三处** (实时比分行 / 每局明细 / 整场汇总), 三处各写
+ * 一份格式化迟早会漂 —— 本工程已经有过"同一个量在屏幕与导出文件里不一致"的事故。
+ *
+ * 两个刻意的选择:
+ *   * 分母为 0 时说"无机会", **不印 0.0%**: "一次吃子机会都没遇到"与"有机会一次都没吃"
+ *     是两件完全不同的事, 混成一个 0% 会把后者的严重性稀释掉 (前者只是这局没碰面);
+ *   * 同时印 **分子/分母** 与百分比: 只印百分比时, 5% 背后的 "2/40" 与 "20/400"
+ *     在读数上是两回事, 而后者才说明"样本够多, 结论可信"。
+ */
+QString ChessBoard::MatchStats::captureLine() const
+{
+    auto one = [](const QString &who, int chosen, int avail) -> QString {
+        if (avail <= 0) {
+            return QStringLiteral("%1 无机会").arg(who);
+        }
+        return QStringLiteral("%1 %2/%3=%4%")
+            .arg(who)
+            .arg(chosen)
+            .arg(avail)
+            .arg(100.0 * (double)chosen / (double)avail, 0, 'f', 1);
+    };
+    return QStringLiteral("该吃时吃到: ")
+           + one(QStringLiteral("A"), capChosenA, capAvailA) + QStringLiteral("  ")
+           + one(QStringLiteral("B"), capChosenB, capAvailB);
+}
+
 QString ChessBoard::MatchStats::summary() const
 {
     QString s = QStringLiteral("%1 %2 : %3 %4")
@@ -2388,6 +2496,14 @@ QString ChessBoard::MatchStats::summary() const
     }
     if (aborted) {
         s += QStringLiteral("  [已中止]");
+    }
+    /*
+       [O1] 把"该吃的时候吃了吗"放进**比分那一行**: 这一行是用户在对弈过程中与结束时
+       都会看到的位置, 而吃子与否正是他报告的那个现象。A/B 的指代由 detail() 的
+       "参赛方"一段给出 (与比分行 "%1 : %3" 同一套 A/B 约定)。
+    */
+    if (capAvailA > 0 || capAvailB > 0) {
+        s += QStringLiteral("  |  ") + captureLine();
     }
     return s;
 }
@@ -2527,6 +2643,50 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
             double totalReward = 0;
             /* 走这一步的是 turn 方, moveForward 之前先记下来 */
             const int mover = turn;
+            /*
+               ================================================================
+               [O1, 2026-09] 吃子行为: "该吃的时候吃了吗"
+               ================================================================
+               位置与下面那条学习口径即时奖励**同一个时序要求**: 必须在 moveForward
+               之前 —— 此刻棋盘还没动, 于是 `chess.sample()` 给出的就是这一手的**完整**
+               合法集, 而 `step` 就是真正要走出的那一手 (无效走法已在上面兜底替换过)。
+               两件事因此严格对应同一个局面, 这就是这个读数全部准确性的来源。
+
+               代价: 每手多一次走法生成 (~40 手)。相对一次 agent 决策 (ms 到 s 级)
+               可以忽略, 而它换来的是界面上**唯一**能回答"吃子无动于衷"的数
+               (奖励曲线不是合适的仪器 —— 见 MatchStats 里那段与 docs 的说明)。
+
+               累计**直接写进 st**、不存本局局部量: 本函数有一条"被中止就 early return"
+               的路径, 用局部量 + 函数末尾累加的话, 被中止的那一局会被漏掉。
+               归属用 `aIsRed` 换算成 A/B, 与奖励记账、胜负记账同一处规则。
+            */
+            {
+                std::vector<Step *> legalCap;
+                chess.sample(turn, legalCap);
+                bool capAvail = false;
+                for (std::size_t li = 0; li < legalCap.size(); li++) {
+                    if (legalCap[li]->nextId != Stone::ID_NONE) {
+                        capAvail = true;
+                        break;
+                    }
+                }
+                Steps::instance().put(legalCap);
+                const bool capChosen = (step.nextId != Stone::ID_NONE);
+                const bool moverIsA = ((turn == Stone::COLOR_RED) == aIsRed);
+                if (capAvail) {
+                    (moverIsA ? st.capAvailA : st.capAvailB)++;
+                }
+                if (capChosen) {
+                    (moverIsA ? st.capChosenA : st.capChosenB)++;
+                    /* 材质**原值**, 不含将 (吃将必然是终局, value_jiang=1000 会顶爆这个数) */
+                    if (step.nextId >= 0 && step.nextId < 32
+                        && chess.stones[step.nextId] != nullptr
+                        && chess.stones[step.nextId]->type != Stone::TYPE_JIANG) {
+                        (moverIsA ? st.matGainedA : st.matGainedB)
+                            += chess.stones[step.nextId]->value;
+                    }
+                }
+            }
             /*
                ---- ④ 学习口径的即时奖励: **必须在 moveForward 之前算** ----
                `computeReward` 要按 `s.nextId` 去读被吃子的 value, 而 moveForward 会把
@@ -2700,8 +2860,20 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         double rewardBlack = 0.0;
         double rewardA = 0.0;
         double rewardB = 0.0;
+        /*
+           [O1] 本局的吃子行为 = 打完这一局之后 st 里那两个累计量的**差**。
+           为什么要取差而不是让 playMatchGame 多返回几个出参: 出参已经有 4 个了, 再加
+           4 个会让签名难以阅读; 而"累计量的差"是现成的、且**天然覆盖被中止的局**
+           (playMatchGame 里有一条 early return, 用出参就得在两处都写一遍)。
+        */
+        const int capAvailA0 = st.capAvailA, capChosenA0 = st.capChosenA;
+        const int capAvailB0 = st.capAvailB, capChosenB0 = st.capChosenB;
         const int res = playMatchGame(redType, blackType, aIsRed, st, rewardRed,
                                       rewardBlack, rewardA, rewardB);
+        const int gCapAvailA = st.capAvailA - capAvailA0;
+        const int gCapChosenA = st.capChosenA - capChosenA0;
+        const int gCapAvailB = st.capAvailB - capAvailB0;
+        const int gCapChosenB = st.capChosenB - capChosenB0;
         if (res == Chess::RESULT_ONGOING) {
             st.aborted = true;      /* playMatchGame 用 ONGOING 表示"被中止" */
             break;
@@ -2749,16 +2921,37 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
                 .arg(rB, 0, 'f', 2)
                 .arg(m_lastReward.learnCaliperB ? QStringLiteral("学习口径")
                                                 : QStringLiteral("引擎口径"));
+        /*
+           [O1] 本局的"该吃的时候吃了吗"。放在**每局那一行**里 (而不只放整场汇总):
+           逐局明细是用户事后回看的地方, 而"吃子无动于衷"往往是**某一类局面**才发生
+           (例如对方送子时不吃) —— 只有逐局能看到它是不是均匀分布的。
+           口径与整场那一行 (captureLine) 完全一致, 只是这里只印本局。
+        */
+        const QString capText =
+            QStringLiteral("  该吃时吃到 A=%1/%2 B=%3/%4")
+                .arg(gCapChosenA).arg(gCapAvailA)
+                .arg(gCapChosenB).arg(gCapAvailB);
         st.log += line + QStringLiteral("  (%1 手)").arg(m_selfPlayMoveNo.load())
-                  + rewardText + QStringLiteral("\n");
+                  + rewardText + capText + QStringLiteral("\n");
 
-        emit matchGameFinished(st.games, games, line + rewardText);
+        emit matchGameFinished(st.games, games, line + rewardText + capText);
         /* ---- 实时比分 (界面用, 见 matchScoreChanged 的注释) ---- */
         {
             QString score = QStringLiteral("%1 %2 : %3 %4")
                                 .arg(st.agentA).arg(st.winA).arg(st.winB).arg(st.agentB);
             score += QStringLiteral("   和 %1").arg(st.draws);
             score += QStringLiteral("   (%1/%2 局)").arg(st.games).arg(games);
+            /*
+               [O1] 实时比分那一行也带上"该吃的时候吃了吗"的**整场累计**:
+               这一行是用户在对弈过程中一直盯着的位置, 而吃子与否正是他报告的现象。
+               整场累计 + 每局明细里各有一份, 于是"一直是这个水平"与"只是这一局异常"
+               能当场分开 (见 captureLine 的说明)。
+            */
+            if (st.capAvailA > 0 || st.capAvailB > 0) {
+                score += QStringLiteral("   该吃时吃到 A=%1/%2 B=%3/%4")
+                             .arg(st.capChosenA).arg(st.capAvailA)
+                             .arg(st.capChosenB).arg(st.capAvailB);
+            }
             emit matchScoreChanged(score);
         }
         emit gameRewardSample(st.games, st.agentA, st.agentB, rA, rB);
@@ -3010,7 +3203,14 @@ void ChessBoard::backgroundTrainLoop()
             break;
         }
         if (!trainable) {
-            if (type != AGENT_ALPHABETA && type != AGENT_MCTS
+            /*
+               纯搜索 agent (Alpha-Beta 各等级 / MCTS) 是**预期**没有后台训练的:
+               它们没有可训练权重, 落到这里不报警。
+               [2026-09] 这里的判据从"枚举点名"改成 abDepthOf(type) > 0 —— 加了三档
+               AB 等级之后, 再按枚举逐个点名就会漏掉新类型, 于是每次轮转都打一条
+               "该 agent 的后台训练尚未接入"的假警告, 把真正的"忘了接线"淹掉。
+            */
+            if (abDepthOf(type) == 0 && type != AGENT_MCTS
                 && notWiredWarned.insert(type).second) {
                 /* 现在十一个 agent 里"有权重可训"的**全部**接上了, 所以这一支只有在
                    以后新增 agent 类型而忘了接线时才会响 —— 留着它就是为了那一天:
