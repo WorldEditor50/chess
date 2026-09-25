@@ -48,6 +48,17 @@ static bool contains(const QString &hay, const QString &needle)
     return hay.contains(needle);
 }
 
+/* [2.7f] 读一个文件的字节内容 (用来做"逐字节不变"的比较); 读不到返回空 */
+static std::string readFileBytes(const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) {
+        return std::string();
+    }
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
 int main(int argc, char *argv[])
 {
     /* 无缓冲: 崩溃时也能看到走到了哪一步 (printf 默认是行/块缓冲, 段错误会把它丢掉) */
@@ -778,6 +789,134 @@ int main(int argc, char *argv[])
         board.setMatchMode(ChessBoard::MATCH_TRAIN);
         board.setPreTrainEnabled(false);
         board.setPreTrainSteps(0);
+    }
+
+    /* ================================================================
+     *  [2.7e] 人机对战那条路也要受对弈模式约束 (P0-b 修掉的洞)
+     * ================================================================
+     *
+     * 洞的形态: `aiThink`(人机) 原来**完全绕过**对弈模式 —— 用户把模式设成
+     * "评估对局 / 只对弈不学习", 然后跟 AI 下棋, AI 照常每手做在线训练, 界面上
+     * 一个字都没说。这是"一个控件两种语义", 比"没做这个功能"更难排查。
+     *
+     * 修法 (语义): 人机对战里**人的棋力不会被这个程序改变**, 所以"待评估的那一方"
+     * 只能是人 ⇒ AI 固定是**冻结的对手**。于是:
+     *   训练模式   -> AI 照旧学 (与改动前一致);
+     *   评估模式   -> AI 不学 (只让"人"学, 而人没有可训练参数);
+     *   只对弈模式 -> AI 不学。
+     *
+     * 判据: 用测试钩子 humanTurnAiMoveForTest 走**与人机路径逐行相同**的决策, 数
+     * 训练损失上报次数 + 模式闸门踩下的次数 (闸门计数是"确实被拦了"的直接证据,
+     * 只看"没上报"分不清"被拦"还是"这一手本来就不学")。
+     */
+    std::printf("\n[2.7e] 人机对战路径受不受对弈模式约束\n");
+    {
+        auto humanMoveLosses = [&board](ChessBoard::AgentType aiType) -> int {
+            board.setAgentType(aiType);
+            /*
+               **必须先把棋盘摆回开局**: 前面的小节把棋盘停在别的局面上了 (不同小节的
+               手数上限/终局状态不一样) —— 不重置的话这一手可能是在"已经没棋可走"的
+               局面上决策, 于是拿不到合法走法, 断言会因为与本事无关的原因失败
+               (第一版就是这么红的)。
+            */
+            board.reset();
+            int n = 0;
+            QMetaObject::Connection conn = QObject::connect(
+                &board, &ChessBoard::trainLossSample,
+                [&n](double loss, const QString &agent, int step) {
+                    (void)loss; (void)agent; (void)step;
+                    n++;
+                });
+            /* 一步"人机对战里 AI 的决策" (AI 执黑, 与人机路径同一条路) */
+            const Step s = board.humanTurnAiMoveForTest(Stone::COLOR_BLACK);
+            QObject::disconnect(conn);
+            CHECK(s.valid, "人机路径的这一步返回了合法走法 (钩子确实走到了决策)");
+            return n;
+        };
+
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        const int nTrain = humanMoveLosses(ChessBoard::AGENT_PPOMCTS);
+        std::printf("    训练模式  : AI 上报 %d 次\n", nTrain);
+        CHECK(nTrain > 0,
+              "训练模式下人机对战里 AI 照常在线训练 (与改动前一致, 行为没被收紧)");
+
+        board.setMatchMode(ChessBoard::MATCH_EVAL);
+        const int blockedBefore = board.matchLearningBlockedCount();
+        const int nEval = humanMoveLosses(ChessBoard::AGENT_PPOMCTS);
+        const int blockedEval = board.matchLearningBlockedCount() - blockedBefore;
+        std::printf("    评估模式  : AI 上报 %d 次, 闸门踩下 %d 次\n", nEval, blockedEval);
+        CHECK(nEval == 0 && blockedEval > 0,
+              "评估模式下人机对战里 AI **不学习**, 而且是被模式闸门拦下的"
+              " (人 = 学习者但没有可训练参数 ⇒ AI 作为冻结对手不学)");
+
+        board.setMatchMode(ChessBoard::MATCH_NO_LEARN);
+        const int blockedBefore2 = board.matchLearningBlockedCount();
+        const int nNone = humanMoveLosses(ChessBoard::AGENT_SACAZ);
+        const int blockedNone = board.matchLearningBlockedCount() - blockedBefore2;
+        std::printf("    只对弈    : SAC 上报 %d 次, 闸门踩下 %d 次\n", nNone, blockedNone);
+        CHECK(nNone == 0 && blockedNone > 0,
+              "只对弈模式下人机对战也不学习 —— 含 SAC 那条 learnFromSearch 路径");
+
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+    }
+
+    /* ================================================================
+     *  [2.7f] 评估/只对弈模式会暂停后台训练 (P0-b)
+     * ================================================================
+     *
+     * 洞的形态: 后台训练线程**开机就在跑**, 每轮把 clone 的权重同步回主 agent ——
+     * 而对弈用的就是这个主 agent。于是"评估对局 / 只对弈不学习"声称的冻结只是
+     * "这一手不学习", 权重仍会在局与局之间被换掉, 报告与读数都会骗人。
+     *
+     * 修法: 这两种模式下 matchAgents 用 pauseBackgroundTraining() 让后台线程**不再改动
+     * 主 agent 的权重** (它在轮次开头等条件变量, 并且在写主 agent 之前于锁内复查暂停标志,
+     * 使得"暂停之前就在飞的那一轮"也会被丢弃而不是写进去)。
+     *
+     * 这里钉住三件事:
+     *   (1) pause/resume 在**后台训练正在跑**的时候也不会卡死 (这是它最容易写错的地方:
+     *       pause 要拿主 agent 的锁, 而训练线程可能正持有它);
+     *   (2) 暂停期间主 agent 的权重**逐字节不变** (真正的"冻结");
+     *   (3) resume 之后后台训练还能继续改权重 (没有把线程等死)。
+     */
+    std::printf("\n[2.7f] 评估/只对弈模式暂停后台训练\n");
+    {
+        board.setBackgroundTrainRound(1, 8);   /* 一轮缩到 8 手, 免得测试等太久 */
+        board.startBackgroundTraining();
+        CHECK(true, "后台训练线程能起来");
+
+        /* 先让它在"训练模式"下真的动一次主 agent 的权重 (否则下一条断言是空测) */
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        const std::string tmpW = "weights/_temp_match_bt_probe";
+        board.saveCurrentAgentModel(ChessBoard::AGENT_PPOMCTS, tmpW);
+        const std::string weighA = readFileBytes(tmpW + "_actor");
+        std::printf("    训练模式下: 主 agent 权重快照 = %zu 字节\n", weighA.size());
+        CHECK(!weighA.empty(), "能读到主 agent 的权重快照 (前置条件)");
+
+        /* 暂停 -> 等一段时间 -> 权重必须逐字节不变 */
+        board.pauseBackgroundTraining();
+        CHECK(true, "pauseBackgroundTraining 在后台线程运行期间也没有卡死");
+        board.saveCurrentAgentModel(ChessBoard::AGENT_PPOMCTS, tmpW);
+        const std::string frozenA = readFileBytes(tmpW + "_actor");
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        board.saveCurrentAgentModel(ChessBoard::AGENT_PPOMCTS, tmpW);
+        const std::string frozenB = readFileBytes(tmpW + "_actor");
+        std::printf("    暂停后两次快照 = %zu / %zu 字节 (3 秒间隔), 逐字节相同 = %d\n",
+                    frozenA.size(), frozenB.size(), (int)(frozenA == frozenB));
+        CHECK(!frozenA.empty() && frozenA == frozenB,
+              "暂停期间主 agent 的权重**逐字节不变** —— 这才叫冻结 (报告里那句"
+              " '双方都不学' 因此才配得上'权重也不变')");
+
+        board.resumeBackgroundTraining();
+        CHECK(true, "resumeBackgroundTraining 正常返回");
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        board.stopBackgroundTraining();
+        CHECK(!board.isBackgroundTrainingRunning(),
+              "后台训练能正常停掉 (测试不做完就退出会让后面的小节被它干扰)");
     }
 
     /* ------------------------------------------------- 2.8 对局过程中的奖励曲线 */

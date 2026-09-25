@@ -1519,7 +1519,7 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
  *     而 SAC+AZ **仍然每手 20 次** —— 于是"关掉探索 = 只看不下"只对一部分 agent 成立。
  *   * 所以本模式必须**同时**管住两条路径, 而且判据只能有一处, 否则一定会漏:
  *       ① 每手一次更新 (preTrainThenDecide)          -> updateEnabledForSide
- *       ② 从自己的搜索学一次 (SAC learnFromSearch)   -> searchLearningEnabledForSide
+ *       ② 从自己的搜索学一次 (SAC learnFromSearch)   -> searchLearningEnabled
  *     两者在 MATCH_NO_LEARN 下都返回 false; MATCH_EVAL 下只放行 A 那一侧。
  *
  * ⚠ 用 `m_matchRunning` 区分"这是对弈还是人机": 人机对战 (aiThink) 沿用原有行为,
@@ -1541,31 +1541,45 @@ bool ChessBoard::matchLearnsSomething() const
     return m_matchMode.load() != MATCH_NO_LEARN;
 }
 
-bool ChessBoard::updateEnabledForSide(bool isA) const
+/*
+ * ---- 学习闸门 (唯一判据) ----
+ *
+ * 语义表 (role x mode):
+ *
+ *      role             TRAIN   EVAL    NO_LEARN
+ *      SIDE_LEARNER      学      学       不学
+ *      SIDE_FROZEN       学     不学      不学
+ *      SIDE_PURE_SEARCH  不学    不学      不学      (没有可训练参数, 与模式无关)
+ *
+ * 对弈: 每一手由 playMatchGame 按"红方是否 A 方"填 role (A=LEARNER, B=FROZEN)。
+ * 人机: AI 固定执黑 ⇒ role 固定 = SIDE_FROZEN (见 process())。所以"评估对局/只对弈"
+ *       对人机**同样生效**, 一个控件一种语义 (这是 P0-b 补掉的那个洞)。
+ */
+bool ChessBoard::updateEnabledForSide(SideRole role) const
 {
-    if (!m_matchRunning.load()) {
-        return true;      /* 不在对弈中: 人机对战照旧 */
+    if (role == SIDE_PURE_SEARCH) {
+        return false;      /* 纯搜索 agent 本来就不学 —— 与模式无关 */
     }
     switch (m_matchMode.load()) {
-    case MATCH_TRAIN:    return true;
-    case MATCH_EVAL:     return isA;     /* 只让 A 方 (待评估者) 学; B 是冻结的参照物 */
-    case MATCH_NO_LEARN: return false;
+    case MATCH_TRAIN:    return true;                                   /* 双方各自学 */
+    case MATCH_EVAL:     return role == SIDE_LEARNER;                   /* 只让学习者学 */
+    case MATCH_NO_LEARN: return false;                                  /* 都不学 */
     }
     return true;
 }
 
-bool ChessBoard::searchLearningEnabledForSide(bool isA) const
+bool ChessBoard::searchLearningEnabled() const
 {
-    /* 口径与 updateEnabledForSide 完全一致 —— 两条学习路径必须同进同退 */
-    return updateEnabledForSide(isA);
+    /* 两条学习路径必须同进同退: 口径就是 updateEnabledForSide 那一个函数 */
+    return updateEnabledForSide(m_sideRole);
 }
 
 bool ChessBoard::perMoveLearningEnabled() const
 {
-    if (!m_matchRunning.load()) {
-        return true;      /* 人机对战: 由界面上的开关与步数决定 (原有行为) */
+    if (m_sideRole == SIDE_PURE_SEARCH) {
+        return false;
     }
-    return updateEnabledForSide(m_sideBeingDecided);
+    return updateEnabledForSide(m_sideRole);
 }
 
 /*
@@ -1894,6 +1908,32 @@ void ChessBoard::emitStage(const QString &stage)
  * ================================================================ */
 Step ChessBoard::aiThink(int color)
 {
+    /*
+       ---- 人机对战: AI 固定是"冻结的对手" (P0-b) ----
+       为什么必须在这里填角色: 在它之前, 人机这条路**完全绕过**了对弈模式 ——
+       用户把模式设成"评估对局 / 只对弈不学习", 然后跟 AI 下棋, AI 照常每手训练,
+       界面上一个字都没说 (一个控件两种语义)。
+       语义定成"人 = 学习者(A), AI = 冻结的对手(B)": 因为人机对战里**人的棋力不会被
+       这个程序改变**, 所以"待评估的那一方"只能是人。于是:
+         * 训练模式   : 双方都能学 ⇒ AI 照旧 (与改动前一致);
+         * 评估模式   : 只让人学 —— 人没有可训练参数 ⇒ AI 不学 (等价于"只对弈");
+         * 只对弈模式 : AI 不学。
+       AI 执黑是 process() 的既有约定 (见那里的 aiThink(Stone::COLOR_BLACK))。
+       ⚠ 这里**委托**给 humanTurnAiMoveForTest, 一份实现两处用: 否则测试钩子与生产
+         路径会各写一遍, 而"两处各写一遍"正是本工程反复栽跟头的地方 (SAC 掩码漏改那次)。
+    */
+    return humanTurnAiMoveForTest(color);
+}
+
+/*
+ * humanTurnAiMoveForTest - 测试钩子: 走一次人机对战的 AI 决策 (P0-b)
+ *
+ * 与 process() 里那一步逐行相同 (先填角色、再 aiThinkRaw), 见 chessboard.h 的说明。
+ * 存在的唯一理由是"人机路径受不受对弈模式约束"必须能被测试钉住 —— 而 aiThink 是私有。
+ */
+Step ChessBoard::humanTurnAiMoveForTest(int color)
+{
+    setSideRole(sideRoleForHumanGame());
     const Step step = aiThinkRaw(color);
     return legalStepOrFallback(color, step, agentDisplayName(m_agentType));
 }
@@ -2651,7 +2691,7 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
     };
     /*
        本局"A 方是不是执红" —— 每局都要重写 (matchAgents 每局交换先后手),
-       决策路径靠它把"这一手替谁下"换算出来 (见下面 m_sideBeingDecided)。
+       决策路径靠它把"这一手替谁下"换算成 SideRole (见下面 setSideRole 那一处)。
     */
     m_matchAIsRed = aIsRed;
     /*
@@ -2692,13 +2732,12 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
 
         const AgentType who = typeForTurn(turn, redType, blackType);
         /*
-           ---- 告诉决策路径"这一手在替谁下" (P0-a 对弈模式) ----
-           MATCH_EVAL 的语义是"冻结 B 方、只让 A 方学", 而决策路径只能看到一个
-           AgentType, 分不出它是 A 还是 B (同一个类型可能两边都在用)。所以这里把
-           "A 方是否执红"换算成"这一手是不是 A 的", 供 updateEnabledForSide 使用。
-           (红黑与 A/B 的换算只有这一处, 与下面 syncAB 的口径同源。)
+           ---- 告诉决策路径"这一手在替谁下" (P0-a/P0-b 对弈模式) ----
+           A 方 = 学习者 (待评估/待训练那一方), B 方 = 冻结的对手。
+           决策路径只看到一个 AgentType, 分不出它是 A 还是 B (同一个类型可能两边都在用),
+           所以这个角色必须由对局循环来填。
         */
-        m_sideBeingDecided = ((turn == Stone::COLOR_RED) == aIsRed);
+        setSideRole(((turn == Stone::COLOR_RED) == aIsRed) ? SIDE_LEARNER : SIDE_FROZEN);
         auto t0 = std::chrono::steady_clock::now();
         Step step = aiThinkForAgent(turn, who);
         auto t1 = std::chrono::steady_clock::now();
@@ -2937,6 +2976,27 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
     if (games < 1) {
         games = 1;
     }
+
+    /*
+       ---- 暂停后台训练 (P0-b): "冻结"必须包括权重不变 ----
+       后台训练每轮会把权重同步回主 agent, 而对弈用的就是这个主 agent。若不暂停,
+       "评估对局 / 只对弈不学习"这两个模式声称的冻结只是"这一手不学习", 权重仍会在
+       局与局之间被换掉 —— 报告与读数都会骗人。
+       放在这里 (而不是每手) 的理由: 一次调用就够, 且它内部会等"正在飞的那一轮"收尾,
+       所以对局期间不会有任何后台写权重。
+       ⚠ 训练模式下**不暂停**: 那种模式下双方本来就在学, 停不停后台都改变不了
+         "权重会变"这件事, 而停掉会让"一边对弈一边后台训练"这个既有用法失效。
+       RAII: 无论正常结束、被中止还是提前 return, 都要恢复。
+    */
+    const bool pauseBg = (m_matchMode.load() != MATCH_TRAIN) && m_bgTraining.load();
+    if (pauseBg) {
+        pauseBackgroundTraining();
+    }
+    struct BgResumeGuard {
+        ChessBoard *self;
+        bool active;
+        ~BgResumeGuard() { if (active) { self->resumeBackgroundTraining(); } }
+    } bgGuard{this, pauseBg};
 
     /*
        对弈期间屏蔽玩家点击。用独立标志而不是改 state —— state 是给 AI 工作线程
@@ -3372,6 +3432,44 @@ void ChessBoard::setBackgroundTrainRound(int episodes, int maxMoves)
     m_bgTrainMaxMoves = (maxMoves > 0) ? maxMoves : 1;
 }
 
+/*
+ * pauseBackgroundTraining - 让后台训练**停止改动主 agent 的权重** (P0-b)
+ *
+ * 为什么是"停止改动权重"而不是"停掉线程": 后台训练的一轮是
+ *     克隆权重 -> 独立棋盘上自对弈 -> 训好写回临时文件 -> **同步回主 agent**
+ * 而"同步回主 agent"那一步才是会污染评估的那件事。线程本身停不停无所谓。
+ *
+ * 做法: 置 m_bgPaused, 然后**等训练线程确认它不再持有主 agent 的锁**。
+ * 等锁这一下是必要的: 否则"对局开始"与"某一轮的收尾同步"可以交错 —— 那一轮在
+ * 暂停之前就已经在飞, 它会在对局中途把权重换掉 (这正是要拦的东西)。
+ *
+ * 死锁分析 (为什么从对弈线程调它是安全的):
+ *   * 对弈线程不持有 m_agentMutex 时调它 (调用点在 matchAgents 开场, 见那里的注释);
+ *   * 训练线程要么还没拿到锁 (立刻放行), 要么正持有锁做一次 loadModel —— 它会很快放锁,
+ *     然后看到 m_bgPaused 并去 wait (不再开始新一轮)。
+ *   * 训练线程**不会**在持有 m_agentMutex 的时候等条件变量 (见 backgroundTrainLoop
+ *     里 pause 检查的位置), 所以不存在"我等你放锁、你等我 resume"的环。
+ */
+void ChessBoard::pauseBackgroundTraining()
+{
+    m_bgPaused = true;
+    {
+        /* 拿一次锁就够了: 能拿到 = 当前没有人在写主 agent 的权重 */
+        std::unique_lock<std::mutex> lock(m_agentMutex);
+    }
+    /* 通知训练线程醒来去 wait (它可能正等在 wait_for 的超时上) */
+    m_bgPauseCv.notify_all();
+}
+
+void ChessBoard::resumeBackgroundTraining()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_bgPauseMutex);
+        m_bgPaused = false;
+    }
+    m_bgPauseCv.notify_all();
+}
+
 void ChessBoard::backgroundTrainLoop()
 {
     QDir().mkpath("weights");
@@ -3384,6 +3482,25 @@ void ChessBoard::backgroundTrainLoop()
     std::set<AgentType> notWiredWarned;
 
     while (m_bgTraining) {
+        /*
+           ---- 暂停闸门 (P0-b) ----
+           对弈在"评估对局 / 只对弈不学习"模式下会暂停后台训练: 这两个模式声称冻结,
+           而本循环每轮会把权重**同步回主 agent** —— 那正是对弈在用的那份权重。
+           等在这里而不是 sleep 轮询: 对局结束时会 notify (见 resumeBackgroundTraining)。
+           ⚠ 条件变量的 wait **不能**在持有 m_agentMutex 时做 (那会与
+             pauseBackgroundTraining 的"拿一次锁"互等, 见那里的死锁分析)。
+        */
+        {
+            std::unique_lock<std::mutex> pauseLock(m_bgPauseMutex);
+            m_bgPauseCv.wait_for(pauseLock, std::chrono::milliseconds(200),
+                                 [this] { return !m_bgPaused.load() || !m_bgTraining; });
+        }
+        if (!m_bgTraining) {
+            break;
+        }
+        if (m_bgPaused.load()) {
+            continue;      /* 暂停中: 不开始新一轮 (也不碰主 agent) */
+        }
         AgentType type = m_agentType;
         /* 本轮的规模 (默认 = BG_TRAIN_*, 测试可以调小, 见 setBackgroundTrainRound) */
         const int roundEpisodes = m_bgTrainEpisodes.load();
@@ -3808,8 +3925,20 @@ void ChessBoard::backgroundTrainLoop()
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
+        /*
+           ---- 第二轮暂停检查 (P0-b): **在锁内**判, 就在写主 agent 之前 ----
+           这一轮可能是在"暂停请求到达之前"就已经开跑的在飞轮次, 所以必须再确认一次。
+           顺序很关键: **先拿 m_agentMutex, 再读 m_bgPaused**。反过来 (先读再抢锁) 会留下
+           一个窗口 —— pauseBackgroundTraining 在那个窗口里拿到锁并返回 (它以为已经没人在
+           写了), 而我们随后拿到锁把权重写了进去, 于是"冻结"是假的。
+           拿到锁之后读到的 paused 一定是最新的: pause 置位在前、抢锁在后。
+           丢弃这一轮是"浪费一点算力", 写进去则是"评估结论被悄悄污染"。
+        */
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
+            if (m_bgPaused.load()) {
+                continue;      /* 安全: lock_guard 会析构 (见暂停闸门的死锁分析) */
+            }
             switch (type) {
             case AGENT_PG:
                 if (m_sfPG && !m_sfPG->loadPolicy(tmpWeights)) {

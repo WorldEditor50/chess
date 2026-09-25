@@ -15,6 +15,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>   /* 后台训练的 pause/resume (P0-b) */
 #include <functional>   /* finishDecision 的"决策回调"参数 (P0-a 对弈模式) */
 #include <vector>
 #include <map>
@@ -292,6 +293,23 @@ public:
 
     /* 让两个 agent 互相对弈 games 局 (每局交换先后手), 阻塞直到结束或被中止 */
     MatchStats matchAgents(AgentType typeA, AgentType typeB, int games);
+
+    /*
+     * ---- 测试钩子: 走一次"人机对战"的 AI 决策 (P0-b) ----
+     *
+     * 为什么需要它: 人机那条路 (aiThink) 是 private, "人机对战也受对弈模式约束"这件事
+     * 在测试里**没有入口**可以钉住 —— 而它正是 P0-b 修掉的洞 (用户把模式设成
+     * 评估/只对弈, 跟 AI 下棋时 AI 照常每手训练, 界面上一个字都没说)。
+     * 给测试留一个显式命名的钩子, 好过让这条路径无人覆盖。
+     *
+     * 语义: 与 process() 里那一步逐行相同 (先 setSideRole(sideRoleForHumanGame()),
+     * 再 aiThinkRaw + 合法性闸门), 而且 aiThink 本身**委托**给它 —— 一份实现两处用,
+     * 不会像"SAC 掩码只改了一半"那样漂移。
+     *
+     * ⚠ 必须放在**本段 (public)**。放在 private 段里测试会报 C2248 —— 这与
+     *   power-of-two 无关, 纯粹是这个文件的段边界很长, 很容易看错。
+     */
+    Step humanTurnAiMoveForTest(int color);
     /*
      * 每局的手数上限 (默认 300)。达到上限即判和棋。
      * 主要给自动化测试用: 把上限调小就能在几秒内跑完一整场对弈, 从而验证
@@ -612,19 +630,47 @@ private:
      * ---------------------------------------------------------------- */
 
     /*
-     * 这一手**要不要做"探索环境 + 预训练"**。
-     *  = 不在对弈中 (人机对战照旧) 或 当前对局处于 MATCH_TRAIN;
-     *    再叠加界面上的"探索+预训练"开关与步数 (>0)。
-     * 注意顺序: "不在对弈中"必须放前面 —— aiThink (人机) 与 aiThinkForAgent (对弈)
-     * 共用这一条判据, 而人机对战不该被对弈模式影响。
+     * ----------------------------------------------------------------
+     *  ---- 这一手"谁在学" (P0-a 的判据输入; 2026-09 统一) ----
+     * ----------------------------------------------------------------
+     * 为什么要把它**独立于 MatchMode** 做成一个枚举, 而不是一个 bool:
+     *   对弈路径 (aiThinkForAgent) 是"替 A 方或 B 方决策", 而人机路径 (aiThink) 里
+     *   AI 固定执黑 (见 process())、玩家是人 —— 同一套模式在两处的含义**本来就不一样**。
+     *   原来用 `bool m_sideBeingDecided` (= "红方是否 A 方") 表达, 人机那条路根本填不出     *   这个值, 于是它只能默认 true ⇒ 人机对战**完全绕过**了对弈模式 (用户把模式设成
+     *   "只对弈不学习" 之后跟 AI 下棋, AI 照常每手训练, 界面上一个字都没说)。
+     *   现在两处都从**自己的实际角色**填这个值, 判据只有一份, 不会两套语义。
+     */
+    enum SideRole {
+        SIDE_LEARNER = 0,      /* 这一手的 agent 是"学习者" (待评估/待训练那一方) */
+        SIDE_FROZEN,           /* 这一手的 agent 是"冻结的对手" (被参照那一方) */
+        SIDE_PURE_SEARCH       /* 纯搜索 agent: 本来就没有可训练参数 (AB 各档 / MCTS) */
+    };
+
+    /*
+     * 这一手**要不要做"探索环境 + 预训练"** (第一条学习路径)。
+     * 只在 SIDE_LEARNER 下允许; 人机对战里 AI 是 SIDE_FROZEN, 因此"只对弈不学习"
+     * 与"评估对局"对人机**同样生效** —— 一个控件一种语义。
+     * 之后再叠加界面上的"探索+预训练"开关与步数 (>0)。
      */
     bool perMoveLearningEnabled() const;
     /*
-     * 这一手**要不要更新** (泛指: 回放池里攒样本 / learnBatch / learnFromSearchStep)。
-     * MATCH_NO_LEARN 一律 false; MATCH_EVAL 时只有 isA 那一侧为 true。
-     * 不在对弈中 -> true (人机对战保持原有行为)。
+     * 第二条学习路径 (SAC 的 learnFromSearch) 这一手允不允许。
+     * 口径与 perMoveLearningEnabled 完全一致 —— 两条路径必须同进同退。
      */
-    bool updateEnabledForSide(bool isA) const;
+    bool searchLearningEnabled() const;
+    /*
+     * 判据本体: 该角色在当前模式下要不要学 (唯一一处实现, 上面两个只是它的两种叫法)。
+     * 公开是为了让测试能直接钉住那张 role x mode 表, 不必绕道对局。
+     */
+    bool updateEnabledForSide(SideRole role) const;
+    /*
+     * 设置"这一手谁在学"。生产者只有两处 (对弈循环 / 人机 process), 都在**决策之前**
+     * 写, 且与决策同线程 (对弈线程或 AI 工作线程) —— 没有并发写入。
+     */
+    void setSideRole(SideRole r) { m_sideRole = r; }
+    SideRole sideRole() const { return m_sideRole; }
+    /* 人类对战那条路里 AI 的角色 (AI 固定执黑, 见 process()) */
+    static SideRole sideRoleForHumanGame() { return SIDE_FROZEN; }
     /*
      * 决策的两个收尾钩子 (把"决策 + 损失上报 + 模式掩码"收在一处)。
      *
@@ -657,14 +703,12 @@ private:
            所以不会把用户/测试设过的 learnFromSearch=false 悄悄打开。
         */
         const bool before = agent->learnFromSearch;
-        agent->learnFromSearch = before && searchLearningEnabledForSide(m_sideBeingDecided);
+        agent->learnFromSearch = before && searchLearningEnabled();
         Step s = decide();
         agent->learnFromSearch = before;
         reportLearnedLoss(agent, stepsBefore);
         return s;
     }
-    /* "从自己的搜索学一次"(SAC 的 learnFromSearch) 这一手允不允许 */
-    bool searchLearningEnabledForSide(bool isA) const;
     /*
      * 诊断计数: 本次对局里"因为模式而被禁止更新"的次数 (每手最多一次)。
      * 为什么需要它: 模式生效与否**在读数上极难分辨** —— "B 侧更新 20 次而不是 40 次"
@@ -676,11 +720,41 @@ public:
     int matchLearningBlockedCount() const { return m_matchLearningBlocked.load(); }
 private:
     /*
-     * 当前这一手是在替哪一方决策 (对弈里 "红方是不是 A 方")。
-     * 人机路径 (aiThink) 保持 true —— 它不在对弈里, 两个判据都只看"是否在对弈中"。
-     * 由 playMatchGame 在每一手之前写 (同一线程, 与决策串行)。
+     * 当前这一手在替谁决策 (对弈里 "这一手是 A 方还是 B 方"; 人机里 AI 固定是冻结方)。
+     * 由对弈循环与 process() 在**决策之前**写 (同线程, 无并发写)。
      */
-    bool m_sideBeingDecided = true;
+    SideRole m_sideRole = SIDE_LEARNER;
+
+    /* ---- 后台训练线程的"暂停" (P0-b) ---- */
+    /*
+     * 为什么必须能暂停: 后台训练每轮把 clone 的权重**同步回主 agent** —— 而对弈用的
+     * 就是这个主 agent。于是"评估对局 / 只对弈不学习"这两个声称冻结的模式下, 权重
+     * 仍会在局与局之间被后台线程换掉 (报告写"双方都不学", 读起来却像权重也是固定的)。
+     * 冻结必须包含**权重不变**, 否则 docs/agents_design.md §10.3 第 7 条那个
+     * "预训练 = 0 的对照" 口径根本不成立。
+     *
+     * 实现选择 (为什么不是 stop/start 线程): 对弈本身跑在后台线程上, 从那里 stop 会
+     * join 自己 → 死锁; 而且 stopBackgroundTraining 与关窗路径会并发调用。
+     * 这里用"标志 + 条件变量": 训练线程在**每轮开头**等 (以及收尾同步前再确认一次),
+     * 对局结束时唤醒。线程生命周期完全不变, 任何线程都能安全 pause/resume。
+     */
+    std::atomic<bool> m_bgPaused{false};
+    std::mutex m_bgPauseMutex;
+    std::condition_variable m_bgPauseCv;
+public:
+    /*
+     * 暂停 / 恢复后台训练 (P0-b)。**public**: 对弈线程要用 (matchAgents 里的 RAII 守卫
+     * 是个局部结构体, 拿不到 private 成员)。
+     *
+     * pauseBackgroundTraining 返回后保证: 后台线程**不再改动主 agent 的权重**
+     * (它要么还没开始新一轮, 要么正持有主 agent 的锁做收尾同步 —— 本函数会等那把锁,
+     *  并且在锁内复查暂停标志, 所以"在飞的那一轮"不会再写)。
+     * resumeBackgroundTraining 唤醒它继续。
+     */
+    void pauseBackgroundTraining();
+    void resumeBackgroundTraining();
+    /* 后台训练线程此刻在不在跑 (测试与界面用; 见 [2.7f]) */
+    bool isBackgroundTrainingRunning() const { return m_bgTraining.load(); }
 
     /* ---- 思考过程可视化 (全部只在 GUI 线程读写, 除了 m_thinkGeneration) ---- */
     void initThinkVisuals();
@@ -834,6 +908,11 @@ private:
 
     /* 后台训练 */
     std::thread m_bgTrainThread;
+    /*
+       atomic: 置位/清位在 GUI 线程 (start/stop), 而读取在训练线程的循环条件、
+       以及暂停闸门的 wait 谓词里 —— 一个普通 bool 被两条线程读写是数据竞争
+       (原来就是, 2026-09 顺手改成 atomic)。
+    */
     std::atomic<bool> m_bgTraining{false};
     /*
      * 一轮的规模 (见 setBackgroundTrainRound)。用 atomic: GUI/测试线程写、训练线程

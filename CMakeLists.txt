@@ -1296,6 +1296,63 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_anchor)
 
+    # ------------------------------- 对弈模式 (P0-a) 的成本/语义读数 (不进 ctest)
+    # "评估模式到底快多少"决定它能不能当日常工具用: 模式同时关掉两条学习路径
+    # (rollout + SAC 的 learnFromSearch), 省下的时间与 agent 组合有关
+    # (SAC+AZ 每手一次 learnBatch 约 2.3 s)。回归断言在 test_match [2.7d], 这里只是读数。
+    #   <build>/bench_match_modes --games=2 --plies=40 --sims=32 --a=ppo --b=sac
+    add_executable(bench_match_modes
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_match_modes_main.cpp
+        ${SRC_DIR}/chessboard.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/evagent.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/dqnagent.cpp
+        ${SRC_DIR}/pgagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/dqnmcts_agent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
+        ${SRC_DIR}/dqnabagent.cpp)
+    target_include_directories(bench_match_modes PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_match_modes PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_match_modes PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_match_modes PROPERTIES
+        AUTOMOC ON
+        AUTOUIC OFF)
+    chess_add_header_deps(bench_match_modes)
+
+    # ------------------- PG "lastLoss 变非有限值且不复位" 的定位探针 (不进 ctest)
+    # test_match [2.7b] 曾经时真时假 (一次绿一次红), 根因就是 dpg.lastLoss 会变成
+    # NaN/Inf 而曲线控件丢弃非有限值 ⇒ 损失曲线静默停止上报。这个探针把"哪一手开始坏"
+    # 打出来。修好后应当打印 "0/N 局出现过非有限 lastLoss"。
+    add_executable(probe_pg_loss_nan
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_pg_loss_nan_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/pgagent.cpp)
+    target_include_directories(probe_pg_loss_nan PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_pg_loss_nan PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(probe_pg_loss_nan PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_pg_loss_nan PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(probe_pg_loss_nan)
+
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、
     # 软价值里 α 熵项的形式、critic 是否真的把 Q 拉向目标。
