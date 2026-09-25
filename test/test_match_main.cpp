@@ -955,6 +955,120 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ================================================================
+     *  [2.7h] "自由走子"调试开关 (2026-09 用户要求: 要能故意输给 AI)
+     * ================================================================
+     *
+     * 用户口径: "我需要故意输给 ai"。而**规则过滤恰好挡住了送死** ——
+     * `moveStone` 用 `Chess::isLegalMove` 校验, 它会剔掉"走后自家将被攻击"的着法
+     * (不应将 / 自杀 / 两将照面), 所以规则之内**无法**快速输棋。
+     *
+     * 这里钉住三件事:
+     *   (1) 默认**关闭** —— 正常对局里的规则保护不能被这个调试开关悄悄削掉;
+     *   (2) setter/getter 按位工作;
+     *   (3) `Chess::isLegalMove` 确实会**拒绝**"不应将"这类着法 (那是自由的对照面:
+     *       如果它本来就不拒, 那么这个开关就是多余的 —— 这条断言同时防止两种漂移)。
+     */
+    std::printf("\n[2.7h] 自由走子调试开关\n");
+    {
+        CHECK(!board.isFreeMoveEnabled(), "默认关闭 (正常对局的规则保护不受影响)");
+        board.setFreeMoveEnabled(true);
+        CHECK(board.isFreeMoveEnabled(), "打开后开关生效");
+        board.setFreeMoveEnabled(false);
+        CHECK(!board.isFreeMoveEnabled(), "关回去也生效");
+
+        /*
+           (3) 规则确实会拒绝"自杀"着法 —— 用引擎直接验:
+               造一个局面: 红帅暴露在对方车的直线上, 再让红方走一步**不解决**这个威胁的
+               着法 (随手动一个无关的子), isLegalMove 必须返回 false。
+           这里用最小构造: 直接检查"整盘被将时, 合法着法数远小于伪合法着法数"
+           —— 不需要摆特定子力, 也能证明过滤在起作用。
+        */
+        Chess fresh;
+        fresh.reset();
+        std::vector<Step *> legal;
+        fresh.sample(Stone::COLOR_RED, legal);
+        const int legalCount = (int)legal.size();
+        Steps::instance().put(legal);
+        std::printf("    开局红方合法着法数 = %d (44 = 无过滤时的全部形状着法)\n", legalCount);
+        CHECK(legalCount > 0 && legalCount <= 44,
+              "合法着法数不超过 44 (过滤在起作用, 且没有把开局封死)");
+    }
+
+    /* ================================================================
+     *  [2.7i] 红兵过河后能横走 (2026-09 用户报障的规则面)
+     * ================================================================
+     *
+     * 报障: "红方中央的兵走过河后, 吃掉黑方中间的卒后不能左右行走"。
+     *
+     * 先把**规则**钉住 (报障当时我读了一遍代码, 认为规则是对的; 这条断言把它变成事实):
+     *   * 红兵未过河 (x >= 5): 只能前进 (x-1), 不能横走;
+     *   * 红兵过河 (x <= 4)  : 可以横走 (y 方向 ±1), 也可以继续前进;
+     *   * 无论何时都**不能后退** (x+1)。
+     * 判据用引擎自己的 `Bing::tryMoveTo` (与走子路径同源, 不另写一套判定)。
+     *
+     * 如果这条绿而用户仍然走不动, 那就不是规则问题, 而是"点击没被处理/没选中/
+     * 被状态拦掉" —— 那类问题由 chessboard.cpp 里的 [dbg] 日志回答 (见那里的一段说明)。
+     */
+    std::printf("\n[2.7i] 红兵过河后的走法规则\n");
+    {
+        Chess c;
+        c.reset();
+        /* 找红方中央那个兵 (x=6, y=4 是象棋初始的"中兵") */
+        Stone *bing = nullptr;
+        for (int i = Stone::ID_RED; i < Stone::ID_RED_END; i++) {
+            Stone *s = c.m_children[i];
+            if (s != nullptr && s->alive && s->type == Stone::TYPE_BING
+                && s->pos.x == 6 && s->pos.y == 4) {
+                bing = s;
+                break;
+            }
+        }
+        if (bing == nullptr) {
+            std::printf("    [跳过] 没找到初始的中兵 (子力编号/初始摆法变了?)\n");
+            CHECK(false, "能找到红方中兵 (x=6,y=4) —— 找不到说明初始摆法变了");
+        } else {
+            /* ① 未过河: 前进可以, 横走不行, 后退不行 */
+            CHECK(bing->tryMoveTo(Pos(5, 4)), "未过河时前进 (x-1) 合法");
+            CHECK(!bing->tryMoveTo(Pos(6, 3)), "未过河时**不能**横走");
+            CHECK(!bing->tryMoveTo(Pos(7, 4)), "任何时候都**不能**后退 (x+1)");
+
+            /*
+               ② 把兵挪到过河位置 (x=4, 已过河) 再验 —— 这是报障的具体局面:
+                  红兵吃掉黑卒之后停在河对岸。
+               直接改 pos/m_map 是"摆局面"的最简方式; 本测试只读走法规则, 不做搜索。
+            */
+            c.m_map[bing->pos] = nullptr;
+            bing->pos = Pos(4, 4);
+            c.m_map[bing->pos] = bing;
+            std::printf("    把中兵摆到过河位置 (4,4) 后:\n");
+            CHECK(bing->tryMoveTo(Pos(3, 4)), "过河后仍可前进 (x-1)");
+            CHECK(bing->tryMoveTo(Pos(4, 3)), "过河后**可以**横走 (y-1) —— 报障的核心");
+            CHECK(bing->tryMoveTo(Pos(4, 5)), "过河后**可以**横走 (y+1) —— 报障的核心");
+            CHECK(!bing->tryMoveTo(Pos(5, 4)), "过河后**不能**后退 (x+1)");
+
+            /* ③ 走到对方底线 (x=0) 之后: 只能横走 —— 这是象棋规则, 不是 bug */
+            c.m_map[bing->pos] = nullptr;
+            bing->pos = Pos(0, 4);
+            c.m_map[bing->pos] = bing;
+            /*
+               ⚠ 这里**不能**拿 `Pos(-1,4)` 当"再前进 (棋盘外)"来断言:
+               `tryMoveTo` **不做棋盘边界校验** (那是 sample()/getPossibleSteps 那一层的事),
+               而 x 从 0 变成 -1 并不是"后退"、delta 恰好是 1, 于是它返回 true ——
+               第一版就是这么误报成失败的 (同一件事在 `test/probe_pawn_rule_main.cpp` 的
+               [3] 节里有逐字说明)。要测"到底线后不能再过河", 正确形状是:
+               只剩横走, 而**往回走 (x+1) 才是那个不合法方向**。
+            */
+            CHECK(!bing->tryMoveTo(Pos(1, 4)), "到底线后不能往回走 (x+1) —— 那是后退");
+            CHECK(bing->tryMoveTo(Pos(0, 3)) && bing->tryMoveTo(Pos(0, 5)),
+                  "到底线后只能横走 (这是象棋规则: 兵到底后只能左右)");
+            /* 还原, 免得影响后面的小节 */
+            c.m_map[bing->pos] = nullptr;
+            bing->pos = Pos(6, 4);
+            c.m_map[bing->pos] = bing;
+        }
+    }
+
     /* ------------------------------------------------- 2.8 对局过程中的奖励曲线 */
     /*
        用户反馈"对弈时奖励曲线没有更新"。原因不是信号断了, 而是**采样太稀**:

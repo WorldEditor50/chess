@@ -228,6 +228,12 @@ alphaBetaPruning(color, depth)         # 顶层入口: 选最优走法
   中止生效），18 条断言；用 `setMaxPliesPerGame(4)` 让结果可预测
 - `test_grad`：**SIMD 之后的梯度传播**（有限差分核对解析梯度 + 直接探测 MM 内核
   "累加 vs 覆盖"），6 条断言；只链 `RL_CORE`，不依赖 Qt
+- `probe_hvai_flow`：**人机对弈状态机**（走真实点击路径 `mousePressEvent`）：一局
+  **由 AI 的落子结束**之后按"开局"，红方再走第一步，黑方必须应手；换对战 agent 之后
+  同理；外加沙漏卡片那一行显示的 agent 名。**已注册进 ctest**（约 5–12 s）——
+  这条路径原先没有任何测试覆盖（其余 `test_*` 走的是 `humanTurnAiMoveForTest` /
+  `matchAgents`，不经过 `ChessBoard::process()` 的终局分支）。设计说明见
+  `docs/agents_design.md` §22，问题记录见 `docs/issues_review.md` C27
 
 ## 四、SQLite 棋局记录功能
 
@@ -300,6 +306,7 @@ SELECT * FROM moves WHERE game_id = 1 ORDER BY move_number;
 | 6 | **叶节点评估粗糙**：`minimizeAlpha` 的叶节点原只返回 `totalReward`（纯材质差），未使用位置评估 | 改为调用 `evaluate()`（材质+位置 PST 综合评估） |
 | 7 | **`alive == true` 类型混用**：`int` 与 `bool` 比较触发编译器警告 C4805 | 改为 `if (stones[i]->alive)` |
 | 8 | **quiescenceSearch 零宽窗口误剪枝**：`maximizeBeta` depth==0 时调用 `quiescenceSearch(color, alpha, value_infi, 3)`，当从 MIN 节点传入 `alpha = value_infi` 时，MIN 分支的 `standPat <= alpha` 总是成立，所有奇数深度(1,3,5)返回 NULL | `quiescenceSearch` 重写为纯 negamax：`evaluate()` 统一转换到当前走棋方视角；统一使用 `standPat >= beta` 剪枝；递归用 `-quiescenceSearch(color_, -beta, -alpha, depth-1)`；depth==0 入口用 `(-value_infi, +value_infi)` 完全开放窗口 |
+| 9 | **人机对弈：一局由 AI 的落子结束之后，黑方再也不应手**（现象：红方下第一个棋后黑方无限等待 / 换对战 agent 无效 / 沙漏那一行显示 `(未选择 agent)`）。根因：`process()` 的主循环写成 `while (state != STATE_TERMINATE)`，而**终局就是**把 `state` 置成 `STATE_TERMINATE` ⇒ 那个 `continue` 之后循环条件为假，**应手线程函数 `return`**。玩家自己走出终局那一支没有 `wakeAll`，线程还在 `condit.wait` 里睡着 ⇒ 只有"黑方胜利"这一类才会坏 | 主循环改 `for (;;)`：终局只把 `state` 停在 `STATE_TERMINATE`（棋盘继续拒收点击），**线程留在等待里**继续服务下一局；新增 `std::atomic<bool> m_processStop` 作为**唯一**退出点（析构里置位 + `wakeAll`），把线程生命周期与对局生命周期解耦。沙漏那一行改由界面喂入**当前选中的对战 agent**（`setConfiguredAgent()`；`resetToIdle()` 不再清空）。回归：`probe_hvai_flow`（走真实点击路径，进 ctest）—— 修前 2 项失败、修后 0 项。见 `docs/agents_design.md` §22 与 `docs/issues_review.md` C27 |
 
 
 ## 六、仍存在的问题
@@ -316,6 +323,12 @@ SELECT * FROM moves WHERE game_id = 1 ORDER BY move_number;
 > 四个训练基准也不再超时：`test_pg` ~18 s、`test_dqn` ~353 s、`test_ppomcts` ~78 s、
 > `test_dqnmcts` ~390 s（曾全部 >900 s 超时），根因 B19 已修（`Tensor::MM` 0.11 →
 > 27.8 GFLOP/s）。
+>
+> **2026-09-26 追记（本机）**：`ctest` 现有 **14** 个条目，其中新增的
+> `probe_hvai_flow` 约 5 s、其余如 `test_mcts` ~158 s / `test_sacaz` ~156 s 均通过；
+> **`test_match` 整场约 31 min**（283 项断言 / 0 项失败），超过它自己的
+> `TIMEOUT 900` —— 进程全程占满一个核、逐节推进（不是死锁），瓶颈是 `[2.7c]`/`[2.7d]`
+> 的 PPO/SAC 对局与 530 MB 权重快照往返；要让 ctest 一次跑绿需把上限提到 ~2400 s。
 
 下面 1–3 条是本文档早先记录的"仍存在的问题"，**均已修复**，保留在此仅为对照
 （结论已更新）：

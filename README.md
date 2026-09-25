@@ -227,7 +227,8 @@ ctest --output-on-failure
 | `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
-| **`repro_concurrency`** | **"对弈 × 后台训练"并发的最小复现**（对弈跑在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；**故意不进 ctest**，见 `docs/issues_review.md` C24 与零之二点二十五）：修前秒崩 `0xC0000374`（堆损坏），修后"全部跑完，没有崩溃"。用法 `repro_concurrency.exe [轮数] [每局手数] [agent枚举值]` |
+| **`probe_hvai_flow`** | **人机对弈状态机**（走**真实点击路径** `mousePressEvent`）：一局**由 AI 的落子结束**之后按"开局"，红方再走第一步，黑方必须应手；换对战 agent 之后同理；外加沙漏那一行显示的 agent 名。**进 ctest**（约 5–12 s） |
+| **`repro_concurrency`** | **"对弈 × 后台训练"并发的最小复现**（对弈跑在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；**故意不进 ctest**）。用法 `repro_concurrency.exe [轮数] [每局手数] [agent枚举值]` |
 
 `test_ppomcts` 也在这 13 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
 置换表 / **PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）。
@@ -405,6 +406,8 @@ PPO 权重对 AB 深度 4 是 **0 胜 1 和 23 负**（Elo 差 −669），与"�
 | `tools/verify_agent_combo.ps1` | **每个 agent 都能在界面上被选中**：把 `src/mainwindow.cpp` 的 `kAgents` 解析出来当期望值，展开三个下拉框，逐条断言它们**可见**（只"在模型里"不算 —— Qt 的 `maxVisibleItems` 默认 10，第 11 项曾被折叠在滚动区里，见 `issues_review.md` C23） |
 | **`bench_sac_learn`** | **"SAC 边下边学"的受控复现**：每手 `exploreAndTrain()` + `selectMove()`（与界面 `preTrainThenDecide` 逐条同协议），对 MCTS 打 N 局，报**胜负和 / 和棋成因（手数上限·60 回合·重复）/ 分胜负的终局类型（吃将·将死·困毙）/ 两种口径的奖励累计 / 损失曲线点数与均值最大值 / 训练后 critic 的 \|Q\| 尺度与策略熵**。带 `--legacy`（59e5233 口径）、`--reward-shape=0\|1\|2`、`--no-search-learn`、`--entropy-ratio/--alpha-lr/--clamp/--huber/--no-sparse-leaf` 等消融旋钮。详见 `docs/sac_learn_reward_2026_09.md` |
 | `tools/verify_app_icon.ps1` | ICO 结构 / 字形真的渲染 / 运行时加载 / exe 图标是"我们的" |
+| `tools/verify_chess_saves_weights.ps1` | 真界面跑完一场【Agent 对弈】，断言权重**真的写到标准路径**（对弈起来 → 对弈结束 → `weights/` 下出现非空的标准命名文件） |
+| `tools/verify_human_vs_ai.ps1` | 真界面**人机对弈**：脚本自己执红走到终局 → 点"开局" → 再走一步，看黑方还会不会应手（依赖 UIA 能定位到棋盘控件；状态机那条判据现在由 `probe_hvai_flow` 覆盖，见 `docs/agents_design.md` §22） |
 | `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） |
 
 > 脚本有两个"血泪规则"写在注释里：**无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码**，
@@ -453,7 +456,7 @@ chess/
 
 | 文档 | 内容 |
 |------|------|
-| [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈）；**§20 完备 MDP 的公共化与推广**；**§21 DQN+MCTS 的表示闸门与自检面板**（探针四个读数 + 为什么损失与自对弈胜率都答不了"值不值得继续训"） |
+| [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈）；**§20 完备 MDP 的公共化与推广**；**§21 DQN+MCTS 的表示闸门与自检面板**（探针四个读数 + 为什么损失与自对弈胜率都答不了"值不值得继续训"）；**§22 人机对弈的状态机**（应手线程的生命周期 / 终局两条路的区别 / 沙漏那一行 agent 名的语义 / 怎么把这条 UI 路径变成可自动化的断言） |
 | [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办。**零之二点十九**：PPO+MCTS 正确性审计（PUCT 的 Q 符号反了 / `loadModel` 静默成功 / 枚举混比 / 模拟数退化 / 搜索看不见将杀）；**零之二点二十**：诊断指标矩阵与当前瓶颈定位（EV<0 ⇒ 该修 value 而不是搜索参数） |
 | [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项。**§9.5** 是 2026-09 的诊断矩阵与负面结果 |
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |

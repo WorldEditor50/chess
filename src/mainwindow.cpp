@@ -232,6 +232,15 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->agentComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onAgentSelected);
 
+    /*
+       ---- 沙漏上那一行"当前对战 agent" (2026-09 用户报障) ----
+       报障: "黑方胜利后, 沙漏显示 agent 未加载"。原因是空闲时那一行显示的是指示器
+       内部的 m_agent, 而按"开局"时 resetToIdle() 把它清空了 —— 于是明明选着 agent,
+       沙漏上却写着 "(未选择 agent)"。现在把当前选中项喂给指示器 (选中即更新),
+       空闲时它就显示真正要跟你下棋的那个 agent。
+    */
+    ui->thinkIndicator->setConfiguredAgent(ui->agentComboBox->currentText());
+
     /* 开局按钮 */
     connect(ui->resetBtn, &QPushButton::clicked,
             ui->gameWidget, &ChessBoard::reset);
@@ -250,6 +259,17 @@ MainWindow::MainWindow(QWidget *parent)
     /* 探索步数实时同步给棋盘 (0 = 不探索) */
     connect(ui->preTrainStepsSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             ui->gameWidget, &ChessBoard::setPreTrainSteps);
+
+    /*
+       ---- "自由走子"调试开关 (2026-09 用户要求) ----
+       用户要"能故意输给 AI", 而规则过滤 (Chess::sample / ChessBoard::moveStone 里的
+       isLegalMove) 恰好剔掉了"走后自家将被攻击"的着法 ⇒ 规则之内无法快速送死。
+       打开这个勾选框后, 玩家那一侧的着法只校验**形状**, 不再要求"走后不被将"。
+       默认关闭, 界面上带 "(调试)" 标注。
+    */
+    connect(ui->freeMoveCheck, &QCheckBox::toggled,
+            ui->gameWidget, &ChessBoard::setFreeMoveEnabled);
+    ui->gameWidget->setFreeMoveEnabled(ui->freeMoveCheck->isChecked());
 
     /* AI Self Play / Agent 对弈 按钮 (对弈进行中兼作"停止") */
     connect(ui->selfPlayBtn, &QPushButton::clicked,
@@ -417,6 +437,16 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->gameWidget, &ChessBoard::replayModeExited,
             this, &MainWindow::onReplayModeExited);
 
+    /*
+       ---- 人机对战终局**不再保存权重** (2026-09 用户口径) ----
+       用户要求: "只有程序退出时再保存模型"。
+       这里原来连了 sendResult -> onHumanGameFinished 做终局保存, 而那正是"黑方赢了
+       之后卡住"最可疑的一环: 保存要拿 AI 决策用的同一把锁 (m_agentMutex), 而它的
+       写盘量是 530 MB 级。既然口径改成"只在退出时保存", 这条连接与那个槽一并删掉 ——
+       终局路径上不再有任何写盘。
+       (唯一落盘点是 ChessBoard::shutdownSave, 见 MainWindow 析构。)
+    */
+
     /* 启动加载完成信号: 启用界面并刷新对局列表 */
     connect(ui->gameWidget, &ChessBoard::startupComplete, this,
         [this]() {
@@ -570,8 +600,19 @@ MainWindow::~MainWindow()
        时间由它决定, 与 ~ChessBoard 里那次是同一个代价; 重复调用安全)。
     */
     ui->gameWidget->stopBackgroundTraining();
-    /* 程序退出前保存所有已训练的agent权重 */
-    ui->gameWidget->shutdownSave();
+    /*
+       ---- 唯一的落盘点: 退出时保存 (2026-09 用户口径) ----
+       用户要求"只有程序退出时再保存模型"。顺序很重要: 先停后台训练 (上一行),
+       再保存 —— 否则退出保存会与后台训练那一轮的收尾同步抢同一张网 (2026-09 用户报的
+       那个 0xC0000374 堆损坏就是这么来的), 而且保存还要排队等它写 558 MB。
+       这里用**同步**保存 (不是后台线程): 退出路径上本来就要等, 而且必须保证
+       "写完再 delete ui"。代价是关窗会等几秒到十几秒 (PPO+MCTS 两份 266/264 MB,
+       稀疏 MoE 三支各 3 x 146 MB), 这是用户明确要的行为。
+       (原来这里还接着调了一次 shutdownSave() —— 它内部就是同一个动作, 会**存两遍**;
+        已经合并成这一处。shutdownSave 现在只是它的一个转发, 保留给外部调用点。)
+    */
+    const int exitSaved = ui->gameWidget->saveAllInstantiatedAgentsOnExit();
+    qInfo().noquote() << QStringLiteral("[weights] 退出保存完成: %1 个 agent").arg(exitSaved);
     delete ui;
 }
 
@@ -738,6 +779,12 @@ void MainWindow::onAgentSelected(int index)
     QString name = ui->agentComboBox->currentText();
     qDebug("AI Agent switched to: %s", qPrintable(name));
 
+    /*
+       换 agent 立刻反映到沙漏上 (用户报障里的"选择黑方对弈 agent 失效": 那时应手线程
+       已经没了, 换谁都不会有反应; 现在线程还在, 而且这一行当场就能看到选中项生效)。
+    */
+    ui->thinkIndicator->setConfiguredAgent(name);
+
     /* 换了 agent 就换一份自检报告 (不支持的 agent 显示"没有自检项") */
     requestSelfCheckPanelUpdate(false);
 }
@@ -827,11 +874,17 @@ void MainWindow::onStartMatch()
             ui->gameListWidget->scrollToBottom();
 
             /*
-               打过的可训练 agent **静默存盘** (用户要求: 不再弹任何窗口)。
-               存到标准路径, 下次启动自然加载; 期间由"请稍候"沙漏提示, 结果写进
-               右侧逐局明细列表。见 saveWeightsAfterMatch() 的注释。
+               ---- 对局结束**不再保存权重** (2026-09 用户口径) ----
+               用户要求: "只有程序退出时再保存模型"。
+               原来这里会调 saveWeightsAfterMatch(...) —— 而保存要么把 530 MB 的权重
+               (PPO+MCTS: 266 MB actor + 264 MB critic) 在 `m_agentMutex` 锁内序列化写盘,
+               要么排队等这把锁; 而 AI 决策/自检也拿同一把锁。实测: 保存 2.4 s 期间一次
+               决策从 6140 ms 被挡到 8411 ms; 长成一局的保存会直接把"黑方该走棋"卡住。
+               现在唯一落盘点是**程序退出**(ChessBoard::shutdownSave), 于是对局路径上
+               再也不会有写盘 —— 界面流畅优先, 代价是"未正常退出则这一场的训练成果丢失"。
             */
-            saveWeightsAfterMatch(QVector<ChessBoard::AgentType>{typeA, typeB});
+            ui->gameListWidget->addItem(
+                QStringLiteral("—— 本场结束 (权重将在**退出程序时**统一保存) ——"));
 
             refreshGameList();
         }, Qt::QueuedConnection);
@@ -1321,7 +1374,7 @@ void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &typ
         return;
     }
 
-    {
+    if (!todo.isEmpty()) {
         std::lock_guard<std::mutex> lk(m_saveMutex);
         for (ChessBoard::AgentType t : todo) {
             if (!m_saveQueue.contains(t)) {
@@ -1335,6 +1388,20 @@ void MainWindow::saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &typ
     }
     m_saveCv.notify_one();
 }
+
+/*
+ * ---- onHumanGameFinished 已删除 (2026-09 用户口径: 只在退出时保存) ----
+ *
+ * 它原来做的是"人机对局终局时把当前 agent 的权重落盘"。删掉的理由有两条:
+ *   1. **口径变了**: 用户要求"只有程序退出时再保存模型" —— 唯一落盘点改为
+ *      ChessBoard::saveAllInstantiatedAgentsOnExit() (由本窗口析构调用)。
+ *   2. **它是卡顿的嫌疑人**: 保存要在 `m_agentMutex` 锁内序列化 530 MB 级权重
+ *      (PPO+MCTS 266 + 264 MB), 而 AI 决策也拿这把锁 —— 实测 2.4 s 的保存让一次决策
+ *      从 6140 ms 涨到 8411 ms。终局恰好是"玩家马上要再走一步"的时刻, 所以它最容易
+ *      表现为"黑方无限等待"。
+ *
+ * 顺带删掉的还有 sendResult -> onHumanGameFinished 那条连接 (见构造函数里的说明)。
+ */
 
 void MainWindow::saveWorkerLoop()
 {

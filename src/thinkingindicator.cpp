@@ -98,6 +98,22 @@ void ThinkingIndicator::setStage(const QString &stage)
     update();
 }
 
+/*
+   setConfiguredAgent - 记下"界面当前选中的对战 agent"
+
+   只影响**空闲**时的显示 (思考期间显示的是 start() 给的那个名字)。用户报障里
+   "沙漏显示 agent 未加载"就是空闲这一行: 按"开局"时 resetToIdle() 会清空 m_agent,
+   而界面上其实选着一个 agent —— 两处说法不一致, 用户看到的就是"未加载"。
+*/
+void ThinkingIndicator::setConfiguredAgent(const QString &agentName)
+{
+    m_configured = agentName;
+    if (!m_running && m_agent != agentName) {
+        m_agent = agentName;
+        update();
+    }
+}
+
 void ThinkingIndicator::stop()
 {
     if (!m_running) {
@@ -116,7 +132,11 @@ void ThinkingIndicator::resetToIdle()
     m_everStarted = false;
     m_finishedMs = -1;
     m_phase = 0.0;
-    m_agent.clear();
+    /*
+       不清空 agent 名, 而是回到"界面当前选中的那个" —— 清空会显示 "(未选择 agent)",
+       而用户明明选着 agent (见 setConfiguredAgent 的说明)。
+    */
+    m_agent = m_configured;
     m_stage.clear();
     update();
 }

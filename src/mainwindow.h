@@ -41,8 +41,9 @@ private:
     void refreshGameList();
     void populateAgentComboBox();
     /*
-     * 对弈结束后把可训练 agent 的权重**静默**存到标准路径 (不弹任何窗口)。
-     * 保存跑在后台线程, 结果写进逐局明细列表; 期间由"请稍候"沙漏提示。
+     * 权重**静默**存到标准路径 (不弹任何窗口): 放在**常驻后台线程**里做。
+     * 两个调用方: Agent 对弈结束 (onStartMatch 那条路) 与人机对局终局
+     * (onHumanGameFinished) —— 两者共用同一套命名 (defaultWeightPath) 与同一个队列。
      */
     void saveWeightsAfterMatch(const QVector<ChessBoard::AgentType> &types);
 

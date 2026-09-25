@@ -8,6 +8,7 @@
 #include <QStringList>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <fstream>      /* 自检面板要报"权重文件在不在、多大" */
 #include <limits>
@@ -103,9 +104,82 @@ bool agentHasLearningRewardTable(ChessBoard::AgentType type)
     }
 }
 
-/* 状态条上的短耗时: "3.24s" / "1:05" */
-QString shortElapsed(long long ms)
+/* ================================================================
+ *  [诊断] 卡顿定位日志 (2026-09, 用户报障 "人机对弈黑方赢了之后卡住")
+ * ================================================================
+ *
+ * 为什么要有它: "黑方赢了之后再次开局, 黑方进入无限等待" 这类现象在**代码上看不出来**
+ * —— 它有可能是 (a) 等某把锁, (b) 状态机停在某个 case, (c) 搜索真的在跑但极慢。
+ * 三者在界面上完全一样 (都是"没反应")。所以这里在关键路径上打**带线程号与耗时**的日志,
+ * 一眼就能区分:
+ *     [dbg] ... (tid=12345)  -> 谁在执行
+ *     [dbg] ... waited 8200 ms -> 它等了多久
+ *
+ * 判读方法 (用户报障的现场):
+ *   * 如果最后一行是 "aiThink: 等 m_agentMutex ..." 且 waited 很大
+ *       -> 有人长时间持有该锁 (最可能是**保存权重**, 见 saveCurrentAgentModel)。
+ *   * 如果最后一行是 "process: state=..." 而之后再没有 "aiThink" 行
+ *       -> 状态机没把 AI 唤醒 (重置/终局路径漏了唤醒)。
+ *   * 如果 "aiThink: 开始" 与 "aiThink: 结束" 之间只差正常耗时
+ *       -> AI 其实在跑, 是**搜索太慢** (例如随机初始化权重 + 大模拟次数)。
+ *
+ * 用环境变量 CHESS_DEBUG_LOCKS=1 打开。**默认关闭**: 这些行在落子/决策路径上, 常态
+ * 跑不该为它们付出格式化字符串 + 写 stderr 的代价 (排查卡死时再打开, 见上表的判读方法)。
+ * (原来的注释写的是"默认打开", 与 `dbgEnabled()` 的实际取值不一致 —— 以代码为准。)
+ */
+namespace {
+bool dbgEnabled()
 {
+    static const bool on = (qEnvironmentVariableIntValue("CHESS_DEBUG_LOCKS") != 0);
+    return on;
+}
+long long dbgTid()
+{
+    return (long long)std::hash<std::thread::id>()(std::this_thread::get_id());
+}
+double dbgNowMs()
+{
+    using namespace std::chrono;
+    return (double)duration_cast<microseconds>(
+               steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+/*
+   直接 printf 到 **stderr** (用户口径: "直接printf")。
+
+   为什么是 stderr 而不是 stdout, 为什么不用 qInfo:
+     * 本程序是 **Console 子系统** (PE Subsystem=3, 实测), 所以两个流都有去处;
+       但 **stdout 是带缓冲的** —— 重定向到文件时整块才 flush, 排查卡死时
+       "日志里什么都没有"就是这么来的 (本仓库已经吃过一次这个亏)。stderr 不带缓冲,
+       卡死/崩溃时最后几行一定已经在终端上。
+     * `qInfo()` 在 MSVC 构建下走 Qt 的消息处理器, 默认送给 `OutputDebugString`,
+       只有挂调试器才看得到 —— 用户在 cmd 里跑却"一行日志都没有", 就是因为它。
+   主程序另外装了一个 Qt 消息处理器把这些转发到文件 (见 main.cpp), 但诊断路径
+   这里是**直连 printf**, 不再经过 Qt。
+*/
+void dbgPrint(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
+void dbgLog(const QString &what)
+{
+    if (!dbgEnabled()) { return; }
+    dbgPrint("[dbg] %s (tid=%lld)", what.toUtf8().constData(), dbgTid());
+}
+void dbgWait(const QString &what, double ms)
+{
+    if (!dbgEnabled()) { return; }
+    dbgPrint("[dbg] %s -- waited %lld ms (tid=%lld)",
+             what.toUtf8().constData(), (long long)ms, dbgTid());
+}
+}  // namespace
+
+/* 状态条上的短耗时: "3.24s" / "1:05" */
+QString shortElapsed(long long ms){
     if (ms < 0) {
         ms = 0;
     }
@@ -962,6 +1036,12 @@ ChessBoard::~ChessBoard()
 
     {
         QMutexLocker locker(&mutex);
+        /*
+           m_processStop 是 process() **唯一**的退出条件 (见 chessboard.h 的成员注释):
+           state = TERMINATE 只表示"这一局完了", 线程会留在等待里继续服务下一局 ——
+           所以关窗时必须显式置位, 否则 join() 会一直等下去。
+        */
+        m_processStop = true;
         state = STATE_TERMINATE;
         condit.wakeAll();
     }
@@ -1037,6 +1117,13 @@ bool ChessBoard::moveStone(const QPoint &point)
        构造候选走法, 由 Chess::isLegalMove 统一校验: 走法形状 + 走后自己是否被将
        (含"不应将"与两将照面)。原来这里只看 selected->tryMoveTo(pos), 于是玩家
        可以自杀、可以在被将时走别的子、也可以主动走出照面。
+
+       ---- 自由走子 (调试开关, 2026-09 用户要求) ----
+       用户要"能故意输给 AI"(送将/不应将), 而上面那条校验恰好挡住了它 ——
+       打开 m_freeMove 时**只跳过"走后是否被将"这一半**, 走法形状仍然要合法
+       (马走日、象走田…), 于是可以自杀/不应将。默认关闭。
+       (为什么不整个跳过: 那样连形状都不判, 会走出"炮直飞"这种局面,
+        棋盘状态可能自相矛盾 —— 调试开关不该制造比问题更难查的状态。)
     */
     Step step;
     step.id = selectID;
@@ -1046,8 +1133,53 @@ bool ChessBoard::moveStone(const QPoint &point)
     step.reward = 0;
     step.valid = true;
 
-    if (chess.isLegalMove(color, &step) == false) {
-        return false;
+    /*
+       形状校验: 直接用棋子自己的走法规则 (tryMoveTo 是"形状 + 目标占用"那一层,
+       与 isLegalMoveInternal 里的形状判定同源)。自由走子时不再要求"走后不被将"。
+    */
+    /*
+       形状/规则校验。
+       ---- 自由走子 (调试开关, 2026-09 用户口径) ----
+       用户要求"被将军时我希望能移动所有棋子"。在它之前, 这个开关只跳过了
+       "走后是否被将"这一半, 形状仍按棋子走 (马走日、兵只能前进或过河横走) ——
+       于是在被将军时挪别的子仍然被拒, 用户看到的仍然是"走不动"。
+       现在口径是: 打开后**任意棋子可以走到任意一格**, 所以这里整个跳过校验。
+       落地由 `Chess::freeMove` 传给 Stone::moveTo (跳过 tryMoveTo), 保证吃子结算、
+       m_map、alive 仍走同一条路 (见 stone.h 的 moveTo 说明)。
+    */
+    if (m_freeMove) {
+        chess.freeMove = true;
+        dbgLog(QStringLiteral("自由走子: 跳过形状校验, 从 (%1,%2) 到 (%3,%4), 类型=%5")
+                   .arg(step.pos.x).arg(step.pos.y)
+                   .arg(step.nextPos.x).arg(step.nextPos.y)
+                   .arg((int)selected->type));
+    } else {
+        chess.freeMove = false;
+        const bool shapeOk = chess.isLegalMove(color, &step);
+        dbgLog(QStringLiteral("规则校验: isLegalMove %1 (从 (%2,%3) 到 (%4,%5), 类型=%6)")
+                   .arg(shapeOk ? QStringLiteral("通过") : QStringLiteral("不通过"))
+                   .arg(step.pos.x).arg(step.pos.y)
+                   .arg(step.nextPos.x).arg(step.nextPos.y)
+                   .arg((int)selected->type));
+        if (shapeOk == false) {
+            /*
+               [诊断] 被拒时把"这个子**实际**能走到哪"列出来 —— 用户报"红兵过河后不能
+               左右走"的时候, 这一行直接给出答案: 横走的目标在不在列表里。
+               (列表用与规则同源的 getPossibleSteps + tryMoveTo, 不是另写一套判定。)
+            */
+            std::vector<Step *> cand;
+            selected->getPossibleSteps(cand);
+            QStringList targets;
+            for (Step *c : cand) {
+                if (c != nullptr && selected->tryMoveTo(c->nextPos)) {
+                    targets << QStringLiteral("(%1,%2)").arg(c->nextPos.x).arg(c->nextPos.y);
+                }
+            }
+            Steps::instance().put(cand);
+            dbgLog(QStringLiteral("  该子的形状可达目标: %1")
+                       .arg(targets.isEmpty() ? QStringLiteral("(空)") : targets.join(' ')));
+            return false;
+        }
     }
 
     double totalReward = 0;
@@ -1249,6 +1381,17 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
        秒级, 这个问题就很突出了。这里在状态条上闪一句"请稍候"。
     */
     if (state == STATE_THINKING || m_selfPlaying.load()) {
+        /*
+           [诊断 2026-09] 用户报"红兵过河后不能左右走": 规则本身允许 (见 Bing::tryMoveTo),
+           所以要先排除"点击根本没被处理"这一类 —— 状态不对时点击是被**静默丢弃**的,
+           玩家看到的"走不动"和"规则不许走"完全一样。这里把真相打出来。
+        */
+        dbgLog(QStringLiteral("点击被丢弃: state=%1 (0=IDLE/1=THINKING/2=TERMINATE), "
+                              "m_selfPlaying=%2, 红方=(%3,%4)")
+                   .arg((int)state.load())
+                   .arg((int)m_selfPlaying.load())
+                   .arg(getStonePos(event->pos()).x)
+                   .arg(getStonePos(event->pos()).y));
         if (state == STATE_THINKING && !m_busyClickSeen) {
             m_busyClickSeen = true;
             m_busyClickTimer->start();
@@ -1256,8 +1399,15 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
         }
         return;
     }
-    if (state != STATE_IDEL) return;
-    if (isReplayMode()) return;
+    if (state != STATE_IDEL) {
+        dbgLog(QStringLiteral("点击被丢弃: state=%1 (既不是 IDLE 也不是 THINKING)")
+                   .arg((int)state.load()));
+        return;
+    }
+    if (isReplayMode()) {
+        dbgLog(QStringLiteral("点击被丢弃: 回放模式"));
+        return;
+    }
 
     if (selectID == -1) {
         /* 选择己方棋子 */
@@ -1265,6 +1415,9 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
         if (stone == nullptr) return;
         if (stone->color != color) return; /* 不能选对方棋子 */
         selectID = stone->id;
+        dbgLog(QStringLiteral("选中棋子 id=%1 类型=%2 位置=(%3,%4)")
+                   .arg(selectID).arg((int)stone->type)
+                   .arg(stone->pos.x).arg(stone->pos.y));
         update();
         return;
     }
@@ -1272,6 +1425,14 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
     /* 已有选中棋子 -> 尝试移动 */
     bool moved = moveStone(event->pos());
     if (!moved) {
+        /*
+           [诊断] 走不动时把"为什么不许"打出来: 形状/被将/目标占用/自由走子开关。
+           这条日志就是为了回答"到底是规则不许、还是开关没生效、还是没选中"。
+        */
+        const Pos from = getStonePos(event->pos());
+        dbgLog(QStringLiteral("走子被拒: selectID=%1 目标=(%2,%3) 自由走子=%4")
+                   .arg(selectID).arg(from.x).arg(from.y)
+                   .arg((int)m_freeMove));
         /* 移动失败 (含非法走法): 可能是点到了己方另一棋子, 重新选 */
         Stone *stone = selectStone(event->pos());
         if (stone != nullptr && stone->color == color) {
@@ -1328,7 +1489,33 @@ void ChessBoard::process()
         QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
     };
 
-    while (state != STATE_TERMINATE) {
+    /*
+       ================================================================
+        ---- 主循环为什么是 for (;;) 而不是 while (state != STATE_TERMINATE) ----
+        ================================================================
+        用户报障 (2026-09): "人机对弈时黑方胜利后, 沙漏显示 agent 未加载, 选择黑方
+        对弈 agent 失效, 红方下第一个棋后黑方无限等待"。
+
+        原来的条件 `while (state != STATE_TERMINATE)` 与**终局**用的是同一个 state:
+        终局分支里 `state = STATE_TERMINATE; ... continue;` 之后循环条件立刻为假 ⇒
+        线程函数 return ⇒ **AI 自己结束一局之后, 这个应手线程就永久消失了**。
+        于是:
+          * 按"开局" (reset()) 只把 state 改回 IDEL —— 没有任何人重新起线程;
+          * 红方再落子 -> state=THINKING + wakeAll, 但**没有等待者** ⇒ "黑方无限等待";
+          * 换对战 agent 也没有人去用它应手 ⇒ "选择黑方对弈 agent 失效";
+          * 沙漏从此收不到 aiThinkingStarted, 而 resetToIdle() 又把 agent 名清空了
+            ⇒ 显示 "(未选择 agent)" ⇒ 用户读成"agent 未加载"。
+
+        为什么不是"在 reset() 里重新起线程": reset() 与工作线程之间**无法**安全地
+        重新 join/新建 —— reset() 可能在"工作线程刚判定完终局、还没跑出循环"的那一瞬
+        发生, 那样 join() 会一直等一个永远不会退出的循环 (它看到 state 又是 IDLE 就继续
+        转)。把"线程该不该活着"与"这一局结没结束"解耦, 才是这件事的正解。
+
+        所以: 终局只把 state 停在 STATE_TERMINATE (棋盘继续拒收点击, 这仍然是对的),
+        **线程留在等待里**; 下一次 reset() 把它叫醒, 它接着服务新的一局。
+        唯一退出点是 m_processStop (析构里置位 + wakeAll, 见成员注释)。
+    */
+    for (;;) {
         {
             QMutexLocker locker(&mutex);
             /*
@@ -1341,11 +1528,14 @@ void ChessBoard::process()
                aiThink(), 一边搜索一边往 env 的 history 里 push_back。
                如果这时另一个线程 (Agent 对弈线程) 也在用同一个 env, 两边同时改
                env.history 就是 double-free / 堆损坏 (ASan 实测抓到的就是这个)。
+
+               现在多一个退出条件: m_processStop (析构里置位)。state == TERMINATE
+               不再退出循环 —— 那只是"这一局完了, 先等着"。
             */
-            while (state != STATE_THINKING && state != STATE_TERMINATE) {
+            while (state != STATE_THINKING && !m_processStop.load()) {
                 condit.wait(&mutex);
             }
-            if (state == STATE_TERMINATE) {
+            if (m_processStop.load()) {
                 break;
             }
         }
@@ -1358,7 +1548,11 @@ void ChessBoard::process()
         emit aiThinkingStarted(agentDisplayName(m_agentType), m_preTrainSteps.load());
 
         /* AI(黑方) 决策 */
+        dbgLog(QStringLiteral("process: 准备调用 aiThink(黑方)"));
+        const double tThinkDbg = dbgNowMs();
         Step step = aiThink(Stone::COLOR_BLACK);
+        dbgWait(QStringLiteral("process: aiThink 返回 (valid=%1)")
+                    .arg((int)step.valid), dbgNowMs() - tThinkDbg);
 
         /* 计时结束 */
         auto t1 = std::chrono::steady_clock::now();
@@ -2010,8 +2204,13 @@ Step ChessBoard::aiThink(int color)
  */
 Step ChessBoard::humanTurnAiMoveForTest(int color)
 {
+    const double t0 = dbgNowMs();
+    dbgLog(QStringLiteral("aiThink 开始 (color=%1, agent=%2)")
+               .arg(color).arg(agentDisplayName(m_agentType)));
     setSideRole(sideRoleForHumanGame());
     const Step step = aiThinkRaw(color);
+    const double waited = dbgNowMs() - t0;
+    dbgWait(QStringLiteral("aiThink 结束 (valid=%1)").arg((int)step.valid), waited);
     return legalStepOrFallback(color, step, agentDisplayName(m_agentType));
 }
 
@@ -2039,9 +2238,12 @@ Step ChessBoard::legalStepOrFallback(int color, const Step &step, const QString 
     if (step.valid) {
         return step;
     }
+    dbgLog(QStringLiteral("legalStepOrFallback: 收到无效走法, 正在等棋盘锁 (who=%1)").arg(who));
+    const double tw = dbgNowMs();
     std::vector<Step *> legal;
     {
         QMutexLocker locker(&mutex);
+        dbgWait(QStringLiteral("legalStepOrFallback: 拿到棋盘锁"), dbgNowMs() - tw);
         chess.sample(color, legal);
     }
     Step fallback;
@@ -2086,7 +2288,10 @@ Step ChessBoard::aiThinkRaw(int color)
        中途不会有人插进来改 env: 所有 env 的写者都在这把锁上排队。
     */
     {
+        /* [诊断] 这一行下面就是"等 m_agentMutex" —— 卡住时这里会报出等了多久 */
+        const double tw = dbgNowMs();
         std::lock_guard<std::mutex> envLock(m_agentMutex);
+        dbgWait(QStringLiteral("aiThinkRaw: 拿到 env 锁 (复制棋盘)"), dbgNowMs() - tw);
         env = chess;
     }
 
@@ -2417,7 +2622,11 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
        不加锁的 `env = chess` 与加锁的读者相撞, 在 Chess 的拷贝构造里堆越界写)。
     */
     {
+        /* [诊断] 对弈路径同样要拿 m_agentMutex —— 卡住时这一行会报出等了多久 */
+        const double tw = dbgNowMs();
         std::lock_guard<std::mutex> envLock(m_agentMutex);
+        dbgWait(QStringLiteral("aiThinkForAgentRaw: 拿到 env 锁 (复制棋盘, agent=%1)")
+                    .arg(agentDisplayName(agentType)), dbgNowMs() - tw);
         env = chess;
     }
 
@@ -3320,6 +3529,26 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
        调用方 (MainWindow 的保存线程 / shutdownSave) 都不持有这把锁, 所以不会自锁。
     */
     std::lock_guard<std::mutex> agentLock(m_agentMutex);
+    /*
+       [诊断] 拿到锁 = 从这一刻起到写盘结束, **任何** AI 决策/自检/训练都要排队。
+       用户报障"黑方无限等待"如果指向这里, 日志会显示:
+           saveCurrentAgentModel: 已拿到 agent 锁, 开始写盘 ...
+           saveCurrentAgentModel: 写盘结束 —— waited N ms
+       而 AI 那边会显示 "aiThinkRaw: 拿到 env 锁 —— waited M ms", M 就是被挡的时间。
+    */
+    const double tSave = dbgNowMs();
+    dbgLog(QStringLiteral("saveCurrentAgentModel: 已拿到 agent 锁, 开始写盘 (agent=%1)")
+               .arg(agentDisplayName(agentType)));
+    /* RAII: 无论从哪个分支 return, 都会记下这次"持锁多久" */
+    struct SaveTimer {
+        double t0;
+        const char *who;
+        ~SaveTimer()
+        {
+            dbgWait(QStringLiteral("saveCurrentAgentModel: 写盘结束 (agent=%1)")
+                        .arg(QString::fromUtf8(who)), dbgNowMs() - t0);
+        }
+    } saveTimer{tSave, agentDisplayName(agentType).toUtf8().constData()};
 
     switch (agentType) {
     case AGENT_PG: {
@@ -4099,19 +4328,50 @@ void ChessBoard::shutdownSave()
 
     /*
        保存 aiThink / aiThinkForAgent 共享的 neural agent 权重。
-       路径全部走 defaultWeightPath() —— 与"对弈结束后静默保存"用的是同一份,
+       路径全部走 defaultWeightPath() —— 与"退出时统一保存"用的是同一份,
        不会再出现"存这边、读那边"的静默失效。
        (EVAB 曾经漏在这里: 它是界面上可选、能被在线训练的 agent, 但退出时从来不落盘,
         于是每次启动都从随机价值网络重新开始, 上一局学到的东西全丢。)
     */
+    const int saved = saveAllInstantiatedAgentsOnExit();
+    qInfo().noquote() << QStringLiteral("[weights] 退出保存: %1 个 agent 已写盘").arg(saved);
+}
+
+/*
+ * saveAllInstantiatedAgentsOnExit - 退出时把**所有已实例化**的可训练 agent 存到标准路径
+ *
+ * 用户口径 (2026-09): "只有程序退出时再保存模型"。
+ *
+ * 这是**唯一**会把权重写到正式路径的地方 (另一处写盘是后台训练的临时文件
+ * weights/_temp_train*)。之所以要把它单独成函数并公开: 退出路径在 MainWindow 的析构里,
+ * 那里要能明确表达"这一步就是在保存", 而不是让"哪里写盘"散在多个事件回调里 ——
+ * 后者正是这次卡顿的来源: 终局回调里也存一次, 而保存持 m_agentMutex 写 530 MB,
+ * 把同一把锁上的 AI 决策挡住 (实测 2.4 s 的保存让一次决策从 6.1 s 涨到 8.4 s)。
+ *
+ * 只存 hasAgentInstance 为真的 agent: 纯搜索的 AB 各档 / MCTS 从来没有实例,
+ * 也就没有权重可存 —— 与 backgroundTrainLoop 同一判据。
+ */
+int ChessBoard::saveAllInstantiatedAgentsOnExit()
+{
+    QDir().mkpath("weights");
+
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
                               AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB,
                               AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD, AGENT_SACAZ_OLD_MOE };
+    int saved = 0;
     for (AgentType t : all) {
-        if (hasAgentInstance(t)) {
-            saveCurrentAgentModel(t, defaultWeightPath(t));
+        if (!hasAgentInstance(t)) {
+            continue;
+        }
+        const bool ok = saveCurrentAgentModel(t, defaultWeightPath(t));
+        qInfo().noquote() << QStringLiteral("[weights] 退出保存 %1: %2")
+                                 .arg(agentDisplayName(t))
+                                 .arg(ok ? QStringLiteral("成功") : QStringLiteral("失败"));
+        if (ok) {
+            saved++;
         }
     }
+    return saved;
 }
 
 /* ================================================================

@@ -651,8 +651,13 @@ bool Chess::applyMove(const Step *s)
         /* Step 里的起点和棋子当前位置不一致 -> 这是一个过期的走法 */
         return false;
     }
-    /* moveTo() 自带 tryMoveTo() 形状校验, 并会在目标格是己方子时返回 false */
-    return stone->moveTo(s->nextPos);
+    /*
+       moveTo() 自带 tryMoveTo() 形状校验, 并会在目标格是己方子时返回 false。
+       freeMove (调试开关, 见 stone.h 的 moveTo 说明): 跳过形状校验, 允许任意子走任意格 ——
+       用户口径 "被将军时我希望能移动所有棋子"。默认 false, 只有 GUI 的
+       "自由走子(调试)" 勾选框会打开它。
+    */
+    return stone->moveTo(s->nextPos, freeMove);
 }
 
 void Chess::undoMove(const Step *s)

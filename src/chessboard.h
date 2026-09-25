@@ -295,6 +295,22 @@ public:
     MatchStats matchAgents(AgentType typeA, AgentType typeB, int games);
 
     /*
+     * ---- "自由走子"调试开关 (2026-09, 用户要求) ----
+     *
+     * 用途: 让**玩家能故意输给 AI** (送将 / 不应将 / 走出两将照面), 以便快速复现
+     * "黑方赢了之后"那类终局相关的现象。
+     *
+     * 为什么需要它: `moveStone` 用 `Chess::isLegalMove` 统一校验, 而那条校验会剔除
+     * "走后自家将被攻击"的着法 (含不应将、自杀、照面) —— 那是**正确的象棋规则**,
+     * 所以玩家在规则之内**无法**快速送死。
+     *
+     * ⚠ 打开之后规则不再保护你: 可以自杀、可以不应将。**默认关闭**, 而且它是调试用,
+     *   界面上带明确标注 —— 不要把它当成正常对局的一部分。
+     */
+    void setFreeMoveEnabled(bool on) { m_freeMove = on; }
+    bool isFreeMoveEnabled() const { return m_freeMove; }
+
+    /*
      * ---- 启动时"到底有没有载入模型"的一句话总结 (2026-09, 用户报障) ----
      *
      * 报障是"点击开局模型未载入"。查下来**不是 bug**: `weights/` 是 gitignore 的运行期
@@ -329,6 +345,22 @@ public:
      *   power-of-two 无关, 纯粹是这个文件的段边界很长, 很容易看错。
      */
     Step humanTurnAiMoveForTest(int color);
+
+    /*
+     * ---- 测试钩子: 内部局面 (2026-09, 人机对弈流程的回归用) ----
+     *
+     * 为什么需要它: 用户报障的那条链路是**整块 UI 状态机** ——
+     *   "红方点击落子 -> state=THINKING -> 工作线程决策 -> 终局 -> 再按开局 -> 红方再落子"
+     * 而它依赖的 `state` / `color` / `chess` 全是 private, 于是"AI 自己结束一局之后
+     * 下一局还有没有人应手"这件事在测试里**没有入口**可以钉住 (只能靠人手点界面复现,
+     * 而那正是这个 bug 逃过全部测试的原因)。
+     *
+     * 语义: 只暴露内部棋盘本身 (摆特殊局面 / 读落子结果)。**不要**用它绕过
+     * moveStone/mousePressEvent —— 那些状态迁移才是被测对象 (用法见
+     * test/probe_hvai_flow_main.cpp)。
+     */
+    Chess &boardForTest() { return chess; }
+
     /*
      * 每局的手数上限 (默认 300)。达到上限即判和棋。
      * 主要给自动化测试用: 把上限调小就能在几秒内跑完一整场对弈, 从而验证
@@ -413,6 +445,23 @@ public:
 
     /* 程序退出时保存所有已初始化的agent权重 */
     void shutdownSave();
+
+    /*
+     * ---- 退出时保存**全部已实例化的可训练 agent** (2026-09 用户口径) ----
+     *
+     * 用户要求: "只有程序退出时再保存模型"。
+     *
+     * 为什么需要这个独立入口 (而不是直接用 saveCurrentAgentModel 逐个存):
+     *   1. 保存是**同步**的 (退出路径上无所谓, 但必须知道会等多久): PPO+MCTS 一份
+     *      266 + 264 MB, 写盘 2 s 量级; 稀疏 MoE 三支是 3 x 146 MB, 十几秒。
+     *   2. 判据与 saveCurrentAgentModel 一样: 只存**确实实例化过**的 agent
+     *      (纯搜索的 AB 各档 / MCTS 没有实例 ⇒ 没有权重可存)。
+     *   3. 这样"哪里会写盘"就只有两处: 后台训练的临时文件 (weights/_temp_train*) 与
+     *      **本函数** —— 对局/终局路径上再也不会写盘, 那是"黑方无限等待"的根因。
+     *
+     * 返回: 成功保存的 agent 数 (供退出日志用)。
+     */
+    int saveAllInstantiatedAgentsOnExit();
 
     /* 后台持续训练: 克隆agent在后台自我对弈, 每4轮同步权重回主agent */
     void startBackgroundTraining();
@@ -563,6 +612,35 @@ private:
     int selectID;
     int color;
     std::atomic<State> state;
+    /*
+     * ================================================================
+     *  ---- 让 process() 退出的**唯一**开关 (2026-09 用户报障) ----
+     * ================================================================
+     *
+     * 报障原文: "人机对弈时黑方胜利后, 沙漏显示 agent 未加载, 选择黑方对弈 agent
+     * 失效, 红方下第一个棋后黑方无限等待"。
+     *
+     * 根因: `process()` 原来的主循环是 `while (state != STATE_TERMINATE)`, 而**终局**
+     * 恰恰就是把 state 置成 STATE_TERMINATE —— 于是"**AI 自己**走出将杀/困毙/判和"
+     * 的那一局结束时, 那个 continue 之后循环条件立刻为假, 线程函数 return ⇒
+     * **人机对弈的应手线程永久消失** (玩家自己走出终局那一支不会: 那条路上没有 wakeAll,
+     * 工作线程还在 condit.wait 里睡着, reset() 一叫它又回来了 —— 这也解释了为什么
+     * 报障偏偏是"黑方胜利后")。
+     *
+     * 之后的三件事全都由它解释:
+     *   * 按"开局" -> reset() 只把 state 改回 IDEL (没有任何人再起线程);
+     *   * 红方落子 -> state=THINKING + wakeAll, 但**没有等待者** ⇒ "黑方无限等待";
+     *   * 换对战 agent 也没人去用它应手 ⇒ "选择黑方对弈 agent 失效";
+     *   * 沙漏 (ThinkingIndicator) 再收不到 aiThinkingStarted, 而按"开局"时
+     *     resetToIdle() 会把 agent 名清空 ⇒ 那一行显示 "(未选择 agent)"
+     *     ⇒ 用户读成"agent 未加载"。
+     *
+     * 现在主循环是 `for (;;)`: 终局只把 state 停在 STATE_TERMINATE (棋盘继续拒收点击,
+     * 这仍然是对的), **线程留在等待里**, 下一次 reset() 把它叫醒, 它接着服务新的一局。
+     * 唯一退出点是本标志 (析构里置位 + wakeAll) —— 线程生命周期与"这一局结没结束"
+     * 彻底解耦。
+     */
+    std::atomic<bool> m_processStop{false};
     /*
      * mutex 声明成 mutable: 自检 (const 方法) 要对真棋盘取一份**副本**再交给 agent,
      * 所以它必须能在 const 里上锁 (见 ChessBoard::getAgentSelfCheck 的说明)。
@@ -920,6 +998,8 @@ private:
     RewardAccounting m_lastReward;
     /* 是否轮到这个 agent 走 (对弈中 arena 用) */
     AgentType typeForTurn(int turn, AgentType redType, AgentType blackType) const;
+    /* 自由走子 (调试): 见 setFreeMoveEnabled 的说明。只在 GUI 线程读写。 */
+    bool m_freeMove = false;
 
     /* 启动加载状态 */
     std::atomic<bool> m_startupComplete{false};

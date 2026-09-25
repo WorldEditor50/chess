@@ -308,9 +308,23 @@ public:
         return *this;
     }
     virtual bool tryMoveTo(const Pos &pos){return true;}
-    bool moveTo(const Pos &pos_)
+    /*
+       moveTo - 真正落子 (会被 `Chess::applyMove` 调用)。
+
+       ---- freeMove (2026-09, 用户要求"被将军时我希望能移动所有棋子") ----
+       为 true 时**跳过 tryMoveTo 的形状校验**: 任意棋子可以走到棋盘上任意一格
+       (仍然不能吃自己的子)。这是**调试/摆局面**用的开关, 目的是让玩家在残局里能任意
+       调整子力 (用户要复现"红兵过河后走不动"这类现象, 而形状规则会挡住他)。
+
+       为什么放在这一层而不是在 GUI 里另写一套落子: 吃子要置 `alive=false`、要改
+       `m_map`、要维护 `pos` —— 另写一套必然与 `moveTo` 漂移, 而漂移的表现是
+       "棋子位置与 m_map 不一致"这种**难查的状态损坏**。所以统一在这里开一个口子。
+
+       ⚠ 默认 false; 只有 `ChessBoard::setFreeMoveEnabled(true)` 时才会走到这条路。
+    */
+    bool moveTo(const Pos &pos_, bool freeMove = false)
     {
-        if (tryMoveTo(pos_) == false) {
+        if (!freeMove && tryMoveTo(pos_) == false) {
             return false;
         }
         Stone *dst = (*m_map)[pos_];

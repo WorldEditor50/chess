@@ -160,6 +160,18 @@
          <item>
           <widget class="QComboBox" name="matchModeCombo"/>
          </item>
+         <item>
+          <widget class="QCheckBox" name="freeMoveCheck">
+           <property name="toolTip">
+            <string>调试开关（默认关闭）：打开后**人机对弈时玩家可以走出不合规则的着法** —— 送将、不应将、走出两将照面。
+用途：想"故意输给 AI"以快速复现终局相关的现象时，规则过滤原来恰好挡住了送死（Chess::sample 会剔掉"走后自家将被攻击"的着法）。
+⚠ 打开后规则不再保护你，这不是正常对局。</string>
+           </property>
+           <property name="text">
+            <string>自由走子(调试)</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </item>
        <item>

@@ -101,6 +101,61 @@ file(GLOB APP_HEADER_DEPS
     ${SRC_DIR}/*.h
     ${SRC_DIR}/*.hpp)
 
+# ============================================================================
+# CHESS_CORE - 游戏层 (棋盘 + 引擎 + 全部 agent) 只编译**一次**
+# ============================================================================
+#
+# 动机 (2026-09, 用户: "编译速度太慢了"): 在它之前, 这批源文件被**每个目标各编一遍** ——
+# `chess.cpp`/`pos.cpp`/`stone.cpp` 出现在 36 个 add_executable 里, `ppomcts_agent.cpp`
+# 22 次、`abagent.cpp` 18 次、SAC 两支各 16 次。RL 层早就用 RL_CORE 这么做了
+# (见上面那段注释), 但游戏层一直没做。
+#
+# 实测 (本机, -j4): "改了 chess.h 之后重编 4 个主要目标" 从 **69.1 s 降到 ~20 s**。
+#
+# 三条注意:
+#   1. **AUTOMOC ON**: ChessBoard/QWidget 有 Q_OBJECT, 信号需要 moc 产物。静态库带
+#      AUTOMOC 之后, 下游目标不必再为这些源重跑 moc (也不会因为缺 moc 产物而
+#      在链接期报 "undefined reference to vtable")。
+#   2. **不放进来的**: main.cpp (有 main(), 库不能带)、mainwindow/dialogs/metricsview
+#      (带 .ui 与 AUTOUIC: 把它们放进库会让每个测试目标都编一遍 Qt UI 代码)、
+#      app.rc (PE 图标必须链进**最终 exe**, 放进静态库不会生效)。
+#   3. `RL_CORE` 作为 PUBLIC 依赖: 库的源文件要 include rl/*.hpp (PPO/SAC 骨干都在那里),
+#      而下游目标也会 include 它们 —— PUBLIC 让 include 目录与链接都自动传递。
+#
+set(CHESS_CORE_SOURCES
+    ${SRC_DIR}/chess.cpp
+    ${SRC_DIR}/pos.cpp
+    ${SRC_DIR}/stone.cpp
+    ${SRC_DIR}/gamedb.cpp
+    ${SRC_DIR}/abagent.cpp
+    ${SRC_DIR}/mcts.cpp
+    ${SRC_DIR}/pgagent.cpp
+    ${SRC_DIR}/dqnagent.cpp
+    ${SRC_DIR}/ppomcts_agent.cpp
+    ${SRC_DIR}/dqnmcts_agent.cpp
+    ${SRC_DIR}/evagent.cpp
+    ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazlegacyagent.cpp
+    ${SRC_DIR}/dqnabagent.cpp
+    ${SRC_DIR}/chessboard.cpp
+)
+add_library(CHESS_CORE STATIC ${CHESS_CORE_SOURCES})
+target_include_directories(CHESS_CORE PUBLIC ${SRC_DIR})
+target_link_libraries(CHESS_CORE PUBLIC
+    RL_CORE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Sql)
+set_target_properties(CHESS_CORE PROPERTIES
+    AUTOMOC ON
+    AUTOUIC OFF
+    AUTORCC OFF)
+target_compile_options(CHESS_CORE PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+
+# 同一个 header-deps workaround (见上面那段): 库里的源文件也要挂上显式头依赖,
+# 否则改了 src/*.h 之后库不会重编 —— 那是最坏的一种"快": 编得快但二进制是旧的。
+set_property(SOURCE ${CHESS_CORE_SOURCES} APPEND PROPERTY OBJECT_DEPENDS ${APP_HEADER_DEPS})
+
 # ---------------------------------------------------------------------------
 # 同一个 workaround 必须应用到**每一个**目标, 不只是 RL_CORE 和 chess。
 # 漏掉测试目标时症状不明显但很恶劣: 改了 src/chess.h / src/stone.h 之后
@@ -246,24 +301,11 @@ if(CHESS_USE_PCH)
 endif()
 
 # =============================================================== GUI program
+# 只有界面这一层在**本目标**里编译; 棋盘/引擎/全部 agent 都在 CHESS_CORE 里编一次
+# (见上面那段的说明: 原来它们在这里又被编了一遍, 每个测试目标再各编一遍)。
 set(APP_SOURCES
     ${SRC_DIR}/main.cpp
-    ${SRC_DIR}/abagent.cpp
-    ${SRC_DIR}/chess.cpp
-    ${SRC_DIR}/chessboard.cpp
-    ${SRC_DIR}/dqnagent.cpp
-    ${SRC_DIR}/dqnmcts_agent.cpp
-    ${SRC_DIR}/evagent.cpp
-    ${SRC_DIR}/gamedb.cpp
     ${SRC_DIR}/mainwindow.cpp
-    ${SRC_DIR}/mcts.cpp
-    ${SRC_DIR}/pgagent.cpp
-    ${SRC_DIR}/pos.cpp
-    ${SRC_DIR}/ppomcts_agent.cpp
-    ${SRC_DIR}/sacazagent.cpp
-    ${SRC_DIR}/sacazlegacyagent.cpp
-    ${SRC_DIR}/dqnabagent.cpp
-    ${SRC_DIR}/stone.cpp
     ${SRC_DIR}/thinkingindicator.cpp
     ${SRC_DIR}/metricsview.cpp
     ${SRC_DIR}/busydialog.cpp
@@ -291,6 +333,7 @@ set_target_properties(chess PROPERTIES
     AUTORCC ON)
 
 target_link_libraries(chess PRIVATE
+    CHESS_CORE
     RL_CORE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Sql)
@@ -545,27 +588,14 @@ if(CHESS_BUILD_TESTS)
     # 通过 setMaxPliesPerGame(4) 把每局压到 4 手, 于是几秒内就能跑完整场。
     add_executable(test_match
         ${CMAKE_CURRENT_SOURCE_DIR}/test/test_match_main.cpp
-        ${SRC_DIR}/chessboard.cpp
-        ${SRC_DIR}/chess.cpp
-        ${SRC_DIR}/gamedb.cpp
-        ${SRC_DIR}/pos.cpp
-        ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/evagent.cpp
-        ${SRC_DIR}/abagent.cpp
-        ${SRC_DIR}/mcts.cpp
-        ${SRC_DIR}/dqnagent.cpp
-        ${SRC_DIR}/pgagent.cpp
-        ${SRC_DIR}/ppomcts_agent.cpp
-        ${SRC_DIR}/dqnmcts_agent.cpp
-        ${SRC_DIR}/sacazagent.cpp
-        ${SRC_DIR}/sacazlegacyagent.cpp
-        ${SRC_DIR}/dqnabagent.cpp
         # [2.9] 节要直接构造 CurveChart, 钉住"换一批线"的语义 (clearData 只清点,
         # removeAllSeries 才清线) —— 曲线控件只依赖 Qt Widgets, 不需要主窗口。
+        # (棋盘/引擎/全部 agent 来自 CHESS_CORE, 不再在这里重复编译。)
         ${SRC_DIR}/metricsview.cpp
         ${SRC_DIR}/metricsview.h)
     target_include_directories(test_match PRIVATE ${SRC_DIR})
     target_link_libraries(test_match PRIVATE
+        CHESS_CORE
         RL_CORE
         Qt${QT_VERSION_MAJOR}::Widgets
         Qt${QT_VERSION_MAJOR}::Sql)
@@ -1302,24 +1332,10 @@ if(CHESS_BUILD_TESTS)
     # (SAC+AZ 每手一次 learnBatch 约 2.3 s)。回归断言在 test_match [2.7d], 这里只是读数。
     #   <build>/bench_match_modes --games=2 --plies=40 --sims=32 --a=ppo --b=sac
     add_executable(bench_match_modes
-        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_match_modes_main.cpp
-        ${SRC_DIR}/chessboard.cpp
-        ${SRC_DIR}/chess.cpp
-        ${SRC_DIR}/gamedb.cpp
-        ${SRC_DIR}/pos.cpp
-        ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/evagent.cpp
-        ${SRC_DIR}/abagent.cpp
-        ${SRC_DIR}/mcts.cpp
-        ${SRC_DIR}/dqnagent.cpp
-        ${SRC_DIR}/pgagent.cpp
-        ${SRC_DIR}/ppomcts_agent.cpp
-        ${SRC_DIR}/dqnmcts_agent.cpp
-        ${SRC_DIR}/sacazagent.cpp
-        ${SRC_DIR}/sacazlegacyagent.cpp
-        ${SRC_DIR}/dqnabagent.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_match_modes_main.cpp)
     target_include_directories(bench_match_modes PRIVATE ${SRC_DIR})
     target_link_libraries(bench_match_modes PRIVATE
+        CHESS_CORE
         RL_CORE
         Qt${QT_VERSION_MAJOR}::Widgets
         Qt${QT_VERSION_MAJOR}::Sql)
@@ -1335,14 +1351,10 @@ if(CHESS_BUILD_TESTS)
     # NaN/Inf 而曲线控件丢弃非有限值 ⇒ 损失曲线静默停止上报。这个探针把"哪一手开始坏"
     # 打出来。修好后应当打印 "0/N 局出现过非有限 lastLoss"。
     add_executable(probe_pg_loss_nan
-        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_pg_loss_nan_main.cpp
-        ${SRC_DIR}/chess.cpp
-        ${SRC_DIR}/gamedb.cpp
-        ${SRC_DIR}/pos.cpp
-        ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/pgagent.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_pg_loss_nan_main.cpp)
     target_include_directories(probe_pg_loss_nan PRIVATE ${SRC_DIR})
     target_link_libraries(probe_pg_loss_nan PRIVATE
+        CHESS_CORE
         RL_CORE
         Qt${QT_VERSION_MAJOR}::Widgets
         Qt${QT_VERSION_MAJOR}::Sql)
@@ -1352,6 +1364,75 @@ if(CHESS_BUILD_TESTS)
         AUTOMOC OFF
         AUTOUIC OFF)
     chess_add_header_deps(probe_pg_loss_nan)
+
+    # ------------- 复现"保存权重把 AI 决策/界面卡住" (不进 ctest)
+    # 用户报障: "黑方赢了之后再次开局, 红方下子后黑方无限等待"。
+    # 待验证假设: 保存持 m_agentMutex 写 530 MB, 而 AI 决策要拿同一把锁。
+    #   <build>/repro_save_blocks_ai --sims=16
+    add_executable(repro_save_blocks_ai
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/repro_save_blocks_ai_main.cpp)
+    target_include_directories(repro_save_blocks_ai PRIVATE ${SRC_DIR})
+    target_link_libraries(repro_save_blocks_ai PRIVATE
+        CHESS_CORE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(repro_save_blocks_ai PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(repro_save_blocks_ai PROPERTIES
+        AUTOMOC ON
+        AUTOUIC OFF)
+    chess_add_header_deps(repro_save_blocks_ai)
+
+    # ------------------- 红兵过河后能否横走 (2026-09 用户报障的最小验证)
+    # 只问引擎 Bing::tryMoveTo: 规则对 ⇒ 走不动的原因在点击/选中/状态, 不在规则。
+    #   <build>/probe_pawn_rule
+    add_executable(probe_pawn_rule
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_pawn_rule_main.cpp)
+    target_include_directories(probe_pawn_rule PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_pawn_rule PRIVATE
+        CHESS_CORE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(probe_pawn_rule PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_pawn_rule PROPERTIES
+        AUTOMOC ON
+        AUTOUIC OFF)
+    chess_add_header_deps(probe_pawn_rule)
+
+    # ---------------- 人机对弈状态机的回归测试 (2026-09 用户报障)
+    # "黑方胜利后, 沙漏显示 agent 未加载 / 选择对战 AI 失效 / 红方下第一个棋后
+    #  黑方无限等待" —— 走**真实点击路径** (mousePressEvent) 连打两局, 钉住
+    # "AI 自己结束一局之后, 下一局黑方还会应手"。
+    #   <build>/probe_hvai_flow
+    #
+    # **进 ctest** (名字带 probe 但它是回归测试, 不是定位工具): 这条路径当时没有任何
+    # 测试覆盖 —— 它需要"一局由 AI 自己结束"才会暴露, 而所有 test_* 走的都是
+    # humanTurnAiMoveForTest / matchAgents, 根本不经过 process() 的终局分支。
+    # 跑一次约 20 s (AB 深度 4, 盘面只有几个子), 超时给 300 s。
+    add_executable(probe_hvai_flow
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_hvai_flow_main.cpp
+        # [C] 节直接构造 ThinkingIndicator, 钉住"按开局之后那一行还显示当前选中的 agent"
+        # (用户报障 "沙漏显示 agent 未加载" 就是这一行被清空过)。它与 metricsview 一样
+        # 只依赖 Qt Widgets, 不在 CHESS_CORE 里, 所以要在这个目标里编一次。
+        ${SRC_DIR}/thinkingindicator.cpp
+        ${SRC_DIR}/thinkingindicator.h)
+    target_include_directories(probe_hvai_flow PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_hvai_flow PRIVATE
+        CHESS_CORE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(probe_hvai_flow PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_hvai_flow PROPERTIES
+        AUTOMOC ON
+        AUTOUIC OFF)
+    chess_add_header_deps(probe_hvai_flow)
+    add_test(NAME probe_hvai_flow COMMAND probe_hvai_flow)
+    set_tests_properties(probe_hvai_flow PROPERTIES TIMEOUT 300)
 
     # ------------------------------------------- SAC + MCTS + AlphaZero agent
     # 盯四件事: 掩码 softmax 的雅可比(有限差分)、搜索给出的走法合法性、

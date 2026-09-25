@@ -8,6 +8,10 @@ build-asan
 .claude
 *.user
 
+# 排查期的构建/日志暂存目录 (各轮会话留下的 build*.log / reconf*.log / 探针输出等,
+# 2026-09 累计约 22 MB)。它是运行期产物, 不该进仓库; 需要留档的结论都已经写进 docs/。
+.r1build/
+
 # 训练权重 (运行期产物, 每个文件约 15 MB; GUI 与基准都从运行目录的 weights/ 读写)
 # 验证用的权重可用 bench_ppo_mt --save=<prefix> 重新生成, 见 docs/training_optimization.md §7
 weights/
