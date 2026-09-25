@@ -694,7 +694,7 @@ bool DQNAgent::loadModel(const std::string &filepath)
 /* ------------------------------------------------------------------ */
 /*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
 /* ------------------------------------------------------------------ */
-bool DQNAgent::exploreAndTrain(int color, int rolloutSteps)
+bool DQNAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0 || batchSize <= 0) {
         return false;
@@ -717,7 +717,9 @@ bool DQNAgent::exploreAndTrain(int color, int rolloutSteps)
         dqn.perceive(s, oneHot, ns, moverRewardToBlackFrame(r, chosen), done);
     };
 
-    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+    /* 局部副本: rolloutFromCurrent 会把"真用了几手对手着法"回填到它里面 (P1) */
+    OpponentPolicy opp = opponent;
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans, opp);
 
     bool trained = false;
     if (collected > 0) {
@@ -727,7 +729,8 @@ bool DQNAgent::exploreAndTrain(int color, int rolloutSteps)
         trained = true;
     }
     m_exploreInfo = "rollout " + std::to_string(collected) + " 步, 训练 1 次(池 "
-                    + std::to_string((int)dqn.memories.size()) + ")";
+                    + std::to_string((int)dqn.memories.size()) + ")"
+                    + opponentRolloutInfo(opp);
     return trained;
 }
 

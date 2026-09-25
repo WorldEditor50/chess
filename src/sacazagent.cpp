@@ -1713,12 +1713,14 @@ void SACAZAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
  *  这些样本的策略目标不是搜索出来的, 所以 hasSearch=false —— 只训练 critic 与
  *  SAC 的软 Q 项, 不用 AlphaZero 的监督项 (否则就是把策略往它自己身上拉)。
  * ============================================================ */
-bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
+bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         m_exploreInfo = "SAC+AZ: 探索步数为 0, 已跳过";
         return false;
     }
+    /* 局部副本: rolloutFromCurrent 会把"真用了几手对手着法"回填到它里面 (P1) */
+    OpponentPolicy opp = opponent;
 
     const int collected = rolloutFromCurrent(
         *this, chess, color, rolloutSteps,
@@ -1769,7 +1771,8 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
             while (memories.size() > maxMemorySize) {
                 memories.pop_front();
             }
-        });
+        },
+        opp);
 
     /*
        在线训练一次。**批大小要按池里的实际条数夹一下**: learnBatch 在
@@ -1780,10 +1783,11 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps)
     const int onlineBatch = std::min(batchSize, (int)memories.size());
     const float loss = learnBatch(onlineBatch);
 
-    char buf[256];
+    char buf[320];
     std::snprintf(buf, sizeof(buf),
-                  "SAC+AZ 探索 %d 步, 训练 1 次 (池 %zu, critic loss %.4f, alpha %.3f)",
-                  collected, memories.size(), (double)loss, (double)alpha[0]);
+                  "SAC+AZ 探索 %d 步, 训练 1 次 (池 %zu, critic loss %.4f, alpha %.3f)%s",
+                  collected, memories.size(), (double)loss, (double)alpha[0],
+                  opponentRolloutInfo(opp).c_str());
     m_exploreInfo = buf;
     return collected > 0;
 }

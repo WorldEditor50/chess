@@ -154,9 +154,12 @@ public:
                即"轮到它走"时**不会**训练, 也不可能被训练;
              * getLastTrainLoss() 恒为 NaN -> 损失曲线上没有它的点 (这是正确行为,
                不是"训练没跑起来"); selfCheckReport 里写明了这一句;
-             * 与它下棋时, 学习型 agent 学的是**它自己滚出来的经验** —— 对手是谁
-               不进入它的训练数据。要"照着 AB 的棋学"必须另接一条对手条件化的
-               采样路径 (本轮未做, 见 docs 里的待办)。
+             * 与它下棋时, 学习型 agent 默认学的仍然是**它自己滚出来的经验** ——
+               [P1, 2026-09 更新] 现在可以打开"对手入训"(setOpponentInRolloutEnabled):
+               探索里轮到对手的手会去问**真实对手**(AB 就是 AB 的搜索), 于是它的棋
+               参与了数据生成。默认关闭 (理由见那一段说明); 打开后对手的着法**只推进
+               局面、不记成学习方的样本** (那是"off-policy 冒充 on-policy", 见 aiagent.h
+               的 OpponentPolicy)。
            这一条不是可以靠"多跑几轮"绕过的: 本工程对"纯搜索 agent"的口径一直是
            "有棋力、没有学习" (见 aiagent.h 的 hasLearningReward / AB 的自检报告)。
 
@@ -199,9 +202,9 @@ public:
      *
      * 三条语义 (由 perMoveLearningEnabled() / searchLearningEnabled() 统一给出):
      *
-     *   MATCH_TRAIN   双方各自学习 —— **双方各自自对弈**, 不是互相学(对手的棋不进训练
-     *                 数据, 见 aiagent.h 里 exploreAndTrain 没有对手参数这件事)。
-     *                 这是"训练对局"。
+     *   MATCH_TRAIN   双方各自学习 —— **双方各自自对弈**, 不是互相学(对手的棋默认不进
+     *                 训练数据 —— [P1] 现在可以打开"对手入训"让它进, 见
+     *                 setOpponentInRolloutEnabled)。这是"训练对局"。
      *   MATCH_EVAL    **冻结对手, 只让一方学**: 谁被冻结是调用方的事 —— 对弈里
      *                 "A 方是待评估者、B 方是参照物", 所以只让 A 那一侧学。
      *                 这是"评估对局": 比分变化因此可以归因到 A 自己的变化上。
@@ -263,6 +266,32 @@ public:
         */
         QString modeName;
         bool learnsSomething = true;
+        /*
+           ================================================================
+           ---- "B 方到底冻住了什么" (P0-b 收尾) ----
+           ================================================================
+           必须在报告里出现, 而且必须**分情况**: "冻结"在这套代码里有三种强度, 读数
+           完全不同, 而它们在比分行上长得一模一样:
+             · frozenToSnapshot  : B 走的是**开场权重快照** (独立实例) ⇒ A 怎么学都
+                                   影响不到 B, B 的权重逐字节不变。最强的口径;
+             · 独立实例 (不同 agent 类型): B 与 A 本来就是两个对象 ⇒ A 的学习写不到
+                                   B 身上 (但 B 自己那份权重仍是常驻实例);
+             · 不可训练 (纯搜索 AB / MCTS): B 没有权重 ⇒ "冻结"平凡成立。
+           frozenNote 是给报告看的**一句话** (由 matchAgents 填), 上面三个 bool 是
+           给断言用的机器可读版本 —— 只有字符串的话, 测试就只能靠 contains 猜。
+        */
+        QString frozenNote;
+        bool frozenToSnapshot = false;      /* 真的用了开场快照实例 */
+        bool frozenAuditDone = false;       /* 做了逐字节审计 */
+        bool frozenWeightsUnchanged = false;/* 审计结果: B 的权重逐字节不变 */
+        /*
+           B 方**实际**用快照实例走了多少手。
+           为什么这条读数必须进报告: "建了快照实例"与"决策真的走了它"是两件事, 而后者
+           才是"冻结"生效的地方。计数为 0 时上面那个 frozenToSnapshot 就是个空承诺。
+        */
+        int frozenDecisions = 0;
+        /* 本场因为"模式"被跳过的后台训练轮数 (与冻结同源, 读数要一起看) */
+        int bgRoundsSkippedByMode = 0;
         /*
            ================================================================
            [O1, 2026-09] 吃子行为 —— "该吃的时候吃了吗"（整场累计）
@@ -594,6 +623,21 @@ private:
     Step aiThinkRaw(int color);
     Step aiThinkForAgentRaw(int color, AgentType agentType);
     /*
+     * ----------------------------------------------------------------
+     *  ---- "在 env 上按类型决策" (P0-b 冻结快照 / P1 对手查询 的公共入口) ----
+     * ----------------------------------------------------------------
+     * aiThinkForAgentRaw 原来是"把 chess 复制进 env" + "一个 11 分支的 switch"两件事
+     * 写在一个函数里。后来有两处需要在**不改动 env** 的前提下用某个 agent 决策:
+     *   * P0-b: 冻结的 B 方走的是**快照实例** (由 decisionInstance 选实例, 与这里无关);
+     *   * P1  : 学习方的探索滚到"对手那一手"时, 要问**真实对手**在这个局面上怎么走 ——
+     *           此刻棋盘正是 env (探索就在 env 上试走), 而"问"必须**不**做
+     *           `env = chess` (那会把探索到一半的局面整份覆盖掉)。
+     * 所以把 switch 抽成 decideOnEnvRawLocked(): **调用方必须已经持有 m_agentMutex**
+     * (它内部逐 case 加锁; 而探索路径本来就在决策的锁内), 且它**不碰** env 的内容。
+     * 抽成一处而不是再抄一份 switch: 抄一份就是"SAC 掩码只改了一半"那类事故的温床。
+     */
+    Step decideOnEnvRawLocked(int color, AgentType agentType);
+    /*
      * 决策输出的合法性闸门 (见 chessboard.cpp 的实现注释):
      * agent 返回无效走法、而棋盘上还有合法走法时, 用第一个合法走法兜底并报警。
      * 真的无棋可走 (将杀/困毙/和棋前的终局) 时把无效 Step 原样返回。
@@ -686,8 +730,14 @@ private:
     /*
      * 对当前 agent 执行一次"探索环境 + 预训练", 然后是决策。
      * 返回探索出来的说明文字 (给界面用)。
+     *
+     * [P1] 探索时是否把**对手的棋**纳入数据, 由 public 段的 setOpponentInRollout* 决定:
+     * 打开后本函数会把"对手在这个局面上会怎么走"作为 OpponentPolicy 传给
+     * `agent->exploreAndTrain()`; 对手类型由 m_rolloutOpponentType 给出 (对局循环每手
+     * 填一次)。人机对战那条路没有对手 agent ⇒ 拿不到对手策略, 于是保持自对弈。
      */
     std::string preTrainThenDecide(AgentBase *agent, int color);
+
 
     /*
      * [2026-09 新] 决策里"从自己的搜索学了一次"之后, 把损失送上损失曲线。
@@ -768,6 +818,55 @@ private:
     SideRole sideRole() const { return m_sideRole; }
     /* 人类对战那条路里 AI 的角色 (AI 固定执黑, 见 process()) */
     static SideRole sideRoleForHumanGame() { return SIDE_FROZEN; }
+
+    /*
+     * ----------------------------------------------------------------
+     *  ---- 决策到底用哪个实例 (冻结快照的**唯一**注入点) ----
+     * ----------------------------------------------------------------
+     * 为什么是一个模板 + 一个非模板判据, 而不是在每个 case 里写 if:
+     * 决策路径有 11 个 case (见 aiThinkForAgentRaw), 每个 case 都要"拿本类型的实例"。
+     * 把"要不要换成冻结实例"的判断写 11 遍, 迟早会漏一支 —— 而漏掉的表现是
+     * "某个 agent 在评估模式下 B 方悄悄用常驻实例下棋", 读数上完全看不出来
+     * (那正是 P0-a 里 SAC 掩码漏改一次的同类错误)。
+     *
+     * 模板负责 static_cast (调用方按**自己的类型**声明局部指针, 所以这里的转换一定
+     * 是同一个类型 —— 冻结实例就是用该类型的构造参数建出来的, 见 makeAgentInstance)。
+     * 判据在 frozenOpponentOverrideFor 里, 只有一处。
+     */
+    AgentBase *frozenOpponentOverrideFor(AgentType type) const;
+    template <class AgentT>
+    AgentT *decisionInstance(AgentT *resident, AgentType type) const
+    {
+        AgentBase *o = frozenOpponentOverrideFor(type);
+        return (o != nullptr) ? static_cast<AgentT *>(o) : resident;
+    }
+
+    /*
+     * ---- 冻结快照的生命周期 (只在 matchAgents 里用; 见头文件上面那段说明) ----
+     *   freezeOpponentToSnapshot : 取快照 + 建冻结实例 (失败时把原因写进 outNote)
+     *   releaseFrozenOpponent    : 删实例 + 删除临时文件 (RAII 保证一定被调)
+     * 返回值: 真的建好了冻结实例。
+     */
+    bool freezeOpponentToSnapshot(AgentType type, QString &outNote);
+    void releaseFrozenOpponent();
+    /*
+     * 按类型**新建**一个实例 (不登记到常驻指针上): 冻结实例用它, loadAgentModel 的
+     * "实例不存在就先建" 也用它 —— 构造参数只有这一处, 与决策路径逐字一致。
+     * 返回 nullptr = 这个类型没有常驻实例 (纯搜索 agent: AB 各档 / MCTS)。
+     */
+    AgentBase *makeAgentInstance(AgentType type);
+    /*
+     * 对**指定的实例**存取权重 (saveCurrentAgentModel / loadAgentModel 的公共实现)。
+     * 为什么要指出实例: 冻结实例不在常驻指针上, 但它同样要能被存/载 (取快照、审计)。
+     * 两者的差别只在"用哪个对象", 类型分派必须共用一份 —— 否则审计与生产会各写一套。
+     */
+    bool saveWeightsOf(AgentBase *inst, AgentType type, const std::string &filepath);
+    bool loadWeightsInto(AgentBase *inst, AgentType type, const std::string &filepath);
+    /*
+     * 审计: 冻结实例此刻的权重 vs 开场快照, 逐字节比 (返回 true = 逐字节相同)。
+     * 只在 setFrozenWeightAuditEnabled(true) 时由 matchAgents 调用 (要额外写一次权重)。
+     */
+    bool auditFrozenOpponentWeights();
     /*
      * 决策的两个收尾钩子 (把"决策 + 损失上报 + 模式掩码"收在一处)。
      *
@@ -838,6 +937,57 @@ private:
     std::atomic<bool> m_bgPaused{false};
     std::mutex m_bgPauseMutex;
     std::condition_variable m_bgPauseCv;
+
+    /* ---- B 方权重快照 (P0-b 收尾; 语义见头文件上面那段) ---- */
+    /*
+     * 冻结实例本身。**唯一**的读取点是 frozenOpponentOverrideFor (决策路径每手查一次),
+     * 写入点是 freezeOpponentToSnapshot / releaseFrozenOpponent —— 只有对弈线程会碰它
+     * (matchAgents 只被一条线程调用), 且全程在 m_agentMutex 的决策段内被使用。
+     */
+    AgentBase *m_frozenOpponent = nullptr;              /* 非空 = 冻结生效 */
+    AgentType m_frozenOpponentType = AGENT_ALPHABETA;   /* m_frozenOpponent 的类型 */
+    std::string m_frozenSnapshotPath;                   /* 开场快照文件 (前缀) */
+    std::string m_frozenAuditPath;                      /* 审计文件 (前缀) */
+    bool m_opponentSnapshotEnabled = true;              /* 见 setOpponentSnapshotEnabled */
+    bool m_frozenWeightAudit = false;                   /* 见 setFrozenWeightAuditEnabled */
+    /*
+     * "B 方实际用快照实例走了多少手" (诊断; 由 frozenOpponentOverrideFor 累加)。
+     * 决策路径上的计数用 atomic: 它是 const 方法里累加的, 而 const 方法可能被
+     * GUI 线程(自检/报告)与对弈线程同时调用 —— 与 m_matchLearningBlocked 同一手法。
+     */
+    mutable std::atomic<int> m_frozenDecisions{0};
+
+    /* ---- P1: 对手参数 (语义见 public 段那一大段说明) ---- */
+    bool m_opponentInRollout = false;      /* 默认关: 行为与改动前逐字相同 */
+    int m_opponentRolloutPlies = 1;        /* 打开时每次探索最多问对手几手 */
+    std::atomic<int> m_opponentQueryCount{0};
+    std::atomic<int> m_opponentQueryUnmatched{0};
+    /* "问对手时的学习被拦下"的次数 (见 public 段 opponentQueryLearnBlockedCount) */
+    mutable std::atomic<int> m_opponentQueryLearnBlocked{0};
+    /*
+     * 这一手的**对手**是哪个 agent 类型 (对局循环每手在 setSideRole 旁边填一次)。
+     * 为什么要有它: preTrainThenDecide 只知道"正在替谁决策", 而对手参数要的是**另一边**
+     * 的类型; 由 playMatchGame 填是唯一知道 A/B 与红黑对应关系的地方。
+     * AGENT_MCTS 兼作"没有对手"的哨兵 (人机对战 / 未开局时)。
+     */
+    AgentType m_rolloutOpponentType = AGENT_MCTS;
+    /*
+     * 查询深度 (P1): "现在是学习方的探索在问对手"期间 > 0。
+     * 两个用途, 都是防嵌套/防偷学:
+     *   * preTrainThenDecide 在查询期间直接返回 (不许对手在被问时自己再探索/训练);
+     *   * searchLearningEnabled() 在查询期间返回 false (SAC 的 learnFromSearch 那条路)。
+     * 用 int 而不是 bool: 对手查询是完全可能重入的 (以后若给对手也开对手参数),
+     * 那时 > 1 仍然表示"深处不许学", 语义不用改。
+     */
+    int m_opponentQueryDepth = 0;
+    /*
+     * 问对手一次着法 (P1)。
+     * ⚠ 只能在**已经持有 m_agentMutex** 的决策路径里调用 (它走 decideOnEnvRawLocked,
+     *   那个函数内部逐 case 再拿同一把锁 —— 从锁外调用才会死锁, 从锁内调用是安全的
+     *   前提: preTrainThenDecide 的所有调用点都在决策分支的锁内)。
+     * 返回的 Step 无效 = 问不到 (此时调用方回退自对弈)。
+     */
+    Step opponentStepForRollout(AgentType type, int turn);
 public:
     /*
      * 暂停 / 恢复后台训练 (P0-b)。**public**: 对弈线程要用 (matchAgents 里的 RAII 守卫
@@ -852,6 +1002,131 @@ public:
     void resumeBackgroundTraining();
     /* 后台训练线程此刻在不在跑 (测试与界面用; 见 [2.7f]) */
     bool isBackgroundTrainingRunning() const { return m_bgTraining.load(); }
+
+    /*
+     * ---- 后台训练**此刻会不会改动主 agent 的权重** (P0-b 收尾) ----
+     *
+     * 为什么除了 isBackgroundTrainingRunning 还需要它: 线程在跑 ≠ 它在改权重。
+     * 有两种情况线程活着但不写权重:
+     *   ① 显式的 pause (对弈用 RAII 包住整场, 见 matchAgents);
+     *   ② **对弈模式不是"训练对局"** —— 评估/只对弈模式声称冻结, 而冻结必须
+     *      包含"权重不变", 所以后台训练在这两种模式下**整体停摆** (不再同步权重回
+     *      主 agent), 不只是"对局那一手不学"。
+     *
+     * 为什么 ② 不能只靠"对弈期间 pause 一下"(P0-b 第一版就是这么做的, 不够):
+     *   * **人机对战那条路不在 matchAgents 里** —— 用户把模式设成评估/只对弈, 然后
+     *     跟 AI 下棋, 后台训练照样在局中把 AI (= 冻结的 B 方) 的权重换掉;
+     *   * **局与局之间**也在改: 一场 4 局的评估, 局间的后台同步会把 B 方的权重换掉,
+     *     于是"每一局面对的对手都不同", 比分照样不可归因。
+     * 所以判据放在**模式**上 (它本来就是"这一场学不学"的唯一权威开关), 由训练线程
+     * 每轮开头 + 写权重前各判一次。
+     */
+    bool isBackgroundTrainingPaused() const;
+    /*
+     * 上一条的第二半: "因为模式"而被跳过的轮数 (诊断用)。
+     * 没有它, 界面上"后台训练好像没动静"既可能是模式拦住了、也可能是线程根本没起来,
+     * 两者读数相同而原因完全不同 (与 matchLearningBlockedCount 同一条理由)。
+     */
+    int backgroundRoundsSkippedByMode() const { return m_bgRoundsSkippedByMode.load(); }
+
+    /*
+     * ================================================================
+     *  ---- P1: 让对手的棋进入训练数据 (exploreAndTrain 的对手参数) ----
+     * ================================================================
+     *
+     * 用户口径: "对手的棋仍然不进训练数据 (exploreAndTrain 没有对手参数) —— 模式解决的
+     * 是'能不能归因', 不是'能不能从对手身上学'"。
+     *
+     * 机制: 学习方每手决策前的探索 (rolloutFromCurrent) 原来是**纯自对弈** ——
+     * "对手那一半"也由学习方自己的策略采样。打开这个开关后, 探索里轮到对手的那些手
+     * 改问**真实对手**: 同一个 AgentType 在**同一个局面**上的决策协议, 与它对局时走的
+     * 是同一条代码 (decideOnEnvRawLocked)。于是学习方的样本落在"被真对手应手之后的
+     * 局面"上, 回报也带着对手的影响 —— 这就是"从对手身上学"的内容。
+     *
+     * 四条必须写清的边界 (否则这个开关会被误读成"从对手身上学"的万能药):
+     *   1. **对手的着法不记成学习方的样本** (理由见 aiagent.h 的 OpponentPolicy):
+     *      自对弈里那一半是学习方自己采样的, 换成真对手就会变成"off-policy 却打着
+     *      on-policy 标签" —— 对 REINFORCE/PPO 是实打实的偏差。所以只推进局面。
+     *      (唯一的例外是 EVAB: 它的样本是"局面 -> 价值", 与谁选的动作无关, 见那边的注释。)
+     *   2. **对手在被问到时不许学习**: 问一次对手 = 走一次它的决策协议, 而 SAC+AZ 的
+     *      selectMove 里带着 learnFromSearch 那条更新路径 —— 不拦住的话, "问对手一手"
+     *      会让对手在**学习方的探索过程中**悄悄更新一次 (读数上天翻地覆, 而且嵌套).
+     *      拦住有两层: preTrainThenDecide 在查询期间直接跳过; searchLearningEnabled()
+     *      在查询期间返回 false (那条路径的掩码就走它)。
+     *   3. **只在对弈里有对手**: 人机对战没有"对手的策略" (人是人), 那条路保持自对弈。
+     *   4. **默认关闭, 而且有手数预算**: 问一次对手 = 一次完整决策 (SAC+AZ 实测 2.3 s/手),
+     *      而一次探索要滚几十手。默认 0 = 行为与改动前逐字相同; 打开时默认只问最前面
+     *      1 手 (即"对手对学习方第一步的应手"), 这是"能负担 + 有意义"的那个点。
+     *
+     * ⚠ 口径提醒 (为什么默认关闭): 价值/策略目标从此**条件化于这个对手**。
+     *   同一份权重里混进"对不同对手"的数据时, V(s) 学的是平均值 —— 那是"对手特征没进
+     *   状态"的必然后果 (见 AGENT_ALPHABETA 的注释与 docs 里的待办)。
+     *   所以它适合"专门练一个对手"的场景, 而不是无脑常开。
+     */
+    void setOpponentInRolloutEnabled(bool on) { m_opponentInRollout = on; }
+    bool isOpponentInRolloutEnabled() const { return m_opponentInRollout; }
+    /* 每次探索最多问对手几次 (夹到 >= 0; 0 = 不问, 即使开关是开的) */
+    void setOpponentRolloutPlies(int n) { m_opponentRolloutPlies = (n > 0) ? n : 0; }
+    int getOpponentRolloutPlies() const { return m_opponentRolloutPlies; }
+    /*
+     * 诊断: 到目前为止**问过对手多少次**、其中多少次它没给出可用着法 (无效 Step)。
+     * 没有这两个数, "开了开关"与"开关真的生效"在读数上完全一样 —— 而本工程最怕的
+     * 就是这种静默失效 (与 matchLearningBlockedCount 同一条理由)。
+     * (另一类回退 —— "给出的着法不在当前合法集里" —— 由探索侧的 OpponentPolicy.unmatched
+     *  计数, 它会出现在探索说明里; 两处分开是因为一个发生在取着法时, 一个发生在用它时。)
+     */
+    int opponentQueryCount() const { return m_opponentQueryCount.load(); }
+    int opponentQueryUnmatchedCount() const { return m_opponentQueryUnmatched.load(); }
+    /*
+     * 第三个数: "问对手这一手时, **本来会发生的学习**被拦下"的次数。
+     * 为什么必须有它: 上面那个"对手没上报损失"的断言有两种解释 —— ① 被拦住了;
+     * ② 那条学习路径本来就没触发 (例如池子不够一个批)。两者读数一样而含义完全不同,
+     * 与 [2.7d] 里"闸门踩下次数"是同一条理由。
+     */
+    int opponentQueryLearnBlockedCount() const
+    {
+        return m_opponentQueryLearnBlocked.load();
+    }
+
+    /*
+     * ================================================================
+     *  ---- B 方冻结成一份**权重快照** (P0-b 收尾, 2026-09) ----
+     * ================================================================
+     *
+     * 用户口径 (原话): "也没把 B 方冻结成一份权重快照 (现在冻结的只是'学习', 不是
+     * '权重')".
+     *
+     * 洞的形态 (为什么会漏): MATCH_EVAL 之前只做了一件事 —— **禁止 B 那一手学习**
+     * (updateEnabledForSide 的 role x mode 表)。可 A 与 B 可以是**同一个 agent 类型**,
+     * 而常驻实例**每个类型只有一个** (m_sfXXX): 于是 "A 学" 与 "B 用" 是**同一张网**。
+     * A 每学一次, B 的棋力当场就变一次 —— 一局之内 B 都在漂移, 比分不可归因。
+     * 这正是"局内非平稳"的第二个来源 (第一个是对手在学, 已由 P0-a 的模式解决;
+     * 第三个是后台训练, 已由 isBackgroundTrainingPaused 解决)。
+     *
+     * 修法: 评估模式开场时, 把 B 方当时的权重**取一份快照**, 并用这份快照单独建一个
+     * **冻结实例**; 对局期间 B 那一手走的就是这个实例 (见 decisionInstance)。
+     *   * 快照在**对局循环之前**取 (A 还没学过一次) —— 它是"开场权重"的字面定义;
+     *   * 冻结实例**没有任何写入路径**: B 那一手不学习 (模式闸门), 后台训练已停摆,
+     *     A 学的是常驻实例 (另一个对象)。三条合起来 ⇒ B 的权重逐字节不变。
+     *   * 只有 `typeA == typeB` 时才需要它: 类型不同时 A 与 B 本来就是两个对象,
+     *     A 的学习写不到 B 身上 (报告里会把这两种情况分开写清)。
+     *
+     * 为什么不做成"每场都建一个冻结实例": B 方的模型可能是 3 x 146 MB, 每场多写一次
+     * 快照 (十几秒) 换来的只是"把一个已经成立的结论再证一遍"。类型不同时报告里写明
+     * "B 与 A 不是同一个实例 ⇒ 权重无写入路径", 这比多花十几秒更有信息量。
+     *
+     * 逐字节审计 (可选, setFrozenWeightAuditEnabled): 对局结束时把**冻结实例**当前的
+     * 权重再存一份, 与开场快照逐字节比对, 把结果写进对局报告。它是给测试与"要证据"
+     * 的场合用的: 逻辑上冻结实例不可能被写, 而"不可能"必须能被量出来 (本工程的口径)。
+     * 默认关闭 —— 它要额外写一次权重文件 (SAC+AZ 系约十几秒)。
+     */
+    bool isOpponentSnapshotEnabled() const { return m_opponentSnapshotEnabled; }
+    void setOpponentSnapshotEnabled(bool on) { m_opponentSnapshotEnabled = on; }
+    void setFrozenWeightAuditEnabled(bool on) { m_frozenWeightAudit = on; }
+    /* 上一场评估对局有没有真的把 B 方冻到快照实例上 (报告与测试用) */
+    bool isOpponentFrozenToSnapshot() const { return m_frozenOpponent != nullptr; }
+    /* 冻结实例此刻的 AgentType (没有冻结实例时无意义; 见上一条) */
+    AgentType frozenOpponentType() const { return m_frozenOpponentType; }
 
     /* ---- 思考过程可视化 (全部只在 GUI 线程读写, 除了 m_thinkGeneration) ---- */
     void initThinkVisuals();
@@ -1013,6 +1288,8 @@ private:
        (原来就是, 2026-09 顺手改成 atomic)。
     */
     std::atomic<bool> m_bgTraining{false};
+    /* "因为对弈模式不是训练对弈"而被跳过的轮数 (见 backgroundRoundsSkippedByMode) */
+    std::atomic<int> m_bgRoundsSkippedByMode{0};
     /*
      * 一轮的规模 (见 setBackgroundTrainRound)。用 atomic: GUI/测试线程写、训练线程
      * 每轮开头读, 两边不需要更强的同步 (读到的是"上一轮或这一轮"的规模, 都合法)。

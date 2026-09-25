@@ -2841,7 +2841,7 @@ void PPOMCTSAgent::endOnline(int winner, int myColor)
 /* ------------------------------------------------------------------ */
 /*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
 /* ------------------------------------------------------------------ */
-bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
+bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         return false;
@@ -2948,7 +2948,9 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
 
     /* 首手之前的势能 (第 0 步的 Φ_before); 必须在下棋之前取 */
     m_phiInit = potentialOf(chess.sideToMove);
-    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+    /* 局部副本: rolloutFromCurrent 会把"真用了几手对手着法"回填到它里面 (P1) */
+    OpponentPolicy opp = opponent;
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans, opp);
 
     bool trained = false;
     if (!traj.empty()) {
@@ -2987,6 +2989,7 @@ bool PPOMCTSAgent::exploreAndTrain(int color, int rolloutSteps)
         trained = true;
     }
     m_exploreInfo = "rollout " + std::to_string(collected) + " 步, PPO 更新 1 次"
-                    + (rolloutEnded ? " (到终局)" : " (截断+自举)");
+                    + (rolloutEnded ? " (到终局)" : " (截断+自举)")
+                    + opponentRolloutInfo(opp);
     return trained;
 }

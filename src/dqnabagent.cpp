@@ -1301,13 +1301,15 @@ double DQNABAgent::trainSelfPlay(int episodes, int maxMoves, bool verbose,
     return lastAvgLoss;
 }
 
-bool DQNABAgent::exploreAndTrain(int color, int rolloutSteps)
+bool DQNABAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         m_exploreInfo = "DQN+AB: 探索步数为 0, 已跳过";
         return false;
     }
     const int before = (int)m_replay.size();
+    /* 局部副本: rolloutFromCurrent 会把"真用了几手对手着法"回填到它里面 (P1) */
+    OpponentPolicy opp = opponent;
 
     const int collected = rolloutFromCurrent(
         *this, chess, color, rolloutSteps,
@@ -1356,17 +1358,19 @@ bool DQNABAgent::exploreAndTrain(int color, int rolloutSteps)
             }
             s.label = (float)plannedLabelFromCurrent(reward, done);
             pushSample(std::move(s));
-        });
+        },
+        opp);
 
     bool trained = false;
     if (batchSize > 0 && (int)m_replay.size() >= batchSize) {
         trained = learnBatch(batchSize, replayEpochs);
     }
 
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "DQN+AB 探索 %d 步 (池 %zu), %s",
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), "DQN+AB 探索 %d 步 (池 %zu), %s%s",
                   collected, m_replay.size(),
-                  trained ? "在线更新 1 次" : "池不足一个批, 未更新");
+                  trained ? "在线更新 1 次" : "池不足一个批, 未更新",
+                  opponentRolloutInfo(opp).c_str());
     m_exploreInfo = buf;
     (void)before;
     return trained;

@@ -135,7 +135,8 @@ public:
      * 从当前局面用本 agent 的探索策略滚若干步收集经验, 在线训练一次, 然后才走子。
      * 探索期间用 moveForward/moveBack 试走, 结束时会原样回退, 不影响真棋局。
      */
-    bool exploreAndTrain(int color, int rolloutSteps) override;
+    bool exploreAndTrain(int color, int rolloutSteps,
+                         const OpponentPolicy &opponent = OpponentPolicy()) override;
     /* ----------------------------------------------------------------
      *  Public API
      * ---------------------------------------------------------------- */

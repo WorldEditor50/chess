@@ -118,7 +118,8 @@ public:
      * 用 dqn.noiseAction() 从当前局面滚 rolloutSteps 步, 每条转移 perceive 进
      * 回放池, 然后 learn() 一次。
      */
-    bool exploreAndTrain(int color, int rolloutSteps) override;
+    bool exploreAndTrain(int color, int rolloutSteps,
+                         const OpponentPolicy &opponent = OpponentPolicy()) override;
 
     /* Select a move:
      *   training=true  : ε-greedy (sample random with prob ε)

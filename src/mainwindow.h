@@ -36,6 +36,14 @@ private slots:
     void onStartMatch();
     /* 对弈模式下拉框 (P0-a): 把"训练 / 评估 / 只对弈不学习"写进 ChessBoard */
     void onMatchModeSelected(int index);
+    /*
+     * ---- P1: 探索里的对手参数 ----
+     * 两个控件 (勾选框 + 手数上限) 在构造函数里**用代码**加进"模式"那一行, 而不是
+     * 写进 mainwindow.ui: 那个文件的编码与既有内容很容易被一串新控件搞乱, 而这两个控件
+     * 的全部语义都可以在这里写清. 语义见 ChessBoard 的 setOpponentInRollout*.
+     */
+    void onOpponentRolloutToggled(bool on);
+    void onOpponentRolloutPliesChanged(int n);
 
 private:
     void refreshGameList();

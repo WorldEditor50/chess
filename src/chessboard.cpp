@@ -4,6 +4,7 @@
 #include "sacazlegacyagent.h"
 #include <QDebug>
 #include <QDir>
+#include <QFile>        /* 冻结快照的清理 (releaseFrozenOpponent) 与审计比对 */
 #include <QFontMetrics>
 #include <QStringList>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <fstream>      /* 自检面板要报"权重文件在不在、多大" */
+#include <iterator>     /* 审计的逐字节比对用 istreambuf_iterator */
 #include <limits>
 #include <set>          /* backgroundTrainLoop: "没接后台训练"每种 agent 只报一次 */
 #include <string>
@@ -1711,6 +1713,40 @@ void ChessBoard::setAgentType(AgentType type)
  *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
  *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
  * ================================================================ */
+/*
+ * opponentStepForRollout - "问对手一手" (P1)
+ *
+ * 时机与契约:
+ *   * 由 preTrainThenDecide 装进 OpponentPolicy.stepFor, 在学习方的**探索**里被调用;
+ *   * 调用发生时, 学习方的决策正持有 m_agentMutex (整段决策都在锁内, 见
+ *     aiThinkForAgentRaw), 所以这里可以直接调 decideOnEnvRawLocked —— 它的契约正是
+ *     "调用方已持有 m_agentMutex"。**绝不能**改成调用 aiThinkForAgentRaw: 那会再拿一次
+ *     同一把非递归锁 ⇒ 自锁死锁 (这条注释就是为了拦住那次"看起来更省事"的改动)。
+ *
+ * 三件必须做的事 (每件都对应一个具体的坏结果):
+ *   1. **角色换成对手那一方**: 评估模式下 A 是学习者、B 是冻结方; 学习方的探索里问的是
+ *      B, 所以这一手要按 B 的角色判 (实例选择/搜索学习掩码都读它)。忘了换的后果是
+ *      评估模式下 B 被问到时**用了常驻实例或允许学习** —— 冻结失效且没有读数。
+ *   2. **m_opponentQueryDepth +1**: 让 preTrainThenDecide 与 searchLearningEnabled 在
+ *      查询期间一律拒绝学习 (见这两处的注释)。
+ *   3. **失败计数**: 问不到 (无效 Step) 时计一次, 由探索回退到自对弈 —— 静默回退会让
+ *      "对手参数没生效"看起来与"对手参数没开"一模一样。
+ */
+Step ChessBoard::opponentStepForRollout(AgentType type, int turn)
+{
+    m_opponentQueryCount.fetch_add(1);
+    const SideRole saved = m_sideRole;
+    setSideRole(saved == SIDE_LEARNER ? SIDE_FROZEN : SIDE_LEARNER);
+    m_opponentQueryDepth++;
+    const Step s = decideOnEnvRawLocked(turn, type);
+    m_opponentQueryDepth--;
+    setSideRole(saved);
+    if (!s.valid) {
+        m_opponentQueryUnmatched.fetch_add(1);
+    }
+    return s;
+}
+
 /* ================================================================
  *  preTrainThenDecide - 走子前的"先探索环境 + 预训练" (仿 snakeAI)
  *
@@ -1724,6 +1760,17 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
 {    if (agent == nullptr) {
         emitStage(QStringLiteral("① 搜索 / 决策"));
         return std::string();
+    }
+    /*
+       ---- P1: "正在问对手一手"期间不许探索/训练 ----
+       问对手 = 走一次它的决策协议 (decideOnEnvRawLocked), 而那条路也会走到本函数。
+       不拦住的话, "问对手一手"会让对手在**学习方的探索过程中**自己再探索 + 训练一次:
+       对手的权重被悄悄改了 (评估模式当场失效), 而且会无限递归 (对手的探索又要问它的
+       对手)。所以查询期间直接返回 —— 问对手**只要它的着法**, 不要它的学习。
+    */
+    if (m_opponentQueryDepth > 0) {
+        m_opponentQueryLearnBlocked.fetch_add(1);
+        return std::string("对手查询: 只取着法, 不探索不训练");
     }
     if (!m_preTrainEnabled.load()) {
         emitStage(QStringLiteral("① 搜索 / 决策"));
@@ -1748,7 +1795,28 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
         return std::string("探索+预训练: 已关闭 (步数=0)");
     }
     emitStage(QStringLiteral("① 探索环境 + 预训练 (≤%1 步)").arg(steps));
-    const bool trained = agent->exploreAndTrain(color, steps);
+    /*
+       ---- P1: 把"对手在这个局面上会怎么走"交给探索 ----
+       默认 budget = 0 ⇒ 探索里对手那一半仍然由学习方自己的策略产生, 与改动前**逐字相同**。
+       打开的条件有四条, 每条都对应一个"不打开"的正当理由:
+         * 开关与预算 (用户没开 / 预算是 0);
+         * **正在对弈** —— 只有对局循环知道对手是谁 (m_rolloutOpponentType);
+         * 那一手是不是在问对手 (m_opponentQueryDepth, 否则递归);
+         * 对手类型是不是一个**有决策分支**的 agent —— 哨兵 AGENT_MCTS 表示"没有对手"
+           (人机对战), 那时保持自对弈。MCTS 自己作为对手类型是合法的, 所以哨兵用它
+           与"真选了 MCTS 当对手"共用同一个值, 判据落在 m_matchRunning 上 (见上面第二条)。
+    */
+    OpponentPolicy opp;
+    if (m_opponentInRollout && m_opponentRolloutPlies > 0
+        && m_matchRunning.load() && m_opponentQueryDepth == 0) {
+        const AgentType oppType = m_rolloutOpponentType;
+        opp.budget = m_opponentRolloutPlies;
+        opp.name = agentDisplayName(oppType).toStdString();
+        opp.stepFor = [this, oppType](int turn) -> Step {
+            return opponentStepForRollout(oppType, turn);
+        };
+    }
+    const bool trained = agent->exploreAndTrain(color, steps, opp);
     std::string info = agent->getExploreInfo();
     if (info.empty()) {
         info = trained ? "已预训练" : "无需预训练 (该 agent 没有在线可训练参数)";
@@ -1841,7 +1909,17 @@ bool ChessBoard::updateEnabledForSide(SideRole role) const
 
 bool ChessBoard::searchLearningEnabled() const
 {
-    /* 两条学习路径必须同进同退: 口径就是 updateEnabledForSide 那一个函数 */
+    /*
+       两条学习路径必须同进同退: 口径就是 updateEnabledForSide 那一个函数。
+       [P1] 另加一条:**正在问对手一手**时一律不许学 —— SAC+AZ 的 selectMove 里带着
+       learnFromSearch 那条更新路径, 而"问对手"就是走一次 selectMove。不拦住的话,
+       学习方的探索会让**对手**每被问到一次就更新一次 (评估模式下 B 方当场就不是冻结的了,
+       而且这条更新发生在谁都看不见的地方)。
+    */
+    if (m_opponentQueryDepth > 0) {
+        m_opponentQueryLearnBlocked.fetch_add(1);
+        return false;
+    }
     return updateEnabledForSide(m_sideRole);
 }
 
@@ -1936,6 +2014,322 @@ AgentBase *ChessBoard::agentInstance(AgentType type) const
     case AGENT_DQNAB:       return m_sfDQNAB;
     default:                return nullptr;   /* Alpha-Beta / MCTS: 没有常驻对象 */
     }
+}
+
+/* ================================================================
+ *  ---- 冻结对手 (B 方) 的权重快照 (P0-b 收尾) ----
+ *
+ *  语义与理由见 chessboard.h 的那一段。这里只写**三个容易写错的地方**:
+ *
+ *  1. 快照必须在**对局循环之前**取。放到"B 第一手决策时再取"看起来更省 (那时常驻
+ *     实例一定已经建好了), 但**A 已经学过一手了** —— 而 A 与 B 共用同一个常驻实例,
+ *     于是那份"开场快照"里已经混进了 A 的第一次更新。表现是"评估仍然不完全干净",
+ *     且完全看不出来 (差的那一点梯度没有任何读数)。
+ *  2. 常驻实例不存在时, 先按**决策路径同一套参数**把它建出来 + 载入扫描到的权重,
+ *     再取快照。判据用 s_weightPaths (与 startupLoad 同一份), 不能自己拼文件名 ——
+ *     PPO+MCTS 曾经因为"扫描的名字与实际写出的名字不一致"而从来没被载入过。
+ *     ⚠ 这里**只在该类型没有实例时**才调 loadAgentModel: 实例已存在时再 load 会把
+ *     内存里已经学到的东西覆盖掉 (评估模式里 A 的在线学习成果)。
+ *  3. 冻结实例的类型分派与决策路径共用 makeAgentInstance: 构造参数写错的后果是
+ *     save/load 结构指纹不匹配 (当场失败) 或**静默换骨干** (SAC 三支), 两种都不该
+ *     靠"记得同步改两处"来避免。
+ * ================================================================ */
+
+/*
+ * frozenOpponentOverrideFor - 这一手要不要改用冻结实例 (唯一判据)
+ *
+ * 三个条件必须同时成立:
+ *   * 有冻结实例 (评估模式开场建好了);
+ *   * 类型对得上 (每个类型的 case 只会问到自己的类型);
+ *   * **这一手是冻结方** (SIDE_FROZEN) 且**正在对弈**。
+ * 最后一条是"人机那条路不许被卷进来"的保险: 冻结实例只在 matchAgents 生命周期内存在,
+ * 而人机决策 (aiThinkRaw) 从不在对局期间发生 —— 就算以后有人让它发生, 这里也会拦住
+ * (人机里 AI 也是 SIDE_FROZEN, 但它用的必须是它自己那份常驻权重)。
+ */
+AgentBase *ChessBoard::frozenOpponentOverrideFor(AgentType type) const
+{
+    if (m_frozenOpponent == nullptr || type != m_frozenOpponentType) {
+        return nullptr;
+    }
+    if (!m_matchRunning.load() || m_sideRole != SIDE_FROZEN) {
+        return nullptr;
+    }
+    /*
+       诊断计数: "B 方实际用快照走了多少手"。
+       为什么需要它: "建了冻结实例"与"决策真的走了它"是两件事 —— 只断言前者的话,
+       decisionInstance 那一行被谁改回 m_sfXXX 都测不出来 (而那就是本工程最怕的
+       "改了但静默失效")。计数为 0 = 快照建了却没被用上。
+    */
+    m_frozenDecisions.fetch_add(1);
+    return m_frozenOpponent;
+}
+
+/*
+ * makeAgentInstance - 按类型新建一个实例 (不登记到常驻指针上)
+ *
+ * 构造参数必须与 aiThinkForAgentRaw / loadAgentModel / 后台训练那几处**逐字一致**;
+ * 与 SAC 三支共用 createSACAZAgent / createSACAZLegacyAgent 那一条"唯一构造点"
+ * 约定 (见那两个函数的注释)。
+ */
+AgentBase *ChessBoard::makeAgentInstance(AgentType type)
+{
+    switch (type) {
+    case AGENT_PG:        return new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
+    case AGENT_DQN:       return new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
+    case AGENT_PPOMCTS:   return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+    case AGENT_PPOMCTS_MLP:
+        /* 骨干参数 (64, 0.1f, true, MlpExperts) 必须与决策路径一致, 否则结构指纹对不上 */
+        return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                true, RL::PPO::Backbone::MlpExperts);
+    case AGENT_DQNMCTS:   return new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
+    case AGENT_EVAB:      return new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
+    case AGENT_SACAZ:     return createSACAZAgent(env, AGENT_SACAZ);
+    case AGENT_SACAZ_MOE: return createSACAZAgent(env, AGENT_SACAZ_MOE);
+    /* 还原版是**独立类**: 必须走它自己那个构造点, 手写 new SACAZAgent 会静默换口径 */
+    case AGENT_SACAZ_OLD:     return createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
+    case AGENT_SACAZ_OLD_MOE: return createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+    case AGENT_DQNAB: {
+        DQNABAgent *a = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
+                                       DQNABAgent::Backbone::SparseMoeTb);
+        a->nodeBudget = DQNAB_NODES;      /* 与 aiThinkRaw 同一预算, 否则搜索行为不一致 */
+        return a;
+    }
+    default:
+        return nullptr;   /* 纯搜索 agent (AB 各档 / MCTS): 没有实例可建 */
+    }
+}
+
+/*
+ * saveWeightsOf / loadWeightsInto - "指定实例"的权重读写 (类型分派只有这一份)
+ *
+ * saveCurrentAgentModel / loadAgentModel 与冻结快照的取数、审计都走这里:
+ * 三处各写一遍 switch 的话, "新加一个 agent 类型"时漏掉一处就是静默失效
+ * (而那正是本工程反复栽的那个跟头)。
+ */
+bool ChessBoard::saveWeightsOf(AgentBase *inst, AgentType type, const std::string &filepath)
+{
+    if (inst == nullptr) {
+        return false;
+    }
+    switch (type) {
+    case AGENT_PG:          return static_cast<PGEagent *>(inst)->savePolicy(filepath);
+    case AGENT_DQN:         return static_cast<DQNAgent *>(inst)->saveModel(filepath);
+    case AGENT_PPOMCTS:     return static_cast<PPOMCTSAgent *>(inst)->saveModel(filepath);
+    case AGENT_PPOMCTS_MLP: return static_cast<PPOMCTSAgent *>(inst)->saveModel(filepath);
+    case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->saveModel(filepath);
+    case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ_MOE:   return static_cast<SACAZAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ_OLD:
+        return static_cast<SACAZLegacyAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ_OLD_MOE:
+        return static_cast<SACAZLegacyAgent *>(inst)->saveModel(filepath);
+    case AGENT_DQNAB:       return static_cast<DQNABAgent *>(inst)->saveModel(filepath);
+    default:                return false;      /* 纯搜索 agent: 没有权重 */
+    }
+}
+
+bool ChessBoard::loadWeightsInto(AgentBase *inst, AgentType type, const std::string &filepath)
+{
+    if (inst == nullptr) {
+        return false;
+    }
+    switch (type) {
+    case AGENT_PG:          return static_cast<PGEagent *>(inst)->loadPolicy(filepath);
+    case AGENT_DQN:         return static_cast<DQNAgent *>(inst)->loadModel(filepath);
+    case AGENT_PPOMCTS:     return static_cast<PPOMCTSAgent *>(inst)->loadModel(filepath);
+    case AGENT_PPOMCTS_MLP: return static_cast<PPOMCTSAgent *>(inst)->loadModel(filepath);
+    case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->loadModel(filepath);
+    case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ_MOE:   return static_cast<SACAZAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ_OLD:
+        return static_cast<SACAZLegacyAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ_OLD_MOE:
+        return static_cast<SACAZLegacyAgent *>(inst)->loadModel(filepath);
+    case AGENT_DQNAB:       return static_cast<DQNABAgent *>(inst)->loadModel(filepath);
+    default:                return false;      /* 纯搜索 agent: 没有权重 */
+    }
+}
+
+/*
+ * 冻结快照的文件前缀 (单一来源): 每种类型一个, 免得两个类型互相覆盖
+ * (与 tmpWeightsOf 同一条理由 —— 那种覆盖是静默的, 表现只是"快照不是我取的那份")。
+ */
+static std::string frozenSnapshotPathOf(ChessBoard::AgentType type)
+{
+    return std::string("weights/_temp_match_frozen_") + std::to_string((int)type);
+}
+static std::string frozenAuditPathOf(ChessBoard::AgentType type)
+{
+    return std::string("weights/_temp_match_frozen_audit_") + std::to_string((int)type);
+}
+
+/*
+ * freezeOpponentToSnapshot - 取开场快照 + 建冻结实例
+ *
+ * 返回 true = 冻结实例建好了 (B 那一手从此走它)。任何一步失败都返回 false, 并把
+ * **原因**写进 outNote (由调用方写进对局报告) —— 静默失败在这里最危险: 报告照样说
+ * "评估对局", 而 B 其实还是那张会被 A 改的网。
+ */
+bool ChessBoard::freezeOpponentToSnapshot(AgentType type, QString &outNote)
+{
+    outNote.clear();
+    if (abDepthOf(type) > 0 || type == AGENT_MCTS) {
+        outNote = QStringLiteral("%1 没有可训练权重 (纯搜索) ⇒ '冻结'平凡成立")
+                      .arg(agentDisplayName(type));
+        return false;
+    }
+    /*
+       常驻实例必须先在 (快照要从它身上取)。**只在它不存在时**才走 loadAgentModel:
+       已存在时再 load 会把 A 已经学到的权重覆盖掉。
+    */
+    if (agentInstance(type) == nullptr) {
+        std::string path = defaultWeightPath(type);
+        auto it = s_weightPaths.find(type);
+        if (it != s_weightPaths.end()) {
+            path = it->second;
+        }
+        /* 返回值故意忽略: 载入失败时实例仍在 (随机初始化), 与决策路径的兜底同一行为;
+           这里要的只是"取快照的对象存在", 而"有没有载入"由下面那句 note 说明。 */
+        const bool loaded = loadAgentModel(type, path);
+        if (!loaded) {
+            outNote += QStringLiteral("(提示: %1 的权重没能从 %2 载入, 快照取的是当前内存里的权重) ")
+                           .arg(agentDisplayName(type))
+                           .arg(QString::fromStdString(path));
+        }
+    }
+
+    m_frozenSnapshotPath = frozenSnapshotPathOf(type);
+    {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (!saveWeightsOf(agentInstance(type), type, m_frozenSnapshotPath)) {
+            outNote += QStringLiteral("!! B 方权重快照**写盘失败** ⇒ 本场没有冻结到快照 "
+                                      "(回退为'只冻结学习', 见报告末行的说明)");
+            m_frozenSnapshotPath.clear();
+            return false;
+        }
+    }
+
+    m_frozenOpponent = makeAgentInstance(type);
+    if (m_frozenOpponent == nullptr) {
+        outNote += QStringLiteral("!! 建冻结实例失败 (%1) ⇒ 本场没有冻结到快照")
+                       .arg(agentDisplayName(type));
+        m_frozenSnapshotPath.clear();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (!loadWeightsInto(m_frozenOpponent, type, m_frozenSnapshotPath)) {
+            outNote += QStringLiteral("!! 快照载入冻结实例失败 ⇒ 本场没有冻结到快照"
+                                      " (绝不能让它拿随机权重去下棋)");
+            delete m_frozenOpponent;
+            m_frozenOpponent = nullptr;
+            QFile::remove(QString::fromStdString(m_frozenSnapshotPath));
+            m_frozenSnapshotPath.clear();
+            return false;
+        }
+    }
+    m_frozenOpponentType = type;
+    m_frozenDecisions.store(0);      /* 本场重新计数 (见 frozenOpponentOverrideFor) */
+    outNote += QStringLiteral("B 方 (%1) 已冻结为**开场权重快照**: 独立实例, A 的学习"
+                              "写不到它身上, 后台训练也不会碰它")
+                   .arg(agentDisplayName(type));
+    qInfo().noquote() << QStringLiteral("[match] 冻结对手快照: %1 -> %2")
+                             .arg(agentDisplayName(type))
+                             .arg(QString::fromStdString(m_frozenSnapshotPath));
+    return true;
+}
+
+/*
+ * releaseFrozenOpponent - 拆掉冻结实例 (并删掉两份临时文件)
+ *
+ * 一定由 matchAgents 的 RAII 守卫调用 (正常结束 / 被中止 / 提前 return 三条路都要走)。
+ * 不释放的后果不只是内存: 下一次对弈的"类型对得上 + 角色是冻结方"会让它**继续被用**,
+ * 而它的权重是上一场的快照 —— 那种错没有任何读数能反映出来。
+ */
+void ChessBoard::releaseFrozenOpponent()
+{
+    if (m_frozenOpponent != nullptr) {
+        delete m_frozenOpponent;
+        m_frozenOpponent = nullptr;
+    }
+    if (!m_frozenSnapshotPath.empty()) {
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_actor"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_critic"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_q1"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_q2"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_trunk"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_v"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_a"));
+        QFile::remove(QString::fromStdString(m_frozenSnapshotPath));
+        m_frozenSnapshotPath.clear();
+    }
+    if (!m_frozenAuditPath.empty()) {
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_actor"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_critic"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_q1"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_q2"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_trunk"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_v"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath + "_a"));
+        QFile::remove(QString::fromStdString(m_frozenAuditPath));
+        m_frozenAuditPath.clear();
+    }
+}
+
+/*
+ * frozenAuditOk - 逐字节审计: 冻结实例此刻的权重 vs 开场快照
+ *
+ * 为什么值得写: 逻辑上冻结实例没有任何写入路径, 但"逻辑上不会"在本工程不算证据 ——
+ * 用户要的是"B 的权重确实没变"这个可量的结论。做法是把冻结实例的权重再存一份, 与
+ * 开场快照逐字节比对 (权重文件是确定性序列化, 同一个网络存两次字节相同)。
+ * 多文件家族 (PPO 两文件 / SAC 三文件 / DQNAB 三文件) 逐个后缀比。
+ *
+ * 只在 m_frozenWeightAudit 打开时调用 (它要额外写一次权重文件)。
+ */
+static bool fileBytesEqual(const std::string &a, const std::string &b)
+{
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    if (!fa.good() || !fb.good()) {
+        return false;
+    }
+    std::string sa((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    std::string sb((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+    return !sa.empty() && sa == sb;
+}
+
+bool ChessBoard::auditFrozenOpponentWeights()
+{
+    if (m_frozenOpponent == nullptr || m_frozenSnapshotPath.empty()) {
+        return false;
+    }
+    const AgentType type = m_frozenOpponentType;
+    const std::string audit = frozenAuditPathOf(type);
+    m_frozenAuditPath = audit;
+    {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (!saveWeightsOf(m_frozenOpponent, type, audit)) {
+            return false;
+        }
+    }
+    /* 后缀表与 weightFilesOf 一致: 单文件 agent 就是前缀本身 */
+    static const char *kSuffixes[] = { "", "_actor", "_critic", "_q1", "_q2",
+                                       "_trunk", "_v", "_a" };
+    bool anyCompared = false;
+    for (const char *sfx : kSuffixes) {
+        const std::string a = m_frozenSnapshotPath + sfx;
+        std::ifstream probe(a, std::ios::binary);
+        if (!probe.good()) {
+            continue;      /* 这个后缀不存在 (该 agent 不是这种文件布局) */
+        }
+        probe.close();
+        if (!fileBytesEqual(a, audit + sfx)) {
+            return false;
+        }
+        anyCompared = true;
+    }
+    return anyCompared;
 }
 
 double ChessBoard::learningStepRewardOrNaN(AgentType type, const Step &step, int mover)
@@ -2168,7 +2562,14 @@ QString ChessBoard::stagePrefix() const
 
 void ChessBoard::emitStage(const QString &stage)
 {
-    emit aiThinkingStage(stagePrefix() + stage);
+    /*
+       [P1] "问对手一手"时, 状态条上必须能看出这行字是**对手**的阶段:
+       那一手走的是对手的决策代码 (它自己会 emit 自己的阶段文字, 例如"Alpha-Beta 深度 1"),
+       而此刻轮到的是**学习方** —— 不加这个前缀, 用户看到的就是"轮到我走, 屏幕上却写着
+       Alpha-Beta 深度 1"这种解释不通的读数 (一次决策最多闪一下, 但那一下会让人以为选错了 agent)。
+    */
+    const QString who = (m_opponentQueryDepth > 0) ? QStringLiteral("对手查询 · ") : QString();
+    emit aiThinkingStage(stagePrefix() + who + stage);
 }
 
 /* ================================================================
@@ -2620,94 +3021,124 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
        **这一步与下面的 AB/MCTS 分支都要拿 `m_agentMutex`** —— 理由见
        aiThinkRaw 顶部那段长注释 (env 是所有 agent 共用的试走棋盘, ASan 实测:
        不加锁的 `env = chess` 与加锁的读者相撞, 在 Chess 的拷贝构造里堆越界写)。
-    */
-    {
-        /* [诊断] 对弈路径同样要拿 m_agentMutex —— 卡住时这一行会报出等了多久 */
-        const double tw = dbgNowMs();
-        std::lock_guard<std::mutex> envLock(m_agentMutex);
-        dbgWait(QStringLiteral("aiThinkForAgentRaw: 拿到 env 锁 (复制棋盘, agent=%1)")
-                    .arg(agentDisplayName(agentType)), dbgNowMs() - tw);
-        env = chess;
-    }
 
+       ---- [P0-b/P1] 锁从"每个 case 各拿一次"提到**整段决策** ----
+       原来这里是"锁内复制 env" + "每个 case 各自再拿一次同一把锁"。两处新增的调用者
+       需要一段**不加锁、也不锁第二次**的决策体:
+         * P1: 学习方的探索滚到"对手那一手"时要问真实对手 —— 问的时机在**学习方决策的
+           锁内**, 而那时再进一次同一个 case 就是 std::mutex 的**自锁死锁** (非递归锁)。
+       所以改成: 本函数拿一次锁, 整段决策都在锁内; 真正的 switch 在
+       decideOnEnvRawLocked() 里, 它的契约就是"调用方已持有 m_agentMutex"。
+       锁的粒度只是**变大** (原来是 env 复制之后有一个小窗口是不锁的), 没有任何调用者
+       依赖那个窗口, 而"决策全程串行"本来就是这套代码的口径 (见 saveCurrentAgentModel)。
+    */
+    std::lock_guard<std::mutex> agentLock(m_agentMutex);
+    const double tw = dbgNowMs();
+    dbgWait(QStringLiteral("aiThinkForAgentRaw: 拿到 env 锁 (复制棋盘, agent=%1)")
+                .arg(agentDisplayName(agentType)), dbgNowMs() - tw);
+    env = chess;
+    return decideOnEnvRawLocked(color, agentType);
+}
+
+/*
+ * decideOnEnvRawLocked - "在 env 上按类型决策" (契约: **调用方必须已持有 m_agentMutex**)
+ *
+ * 为什么单独存在 (而不是并进 aiThinkForAgentRaw): 见上面那段 —— P1 的"问对手一手"
+ * 发生在学习方决策的锁内, 那里**不能**再进一次这个 switch 的加锁版本。
+ * 它**不动 env 的内容**: 调用方负责把局面摆好 (aiThinkForAgentRaw 是 `env = chess`;
+ * 探索路径是"探索本来就在 env 上试走到了那一手")。
+ */
+Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
+{
     switch (agentType) {
     case AGENT_ALPHABETA:
     case AGENT_AB_L1:
     case AGENT_AB_L2:
     case AGENT_AB_L3: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         const int depth = abDepthOf(agentType);     /* 同上: 深度按类型取, 不写死 */
         emitStage(QStringLiteral("① 搜索 / 决策 (Alpha-Beta 深度 %1)").arg(depth));
         ABAgent abAIForAgent(env, depth);
         return abAIForAgent.getBestMove(color);
     }
     case AGENT_MCTS: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
         emitStage(QStringLiteral("① 搜索 / 决策 (MCTS %1 次模拟)").arg(MCTS_SIMS));
         MCTS mctsAI(env, 1.414f);
         return mctsAI.findBestMove(color, MCTS_SIMS);
     }
     case AGENT_PG: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfPG == nullptr) {
+        /*
+           ---- 这一手用哪个实例 (P0-b 收尾: 冻结快照) ----
+           decisionInstance 只在"这一手是冻结的 B 方 + 本类型有开场快照"时换成快照实例,
+           其余情况原样返回常驻实例 —— 判断只有一处 (frozenOpponentOverrideFor),
+           11 个 case 都不自己写 if (那种写法必然漏掉某一支, 见 aiagent 的 SAC 掩码事故)。
+        */
+        PGEagent *ag = decisionInstance(m_sfPG, AGENT_PG);
+        if (ag == nullptr) {
             m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
+            ag = m_sfPG;
         }
-        preTrainThenDecide(m_sfPG, color);
-        return m_sfPG->selectMove(color, false);
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, false);
     }
     case AGENT_DQN: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfDQN == nullptr) {
+        DQNAgent *ag = decisionInstance(m_sfDQN, AGENT_DQN);
+        if (ag == nullptr) {
             m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
+            ag = m_sfDQN;
         }
-        preTrainThenDecide(m_sfDQN, color);
-        return m_sfDQN->selectMove(color, false);
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, false);
     }
     case AGENT_PPOMCTS: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfPPOMCTS == nullptr) {
+        PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTS, AGENT_PPOMCTS);
+        if (ag == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            ag = m_sfPPOMCTS;
         }
-        preTrainThenDecide(m_sfPPOMCTS, color);
-        return m_sfPPOMCTS->selectMove(color, PPO_SIMS, 0.0f);
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, PPO_SIMS, 0.0f);
     }
     case AGENT_DQNMCTS: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfDQNMCTS == nullptr) {
+        DQNMCTSAgent *ag = decisionInstance(m_sfDQNMCTS, AGENT_DQNMCTS);
+        if (ag == nullptr) {
             m_sfDQNMCTS = new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
+            ag = m_sfDQNMCTS;
         }
-        preTrainThenDecide(m_sfDQNMCTS, color);
+        preTrainThenDecide(ag, color);
         /* self-play 走贪心 (training=false), 否则恒为 1.0 的探索率会让它随机走子 */
-        return m_sfDQNMCTS->selectMove(color, DQNMCTS_ITERATIONS, false);
+        return ag->selectMove(color, DQNMCTS_ITERATIONS, false);
     }
     case AGENT_EVAB: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfEVAB == nullptr) {
+        EVABAgent *ag = decisionInstance(m_sfEVAB, AGENT_EVAB);
+        if (ag == nullptr) {
             m_sfEVAB = new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
+            ag = m_sfEVAB;
         }
-        preTrainThenDecide(m_sfEVAB, color);
-        return m_sfEVAB->getBestMove(color);
+        preTrainThenDecide(ag, color);
+        return ag->getBestMove(color);
     }
     case AGENT_SACAZ: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfSACAZ == nullptr) {
+        SACAZAgent *ag = decisionInstance(m_sfSACAZ, AGENT_SACAZ);
+        if (ag == nullptr) {
             m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+            ag = m_sfSACAZ;
         }
-        preTrainThenDecide(m_sfSACAZ, color);
+        preTrainThenDecide(ag, color);
         /* 走 finishDecisionSearch: 上报那次 learnFromSearch 的损失 + 装对弈模式掩码。
            ⚠ 这一支曾经漏改过: aiThinkRaw 与 aiThinkForAgentRaw 各有一份 SAC 分支,
              而**对弈走的是后者** —— 只改了前者的话, 评估模式下 SAC 照样每手更新,
              在读数上表现为"B 侧 20 次而不是 0 次", 极难归因 (见 [2.7d] 的注释)。 */
-        return finishDecisionSearch(m_sfSACAZ, [&] {
-            return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+        return finishDecisionSearch(ag, [&] {
+            return ag->selectMove(color, SACAZ_SIMS, 0.0f);
         });
     }
     case AGENT_SACAZ_MOE: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfSACAZMoe == nullptr) {
+        SACAZAgent *ag = decisionInstance(m_sfSACAZMoe, AGENT_SACAZ_MOE);
+        if (ag == nullptr) {
             m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
                                           SACAZAgent::Backbone::SparseMoeTb,
                                           64, SACAZ_MOE_AUX);
+            ag = m_sfSACAZMoe;
             /*
                以前这里**只建对象、不载权重** —— 于是对弈里用到这个 agent 时跑的是
                随机初始化的网络 (界面上"选了它却像没训练过"), 而它自己在 aiThink
@@ -2725,15 +3156,15 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
                     && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
                     prefix.erase(prefix.size() - suffix.size());
                 }
-                m_sfSACAZMoe->loadModel(prefix);
+                ag->loadModel(prefix);
                 emit busyFinished();
             }
         }
-        preTrainThenDecide(m_sfSACAZMoe, color);
+        preTrainThenDecide(ag, color);
 {
             /* 走 finishDecisionSearch: 上报那次 learnFromSearch 的损失 + 装对弈模式掩码 */
-            return finishDecisionSearch(m_sfSACAZMoe, [&] {
-                return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            return finishDecisionSearch(ag, [&] {
+                return ag->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
             });
         }
     }
@@ -2743,9 +3174,10 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
            (建了对象就把权重载上), 但构造的是**独立类** SACAZLegacyAgent ——
            口径不同, 所以权重前缀也独立 (weights/sacaz_old_agent*)。
         */
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfSACAZOld == nullptr) {
+        SACAZLegacyAgent *ag = decisionInstance(m_sfSACAZOld, AGENT_SACAZ_OLD);
+        if (ag == nullptr) {
             m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
+            ag = m_sfSACAZOld;
             auto it = s_weightPaths.find(AGENT_SACAZ_OLD);
             if (it != s_weightPaths.end()) {
                 std::string prefix = it->second;
@@ -2754,10 +3186,10 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
                     && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
                     prefix.erase(prefix.size() - suffix.size());
                 }
-                m_sfSACAZOld->loadModel(prefix);
+                ag->loadModel(prefix);
             }
         }
-        preTrainThenDecide(m_sfSACAZOld, color);
+        preTrainThenDecide(ag, color);
 {
             /* 决策里可能用自己的搜索样本学了一次 (learnFromSearch), 那次损失也要上曲线 */
             /*
@@ -2765,8 +3197,8 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
                createSACAZLegacyAgent 的注释), 所以这里用普通收尾钩子: 它只负责
                "决策 + 那次更新的损失上报", 不需要装掩码。
             */
-            return finishDecision(m_sfSACAZOld, [&] {
-                return m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
+            return finishDecision(ag, [&] {
+                return ag->selectMove(color, SACAZ_SIMS, 0.0f);
             });
         }
     }
@@ -2776,9 +3208,10 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
            同一条"建了对象就把权重载上"的兜底约定, 前缀独立
            (weights/sacaz_old_moe_agent*)。
         */
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfSACAZOldMoe == nullptr) {
+        SACAZLegacyAgent *ag = decisionInstance(m_sfSACAZOldMoe, AGENT_SACAZ_OLD_MOE);
+        if (ag == nullptr) {
             m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
+            ag = m_sfSACAZOldMoe;
             auto it = s_weightPaths.find(AGENT_SACAZ_OLD_MOE);
             if (it != s_weightPaths.end()) {
                 emit busyStarted(QStringLiteral("正在载入"),
@@ -2790,23 +3223,24 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
                     && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
                     prefix.erase(prefix.size() - suffix.size());
                 }
-                m_sfSACAZOldMoe->loadModel(prefix);
+                ag->loadModel(prefix);
                 emit busyFinished();
             }
         }
-        preTrainThenDecide(m_sfSACAZOldMoe, color);
+        preTrainThenDecide(ag, color);
         {
             /* 同上面两支: 还原版没有 learnFromSearch, 用普通收尾钩子即可 */
-            return finishDecision(m_sfSACAZOldMoe, [&] {
-                return m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            return finishDecision(ag, [&] {
+                return ag->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
             });
         }
     }
     case AGENT_DQNAB: {
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfDQNAB == nullptr) {
+        DQNABAgent *ag = decisionInstance(m_sfDQNAB, AGENT_DQNAB);
+        if (ag == nullptr) {
             m_sfDQNAB = new DQNABAgent(env, DQNAB_HIDDEN, 0.99f, 0.001f,
                                              DQNABAgent::Backbone::SparseMoeTb);
+            ag = m_sfDQNAB;
             /* 与上面 SACAZ_MOE 同一条约定: 建了对象就把权重载上, 两条兜底路径不许分叉 */
             auto it = s_weightPaths.find(AGENT_DQNAB);
             if (it != s_weightPaths.end()) {
@@ -2818,13 +3252,13 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
                     && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
                     prefix.erase(prefix.size() - suffix.size());
                 }
-                m_sfDQNAB->loadModel(prefix);
+                ag->loadModel(prefix);
                 emit busyFinished();
             }
         }
-        m_sfDQNAB->nodeBudget = DQNAB_NODES;
-        preTrainThenDecide(m_sfDQNAB, color);
-        return m_sfDQNAB->selectMove(color, 0.0f);
+        ag->nodeBudget = DQNAB_NODES;
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, 0.0f);
     }
     case AGENT_PPOMCTS_MLP: {
         /*
@@ -2832,18 +3266,19 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
            AGENT_PPOMCTS 共享同一份实现, 只有骨干这一项不同 (见 chessboard.h 的枚举注释)。
            模拟次数给 PPO_MLP_SIMS —— 远比 TB 那一支多, 因为一次模拟便宜 ~25x。
         */
-        std::lock_guard<std::mutex> agentLock(m_agentMutex);
-        if (m_sfPPOMCTSMLP == nullptr) {
+        PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTSMLP, AGENT_PPOMCTS_MLP);
+        if (ag == nullptr) {
             m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                               true, RL::PPO::Backbone::MlpExperts);
+            ag = m_sfPPOMCTSMLP;
             /* 与上面 DQNAB / SACAZ_MOE 同一条约定: 建了对象就把权重载上 */
             auto it = s_weightPaths.find(AGENT_PPOMCTS_MLP);
             if (it != s_weightPaths.end()) {
-                m_sfPPOMCTSMLP->loadModel(it->second);
+                ag->loadModel(it->second);
             }
         }
-        preTrainThenDecide(m_sfPPOMCTSMLP, color);
-        return m_sfPPOMCTSMLP->selectMove(color, PPO_MLP_SIMS, 0.0f);
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, PPO_MLP_SIMS, 0.0f);
     }
     default:
         /* 兜底: 同 aiThinkRaw 的 default (加一行 warning, 让它不是静默的降级) */
@@ -2934,6 +3369,28 @@ QString ChessBoard::MatchStats::detail() const
        这里把模式**直接印出来**, 于是读数自带前提, 不再需要读者自己去悟。
     */
     d += QStringLiteral("\n对弈模式: %1").arg(modeName);
+    /*
+       ---- B 方到底冻住了什么 (P0-b 收尾) ----
+       "这一场学不学"与"这一场的权重会不会变"是**两件事**, 而比分只在前者被写清时
+       才有解释力。这一行把后者也印出来: 报告里说"冻结"时, 读者必须能知道冻的是
+       "B 那一手不学习"还是"B 的权重逐字节不变" —— 两者对结论的支持强度完全不同。
+    */
+    if (!frozenNote.isEmpty()) {
+        d += QStringLiteral("\nB 方冻结口径: %1").arg(frozenNote);
+    }
+    if (frozenToSnapshot) {
+        d += QStringLiteral("\n  B 方用开场快照走了 %1 手").arg(frozenDecisions);
+    }
+    if (frozenAuditDone) {
+        d += QStringLiteral("\n  逐字节审计: %1")
+                 .arg(frozenWeightsUnchanged
+                          ? QStringLiteral("B 方的权重与开场快照**逐字节相同**")
+                          : QStringLiteral("!! B 方的权重与开场快照**不同** (冻结是假的)"));
+    }
+    if (bgRoundsSkippedByMode > 0) {
+        d += QStringLiteral("\n  后台训练: 本模式下跳过了 %1 轮 (不写主 agent 权重)")
+                 .arg(bgRoundsSkippedByMode);
+    }
     if (!learnsSomething) {
         d += QStringLiteral("\n  注: 本场**不能**当作棋力结论 —— 只有固定参照物 +"
                             " 对照口径下的比分才可归因 (见 docs/agents_design.md §10.3"
@@ -3024,6 +3481,13 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
            所以这个角色必须由对局循环来填。
         */
         setSideRole(((turn == Stone::COLOR_RED) == aIsRed) ? SIDE_LEARNER : SIDE_FROZEN);
+        /*
+           ---- [P1] 顺手把"这一手的对手是哪个类型"也填上 ----
+           探索的对手参数要用它 (preTrainThenDecide 只知道自己替谁决策, 而对手是**另一边**)。
+           这里是唯一知道"A/B 与红黑怎么对应"的地方 —— 在别处按 m_agentType 猜会猜错:
+           对弈里 m_agentType 是界面上选中的那个, 与场上这手是谁毫无关系。
+        */
+        m_rolloutOpponentType = (who == redType) ? blackType : redType;
         auto t0 = std::chrono::steady_clock::now();
         Step step = aiThinkForAgent(turn, who);
         auto t1 = std::chrono::steady_clock::now();
@@ -3264,6 +3728,59 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
     }
 
     /*
+       ================================================================
+        ---- B 方冻住的是什么 (P0-b 收尾): 学习, 还是**权重**? ----
+       ================================================================
+       用户口径: "现在冻结的只是'学习', 不是'权重'". 前者拦得住 B 自己更新, 拦不住
+       **A 的更新经由共用实例流到 B 身上** —— 而"每个 agent 类型只有一个常驻实例"
+       (m_sfXXX) 意味着 A == B 类型时两者就是同一张网: A 学一次, B 的棋力当场变一次。
+       所以这里在开场做一次判定并把结论写进报告, 三种强度分得清:
+         · 评估模式 + A/B 同类型  -> **取快照 + 建冻结实例** (最强口径);
+         · 评估模式 + A/B 不同类型-> 两个实例, A 的学习写不到 B (后台训练已停摆);
+         · 只对弈不学习           -> 双方都不学, 且后台训练本模式停摆。
+       ⚠ 快照必须在**对局循环之前**取: A 的第一手决策里就有一次在线更新, 而它与 B
+         共用实例 —— 放到后面取, 快照里就混进了 A 的更新 (见 freezeOpponentToSnapshot)。
+       RAII: 无论正常结束、被中止还是提前 return, 冻结实例与临时文件都必须拆掉:
+         留着的后果是**下一场**会继续用上一场的快照下棋, 而那没有任何读数能反映。
+    */
+    struct FrozenGuard {
+        ChessBoard *self;
+        ~FrozenGuard() { self->releaseFrozenOpponent(); }
+    } frozenGuard{this};
+    /*
+       计数归零: 报告里的"B 方用快照走了几手"必须是**本场**的数 ——
+       不归零的话, 一场没有快照的对局会带上上一场留下的数字 (那是假的读数)。
+    */
+    m_frozenDecisions.store(0);
+    const int bgSkippedBefore = m_bgRoundsSkippedByMode.load();
+    {
+        const MatchMode m = m_matchMode.load();
+        if (m == MATCH_NO_LEARN) {
+            st.frozenNote = QStringLiteral("双方都不学, 且后台训练在本模式下停摆"
+                                           " ⇒ 本场没有任何写权重的路径");
+        } else if (m == MATCH_TRAIN) {
+            st.frozenNote = QStringLiteral("训练模式: 不冻结任何一方 (双方都在学,"
+                                           " 权重本来就会变)");
+        } else if (typeA != typeB) {
+            st.frozenNote = QStringLiteral("A/B 不是同一个 agent 类型 ⇒ 各自一个常驻实例,"
+                                           " A 的学习写不到 B 身上; 后台训练本模式停摆"
+                                           " ⇒ B 的权重无写入路径 (不需要快照)");
+        } else if (!m_opponentSnapshotEnabled) {
+            /* 对照口径: 显式关掉快照, 让"共用实例导致 B 跟着变"这件事能被测出来 */
+            st.frozenNote = QStringLiteral("!! 权重快照被显式关闭 (对照口径): A/B 共用同一个"
+                                           " 实例 ⇒ A 每学一次 B 就变一次, 本场比分**不可"
+                                           " 归因** (这正是 P0-b 要修掉的那个洞)");
+        } else {
+            QString note;
+            st.frozenToSnapshot = freezeOpponentToSnapshot(typeB, note);
+            st.frozenNote = note;
+            if (!st.frozenToSnapshot && st.frozenNote.isEmpty()) {
+                st.frozenNote = QStringLiteral("B 方的权重快照没能建起来");
+            }
+        }
+    }
+
+    /*
        ---- 暂停后台训练 (P0-b): "冻结"必须包括权重不变 ----
        后台训练每轮会把权重同步回主 agent, 而对弈用的就是这个主 agent。若不暂停,
        "评估对局 / 只对弈不学习"这两个模式声称的冻结只是"这一手不学习", 权重仍会在
@@ -3272,6 +3789,11 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
        所以对局期间不会有任何后台写权重。
        ⚠ 训练模式下**不暂停**: 那种模式下双方本来就在学, 停不停后台都改变不了
          "权重会变"这件事, 而停掉会让"一边对弈一边后台训练"这个既有用法失效。
+       [P0-b 收尾] 这一层之外还有第二层: 训练线程自己也会在**每一轮开头**与**写权重
+       之前**判一次对弈模式 (见 isBackgroundTrainingPaused), 于是人机对战那条路
+       (不在本函数里) 与"局与局之间"同样不会被后台权重改动污染。保留本层的理由:
+       它是个**屏障** —— 它返回时保证"在飞的那一轮"已经收尾或被丢弃, 而且即使用户
+       在对局中途把模式切回"训练对局", 这一场也仍然全程无后台写入。
        RAII: 无论正常结束、被中止还是提前 return, 都要恢复。
     */
     const bool pauseBg = (m_matchMode.load() != MATCH_TRAIN) && m_bgTraining.load();
@@ -3425,6 +3947,19 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         emit gameRewardSample(st.games, st.agentA, st.agentB, rA, rB);
     }
 
+    /*
+       ---- 冻结的**证据** (P0-b 收尾) ----
+       审计在拆冻结实例之前做 (它比的就是那个实例此刻的权重): 把 B 方全程用过的实例
+       的权重再存一份, 与开场快照逐字节比对。默认关闭 —— 它要额外写一次权重文件;
+       打开它的场合是"要证据"(测试 / 需要写进报告的评估)。
+    */
+    if (m_frozenWeightAudit && m_frozenOpponent != nullptr) {
+        st.frozenAuditDone = true;
+        st.frozenWeightsUnchanged = auditFrozenOpponentWeights();
+    }
+    st.bgRoundsSkippedByMode = m_bgRoundsSkippedByMode.load() - bgSkippedBefore;
+    st.frozenDecisions = m_frozenDecisions.load();
+
     m_matchRunning = false;
     m_selfPlaying = false;
     m_selfPlayMoveNo = 0;
@@ -3550,60 +4085,16 @@ bool ChessBoard::saveCurrentAgentModel(AgentType agentType, const std::string &f
         }
     } saveTimer{tSave, agentDisplayName(agentType).toUtf8().constData()};
 
-    switch (agentType) {
-    case AGENT_PG: {
-        if (m_sfPG == nullptr) return false;
-        return m_sfPG->savePolicy(filepath);
-    }
-    case AGENT_DQN: {
-        if (m_sfDQN == nullptr) return false;
-        return m_sfDQN->saveModel(filepath);
-    }
-    case AGENT_PPOMCTS: {
-        if (m_sfPPOMCTS == nullptr) return false;
-        return m_sfPPOMCTS->saveModel(filepath);
-    }
-    case AGENT_PPOMCTS_MLP: {
-        if (m_sfPPOMCTSMLP == nullptr) return false;
-        /* 与 TB 那一支同样的两个文件 (前缀 -> _actor / _critic), 但前缀不同 */
-        return m_sfPPOMCTSMLP->saveModel(filepath);
-    }
-    case AGENT_DQNMCTS: {
-        if (m_sfDQNMCTS == nullptr) return false;
-        return m_sfDQNMCTS->saveModel(filepath);
-    }
-    case AGENT_EVAB: {
-        if (m_sfEVAB == nullptr) return false;
-        return m_sfEVAB->saveModel(filepath);
-    }
-    case AGENT_SACAZ: {
-        if (m_sfSACAZ == nullptr) return false;
-        /* 一个模型三个文件: filepath 是前缀 -> filepath_actor / _q1 / _q2 */
-        return m_sfSACAZ->saveModel(filepath);
-    }
-    case AGENT_SACAZ_MOE: {
-        if (m_sfSACAZMoe == nullptr) return false;
-        return m_sfSACAZMoe->saveModel(filepath);
-    }
-    case AGENT_SACAZ_OLD: {
-        if (m_sfSACAZOld == nullptr) return false;
-        /* 与 AGENT_SACAZ 同样的三个文件, 但 filepath 是**另一个前缀**
-           (weights/sacaz_old_agent), 见 defaultWeightPath */
-        return m_sfSACAZOld->saveModel(filepath);
-    }
-    case AGENT_SACAZ_OLD_MOE: {
-        if (m_sfSACAZOldMoe == nullptr) return false;
-        /* 同上, 前缀是 weights/sacaz_old_moe_agent (TB 专家骨干那一支) */
-        return m_sfSACAZOldMoe->saveModel(filepath);
-    }
-    case AGENT_DQNAB: {
-        if (m_sfDQNAB == nullptr) return false;
-        /* 一个模型三个文件: filepath 是前缀 -> filepath_trunk / _v / _a */
-        return m_sfDQNAB->saveModel(filepath);
-    }
-    default:
-        return false;
-    }
+    /*
+       ---- 类型分派走 saveWeightsOf (P0-b 收尾: 与"冻结快照的取数/审计"共用一份) ----
+       原来这里是一个 11 分支的 switch, 而"把指定实例的权重写出去"这件事现在有**三个**
+       调用方 (本函数 / 冻结快照 / 逐字节审计) —— 三份 switch 意味着"以后加一个 agent
+       类型"时漏掉一处就是静默失效 (保存说成功、文件却没写)。所以口径统一到
+       saveWeightsOf: 它只认"实例 + 类型 + 路径", 不关心实例是不是常驻的那一个。
+       注意 filepath 的语义**仍按类型** (单文件 / 前缀), 这一点由各 agent 的 save* 决定,
+       与 defaultWeightPath 的约定一致。
+    */
+    return saveWeightsOf(agentInstance(agentType), agentType, filepath);
 }
 
 /*
@@ -3776,6 +4267,21 @@ void ChessBoard::resumeBackgroundTraining()
     m_bgPauseCv.notify_all();
 }
 
+/*
+ * isBackgroundTrainingPaused - "后台训练此刻不许改主 agent 的权重吗" (P0-b 收尾)
+ *
+ * 两个来源, 取或:
+ *   * m_bgPaused     : 显式 pause (matchAgents 用 RAII 包住整场, 见那里的注释);
+ *   * 对弈模式 ≠ 训练: 评估/只对弈模式声称"冻结", 而冻结必须包含**权重不变**。
+ *
+ * 为什么模式这一条要做成**整体停摆**而不是"对局期间暂停一下": 见头文件里那段说明
+ * (人机那条路不在 matchAgents 里; 局与局之间也在同步权重)。
+ */
+bool ChessBoard::isBackgroundTrainingPaused() const
+{
+    return m_bgPaused.load() || m_matchMode.load() != MATCH_TRAIN;
+}
+
 void ChessBoard::backgroundTrainLoop()
 {
     QDir().mkpath("weights");
@@ -3786,27 +4292,53 @@ void ChessBoard::backgroundTrainLoop()
        失败"每 2 秒刷一次, 反倒把真实原因淹掉了)。切到别的 agent 再切回来也不重报。
     */
     std::set<AgentType> notWiredWarned;
+    /*
+       "因为模式停摆"的消息同样**只报一次**: 这个循环每 200 ms 转一圈, 每圈都报的话
+       日志会被同一句话刷满 (与上面那条"尚未接入"同一条理由)。
+    */
+    bool modeGateReported = false;
 
     while (m_bgTraining) {
         /*
            ---- 暂停闸门 (P0-b) ----
-           对弈在"评估对局 / 只对弈不学习"模式下会暂停后台训练: 这两个模式声称冻结,
-           而本循环每轮会把权重**同步回主 agent** —— 那正是对弈在用的那份权重。
            等在这里而不是 sleep 轮询: 对局结束时会 notify (见 resumeBackgroundTraining)。
            ⚠ 条件变量的 wait **不能**在持有 m_agentMutex 时做 (那会与
              pauseBackgroundTraining 的"拿一次锁"互等, 见那里的死锁分析)。
+
+           [P0-b 收尾] 闸门条件从"m_bgPaused"扩成 isBackgroundTrainingPaused():
+           后者还把**对弈模式**算进来 —— 评估/只对弈模式下这条线程整体停摆, 于是在
+           人机对战与局间这两个 matchAgents 管不到的时刻, 它也不会去改主 agent 的权重。
         */
         {
             std::unique_lock<std::mutex> pauseLock(m_bgPauseMutex);
             m_bgPauseCv.wait_for(pauseLock, std::chrono::milliseconds(200),
-                                 [this] { return !m_bgPaused.load() || !m_bgTraining; });
+                                 [this] { return !isBackgroundTrainingPaused()
+                                                 || !m_bgTraining; });
         }
         if (!m_bgTraining) {
             break;
         }
-        if (m_bgPaused.load()) {
-            continue;      /* 暂停中: 不开始新一轮 (也不碰主 agent) */
+        if (isBackgroundTrainingPaused()) {
+            /*
+               区分"模式拦下的"与"显式暂停的": 只有前者要计数与报一次 —— 显式暂停是
+               对弈期间每场都会发生的事, 报出来没有信息量。
+            */
+            if (m_matchMode.load() != MATCH_TRAIN) {
+                m_bgRoundsSkippedByMode.fetch_add(1);
+                if (!modeGateReported) {
+                    modeGateReported = true;
+                    qInfo().noquote()
+                        << QStringLiteral("[train] 后台训练已按对弈模式停摆 (模式 = %1): "
+                                          "本模式下不再把训练权重同步回主 agent —— "
+                                          "评估/只对弈要的是**权重也不变**, 不只是"
+                                          "'这一手不学'。切回'训练对局'即自动恢复。")
+                               .arg(matchModeName(m_matchMode.load()));
+                }
+            }
+            continue;      /* 不开始新一轮 (也不碰主 agent) */
         }
+        modeGateReported = false;   /* 恢复后, 下一次停摆再报一次 */
+
         AgentType type = m_agentType;
         /* 本轮的规模 (默认 = BG_TRAIN_*, 测试可以调小, 见 setBackgroundTrainRound) */
         const int roundEpisodes = m_bgTrainEpisodes.load();
@@ -4242,7 +4774,15 @@ void ChessBoard::backgroundTrainLoop()
         */
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
-            if (m_bgPaused.load()) {
+            /*
+               [P0-b 收尾] 判据与循环开头是**同一个** isBackgroundTrainingPaused():
+               它把对弈模式也算进来 ⇒ 用户在某一轮训练**跑到一半时**把模式切成
+               评估/只对弈, 那一轮的成果同样会被丢弃, 而不是"赶在冻结生效之前先写进去"。
+            */
+            if (isBackgroundTrainingPaused()) {
+                if (m_matchMode.load() != MATCH_TRAIN) {
+                    m_bgRoundsSkippedByMode.fetch_add(1);
+                }
                 continue;      /* 安全: lock_guard 会析构 (见暂停闸门的死锁分析) */
             }
             switch (type) {

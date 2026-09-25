@@ -236,7 +236,8 @@ public:
     /* ---------------- AgentBase ---------------- */
     Step getBestMove(int color) override;
     std::string getName() const override;
-    bool exploreAndTrain(int color, int rolloutSteps) override;
+    bool exploreAndTrain(int color, int rolloutSteps,
+                         const OpponentPolicy &opponent = OpponentPolicy()) override;
     float getLastTrainLoss() const override { return m_lastLoss; }
 
     /* ----------------------------------------------------------------

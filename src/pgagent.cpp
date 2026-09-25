@@ -554,7 +554,7 @@ void PGEagent::endOnline(int winner, int myColor)
 /* ------------------------------------------------------------------ */
 /*  exploreAndTrain: 走子前"先探索环境 + 在线训练一次" (仿 snakeAI)      */
 /* ------------------------------------------------------------------ */
-bool PGEagent::exploreAndTrain(int color, int rolloutSteps)
+bool PGEagent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         return false;
@@ -580,7 +580,9 @@ bool PGEagent::exploreAndTrain(int color, int rolloutSteps)
         traj.emplace_back(s, oneHot, moverRewardToBlackFrame(r, chosen));
     };
 
-    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans);
+    /* 局部副本: rolloutFromCurrent 会把"真用了几手对手着法"回填到它里面 (P1) */
+    OpponentPolicy opp = opponent;
+    const int collected = rolloutFromCurrent(*this, chess, color, rolloutSteps, pick, onTrans, opp);
 
     bool trained = false;
     if (!traj.empty()) {
@@ -588,7 +590,8 @@ bool PGEagent::exploreAndTrain(int color, int rolloutSteps)
         dpg.reinforce(traj, learningRate);
         trained = true;
     }
-    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, reinforce 1 次";
+    m_exploreInfo = "rollout " + std::to_string(collected) + " 步, reinforce 1 次"
+                    + opponentRolloutInfo(opp);
     return trained;
 }
 

@@ -742,6 +742,77 @@ void MainWindow::populateAgentComboBox()
         /* 把当前模式同步给棋盘 (构造函数里 combo 已经填好了) */
         onMatchModeSelected(c->currentIndex());
     }
+
+    /*
+       ================================================================
+       ---- P1: "对手的棋进训练数据"的开关 (2026-09) ----
+       ================================================================
+       用户口径: "对手的棋仍然不进训练数据 (exploreAndTrain 没有对手参数) —— 模式解决的
+       是'能不能归因', 不是'能不能从对手身上学'"。
+
+       为什么这两个控件**在代码里建**而不是写进 mainwindow.ui: .ui 是中英混排的大文件,
+       而这两个控件的语义 (下面这一整段) 必须贴着控件走; 工具提示里要写清"默认关 +
+       每次探索最多问几手 + 代价", 那些字写在 .ui 的 XML 里反而更难读。
+       默认**关着**: 打开它会让价值/策略目标条件化于**当前这个对手** (同一份权重里混进
+       对不同对手的数据时 V(s) 学的是平均值), 所以它适合"专门练一个对手", 不适合常开。
+    */
+    {
+        QCheckBox *cb = new QCheckBox(QStringLiteral("对手入训"), this);
+        cb->setObjectName(QStringLiteral("opponentRolloutCheck"));
+        cb->setChecked(ui->gameWidget->isOpponentInRolloutEnabled());
+        cb->setToolTip(QStringLiteral(
+            "P1: 让**对手的棋**进入训练数据 (默认关闭)\n\n"
+            "打开后: 学习方每手决策前的探索里, \"对手那一半\"不再由学习方自己的策略猜测,"
+            " 而是去问**真实对手**在这个局面上会怎么走 —— 走的是它对局时同一条决策代码。\n"
+            "于是学习方的样本落在\"被真对手应手之后的局面\"上 (这才是\"从对手身上学\")。\n\n"
+            "三条边界 (都由实现强制):\n"
+            "  1. 对手的着法**不记成学习方的样本** —— 自对弈时那一半是学习方自己采样的,"
+            " 换成真对手就会变成\"off-policy 却打着 on-policy 标签\", 对 REINFORCE/PPO"
+            " 是实打实的偏差; 所以它只推进局面。\n"
+            "  2. 对手**被问到时不许学习** (SAC+AZ 的 learnFromSearch 那条路径会被关掉)。\n"
+            "  3. 只在**对弈**里有对手 (人机对战那条路保持自对弈 —— 人没有策略可问)。\n\n"
+            "⚠ 问一次对手 = 一次完整决策 (SAC+AZ 实测 2.3 s/手), 所以要给手数上限。\n"
+            "⚠ 口径: 打开后价值/策略目标**条件化于这个对手**; 混着不同对手训练时 V(s)"
+            " 学的是平均值 (对手特征没有进状态)。"));
+        ui->matchModeRow->addWidget(cb);
+
+        QSpinBox *sp = new QSpinBox(this);
+        sp->setObjectName(QStringLiteral("opponentRolloutSpin"));
+        sp->setRange(0, 64);
+        sp->setValue(ui->gameWidget->getOpponentRolloutPlies());
+        sp->setToolTip(QStringLiteral(
+            "P1: 每次探索最多问对手几手 (0 = 不问)\n\n"
+            "默认 1 = 只问\"对手对学习方第一步的应手\" (能负担又有意义的那个点)。\n"
+            "调大 = 探索的更多手由真对手产生, 代价是每多一手就多一次完整决策。"));
+        ui->matchModeRow->addWidget(sp);
+
+        QObject::connect(cb, &QCheckBox::toggled, this,
+                         &MainWindow::onOpponentRolloutToggled);
+        QObject::connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         &MainWindow::onOpponentRolloutPliesChanged);
+    }
+}
+
+/*
+ * onOpponentRolloutToggled / onOpponentRolloutPliesChanged - P1 的两个旋钮
+ *
+ * 只做一件事: 把值写进 ChessBoard。**不**在这里判"现在对弈跑没跑" —— 那两个 setter
+ * 只在下一手决策时被读, 中途改也只是让"接下来的探索"换口径 (与对弈模式的快照口径
+ * 不同: 模式在开场就锁进报告, 而这一项是每手现读的, 所以报告不能声称全场一致 ——
+ * 报告里只写"本场有没有开启过", 见 MatchStats 的说明)。
+ */
+void MainWindow::onOpponentRolloutToggled(bool on)
+{
+    ui->gameWidget->setOpponentInRolloutEnabled(on);
+    qInfo().noquote() << QStringLiteral("[P1] 对手入训 = %1 (探索里%2问真实对手)")
+                             .arg(on ? QStringLiteral("开") : QStringLiteral("关"))
+                             .arg(on ? QString() : QStringLiteral("不"));
+}
+
+void MainWindow::onOpponentRolloutPliesChanged(int n)
+{
+    ui->gameWidget->setOpponentRolloutPlies(n);
+    qInfo().noquote() << QStringLiteral("[P1] 每次探索最多问对手 %1 手").arg(n);
 }
 
 /*
@@ -764,8 +835,23 @@ void MainWindow::onMatchModeSelected(int index)
     default:                         m = ChessBoard::MATCH_TRAIN; break;
     }
     ui->gameWidget->setMatchMode(m);
-    qInfo().noquote() << QStringLiteral("[match] 对弈模式 = %1")
-                             .arg(ChessBoard::matchModeName(m));
+    /*
+       [P0-b 收尾] 把"这个模式还会顺手关掉什么"写进日志: 非训练模式下**后台训练整体
+       停摆** (它每轮会把新权重同步回主 agent, 而主 agent 正是对局/人机在用的那份),
+       而且评估模式下 A/B 同类型时 B 会走**开场权重快照**。以前这两件事都是静默的:
+       用户看到的是"我明明关了学习, 权重却还在变"(见 test_match [2.7j]/[2.7k])。
+    */
+    QString extra;
+    if (m == ChessBoard::MATCH_TRAIN) {
+        extra = QStringLiteral(" (后台训练照常; 权重本来就会变)");
+    } else {
+        extra = QStringLiteral(" (后台训练本模式下停摆: 不再把权重同步回主 agent)");
+        if (m == ChessBoard::MATCH_EVAL) {
+            extra += QStringLiteral("; A/B 同类型时 B 方走开场权重快照");
+        }
+    }
+    qInfo().noquote() << QStringLiteral("[match] 对弈模式 = %1%2")
+                             .arg(ChessBoard::matchModeName(m), extra);
 }
 
 void MainWindow::onAgentSelected(int index)

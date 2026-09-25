@@ -4,7 +4,56 @@
 #include <string>
 #include <fstream>
 #include <limits>
+#include <functional>   /* OpponentPolicy 的"对手在这一手会怎么走" (P1) */
 #include "chess.h"
+
+/*
+ * ================================================================
+ *  OpponentPolicy - "对手在这个局面上会怎么走" (P1, 2026-09)
+ * ================================================================
+ *
+ * 为什么需要它 (用户口径): "对手的棋仍然不进训练数据 (exploreAndTrain 没有对手参数)
+ * —— 模式解决的是'能不能归因', 不是'能不能从对手身上学'"。
+ *
+ * 现状: 探索 (rolloutFromCurrent) 是**纯自对弈** —— 从当前局面出发滚 N 手, 每一步
+ * (包括"对手那一半")都由**学习方自己的策略**产生。于是学习方学到的永远是"怎么跟
+ * 自己下", 而真实对手的着法从未参与数据生成。选了 Alpha-Beta 当陪练也一样:
+ * 学的是"自己滚出来的经验" (见 chessboard.h 里 AGENT_ALPHABETA 的注释)。
+ *
+ * 这个结构把"对手的着法从哪来"传进探索: `stepFor(turn)` 由**调用方**实现, 它在
+ * **当前探索局面**上给出真实对手会走的那一手 (界面里就是对手 agent 的决策协议)。
+ * 于是探索里"对手那一半"不再是学习方自己的猜测。
+ *
+ * ⚠ 两条**刻意的**设计选择 (都有代价, 写在这里免得以后被当成遗漏):
+ *
+ *  1. **对手着法不记成学习方的样本**。自对弈里"对手那一半"是学习方自己采样出来的,
+ *     所以把它记成学习方的动作转移是**on-policy** 的; 换成真对手之后同一份记录会变成
+ *     **off-policy 却打着 on-policy 的标签** —— 对 REINFORCE/PPO 这类要行为策略的东西
+ *     是实打实的偏差 (冒充进来的动作从来没有以那个概率被采样过)。
+ *     所以这里只用它**推进局面**: 学习方自己那些转移落在"被真对手应手之后的局面"上,
+ *     回报也因此带着对手的影响 —— 这正是"从对手身上学"的内容。
+ *     (把对手着法当**样本**收进来是另一件事: 那要求"给网络对手特征"或按 off-policy
+ *     方法处理, 否则价值目标不可辨识; 见 docs 里的待办。)
+ *
+ *  2. **有预算上限** (`budget`): 一次决策里的探索可能滚几十手, 而"问一次对手"= 一次
+ *     完整决策 (SAC+AZ 实测 2.3 s/手)。所以对手只在**最前面 budget 个对手手**上被问到,
+ *     之后回退到原来的自对弈。默认 0 = 完全不问 (行为与改动前逐字相同)。
+ */
+struct OpponentPolicy
+{
+    /* 在当前舞台 (棋盘) 上给出对手的着法; 返回无效 Step 表示"问不到, 回退自对弈" */
+    std::function<Step(int turn)> stepFor;
+    /* 名字 (日志/探索说明用), 例如 "PPO+MCTS" */
+    std::string name;
+    /* 本次探索里最多问几次 (0 = 不问) */
+    int budget = 0;
+    /* 问到的着法**真的**被用在探索里的次数 (由 rolloutFromCurrent 回填) */
+    int used = 0;
+    /* 问到了但不在合法集里 (编码/规则不一致) 而回退的次数 —— 诊断用 */
+    int unmatched = 0;
+
+    bool valid() const { return budget > 0 && (bool)stepFor; }
+};
 
 /*
  * AgentBase - Abstract base class for all chess AI agents
@@ -103,12 +152,18 @@ public:
      *
      *   color        : 轮到谁走
      *   rolloutSteps : 最多滚多少步
+     *   opponent     : (P1, 可选) "对手在这个局面上会怎么走"。见上面的 OpponentPolicy:
+     *                  budget = 0 (默认) 时行为与改动前**逐字相同** (纯自对弈);
+     *                  budget > 0 时, 探索里"对手那一半"最前面若干手改由**真实对手**
+     *                  产生。它只推进局面, **不**记成学习方的样本 (理由见那里的注释)。
      * 返回 true 表示这次确实做了在线训练。
      */
-    virtual bool exploreAndTrain(int color, int rolloutSteps)
+    virtual bool exploreAndTrain(int color, int rolloutSteps,
+                                 const OpponentPolicy &opponent = OpponentPolicy())
     {
         (void)color;
         (void)rolloutSteps;
+        (void)opponent;
         return false;
     }
 
@@ -176,6 +231,28 @@ inline bool weightFileReadable(const std::string &path)
 {
     std::ifstream f(path, std::ios::binary);
     return f.good();
+}
+
+/*
+ * 终局值的**可选 agent 钩子** 之类的小工具放在各自文件里; 这一个专门给"探索说明"
+ * 用: 把对手参数**真的生效了多少**写成半句话 (P1)。
+ *
+ * 为什么必须写出来而不是只报"开了对手参数": "参数传进来了"与"对手着法真的被用上了"
+ * 是两件事 —— 对手返回无效着法、或者它的着法不在当前合法集里 (编码/规则不一致) 时
+ * 都会回退到自对弈, 而那种回退在读数上与"没开这个功能"完全一样。unmatched 就是
+ * 这条回退的计数: 它一直涨说明对手的着法表示与棋盘对不上 (那不是"对手弱")。
+ */
+inline std::string opponentRolloutInfo(const OpponentPolicy &o)
+{
+    if (!o.valid()) {
+        return std::string();      /* 没开: 说明里不出现这一项 (默认口径逐字不变) */
+    }
+    std::string s = ", 对手(" + (o.name.empty() ? std::string("未知") : o.name) + ")应手 "
+                    + std::to_string(o.used) + "/" + std::to_string(o.budget) + " 手";
+    if (o.unmatched > 0) {
+        s += ", 回退 " + std::to_string(o.unmatched) + " 次 (对手着法不在合法集里)";
+    }
+    return s;
 }
 
 #endif // AIAGENT_H

@@ -869,11 +869,21 @@ double EVABAgent::netHandGap(int samples)
     return (n > 0) ? sum/(double)n : 0.0;
 }
 
-bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
+bool EVABAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         return false;
     }
+    /*
+       ---- P1: 对手参数 ----
+       本 agent 的探索**不是** rolloutFromCurrent (它自己滚随机合法走法 + 用搜索评分
+       当标签), 所以对手那一半由这里的循环自己处理。见下面循环里的那一段:
+       EVAB 的样本是 (局面 -> 价值), 与"谁选了这一步"无关 ⇒ 对手的着法在这里**照记**,
+       是纯粹的数据增广 (那条"不能把对手动作冒充成自己动作"的纪律只对带动作标签的
+       agent 成立: PG / DQN / PPO / SAC / DQNAB)。
+    */
+    OpponentPolicy opp = opponent;
+    int opponentBudget = opp.valid() ? opp.budget : 0;
 
     /*
        1) 备份当前权重以便回滚。
@@ -930,6 +940,33 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
             break;
         }
         Step chosen = *legal[(std::size_t)(std::rand() % (int)legal.size())];
+        /*
+           ---- P1: 轮到对手时改问真实对手 ----
+           对手给的着法必须**在当前合法集里**才对得上 (它的编码/规则与这里同源,
+           所以正常情况下一定对得上; 对不上说明两边表示漂了, 计一次 unmatched 并回退
+           到随机合法走法)。见上面函数头那段: 这里照记样本, 因为 EVAB 的样本是价值。
+        */
+        if (turn != color && opponentBudget > 0 && (bool)opp.stepFor) {
+            const Step ostep = opp.stepFor(turn);
+            bool matched = false;
+            if (ostep.valid) {
+                for (std::size_t li = 0; li < legal.size(); li++) {
+                    const Step &cand = *legal[li];
+                    if (cand.id == ostep.id && cand.nextPos.x == ostep.nextPos.x
+                        && cand.nextPos.y == ostep.nextPos.y && cand.nextId == ostep.nextId) {
+                        chosen = cand;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (matched) {
+                opponentBudget--;
+                opp.used++;
+            } else {
+                opp.unmatched++;
+            }
+        }
         Steps::instance().put(legal);
         rolled++;
 
@@ -1019,7 +1056,8 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
                                                                      : " 步")
                         + ", 更新后偏差 " + std::to_string(gapAfter)
                         + " > " + std::to_string(gapBefore) + " -> 已回滚 (blend "
-                        + std::to_string(blend) + ")";
+                        + std::to_string(blend) + ")"
+                        + opponentRolloutInfo(opp);
         return false;
     }
 
@@ -1043,7 +1081,8 @@ bool EVABAgent::exploreAndTrain(int color, int rolloutSteps)
                     + " 步" + (samples.size() < (std::size_t)rolloutSteps ? "(时间上限)" : "")
                     + ", 价值网络更新 1 次 (|net-hand| "
                     + std::to_string(gapAfter) + ", blend "
-                    + std::to_string(blendBefore) + "->" + std::to_string(blend) + ")";
+                    + std::to_string(blendBefore) + "->" + std::to_string(blend) + ")"
+                    + opponentRolloutInfo(opp);
     return true;
 }
 

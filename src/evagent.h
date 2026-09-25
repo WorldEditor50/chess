@@ -136,7 +136,8 @@ public:
      * 评估带偏、棋力反而下降。因此这里 (a) 目标值向手工评估锚定一半, (b) 更新后
      * 检查网络与手工评估的差距, 超过阈值就**整段回滚**。
      */
-    bool exploreAndTrain(int color, int rolloutSteps) override;
+    bool exploreAndTrain(int color, int rolloutSteps,
+                         const OpponentPolicy &opponent = OpponentPolicy()) override;
 
     /* 搜索入口: 迭代加深 + alpha-beta; 返回的 Step.valid == false 表示无合法走法 */
     Step search(int color, int depth, long long budgetMs = 0);

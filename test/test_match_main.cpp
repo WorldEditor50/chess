@@ -59,6 +59,64 @@ static std::string readFileBytes(const std::string &path)
                        std::istreambuf_iterator<char>());
 }
 
+/*
+ * 权重文件里有多少个**非有限值** (NaN / ±Inf) 的 float32。
+ *
+ * 为什么必须**解码**而不能直接搜 "nan"/"inf" 字符串 (第一版就是这么写的, 结果误报):
+ * 权重是按 base64 存的**二进制**, 所以 "nan"、"inf" 这样的字母组合会随机出现在编码
+ * 结果里 —— 健康权重被判成"非有限", 而真坏了的文件反而可能判成"干净"。
+ * 这里的判据是 IEEE754 的指数字段全 1 (NaN 还要尾数非 0): 与数值本身无关, 不会误报。
+ *
+ * 为什么这条读数重要: **非有限的权重会让"权重变没变"的断言恒为假** —— nan 的字节表示
+ * 是不变的, 所以"连着两次保存逐字节相同"既可能是"没人动权重", 也可能是"权重已经坏了、
+ * 动也动不出差别"。PG 恰好有一条既有缺陷 (probe_pg_loss_nan: 参数被写坏且不复位),
+ * 会把读数变成后一种 —— [2.7j]/[2.7k] 第一次跑就是这么红的。
+ */
+static int nonFiniteWeightCount(const std::string &path)
+{
+    std::ifstream f(path);
+    if (!f.good()) {
+        return -1;      /* 读不到: 与"没有非有限值"必须分开 (前者是仪器坏了) */
+    }
+    int bad = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        const std::size_t colon = line.rfind(':');
+        if (colon == std::string::npos) {
+            continue;               /* 头一行 (CHWGT2 magic ...), 不是层数据 */
+        }
+        std::vector<unsigned char> bytes;
+        int acc = 0, bits = 0;
+        for (std::size_t i = colon + 1; i < line.size(); i++) {
+            const char ch = line[i];
+            int v = -1;
+            if (ch >= 'A' && ch <= 'Z')      { v = ch - 'A'; }
+            else if (ch >= 'a' && ch <= 'z') { v = ch - 'a' + 26; }
+            else if (ch >= '0' && ch <= '9') { v = ch - '0' + 52; }
+            else if (ch == '+')              { v = 62; }
+            else if (ch == '/')              { v = 63; }
+            if (v < 0) {
+                continue;           /* '=' 与行尾的 '\r' 都跳过 */
+            }
+            acc = (acc << 6) | v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                bytes.push_back((unsigned char)((acc >> bits) & 0xFF));
+            }
+        }
+        for (std::size_t i = 0; i + 3 < bytes.size(); i += 4) {
+            const unsigned expo = ((unsigned)bytes[i + 3] << 1) | ((unsigned)bytes[i + 2] >> 7);
+            const unsigned mant = (((unsigned)bytes[i + 2] & 0x7Fu) << 16)
+                                  | ((unsigned)bytes[i + 1] << 8) | (unsigned)bytes[i];
+            if (expo == 0xFFu) {
+                bad++;              /* NaN (尾数非 0) 或 ±Inf (尾数 0), 都算非有限 */
+            }
+        }
+    }
+    return bad;
+}
+
 int main(int argc, char *argv[])
 {
     /* 无缓冲: 崩溃时也能看到走到了哪一步 (printf 默认是行/块缓冲, 段错误会把它丢掉) */
@@ -78,6 +136,29 @@ int main(int argc, char *argv[])
     /* 不探索: 这个测试关心的是对弈统计, 不是探索 (那是 test_pretrain 的事) */
     board.setPreTrainEnabled(false);
     board.setPreTrainSteps(0);
+
+    /*
+       ================================================================
+       ---- "健康的 PG 权重"备份 (给 [2.7j]/[2.7k] 的"权重有没有变"用) ----
+       ================================================================
+       为什么必须在**这里**取 (而不是在那两节里现取): PG 的权重在这个测试里会被前面的
+       小节写坏 —— `probe_pg_loss_nan` 已确认那条既有缺陷 (40 局里 35 局出现, 而且
+       一旦出现就是"参数被写坏, 不会复位"). 权重一旦是非有限值, "权重变了没有"这类
+       断言就**恒为假**: nan 的文本表示是不变的, 保存出来的文件逐字节相同。
+       [2.7j] 第一版就是这么红的 (对照那一半读出来"逐字节相同"), 而那不是"洞不存在",
+       是**仪器坏了**。所以: 在还没人训过 PG 的时刻取一份基线, 那两节先把它装回去。
+       这一步本身不训练 (预训已关、每局 4 手), 只把实例建出来。
+    */
+    const std::string pgHealthyPath = "weights/_temp_match_pg_healthy.dat";
+    {
+        const int savedPlies = board.getMaxPliesPerGame();
+        board.setMaxPliesPerGame(4);
+        board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_PG, 1);
+        board.setMaxPliesPerGame(savedPlies);
+        const bool ok = board.saveCurrentAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        std::printf("[ok] PG 健康权重基线: %s (%zu 字节)\n", ok ? "已存" : "**失败**",
+                    readFileBytes(pgHealthyPath).size());
+    }
 
     /* ---------------------------------------------------------------- 1. 交换先后手 + 比分归属 */
     std::printf("\n[1] 2 局, 每局限 4 手 (必然判和), 检查先后手交换与统计\n");
@@ -917,6 +998,335 @@ int main(int argc, char *argv[])
         board.stopBackgroundTraining();
         CHECK(!board.isBackgroundTrainingRunning(),
               "后台训练能正常停掉 (测试不做完就退出会让后面的小节被它干扰)");
+    }
+
+    /* ================================================================
+     *  [2.7j] 评估模式把 B 方冻结成**权重快照** (P0-b 收尾)
+     * ================================================================
+     *
+     * 用户口径 (原话): "也没把 B 方冻结成一份权重快照 (现在冻结的只是'学习', 不是
+     * '权重'; B 若被后台训练改动, 仍会让评估不完全干净)".
+     *
+     * 洞的形态: MATCH_EVAL 原来只禁止 B **自己**更新。而"每个 agent 类型只有一个
+     * 常驻实例" (m_sfXXX) 意味着 A 与 B 同类型时它们就是**同一张网** —— A 每学一次,
+     * B 当下用的那份权重就变一次, 一局之内 B 都在漂移 (局内非平稳的第二个来源)。
+     *
+     * 修法: 评估模式开场取一份 B 的权重快照, 用快照单独建一个冻结实例, B 那一手走它。
+     *
+     * 这一节用**同一对 agent (PG vs PG, 小网络、秒级)** 跑两次, 只差一个开关:
+     *   (1) 快照**关** (对照 = 改动前的口径): 常驻实例的权重在局中确实会变 ⇒ 洞是真的;
+     *   (2) 快照**开** (默认): A 照常学 (常驻实例照样变), 而 B 用的那份快照逐字节不变。
+     * 两次都用"存权重 -> 比字节"来量, 不靠"看起来像冻结了" —— 三处读数缺一不可:
+     *   常驻实例变了  = A 确实在学 (冻结没有把学习一起冻掉);
+     *   快照逐字节不变= B 确实没被 A 的学习碰到;
+     *   用快照走 N 手 = 决策路径**真的**走了那个实例 (建了却没用上 = 静默失效)。
+     */
+    std::printf("\n[2.7j] 评估模式: B 方冻结成权重快照 (P0-b 收尾)\n");
+    {
+        const std::string pgW = "weights/_temp_match_pg_probe.dat";
+        auto pgBytes = [&board, &pgW]() -> std::string {
+            board.saveCurrentAgentModel(ChessBoard::AGENT_PG, pgW);
+            return readFileBytes(pgW);
+        };
+        /*
+           **前置条件**: 常驻 PG 必须是一份**有限**的权重。
+           前面的小节 (PG vs AB-L2 等) 会训练 PG, 而 PG 有一条既有缺陷: 参数一旦变成
+           非有限值就不复位 (probe_pg_loss_nan)。而"权重有没有变"在 nan 上恒为假 ——
+           第一版 [2.7j] 的对照那一半就是这么红的 (读出来"逐字节相同", 看起来像
+           "洞不存在", 其实是仪器坏了)。所以这里先把 main 开头存的那份健康权重装回去。
+        */
+        const bool restored = board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        CHECK(restored, "能把常驻 PG 装回健康权重基线 (前置条件; 见本文件 main 开头那段)");
+        /*
+           先把 PG 的常驻实例建出来 (两次实验的基线都从它身上取)。
+           用"训练模式 + 关预训"跑一场: 双方都不更新, 只是把实例建起来。
+        */
+        board.setMaxPliesPerGame(40);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_PG, 1);
+        const std::string baseline = pgBytes();
+        std::printf("    PG 常驻实例就位: 权重快照 %zu 字节\n", baseline.size());
+        CHECK(!baseline.empty(), "能读到 PG 常驻实例的权重 (前置条件)");
+
+        /* ---- (1) 对照: 快照关 = 改动前的口径 ---- */
+        board.setOpponentSnapshotEnabled(false);
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        board.setMatchMode(ChessBoard::MATCH_EVAL);
+        const std::string before1 = pgBytes();
+        const int nf1Before = nonFiniteWeightCount(pgW);
+        const ChessBoard::MatchStats st1 =
+            board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_PG, 1);
+        const std::string after1 = pgBytes();
+        const int nf1After = nonFiniteWeightCount(pgW);
+        std::printf("    对照 (快照关): 常驻权重 %zu -> %zu 字节, 相同 = %d, B 用快照走了 %d 手\n",
+                    before1.size(), after1.size(), (int)(before1 == after1), st1.frozenDecisions);
+        std::printf("    非有限值: 训练前 %d 个, 训练后 %d 个 (后者 > 0 = 撞上 PG 那条既有"
+                    "缺陷, 不是本节的被测对象)\n", nf1Before, nf1After);
+        CHECK(!before1.empty() && !after1.empty(), "两次都能读到常驻 PG 的权重 (前置条件)");
+        CHECK(nf1Before == 0,
+              "测量前常驻 PG 的权重是**有限值** (前置条件: nan 会让'变了没有'恒为假)");
+        CHECK(!st1.frozenToSnapshot && st1.frozenDecisions == 0,
+              "快照关掉时报告不说'用了快照', 也没有人走那个实例 (对照口径要干净)");
+        CHECK(before1 != after1,
+              "**洞是真的**: 快照关掉时 A/B 共用同一个实例 ⇒ A 一学, B 用的那份权重当场"
+              "就变了 (这一条绿了, 下面那一条才有意义)");
+
+        /* ---- (2) 修好之后: 快照开 (默认) ---- */
+        board.setOpponentSnapshotEnabled(true);
+        board.setFrozenWeightAuditEnabled(true);
+        /*
+           ⚠ **每次测量前都要把常驻 PG 装回健康权重** (不只是这一节开头一次):
+           PG 有一条既有缺陷 —— 参数被写坏成非有限值且不复位 (probe_pg_loss_nan)。
+           而权重一旦是 nan, "变了没有"就**恒为假** (nan 的字节表示不变), 读起来像
+           "冻结把 A 的学习也冻掉了" —— 第一版就是这么红的。见 nonFiniteWeightCount。
+        */
+        const bool restored2 = board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        CHECK(restored2, "第二段测量前也能把常驻 PG 装回健康权重 (前置条件)");
+        const std::string before2 = pgBytes();
+        const int nf2Before = nonFiniteWeightCount(pgW);
+        const ChessBoard::MatchStats st2 =
+            board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_PG, 1);
+        const std::string after2 = pgBytes();
+        const QString d2 = st2.detail();
+        std::printf("    修好 (快照开): 常驻权重 %zu -> %zu 字节, 相同 = %d (非有限值 %d)\n",
+                    before2.size(), after2.size(), (int)(before2 == after2), nf2Before);
+        std::printf("    B 用开场快照走了 %d 手; 审计: 做了=%d, 与快照逐字节相同=%d\n",
+                    st2.frozenDecisions, (int)st2.frozenAuditDone,
+                    (int)st2.frozenWeightsUnchanged);
+        CHECK(st2.frozenToSnapshot,
+              "评估模式 + A/B 同类型 ⇒ B 走的是**开场权重快照** (独立实例)");
+        CHECK(st2.frozenDecisions > 0,
+              "B 方**实际**用快照实例走了棋 (建了实例却没人用 = 静默失效, 断言只查"
+              " frozenToSnapshot 是抓不到的)");
+        CHECK(st2.frozenAuditDone && st2.frozenWeightsUnchanged,
+              "逐字节审计: B 全程用过的那份权重与开场快照**逐字节相同** —— 这才叫"
+              " '权重被冻住', 而不只是'这一手不学'");
+        CHECK(before2 != after2,
+              "A 方照常学 (常驻实例的权重确实变了) —— 冻结 B 没有把 A 的学习一起冻掉");
+        CHECK(contains(d2, QStringLiteral("快照")) && contains(d2, QStringLiteral("逐字节")),
+              "对局报告里印出了 B 的冻结口径与审计结果 (读数自带前提)");
+        CHECK(!board.isOpponentFrozenToSnapshot(),
+              "对局结束后冻结实例被拆掉 (留着的后果是下一场继续用上一场的快照下棋,"
+              " 而那没有任何读数能反映)");
+
+        /* 复位: 后面的小节按"改动前的默认口径"跑 */
+        board.setFrozenWeightAuditEnabled(false);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        board.setMaxPliesPerGame(ChessBoard::DEFAULT_MAX_PLIES);
+    }
+
+    /* ================================================================
+     *  [2.7k] 后台训练按**对弈模式**停摆 (P0-b 收尾: 人机路径与局间也覆盖)
+     * ================================================================
+     *
+     * [2.7f] 钉住的是"显式 pause/resume"这一层 (对弈用 RAII 包住整场)。但冻结还有
+     * 两个**matchAgents 管不到的时刻**:
+     *   * 人机对战 (aiThink 那条路不在 matchAgents 里) —— 用户把模式设成评估/只对弈,
+     *     然后跟 AI 下棋, 后台训练照样在局中把 AI (= 冻结的 B 方) 的权重换掉;
+     *   * 局与局之间 —— 一场 4 局的评估, 局间的后台同步会把 B 的权重换掉, 于是
+     *     "每一局面对的对手都不同", 比分照样不可归因。
+     * 修法: 训练线程自己每轮开头 + **写权重之前**各判一次对弈模式 (见
+     * isBackgroundTrainingPaused) ⇒ 非训练模式下整体停摆, 不管对局是不是 matchAgents。
+     *
+     * 这一节按"读数能不能证伪"来写, 三步缺一不可:
+     *   (1) 训练模式下后台训练**确实会**改主 agent 的权重 (正对照; 没有它, 下面的
+     *       "不变"可能只是"训练本来就没跑");
+     *   (2) 切成评估模式后 (此处**没有**任何对局在跑, 等价于人机/局间那种时刻),
+     *       权重**逐字节不变**, 且模式闸门的诊断计数在涨 (= 确实是模式拦下的);
+     *   (3) 切回训练模式后权重又能变 (没有把线程等死/等成僵尸)。
+     */
+    std::printf("\n[2.7k] 后台训练按对弈模式停摆 (人机路径与局间也覆盖)\n");
+    {
+        const std::string w = "weights/_temp_match_bgmode_probe.dat";
+        auto pgBytes = [&board, &w]() -> std::string {
+            board.saveCurrentAgentModel(ChessBoard::AGENT_PG, w);
+            return readFileBytes(w);
+        };
+        board.setAgentType(ChessBoard::AGENT_PG);
+        board.setBackgroundTrainRound(1, 40);   /* >32: 一轮里真的会发生梯度更新 */
+        /*
+           同一个前置条件: 先把常驻 PG 装回健康权重 (见 [2.7j] 与 main 开头那段) ——
+           否则"后台训练没改动权重"这条断言在 nan 上恒为假, 读起来像"闸门没生效"。
+        */
+        const bool restored = board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        CHECK(restored, "能把常驻 PG 装回健康权重基线 (前置条件)");
+
+        /* ---- (1) 正对照: 训练模式下后台训练会改权重 ---- */
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.startBackgroundTraining();
+        const std::string t0 = pgBytes();
+        std::string t1 = t0;
+        for (int i = 0; i < 30 && t1 == t0; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            t1 = pgBytes();
+        }
+        std::printf("    训练模式: 权重 %zu -> %zu 字节, 变了 = %d (非有限值 %d 个)\n",
+                    t0.size(), t1.size(), (int)(t1 != t0), nonFiniteWeightCount(w));
+        CHECK(!t0.empty() && t1 != t0,
+              "训练模式下后台训练**确实**会把新权重同步回主 agent (正对照: 否则下面"
+              " 那条'不变'证明不了任何事)");
+
+        /* ---- (2) 评估模式: 没有对局在跑, 权重必须逐字节不变 ---- */
+        const int skippedBefore = board.backgroundRoundsSkippedByMode();
+        board.setMatchMode(ChessBoard::MATCH_EVAL);
+        /*
+           前置条件: 这一段的判据是"逐字节不变", 而**非有限的权重永远不变** (nan 的字节
+           表示是不变的) ⇒ 拿一份已经坏掉的权重去测, 会以"没变"的形式**假通过**。
+           PG 在第 (1) 步之后很可能已经坏了 (那条既有缺陷), 所以这里再装一次健康权重。
+        */
+        CHECK(board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath),
+              "第二段测量前把常驻 PG 装回健康权重 (前置条件)");
+        std::this_thread::sleep_for(std::chrono::seconds(1));   /* 让在飞的那一轮被丢弃 */
+        const std::string e0 = pgBytes();
+        const int nfE0 = nonFiniteWeightCount(w);
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        const std::string e1 = pgBytes();
+        const int skippedCount = board.backgroundRoundsSkippedByMode() - skippedBefore;
+        std::printf("    评估模式 (无对局在跑): 权重 %zu / %zu 字节, 逐字节相同 = %d,"
+                    " 非有限值 %d 个, 模式跳过 %d 轮\n",
+                    e0.size(), e1.size(), (int)(e0 == e1), nfE0, skippedCount);
+        CHECK(!e0.empty() && e0 == e1,
+              "评估模式下后台训练**不再改动主 agent 权重** —— 覆盖了人机对战与局间这两个"
+              " matchAgents 管不到的时刻 (冻结必须包含权重不变)");
+        CHECK(nfE0 == 0,
+              "这份权重是**有限**的 ⇒ 上面那条'不变'不是 nan 造成的假象 (前置条件)");
+        CHECK(skippedCount > 0,
+              "确实是**模式闸门**拦下的 (计数在涨), 不是'训练碰巧没跑起来'");
+
+        /* ---- (3) 切回训练模式: 权重又能变 (线程没被等死) ---- */
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        /*
+           同一条前置条件: 先把常驻 PG 装回健康权重 ——
+           第 (1) 步的训练很可能已经把它写成非有限值 (PG 的既有缺陷), 而那种权重**永远
+           不会再变** (nan 的字节表示不变), 于是这一条会以"闸门没恢复"的形式假红。
+        */
+        const bool restored3 = board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        CHECK(restored3, "第三段测量前把常驻 PG 装回健康权重 (前置条件)");
+        std::string r0 = pgBytes();
+        std::printf("    切回训练模式前: 非有限值 %d 个 (要 0, 否则下面的'变了'会假红)\n",
+                    nonFiniteWeightCount(w));
+        std::string r1 = r0;
+        for (int i = 0; i < 30 && r1 == r0; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            r1 = pgBytes();
+        }
+        CHECK(r1 != r0, "切回训练模式后后台训练继续改权重 (恢复是活的, 不是僵尸线程)");
+
+        board.stopBackgroundTraining();
+        CHECK(!board.isBackgroundTrainingRunning(), "后台训练能正常停掉");
+        board.setBackgroundTrainRound(1, 60);
+        board.setAgentType(ChessBoard::AGENT_PPOMCTS);
+    }
+
+    /* ================================================================
+     *  [2.7l] P1: 对手的棋进入训练数据 (exploreAndTrain 有了对手参数)
+     * ================================================================
+     *
+     * 用户口径: "对手的棋仍然不进训练数据 (exploreAndTrain 没有对手参数) —— 模式解决的
+     * 是'能不能归因', 不是'能不能从对手身上学'"。
+     *
+     * 修法: 学习方每手决策前的探索 (rolloutFromCurrent) 原来是纯自对弈 —— "对手那一半"
+     * 也由学习方自己的策略采样。现在可以把"对手在这个局面上会怎么走"传进去, 于是那一半
+     * 改由**真实对手**产生 (走的是它对局时同一条决策代码)。
+     *
+     * 这一节钉四件事 (机制 / 不偷学 / 没过度冻结 / 可归因的读数):
+     *   (1) 默认**不问** (开关关着): 行为与改动前逐字相同;
+     *   (2) 打开后学习方**真的问了**对手 (计数 > 0), 且对手的着法全部对得上合法集;
+     *   (3) 被问到的对手**一次都没学** (评估模式下 B=SAC+AZ 只报 0 次损失), 而且
+     *       "本来会发生的学习"被拦下的计数 > 0 —— 只看前者分不清"被拦"与"没触发";
+     *   (4) A 方照常学 (查询没有把学习一起关掉), 且探索说明里印出"对手(...)应手 N/M 手"
+     *       —— 那是界面上唯一能看出这件事真的发生了的地方。
+     *
+     * 用 PG(A) vs SAC+AZ(B) + 每局 4 手: PG 便宜、SAC 贵但只被问 2 次 (~2 s/次)。
+     */
+    std::printf("\n[2.7l] P1: 学习方的探索改问真实对手\n");
+    {
+        board.setMaxPliesPerGame(4);
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(8);
+        board.setMatchMode(ChessBoard::MATCH_EVAL);   /* A=PG 学, B=SAC+AZ 冻结 */
+
+        /* ---- (1) 默认: 开关关着, 一次都不问 ---- */
+        const int q0 = board.opponentQueryCount();
+        board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_SACAZ, 1);
+        const int queriedOff = board.opponentQueryCount() - q0;
+        std::printf("    开关关着: 问对手 %d 次 (应为 0)\n", queriedOff);
+        CHECK(queriedOff == 0, "默认口径下学习方**不会**问对手 (与改动前逐字相同)");
+
+        /* ---- (2)(3)(4) 打开开关 ---- */
+        board.setOpponentInRolloutEnabled(true);
+        board.setOpponentRolloutPlies(1);     /* 每次探索只问最前面 1 手 (成本上限) */
+        /*
+           "A 照常学"的判据用**权重字节变了**而不是损失上报次数: PG 有一条既有缺陷
+           (probe_pg_loss_nan: lastLoss 会变成非有限值且不复位), 而 preTrainThenDecide
+           对非有限损失是**直接丢弃**的 —— 拿它当判据会得到"没上报 = 没学习"的假结论。
+           (损失次数仍然打印出来, 作为诊断。)
+        */
+        const bool restoredA = board.loadAgentModel(ChessBoard::AGENT_PG, pgHealthyPath);
+        CHECK(restoredA, "把 A 方 (PG) 装回健康权重 (前置条件: 见下面那条注释)");
+        const std::string pgW = "weights/_temp_match_p1_probe.dat";
+        board.saveCurrentAgentModel(ChessBoard::AGENT_PG, pgW);
+        const std::string pgBefore = readFileBytes(pgW);
+        int pgLoss = 0, sacLoss = 0;
+        bool sawOpponentInfo = false;
+        QMetaObject::Connection c1 = QObject::connect(
+            &board, &ChessBoard::trainLossSample,
+            [&pgLoss, &sacLoss](double loss, const QString &agent, int step) {
+                (void)loss; (void)step;
+                if (agent.contains(QStringLiteral("SAC"))) {
+                    sacLoss++;
+                } else {
+                    pgLoss++;
+                }
+            });
+        QMetaObject::Connection c2 = QObject::connect(
+            &board, &ChessBoard::aiExploreInfo,
+            [&sawOpponentInfo](const QString &info) {
+                if (info.contains(QStringLiteral("对手("))) {
+                    sawOpponentInfo = true;
+                }
+            });
+        const int blockedBefore = board.opponentQueryLearnBlockedCount();
+        board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_SACAZ, 1);
+        QObject::disconnect(c1);
+        QObject::disconnect(c2);
+        board.saveCurrentAgentModel(ChessBoard::AGENT_PG, pgW);
+        const std::string pgAfter = readFileBytes(pgW);
+        const int queried = board.opponentQueryCount() - q0;
+        const int blocked = board.opponentQueryLearnBlockedCount() - blockedBefore;
+        std::printf("    开关打开: 问对手 %d 次 (回退 %d 次) | A(PG) 上报 %d 次,"
+                    " B(SAC) 上报 %d 次 | 查询期间拦下学习 %d 次 | 探索说明里有'对手('=%d\n",
+                    queried, board.opponentQueryUnmatchedCount(), pgLoss, sacLoss, blocked,
+                    (int)sawOpponentInfo);
+        std::printf("    A 方权重: %zu -> %zu 字节, 变了 = %d\n",
+                    pgBefore.size(), pgAfter.size(), (int)(pgBefore != pgAfter));
+        CHECK(queried > 0, "打开后学习方**真的**问了对手 (机制生效, 不是只翻了个开关)");
+        CHECK(board.opponentQueryUnmatchedCount() == 0,
+              "对手的着法**全部**对得上当前合法集 (同一套规则/编码; 一直涨说明表示漂了)");
+        CHECK(sacLoss == 0,
+              "被问到的对手 (B=SAC+AZ) **一次都没学** —— 评估模式下它本来是冻结的,"
+              " 而'问它一手'绝不能变成'让它学一手' (learnFromSearch 那条路径)");
+        CHECK(blocked > 0,
+              "而且'本来会发生的学习'确实**被拦下了** (只看上面那条分不清'被拦'与"
+              "'那条路径本来就没触发')");
+        CHECK(!pgBefore.empty() && pgBefore != pgAfter,
+              "A 方照常学习 (查询没有把学习一起关掉 —— 那是过度冻结)");
+        CHECK(sawOpponentInfo,
+              "探索说明里印出了'对手(...)应手 N/M 手' (界面上唯一能看出这件事真的"
+              " 发生了的地方)");
+
+        /* 复位 */
+        board.setOpponentInRolloutEnabled(false);
+        board.setOpponentRolloutPlies(1);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        board.setMaxPliesPerGame(ChessBoard::DEFAULT_MAX_PLIES);
     }
 
     /* ================================================================
