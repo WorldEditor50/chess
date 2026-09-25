@@ -804,6 +804,83 @@ void ChessBoard::startupLoad()
     }, Qt::QueuedConnection);
 }
 
+/*
+ * weightLoadSummary - 启动时"有没有模型"的一句话 (界面用; 见头文件里的说明)
+ *
+ * 为什么要有它: 用户报障"点击开局模型未载入", 查下来是"`weights/` 是 gitignore 的运行期
+ * 产物, 没存过权重时它就是空的" —— 代码没错, 但这件事**只在日志/自检面板里**说, 而用户
+ * 按"开局"时看不到那两处。于是"没有模型"表现为"AI 下得像随机", 没有任何人能看见的提示。
+ * 这一行就挂在**对局列表**(开局后必看的那个面板) 的最上面。
+ *
+ * 判据用的是 `s_weightPaths` (启动扫描的命中结果), 所以它只有在扫描之后才有意义 ——
+ * 调用点是 startupComplete 之后 (见 MainWindow 的连接)。
+ */
+std::string ChessBoard::weightLoadSummary() const
+{
+    QStringList have;
+    QStringList missing;
+    for (AgentType t : kWeightAgents) {
+        if (s_weightPaths.count(t) != 0) {
+            have << agentDisplayName(t);
+        } else {
+            missing << agentDisplayName(t);
+        }
+    }
+
+    /*
+       ⚠ 这一行会被放进 QListWidget 的**单个条目**里 —— 所以不许有换行
+         (换行会被压平成一团, 比不写还难读)。细节在 weightLoadHint() 里 (tooltip)。
+    */
+    if (have.isEmpty()) {
+        return QStringLiteral("⚠ 未载入任何模型权重 (%1 组全缺) —— 权重是运行期产物, "
+                              "跑一场对弈或正常关窗后才会写到 weights/ (悬停看说明)")
+                   .arg(missing.size()).toStdString();
+    }
+    if (!missing.isEmpty()) {
+        return QStringLiteral("启动时载入 %1/%2 组权重; 缺失: %3 (这些 agent 从随机初始化开始)")
+                   .arg(have.size()).arg(have.size() + missing.size())
+                   .arg(missing.join(QStringLiteral(", "))).toStdString();
+    }
+    return QStringLiteral("启动时载入 %1/%2 组权重 (全部命中)")
+               .arg(have.size()).arg(have.size()).toStdString();
+}
+
+std::string ChessBoard::weightLoadHint() const
+{
+    QStringList have;
+    QStringList missing;
+    for (AgentType t : kWeightAgents) {
+        if (s_weightPaths.count(t) != 0) {
+            have << agentDisplayName(t);
+        } else {
+            missing << agentDisplayName(t);
+        }
+    }
+
+    QString s;
+    if (have.isEmpty()) {
+        s += QStringLiteral("⚠ 没有载入任何模型权重\n");
+        s += QStringLiteral("weights/ 下没有权重文件 (%1 组全部缺失): %2\n")
+                 .arg(missing.size()).arg(missing.join(QStringLiteral(", ")));
+        s += QStringLiteral("此时每个 agent 都从**随机初始化**开始 —— 棋力接近随机。\n"
+                            "这不是模型坏了, 而是**还没有权重**。\n");
+        s += QStringLiteral("\n权重是**运行期产物** (weights/ 被 .gitignore 忽略, "
+                            "所以新克隆的仓库里本来就没有):\n"
+                            "  · 跑一场【对弈】结束后会自动按标准名字写出;\n"
+                            "  · 或者正常关窗 (shutdownSave) 时写出。\n");
+        s += QStringLiteral("\n每个文件在不在, 看右侧\"模型自检\"面板第一段 "
+                            "(它印的是**实际文件名**, 不是前缀)。");
+    } else {
+        s += QStringLiteral("启动时载入 %1/%2 组权重\n")
+                 .arg(have.size()).arg(have.size() + missing.size());
+        if (!missing.isEmpty()) {
+            s += QStringLiteral("缺失: %1\n(这些 agent 从随机初始化开始)")
+                     .arg(missing.join(QStringLiteral(", ")));
+        }
+    }
+    return s.toStdString();
+}
+
 ChessBoard::ChessBoard(QWidget *parent) :
     QWidget(parent),
     selectID(-1),

@@ -436,6 +436,21 @@ MainWindow::MainWindow(QWidget *parent)
             /* 启动加载完成: 现在才有 agent 可以自检 (之前都是 nullptr) */
             requestSelfCheckPanelUpdate(false);
             refreshGameList();
+            /*
+               ---- 把"有没有载入模型"顶到对局列表最上面 (2026-09, 用户报障) ----
+               报障是"点击开局模型未载入": 查下来代码没错 (weights/ 是 gitignore 的运行期
+               产物, 没存过就是空的), 但这句话原来只在日志与自检面板里 —— 用户按"开局"
+               看到的是"AI 下得像随机", 没有任何人能看见的提示。
+               放在**列表最上面**: 对局列表是开局后必然被看的那一块。
+               细节放 tooltip (单行条目里塞换行会被压平成一团)。
+            */
+            {
+                auto *item = new QListWidgetItem(
+                    QStringLiteral("—— %1 ——")
+                        .arg(QString::fromStdString(ui->gameWidget->weightLoadSummary())));
+                item->setToolTip(QString::fromStdString(ui->gameWidget->weightLoadHint()));
+                ui->gameListWidget->addItem(item);
+            }
         });
 
     /* ---- 启动加载阶段: 禁用所有交互控件 ---- */
