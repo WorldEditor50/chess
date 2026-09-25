@@ -142,6 +142,27 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="matchModeRow">
+         <item>
+          <widget class="QLabel" name="matchModeLabel">
+           <property name="toolTip">
+            <string>本场对弈的语义 (P0-a)：
+训练对局 = 双方各自学习（各自自对弈，对手的棋不进训练数据）；
+评估对局 = 冻结 B 方、只让 A 方学，比分变化可归因到 A 自己；
+只对弈不学习 = 两条学习路径都关掉，比分才可直接比较。
+注意：选 A/B 的 agent 类型**不决定**学不学，"预训"步数也只管住一部分路径 —— 所以本项是唯一权威开关。</string>
+           </property>
+           <property name="text">
+            <string>模式</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="matchModeCombo"/>
+         </item>
+        </layout>
+       </item>
+       <item>
         <widget class="ThinkingIndicator" name="thinkIndicator"/>
        </item>
        <item>

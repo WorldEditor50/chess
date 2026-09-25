@@ -659,6 +659,57 @@ void MainWindow::populateAgentComboBox()
     */
     fillAgentCombo(ui->matchAComboBox, ChessBoard::AGENT_ALPHABETA);
     fillAgentCombo(ui->matchBComboBox, ChessBoard::AGENT_EVAB);
+
+    /*
+       ---- 对弈模式 (P0-a) ----
+       三项与 ChessBoard::MatchMode 一一对应, 用 userData 存枚举值 (与 agent 下拉框
+       同一手法: **不按下标**取, 以后插入新项也不会静默指错)。
+       为什么必须让用户能选: 在它之前, "这一场学不学"没有任何界面表达 —— 而实测
+       (test_match [2.7c]) 表明"预训步数 = 0"只关得住 PPO 那类 agent 的第一条学习
+       路径, SAC+AZ 在 selectMove 里还有第二条 (learnFromSearch), 那个勾选框压根管不到。
+       默认 = 训练对局, 与改动前的行为一致 (不改变老用户的既有读数口径)。
+    */
+    {
+        QComboBox *c = ui->matchModeCombo;
+        c->clear();
+        c->addItem(ChessBoard::matchModeName(ChessBoard::MATCH_TRAIN),
+                   static_cast<int>(ChessBoard::MATCH_TRAIN));
+        c->addItem(ChessBoard::matchModeName(ChessBoard::MATCH_EVAL),
+                   static_cast<int>(ChessBoard::MATCH_EVAL));
+        c->addItem(ChessBoard::matchModeName(ChessBoard::MATCH_NO_LEARN),
+                   static_cast<int>(ChessBoard::MATCH_NO_LEARN));
+        c->setMaxVisibleItems(3 + 2);
+        const int idx = c->findData(static_cast<int>(ChessBoard::MATCH_TRAIN));
+        c->setCurrentIndex(idx >= 0 ? idx : 0);
+        QObject::connect(c, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                         this, &MainWindow::onMatchModeSelected);
+        /* 把当前模式同步给棋盘 (构造函数里 combo 已经填好了) */
+        onMatchModeSelected(c->currentIndex());
+    }
+}
+
+/*
+ * onMatchModeSelected - 对弈模式下拉框回调 (P0-a)
+ *
+ * 只做一件事: 把模式写进 ChessBoard。**模式是"开场时快照"的** (见
+ * ChessBoard::matchAgents 里的 modeName), 所以对弈进行中改这一项不会改变
+ * 正在跑的那一场 —— 报告里的模式永远是这一场实际用的那个。
+ */
+void MainWindow::onMatchModeSelected(int index)
+{
+    if (index < 0 || ui->matchModeCombo == nullptr) {
+        return;
+    }
+    const int raw = ui->matchModeCombo->itemData(index).toInt();
+    ChessBoard::MatchMode m = ChessBoard::MATCH_TRAIN;
+    switch (raw) {
+    case ChessBoard::MATCH_EVAL:     m = ChessBoard::MATCH_EVAL; break;
+    case ChessBoard::MATCH_NO_LEARN: m = ChessBoard::MATCH_NO_LEARN; break;
+    default:                         m = ChessBoard::MATCH_TRAIN; break;
+    }
+    ui->gameWidget->setMatchMode(m);
+    qInfo().noquote() << QStringLiteral("[match] 对弈模式 = %1")
+                             .arg(ChessBoard::matchModeName(m));
 }
 
 void MainWindow::onAgentSelected(int index)

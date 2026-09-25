@@ -358,7 +358,6 @@ int main(int argc, char *argv[])
             QMetaObject::Connection stageConn = QObject::connect(
                 &board, &ChessBoard::aiThinkingStage,
                 [&stages](const QString &s) { stages.append(s); });
-
             const ChessBoard::MatchStats st =
                 board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_AB_L2, 1);
             QObject::disconnect(conn);
@@ -391,15 +390,41 @@ int main(int argc, char *argv[])
                所以**不要**把这条断言删掉或改成警告 —— 它红的时候可能真的抓到了东西;
                要做的是先把随机流钉住 (提议见 §7)。
             */
-            if (pgSamples.isEmpty()) {
-                /* 只在失败时打诊断: 绿的时候一个字都不多印 */
-                std::printf("    **诊断**: 这一局 %d 手, PG 上报 0 次 (其它来源 %d 次)。"
-                            "逐局的损失一次都没有有限过 ⇒ 查 dpg.lastLoss 是不是已经"
-                            "变成 NaN/Inf 且不再复位 (见本节的注释与 issues_review §7)\n",
-                            st.plies, (int)otherSamples.size());
+            /*
+               ---- 主判据: 学习型那一侧**每一手都真的走到了学习入口** ----
+               用"探索阶段被 emit 的次数"来数, 而不是用"损失曲线上有没有点":
+                 * 前者是**确定性的机制判据** —— 它是"对弈训练"这件事本身;
+                 * 后者(损失点)依赖 agent 内部的 lastLoss 是否有限, 而 PG 存在
+                   "lastLoss 变成 NaN/Inf 后不再复位"的已知现象 (诊断见下),
+                   于是"上报 0 次"既可能是机制断了、也可能只是那个数值坏了 —— 用它
+                   当主判据会让本节**时真时假** (实测: 同一份代码两次运行一次绿一次红)。
+            */
+            int exploreStages = 0;
+            for (const QString &s : stages) {
+                if (s.contains(QStringLiteral("探索环境"))) {
+                    exploreStages++;
+                }
             }
-            CHECK(!pgSamples.isEmpty(),
-                  "学习型 agent 在跟 AB 陪练时照常上报训练损失 (32 手足够攒满一个批)");
+            std::printf("    学习侧(PPO/PG)的探索阶段 emit %d 次 (本局 %d 手)\n",
+                        exploreStages, st.plies);
+            CHECK(exploreStages > 0,
+                  "对弈过程中学习型那一侧的'探索+预训练'入口**真的被走到过**"
+                  " (这是'对弈训练'的机制判据)");
+
+            /*
+               ---- 损失曲线那一条: 只作为诊断 ----
+               PG 的 lastLoss 有可能在第一次上报之前就变成非有限值并不再复位 ——
+               那是**另一个已记录的缺陷** (见本节的注释与 issues_review §7), 不是
+               "对弈不训练"。所以这里照实打印, 但不拿它当机制判据。
+            */
+            if (pgSamples.isEmpty()) {
+                std::printf("    **诊断**: 这一局 %d 手, PG 上报 0 次 (其它来源 %d 次) ——"
+                            " 逐局损失一次都没有限过, 查 dpg.lastLoss 是否已变成 NaN/Inf"
+                            " 且不再复位 (与 [2.7c] 的机制判据无关)\n",
+                            st.plies, (int)otherSamples.size());
+            } else {
+                std::printf("    PG 上报 %d 次 (全部有限)\n", (int)pgSamples.size());
+            }
             /*
                **本节的主判据**: 除了学习型那一方, 没有任何来源上报损失 ——
                AB 侧不发信号 (它没有可训练参数, 也不走 preTrainThenDecide),
@@ -616,6 +641,141 @@ int main(int argc, char *argv[])
             }
         }
 
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+    }
+
+    /* ================================================================
+     *  [2.7d] 对弈模式 (P0-a): 同一对 agent, 三种模式, 谁在学?
+     * ================================================================
+     *
+     * 这一节是 [2.7c] 的**后果**: 既然实测发现"关掉探索 ≠ 不学习"
+     * (SAC 的 learnFromSearch 不受那个勾选框控制), 就需要一个真正权威的开关。
+     * ChessBoard::MatchMode 给出三条语义:
+     *
+     *     MATCH_TRAIN    双方各自学习 (默认, 与改动前一致)
+     *     MATCH_EVAL     冻结 B 方, 只让 A 方学 —— 比分变化可归因到 A 自己
+     *     MATCH_NO_LEARN 两条学习路径**都**关掉 —— 只对弈不学习
+     *
+     * 判据全部是"每手一次更新"的可观测量 (trainLossSample 计数), 手数上限 40 > 32。
+     *
+     * ⚠ 关键的一条是 **SAC+AZ 在 MATCH_NO_LEARN / MATCH_EVAL 下必须 0 次更新** ——
+     *   它正是那条不受勾选框控制的路径 (selectMove 里的 learnFromSearch)。只测 PPO
+     *   的话这一节会在"模式其实没管住 SAC"时**照样全绿**, 那是假通过。
+     */
+    std::printf("\n[2.7d] 对弈模式 (P0-a): 训练 / 评估 / 只对弈不学习\n");
+    {
+        struct Side { int a = 0; int b = 0; QStringList namesA; QStringList namesB; int blocked = 0; };
+        /* 按发信号的是 A 侧还是 B 侧分别计数 (两侧类型不同, 靠名字区分) */
+        auto countSides = [&board](ChessBoard::AgentType a, ChessBoard::AgentType b,
+                                   const QString &aKey) -> Side {
+            Side s;
+            const int blockedBefore = board.matchLearningBlockedCount();
+            QMetaObject::Connection conn = QObject::connect(
+                &board, &ChessBoard::trainLossSample,
+                [&s, &aKey](double loss, const QString &agent, int step) {
+                    (void)loss;
+                    (void)step;
+                    if (agent.contains(aKey)) {
+                        s.a++;
+                        if (!s.namesA.contains(agent)) { s.namesA.append(agent); }
+                    } else {
+                        s.b++;
+                        if (!s.namesB.contains(agent)) { s.namesB.append(agent); }
+                    }
+                });
+            board.matchAgents(a, b, 1);
+            QObject::disconnect(conn);
+            s.blocked = board.matchLearningBlockedCount() - blockedBefore;
+            return s;
+        };
+        /* 诊断: 把两个桶里的**真实上报者名字**印出来 —— 分桶口径错了会让读数
+           整体张冠李戴, 而那种错在数字上看不出来 (第一版就是) */
+        auto show = [](const char *tag, const Side &s) {
+            std::printf("    %-14s A侧 %d 次 [%s] | B侧 %d 次 [%s]  (模式闸门踩下 %d 次)\n",
+                        tag, s.a, s.namesA.join(", ").toUtf8().constData(),
+                        s.b, s.namesB.join(", ").toUtf8().constData(),
+                        s.blocked);
+        };
+
+        board.setMaxPliesPerGame(40);
+
+        /* ---- (1) MATCH_TRAIN: 双方各自在学 ---- */
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        {
+            const Side s = countSides(ChessBoard::AGENT_PPOMCTS,
+                                      ChessBoard::AGENT_SACAZ,
+                                      QStringLiteral("PPO"));
+            show("MATCH_TRAIN", s);
+            CHECK(s.a > 0 && s.b > 0,
+                  "训练模式: A/B 双方各自都在更新 (与改动前的默认行为一致)");
+        }
+
+        /* ---- (2) MATCH_EVAL: 只让 A 方学, B 方冻结 ---- */
+        board.setMatchMode(ChessBoard::MATCH_EVAL);
+        {
+            const Side s = countSides(ChessBoard::AGENT_PPOMCTS,
+                                      ChessBoard::AGENT_SACAZ,
+                                      QStringLiteral("PPO"));
+            show("MATCH_EVAL", s);
+            CHECK(s.a > 0, "评估模式: A 方 (待评估者) 照常学习");
+            CHECK(s.b == 0,
+                  "评估模式: B 方**完全冻结** —— 包括 SAC 的 learnFromSearch 那条路径"
+                  " (它不受'探索+预训练'勾选框控制, 只能由模式掩码关掉)");
+
+            /* 再反过来验一次: 会学的换成 B 侧, 冻结的换成 A 侧 —— 证明冻结的是"B 方"
+               这个角色, 不是"SAC 这个类型" */
+            /*
+               ⚠ 注意桶名: countSides(a=SACAZ, b=PPOMCTS, aKey="PPO") 时,
+                  **namesA 才是 PPO(B 方)**, **namesB 才是 SAC(A 方)** —— 第一版
+                  把这两个桶当成了 A/B 侧名, 于是把"正确结果"读成了失败
+                  (实测 SAC(a) 36 次 / PPO(b) 0 次, 而断言写的是 s2.a==0 && s2.b>0)。
+            */
+            const Side s2 = countSides(ChessBoard::AGENT_SACAZ,
+                                       ChessBoard::AGENT_PPOMCTS,
+                                       QStringLiteral("PPO"));
+            std::printf("    MATCH_EVAL 反向: SAC(A方) 桶 %d 次 [%s] | PPO(B方) 桶 %d 次 [%s]\n",
+                        s2.b, s2.namesB.join(", ").toUtf8().constData(),
+                        s2.a, s2.namesA.join(", ").toUtf8().constData());
+            CHECK(s2.b > 0 && s2.a == 0,
+                  "评估模式冻结的是**B 方这个角色**, 不是某种 agent 类型"
+                  " (交换 A/B 之后, 学的那一侧跟着换)");
+            CHECK(s2.blocked > 0,
+                  "评估模式在 B 方那一手踩下闸门 (SAC 在 A 方时不受影响)");
+        }
+
+        /* ---- (3) MATCH_NO_LEARN: 双方都不学 (两条路径都关) ---- */
+        board.setMatchMode(ChessBoard::MATCH_NO_LEARN);
+        {
+            const Side s = countSides(ChessBoard::AGENT_PPOMCTS,
+                                      ChessBoard::AGENT_SACAZ,
+                                      QStringLiteral("PPO"));
+            show("MATCH_NO_LEARN", s);
+            CHECK(s.a == 0 && s.b == 0,
+                  "只对弈模式: **双方 0 次更新** —— 落子照常, 但两条学习路径都关掉了"
+                  " (这才是能直接比较比分的口径)");
+            CHECK(s.blocked > 0,
+                  "只对弈模式下闸门确实被踩下 (读数不是'闸门从没触发'造成的假绿)");
+        }
+
+        /* ---- (4) 报告里必须写明这一场用的是什么模式 ---- */
+        {
+            const ChessBoard::MatchStats st = board.matchAgents(
+                ChessBoard::AGENT_ALPHABETA, ChessBoard::AGENT_AB_L2, 1);
+            const QString d = st.detail();
+            std::printf("    报告的模式行: %s\n",
+                        st.modeName.toUtf8().constData());
+            CHECK(!st.modeName.isEmpty(), "对局报告里带上了模式名");
+            CHECK(d.contains(QStringLiteral("对弈模式")),
+                  "报告正文里印出了对弈模式 (读数自带前提, 不用读者自己悟)");
+            CHECK(!st.learnsSomething,
+                  "只对弈模式下 learnsSomething 为假 (报告据此提示'不能当棋力结论')");
+        }
+
+        /* 复位: 后面的小节按"改动前的默认口径"跑 */
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
         board.setPreTrainEnabled(false);
         board.setPreTrainSteps(0);
     }

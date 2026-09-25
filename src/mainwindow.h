@@ -34,6 +34,8 @@ private slots:
     void onReplayModeExited();
     /* 开始 / 停止 Agent 对 Agent 对弈 (按钮兼作"停止") */
     void onStartMatch();
+    /* 对弈模式下拉框 (P0-a): 把"训练 / 评估 / 只对弈不学习"写进 ChessBoard */
+    void onMatchModeSelected(int index);
 
 private:
     void refreshGameList();

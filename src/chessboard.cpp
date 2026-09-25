@@ -1458,6 +1458,18 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
         emitStage(QStringLiteral("① 搜索 / 决策"));
         return std::string("探索+预训练: 已关闭");
     }
+    /*
+       ---- 对弈模式的闸门 (P0-a) ----
+       评估模式 (只让 A 方学) 与"只对弈不学习"模式下, 这一手**不做**在线更新。
+       闸门放在这里而不是放在界面那个勾选框上: 后者只是"用户想不想训", 而这里是
+       "本场对局的语义允不允许训" —— 两者都在, 取与。理由见 chessboard.h 的 MatchMode。
+    */
+    if (!perMoveLearningEnabled()) {
+        m_matchLearningBlocked.fetch_add(1);
+        emitStage(QStringLiteral("① 搜索 / 决策 (本场对局禁用在线学习: %1)")
+                      .arg(matchModeName(m_matchMode.load())));
+        return std::string("探索+预训练: 本场对局模式已禁用 (评估/只对弈模式)");
+    }
     const int steps = m_preTrainSteps.load();
     if (steps <= 0) {
         /* 步数设成 0 等价于关掉探索 (界面上允许这么设, 用来做对照) */
@@ -1494,6 +1506,74 @@ std::string ChessBoard::preTrainThenDecide(AgentBase *agent, int color)
     emitStage(QStringLiteral("② 搜索 / 决策"));
     return info;
 }
+
+/* ================================================================
+ *  ---- 对弈模式 (P0-a, 2026-09, dev-selfplay) ----
+ * ================================================================
+ *
+ * 动机与三条语义见 chessboard.h 的 MatchMode 注释。这里只说明**为什么判据写在这里**:
+ *
+ *   * 在它之前, "对弈时学不学"这件事**没有任何单一判据** —— 每一手都无条件走
+ *     preTrainThenDecide, 而 SAC 还有第二条路径 (selectMove 里的 learnFromSearch)。
+ *     实测 (test_match [2.7c]): 关掉界面的"探索+预训练"之后, PPO 0 次更新、
+ *     而 SAC+AZ **仍然每手 20 次** —— 于是"关掉探索 = 只看不下"只对一部分 agent 成立。
+ *   * 所以本模式必须**同时**管住两条路径, 而且判据只能有一处, 否则一定会漏:
+ *       ① 每手一次更新 (preTrainThenDecide)          -> updateEnabledForSide
+ *       ② 从自己的搜索学一次 (SAC learnFromSearch)   -> searchLearningEnabledForSide
+ *     两者在 MATCH_NO_LEARN 下都返回 false; MATCH_EVAL 下只放行 A 那一侧。
+ *
+ * ⚠ 用 `m_matchRunning` 区分"这是对弈还是人机": 人机对战 (aiThink) 沿用原有行为,
+ *   不受对弈模式影响 (用户没有要求改人机那条路)。
+ */
+
+QString ChessBoard::matchModeName(MatchMode m)
+{
+    switch (m) {
+    case MATCH_TRAIN:    return QStringLiteral("训练对局 (双方各自学习)");
+    case MATCH_EVAL:     return QStringLiteral("评估对局 (冻结 B 方, 只让 A 方学)");
+    case MATCH_NO_LEARN: return QStringLiteral("只对弈不学习 (纯对照, 两条学习路径都关)");
+    }
+    return QStringLiteral("未知模式");
+}
+
+bool ChessBoard::matchLearnsSomething() const
+{
+    return m_matchMode.load() != MATCH_NO_LEARN;
+}
+
+bool ChessBoard::updateEnabledForSide(bool isA) const
+{
+    if (!m_matchRunning.load()) {
+        return true;      /* 不在对弈中: 人机对战照旧 */
+    }
+    switch (m_matchMode.load()) {
+    case MATCH_TRAIN:    return true;
+    case MATCH_EVAL:     return isA;     /* 只让 A 方 (待评估者) 学; B 是冻结的参照物 */
+    case MATCH_NO_LEARN: return false;
+    }
+    return true;
+}
+
+bool ChessBoard::searchLearningEnabledForSide(bool isA) const
+{
+    /* 口径与 updateEnabledForSide 完全一致 —— 两条学习路径必须同进同退 */
+    return updateEnabledForSide(isA);
+}
+
+bool ChessBoard::perMoveLearningEnabled() const
+{
+    if (!m_matchRunning.load()) {
+        return true;      /* 人机对战: 由界面上的开关与步数决定 (原有行为) */
+    }
+    return updateEnabledForSide(m_sideBeingDecided);
+}
+
+/*
+ * 决策收尾的两个模板都定义在头文件里 (reportLearnedLoss 也在那里) —— 它们必须看到
+ * agent 的具体类型才能取 getLearnSteps()/learnFromSearch, 而 AgentBase 上没有这些接口。
+ * 这里只保留**非模板**的判据实现 (matchModeName / updateEnabledForSide / ...),
+ * 它们是模式语义的唯一来源。
+ */
 
 /*
  * reportLearnedLossOf - "决策里学了一次"的**口径唯一实现** (头文件里那个模板转到这里)。
@@ -2022,14 +2102,15 @@ Step ChessBoard::aiThinkRaw(int color)
             }
         }
         preTrainThenDecide(m_sfSACAZ, color);
-        /* temp = 0: 取访问数最多的走法 (确定性) */
-        {
-            /* selectMove 里会用自己的搜索样本学一次 (learnFromSearch), 那次损失也要上曲线 */
-            const int stepsBefore = m_sfSACAZ->getLearnSteps();
-            const Step s = m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZ, stepsBefore);
-            return s;
-        }
+        /* temp = 0: 取访问数最多的走法 (确定性)。
+           走 finishDecisionSearch 而不是裸调 selectMove: 它同时负责
+             (a) selectMove 里那次 learnFromSearch 的损失上报, 以及
+             (b) **对弈模式的掩码** —— 评估/只对弈模式下把 learnFromSearch 关掉。
+           实测 (test_match [2.7c]): 这条路径不受界面"探索+预训练"勾选框控制, 所以
+           模式掩码只能在这里装。 */
+        return finishDecisionSearch(m_sfSACAZ, [&] {
+            return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+        });
     }
     case AGENT_SACAZ_MOE: {
         /*
@@ -2069,10 +2150,10 @@ Step ChessBoard::aiThinkRaw(int color)
         }
         preTrainThenDecide(m_sfSACAZMoe, color);
 {
-            const int stepsBefore = m_sfSACAZMoe->getLearnSteps();
-            const Step s = m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZMoe, stepsBefore);
-            return s;
+            /* 走 finishDecisionSearch: 上报那次 learnFromSearch 的损失 + 装对弈模式掩码 */
+            return finishDecisionSearch(m_sfSACAZMoe, [&] {
+                return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_SACAZ_OLD: {
@@ -2099,10 +2180,14 @@ Step ChessBoard::aiThinkRaw(int color)
         preTrainThenDecide(m_sfSACAZOld, color);
         /* temp = 0: 取访问数最多的走法 (确定性), 与 AGENT_SACAZ 同一口径 */
 {
-            const int stepsBefore = m_sfSACAZOld->getLearnSteps();
-            const Step s = m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZOld, stepsBefore);
-            return s;
+            /*
+               59e5233 还原版**没有** learnFromSearch 那条路径 (见
+               createSACAZLegacyAgent 的注释), 所以这里用普通收尾钩子: 它只负责
+               "决策 + 那次更新的损失上报", 不需要装掩码。
+            */
+            return finishDecision(m_sfSACAZOld, [&] {
+                return m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_SACAZ_OLD_MOE: {
@@ -2135,10 +2220,10 @@ Step ChessBoard::aiThinkRaw(int color)
         preTrainThenDecide(m_sfSACAZOldMoe, color);
         /* temp = 0: 取访问数最多的走法 (确定性), 与两支 SACAZ 同一口径 */
         {
-            const int stepsBefore = m_sfSACAZOldMoe->getLearnSteps();
-            const Step s = m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZOldMoe, stepsBefore);
-            return s;
+            /* 同上面两支: 还原版没有 learnFromSearch, 用普通收尾钩子即可 */
+            return finishDecision(m_sfSACAZOldMoe, [&] {
+                return m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_DQNAB: {
@@ -2283,13 +2368,13 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
             m_sfSACAZ = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
         }
         preTrainThenDecide(m_sfSACAZ, color);
-        {
-            /* 决策里会用自己的搜索样本学一次 (learnFromSearch), 那次损失也要上曲线 */
-            const int stepsBefore = m_sfSACAZ->getLearnSteps();
-            const Step s = m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZ, stepsBefore);
-            return s;
-        }
+        /* 走 finishDecisionSearch: 上报那次 learnFromSearch 的损失 + 装对弈模式掩码。
+           ⚠ 这一支曾经漏改过: aiThinkRaw 与 aiThinkForAgentRaw 各有一份 SAC 分支,
+             而**对弈走的是后者** —— 只改了前者的话, 评估模式下 SAC 照样每手更新,
+             在读数上表现为"B 侧 20 次而不是 0 次", 极难归因 (见 [2.7d] 的注释)。 */
+        return finishDecisionSearch(m_sfSACAZ, [&] {
+            return m_sfSACAZ->selectMove(color, SACAZ_SIMS, 0.0f);
+        });
     }
     case AGENT_SACAZ_MOE: {
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
@@ -2320,10 +2405,10 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
         }
         preTrainThenDecide(m_sfSACAZMoe, color);
 {
-            const int stepsBefore = m_sfSACAZMoe->getLearnSteps();
-            const Step s = m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZMoe, stepsBefore);
-            return s;
+            /* 走 finishDecisionSearch: 上报那次 learnFromSearch 的损失 + 装对弈模式掩码 */
+            return finishDecisionSearch(m_sfSACAZMoe, [&] {
+                return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_SACAZ_OLD: {
@@ -2349,10 +2434,14 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
         preTrainThenDecide(m_sfSACAZOld, color);
 {
             /* 决策里可能用自己的搜索样本学了一次 (learnFromSearch), 那次损失也要上曲线 */
-            const int stepsBefore = m_sfSACAZOld->getLearnSteps();
-            const Step s = m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZOld, stepsBefore);
-            return s;
+            /*
+               59e5233 还原版**没有** learnFromSearch 那条路径 (见
+               createSACAZLegacyAgent 的注释), 所以这里用普通收尾钩子: 它只负责
+               "决策 + 那次更新的损失上报", 不需要装掩码。
+            */
+            return finishDecision(m_sfSACAZOld, [&] {
+                return m_sfSACAZOld->selectMove(color, SACAZ_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_SACAZ_OLD_MOE: {
@@ -2381,10 +2470,10 @@ Step ChessBoard::aiThinkForAgentRaw(int color, AgentType agentType)
         }
         preTrainThenDecide(m_sfSACAZOldMoe, color);
         {
-            const int stepsBefore = m_sfSACAZOldMoe->getLearnSteps();
-            const Step s = m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
-            reportLearnedLoss(m_sfSACAZOldMoe, stepsBefore);
-            return s;
+            /* 同上面两支: 还原版没有 learnFromSearch, 用普通收尾钩子即可 */
+            return finishDecision(m_sfSACAZOldMoe, [&] {
+                return m_sfSACAZOldMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
+            });
         }
     }
     case AGENT_DQNAB: {
@@ -2512,6 +2601,18 @@ QString ChessBoard::MatchStats::detail() const
 {
     QString d = summary();
     d += QStringLiteral("\n\n参赛方:\n  A = %1\n  B = %2").arg(agentA, agentB);
+    /*
+       ---- 这一场到底学不学 (P0-a 对弈模式) ----
+       必须写在报告里: 在它之前, "比分"与"训练"是混在一起的 —— 双方都在学, 于是
+       "A 赢了 B" 既可能因为 A 变强、也可能因为 B 变弱。用户读到的却只是一行比分。
+       这里把模式**直接印出来**, 于是读数自带前提, 不再需要读者自己去悟。
+    */
+    d += QStringLiteral("\n对弈模式: %1").arg(modeName);
+    if (!learnsSomething) {
+        d += QStringLiteral("\n  注: 本场**不能**当作棋力结论 —— 只有固定参照物 +"
+                            " 对照口径下的比分才可归因 (见 docs/agents_design.md §10.3"
+                            " 与 bench_anchor 的锚点对局)");
+    }
     d += QStringLiteral("\n\n每局明细 (每局交换先后手):\n");
     d += log;
     if (plies > 0) {
@@ -2549,6 +2650,11 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
         rewardB = aIsRed ? rewardBlack : rewardRed;
     };
     /*
+       本局"A 方是不是执红" —— 每局都要重写 (matchAgents 每局交换先后手),
+       决策路径靠它把"这一手替谁下"换算出来 (见下面 m_sideBeingDecided)。
+    */
+    m_matchAIsRed = aIsRed;
+    /*
        ---- ④ 两本账 (本次改动新增) ----
        `rewardRed/rewardBlack` 从此是"**曲线口径**的即时累计": 哪一方有学习口径就用
        学习口径, 没有就用引擎口径 (见下面每手的取值)。另外两对本地的账只用于
@@ -2585,6 +2691,14 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
         }
 
         const AgentType who = typeForTurn(turn, redType, blackType);
+        /*
+           ---- 告诉决策路径"这一手在替谁下" (P0-a 对弈模式) ----
+           MATCH_EVAL 的语义是"冻结 B 方、只让 A 方学", 而决策路径只能看到一个
+           AgentType, 分不出它是 A 还是 B (同一个类型可能两边都在用)。所以这里把
+           "A 方是否执红"换算成"这一手是不是 A 的", 供 updateEnabledForSide 使用。
+           (红黑与 A/B 的换算只有这一处, 与下面 syncAB 的口径同源。)
+        */
+        m_sideBeingDecided = ((turn == Stone::COLOR_RED) == aIsRed);
         auto t0 = std::chrono::steady_clock::now();
         Step step = aiThinkForAgent(turn, who);
         auto t1 = std::chrono::steady_clock::now();
@@ -2812,6 +2926,14 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
     MatchStats st;
     st.agentA = agentDisplayName(typeA);
     st.agentB = agentDisplayName(typeB);
+    /*
+       ---- 把本场的对弈模式写进报告 (P0-a) ----
+       在这里**快照**模式而不是在 detail() 里现读: 一场对弈可能跑很久, 期间用户可能
+       又改了模式 —— 报告必须描述**这一场实际用的**那个模式, 否则"报告说评估、其实是
+       在训练"就是一个假的读数 (本工程最怕的那类静默失效)。
+    */
+    st.modeName = matchModeName(m_matchMode.load());
+    st.learnsSomething = matchLearnsSomething() && m_preTrainEnabled.load();
     if (games < 1) {
         games = 1;
     }

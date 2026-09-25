@@ -15,6 +15,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <functional>   /* finishDecision 的"决策回调"参数 (P0-a 对弈模式) */
 #include <vector>
 #include <map>
 #include <fstream>
@@ -183,6 +184,53 @@ public:
     void setAgentType(AgentType type);
     AgentType getAgentType() const { return m_agentType; }
 
+    /*
+     * ================================================================
+     *  ---- 对弈模式 (P0-a, 2026-09, dev-selfplay) ----
+     * ================================================================
+     *
+     * 为什么需要它 (用户提问: "对弈的 A/B 双方都是自己实现 (自对弈), 是否合理?"):
+     * 在它之前, 界面上**没有** "这是训练还是评估" 这个概念 —— 每一手都会走
+     * aiThinkForAgent -> preTrainThenDecide -> exploreAndTrain, 于是对弈总是"双方各自
+     * 在学", 而"谁能赢"这件事因此**不可归因**: 得分变化既可能来自我方变强, 也可能来自
+     * 对手(也在学)变弱。更糟的是"学"不止一条路径 (见下面 MatchMode 的说明) ——
+     * 实测 (test_match [2.7c]) SAC+AZ 在关掉"探索+预训练"之后**仍然每手更新**。
+     *
+     * 三条语义 (由 perMoveLearningEnabled() / searchLearningEnabled() 统一给出):
+     *
+     *   MATCH_TRAIN   双方各自学习 —— **双方各自自对弈**, 不是互相学(对手的棋不进训练
+     *                 数据, 见 aiagent.h 里 exploreAndTrain 没有对手参数这件事)。
+     *                 这是"训练对局"。
+     *   MATCH_EVAL    **冻结对手, 只让一方学**: 谁被冻结是调用方的事 —— 对弈里
+     *                 "A 方是待评估者、B 方是参照物", 所以只让 A 那一侧学。
+     *                 这是"评估对局": 比分变化因此可以归因到 A 自己的变化上。
+     *   MATCH_NO_LEARN 双方都不学, **两条学习路径都关掉** ⇒ "只对弈不学习"的纯对照。
+     *                 这是唯一能让"这一场比分"直接可比的口径 (docs/agents_design.md
+     *                 §10.3 第 7 条: 棋力结论只能来自"预训练 = 0"的对照)。
+     *
+     * ⚠ MATCH_EVAL / MATCH_NO_LEARN 都必须**同时**关掉两条学习路径, 否则"不学"是假的:
+     *     ① preTrainThenDecide 的探索+预训练 (受界面"探索步数"控制);
+     *     ② SAC+AZ 的 learnFromSearch (在 selectMove 里, **不受那个勾选框控制**,
+     *        原来界面上根本关不掉它)。
+     *   两条都由本模式统一管辖 —— 这正是 [2.7c] 实测出来的那个洞。
+     *
+     * ⚠ 本模式**只作用于对弈** (matchAgents)。人机对战那条路 (aiThink) 不受影响。
+     * ⚠ 对局的**双方**用同一个模式 (不是每方一个开关): "评估对局"的定义是"A 学、B 冻结",
+     *   把它做成两个独立开关会允许"A 学、B 也学"(= MATCH_TRAIN) 与"A 不学、B 也不学"
+     *   (= MATCH_NO_LEARN) 这两种等价写法, 于是"模式"这个词就失去意义了。
+     */
+    enum MatchMode {
+        MATCH_TRAIN = 0,      /* 双方各自学习 (默认; 与改动前的行为一致) */
+        MATCH_EVAL,           /* 冻结对手, 只让 A 方学 */
+        MATCH_NO_LEARN        /* 双方都不学 (只对弈) */
+    };
+    void setMatchMode(MatchMode m) { m_matchMode = m; }
+    MatchMode getMatchMode() const { return m_matchMode; }
+    /* 界面/报告用的名字 (同时是"这一场到底学不学"的唯一表述) */
+    static QString matchModeName(MatchMode m);
+    /* 这一场会不会发生在线学习 (用于对局报告与界面提示) */
+    bool matchLearnsSomething() const;
+
     /* 启动加载: 异步加载数据库和AI模型权重 */
     void startupLoad();
     bool isStartupComplete() const { return m_startupComplete.load(); }
@@ -206,6 +254,14 @@ public:
         long long maxThinkMs = 0;   /* 单步最长思考时间 */
         QString log;                /* 每局一行 */
         bool aborted = false;
+        /*
+           本场的对弈模式 (P0-a)。**必须有**: 比分本身不带前提, 而"这一场学不学"
+           决定了它能不能被读成棋力结论。由 matchAgents 在开场时写进报告。
+             modeName        : 模式名 (界面/报告显示)
+             learnsSomething : 本场会不会发生在线学习 (用于那句"不能当棋力结论"的提示)
+        */
+        QString modeName;
+        bool learnsSomething = true;
         /*
            ================================================================
            [O1, 2026-09] 吃子行为 —— "该吃的时候吃了吗"（整场累计）
@@ -550,6 +606,82 @@ private:
     /* reportLearnedLoss 模板的公共实现 (定义在 .cpp: 信号与曲线口径不进头文件) */
     void reportLearnedLossOf(AgentBase *agent, int learnSteps, int teachStepsBefore);
 
+    /* ----------------------------------------------------------------
+     *  ---- 对弈模式 (P0-a) 的判据与决策收尾钩子 ----
+     *  只有一处实现, 决策路径与"装/拆掩码"都从这里取, 免得两处漂移。
+     * ---------------------------------------------------------------- */
+
+    /*
+     * 这一手**要不要做"探索环境 + 预训练"**。
+     *  = 不在对弈中 (人机对战照旧) 或 当前对局处于 MATCH_TRAIN;
+     *    再叠加界面上的"探索+预训练"开关与步数 (>0)。
+     * 注意顺序: "不在对弈中"必须放前面 —— aiThink (人机) 与 aiThinkForAgent (对弈)
+     * 共用这一条判据, 而人机对战不该被对弈模式影响。
+     */
+    bool perMoveLearningEnabled() const;
+    /*
+     * 这一手**要不要更新** (泛指: 回放池里攒样本 / learnBatch / learnFromSearchStep)。
+     * MATCH_NO_LEARN 一律 false; MATCH_EVAL 时只有 isA 那一侧为 true。
+     * 不在对弈中 -> true (人机对战保持原有行为)。
+     */
+    bool updateEnabledForSide(bool isA) const;
+    /*
+     * 决策的两个收尾钩子 (把"决策 + 损失上报 + 模式掩码"收在一处)。
+     *
+     * 为什么要有它们: 原来每个 RL 分支各自写 `const int stepsBefore = ...; selectMove(...);
+     * reportLearnedLoss(...)`, 而 SAC 系还要额外处理 learnFromSearch —— 五处重复。
+     * 模式一加进来, 那种写法必然漏掉某一支, 于是"评估模式"在某些 agent 上静默失效。
+     *
+     * 两个都是**模板** (与 reportLearnedLoss 同一手法): getLearnSteps() / learnFromSearch
+     * 只在具体 agent 上有, AgentBase 上没有这些接口 —— 一个非模板签名要么接不住它们,
+     * 要么就得在基类上开洞。
+     *
+     *   finishDecision       : 普通 RL 分支 (PG / DQN / PPO+MCTS / DQN+MCTS / EVAB / DQNAB)
+     *   finishDecisionSearch : 带 learnFromSearch 的分支 (SAC+AZ 的两支)
+     */
+    template <class AgentT>
+    Step finishDecision(AgentT *agent, const std::function<Step()> &decide)
+    {
+        const int stepsBefore = agent->getLearnSteps();
+        Step s = decide();
+        reportLearnedLoss(agent, stepsBefore);
+        return s;
+    }
+    template <class SACLike>
+    Step finishDecisionSearch(SACLike *agent, const std::function<Step()> &decide)
+    {
+        const int stepsBefore = agent->getLearnSteps();
+        /*
+           掩码: 本模式若禁止"从自己的搜索学一次", 就在这一手内把它关掉, 决策完再还原。
+           用 before 暂存原值 —— 还原回去的是**agent 自己的配置**, 不是我们改成的值,
+           所以不会把用户/测试设过的 learnFromSearch=false 悄悄打开。
+        */
+        const bool before = agent->learnFromSearch;
+        agent->learnFromSearch = before && searchLearningEnabledForSide(m_sideBeingDecided);
+        Step s = decide();
+        agent->learnFromSearch = before;
+        reportLearnedLoss(agent, stepsBefore);
+        return s;
+    }
+    /* "从自己的搜索学一次"(SAC 的 learnFromSearch) 这一手允不允许 */
+    bool searchLearningEnabledForSide(bool isA) const;
+    /*
+     * 诊断计数: 本次对局里"因为模式而被禁止更新"的次数 (每手最多一次)。
+     * 为什么需要它: 模式生效与否**在读数上极难分辨** —— "B 侧更新 20 次而不是 40 次"
+     * 既可能是"掩码关掉了一条路径", 也可能是"另一条路径本来就没触发"。只有把闸门
+     * 被踩下的次数直接数出来, 才能区分这两种情况 (第一版 [2.7d] 就卡在这里)。
+     */
+    std::atomic<int> m_matchLearningBlocked{0};
+public:
+    int matchLearningBlockedCount() const { return m_matchLearningBlocked.load(); }
+private:
+    /*
+     * 当前这一手是在替哪一方决策 (对弈里 "红方是不是 A 方")。
+     * 人机路径 (aiThink) 保持 true —— 它不在对弈里, 两个判据都只看"是否在对弈中"。
+     * 由 playMatchGame 在每一手之前写 (同一线程, 与决策串行)。
+     */
+    bool m_sideBeingDecided = true;
+
     /* ---- 思考过程可视化 (全部只在 GUI 线程读写, 除了 m_thinkGeneration) ---- */
     void initThinkVisuals();
     /* 棋盘顶部那条状态提示的矩形 (只看这块重绘, 不重画整个棋盘) */
@@ -573,6 +705,13 @@ private:
     std::atomic<bool> m_matchAbort{false};
     std::atomic<int> m_matchGameNo{0};
     std::atomic<int> m_matchGames{0};
+    /*
+       对弈模式 (P0-a): 写在"开始对弈"之前 (GUI/测试线程), 由对弈线程每手读。
+       atomic 是因为它可能在另一线程被改 (例如勾选框变化), 而决策路径每手都要查它。
+    */
+    std::atomic<MatchMode> m_matchMode{MATCH_TRAIN};
+    /* 对弈中"A 方是不是执红" (每局开始写; MATCH_EVAL 靠它判断这一手替谁决策) */
+    bool m_matchAIsRed = true;
     int m_maxPliesPerGame = DEFAULT_MAX_PLIES;   /* 单局手数上限, 到顶判和 */
     /*
      * 打一局: 红方用 redType, 黑方用 blackType; 返回 Chess::RESULT_*。
