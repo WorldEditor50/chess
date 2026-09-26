@@ -162,6 +162,93 @@ public:
 
     /*
        ================================================================
+        [2026-09 dev-sacmoetb] **共享骨干** (trunkMode): 一个骨干 + 三个头
+       ================================================================
+       现状 (TrunkMode::Separate, 默认): actor / q1 / q2 / q1Target / q2Target
+       **五张各自独立的网**, 每张都背着一整套骨干 (TB 专家时 28.8 M 参数/张)。
+       代价有三个, 全是实测出来的:
+
+         * **搜索**: 一次叶子估值 = policySparse(actor 前向) + qValuesSparse(q1 前向 +
+           q2 前向) —— 同一个局面, 骨干被算了**三遍**, 而这三遍的差别只在最后那层
+           64->128 的线性头。实测 1 个 TB 专家前向 5.4 ms (修完头数口径之后), 也就是说
+           一次模拟里 16 ms 花在"把同一件事算三遍"上。
+         * **训练**: learnBatch 每个样本要跑 6 次全网前向 (actor(s'), 两个目标网(s'),
+           actor(s), q1(s), q2(s)) + 3 次全网反向。共享之后只需要 **3 次骨干前向**
+           (在线骨干 s' / 目标骨干 s' / 在线骨干 s) + 3 次头反向 + 1 次骨干反向。
+         * **参数/数据比**: 5 张网 = 5 x 28.8 M = 144 M 参数, 而自对弈数据以"千条"计。
+           本文件顶部 §表示那条结论(策略头 63 倍参数量就吃掉 200 Elo)在这里同样成立 ——
+           只是被"五张网"放大了 5 倍。
+
+       TrunkMode::Shared: **骨干只留一份** (在线 + 目标各一份, 目标网照旧只前向),
+       actor/q1/q2 退化成三个只有输出层的头。这是 AlphaZero 的标准结构 (共享 body +
+       policy/value 两个头), 三点好处:
+         1. 搜索每次叶子估值 3 次骨干前向 -> **1 次** (精确 3 倍);
+         2. 训练每样本 6 次骨干前向 -> 3 次, 3 次骨干反向 -> 1 次;
+         3. 骨干同时收到策略与双 Q 的梯度 (3 份信号), 而不是三张网各自从零学表示。
+
+       **actor / q1 / q2 这三个成员在两种模式下都仍然是"端到端可用"的完整网络**
+       (共享模式下它们与 trunk / 各 head **共享同一批层对象**, 见 .cpp 的 buildNet),
+       所以 test / GUI / selfCheckReport 里所有 `agent.actor.xxx` 的用法一行都不用改;
+       区别只在 agent 内部的热路径显式地"骨干跑一次、三个头各跑一次"。
+       `Shared` 只保证**语义**不变 (同样的 π、同样的 Q), 不保证逐位 —— MoE 的门控与
+       专家的中间量被复用, 浮点加法结合顺序会有极小差别 (test_sacaz [17] 钉住量级)。
+
+       **默认值是 Separate** (与改动前逐位一致, 所有历史读数/权重不受影响);
+       GUI 的 AGENT_SACAZ_MOE 那一支显式改用 Shared (权重前缀也换成独立的一支,
+       见 defaultWeightPrefix / sharedWeightPrefix —— 两个口径的权重**绝不能互相载入**)。
+    */
+    enum class TrunkMode {
+        Separate = 0,
+        Shared,
+        Count
+    };
+    static const char *trunkModeName(TrunkMode m);
+    bool sharedTrunk() const { return trunkMode == TrunkMode::Shared; }
+    /* 构造时定, 之后不要改 (改了 Net 的组装关系就与它不一致了) */
+    TrunkMode trunkMode;
+
+    /*
+       ================================================================
+        [2026-09 dev-sacmoetb] TB 专家的**头数口径** (tbHonorHeads)
+       ================================================================
+       实测出来的静默降级: 本文件写着 `MOE_TB_HEADS = 15` ("d_model/15 = 84 维/头"),
+       而 TB 专家真实的 d_model 是 **STATE_DIM = 1263 = 3 x 421** (421 是素数)。
+       `MultiHeadAttention` 老的构造规则是"从请求的头数往下找第一个**整除** d_model 的
+       数", 在 1263 上找到的是 **3** —— 于是:
+
+           真实 head 数 3, d_k = 421, 注意力元素 531,723, 1 个 TB 专家前向 **15.71 ms**
+           (头数铺满时 105,840 个元素, **5.37 ms**, 3.0 倍)
+
+       而 15 个 head 对象**全都分配了**, 只有 3 个参与前向 —— 80% 的 qkv 张量是死的
+       (每个专家分配 96 MB, 实际用到 19 MB; 算上 withGrad 的 g/gv/gm 三份副本,
+       一个 5 网 TB agent 常驻内存里有一大块是这个)。
+
+       为什么参数指纹 / paramCount / 权重文件**一个都没报警**: 层类型序列没变、
+       `paramCount()` 本来就只数在用的 head、权重文件本来就只写在用的 head ——
+       变的只有"慢 3 倍"和"多用一倍多的内存"。与 TanhNorm<Sigmoid> 那次回归同类。
+
+       `tbHonorHeads = true` (默认) 用新的"HONOR 请求头数、允许头不铺满 d_model"口径
+       (见 rl/attention.hpp 的 MultiHeadAttention 类头注释); `false` 是改动前的口径,
+       保留给 A/B 对照。
+       **注意 `SACAZLegacyAgent` (59e5233 行为还原版) 没有这个成员, 也永远不用这个口径**
+       —— 那一支必须逐位复现历史 (它在另一个类里, 见 src/sacazlegacyagent.h)。
+    */
+    bool tbHonorHeads = true;
+
+    /* ----------------------------------------------------------------
+     *  共享骨干 (只在 trunkMode == Shared 时有内容)
+     *  非共享模式下这几个 Net 是空的 (size() == 0), 热路径不会碰它们。
+     * ---------------------------------------------------------------- */
+    RL::Net trunk;          /* 共享骨干, 有梯度 (在线) */
+    RL::Net trunkTarget;    /* 共享骨干的目标副本, 无梯度 */
+    RL::Net actorHead;      /* 三个头: 输入 = 骨干输出 h (hiddenDim 维) */
+    RL::Net q1Head;
+    RL::Net q2Head;
+    RL::Net q1TargetHead;
+    RL::Net q2TargetHead;
+
+    /*
+       ================================================================
        隐层激活: 59e5233 用的是 `Layer<Tanh>`, 而**不能**用 TanhNorm 去"复现"它
        ================================================================
        背景: 这一层激活在**未提交的工作区改动**里被从 `RL::Layer<RL::Tanh>` 换成了
@@ -216,6 +303,19 @@ public:
        派生类: 两个类没有继承关系, 只是刻意共用同一套命名约定)。
     */
     static const char *defaultWeightPrefix();
+
+    /*
+       共享骨干口径的权重前缀 (2026-09 dev-sacmoetb)。
+       为什么**必须**与 defaultWeightPrefix() 不同 (用户口径: 新旧 SAC 的权重文件
+       必须用不同名字, 见上面那一段): 共享口径把"5 张各自独立的网"换成"1 个骨干 +
+       3 个头", 两者的**权重文件个数与语义都不同** (共享口径写 4 个文件, 没有 _actor,
+       骨干只存一份)。如果共用一个前缀, `loadModel` 会找不到文件而返回 false ——
+       看起来是"载入失败", 但如果有人为了"让老文件也能读"而补一条回退, 载进来的
+       `_actor/_q1/_q2` 会被当成"骨干 + 头"使用: 那是把三份**互不相同**的骨干随机
+       初始化里的第一份当共享骨干用, 另外两份直接丢掉 (静默, 不报错)。
+       所以两个口径各有各的前缀, 界面按 agent 类型 + 模式取默认值。
+    */
+    static const char *sharedWeightPrefix();
 
     /* 各骨干的固定结构 (模板参数必须编译期确定, 所以不做成运行时成员) */
     static constexpr int MOE_MLP_EXPERTS = 8;
@@ -316,6 +416,14 @@ public:
     float gamma;
     float learningRateActor;
     float learningRateCritic;
+    /*
+       [2026-09 dev-sacmoetb] 共享骨干的学习率 (只在 trunkMode == Shared 时有意义)。
+       默认取构造参数里的 lr —— 与 learningRateActor / learningRateCritic 同一个值,
+       也就是"共享这件事本身不改变任何一层的有效步长"。单独留一个成员是因为共享之后
+       骨干同时吃策略梯度与双 Q 梯度, 想单独调它必须有一处**显式**的地方可调, 而不是
+       靠"顺手改 actor 的学习率"。
+    */
+    float learningRateTrunk;
     float learningRateAlpha;
     float c_puct;             /* PUCT 探索常数 */
     float azWeight;           /* 策略损失里 AZ 监督项(交叉熵)的权重 */
@@ -425,6 +533,24 @@ public:
     /* legalIdx 上的软价值: E_π[min Q − α log π] (π 是合法集上的策略, 由本函数内部算) */
     bool softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
                          double &valueOut);
+    /*
+       ================================================================
+        [2026-09 dev-sacmoetb] 一次叶子求值的**完整稀疏路径** (搜索热路径专用)
+       ================================================================
+       上面的 policySparse / qValuesSparse / softValueSparse 是**公开 API**(测试与诊断
+       单独调它们), 而搜索里每次展开都要"π + 双 Q"三样一起要 —— 分开调就会把骨干
+       跑两遍 (policySparse 一遍 + qValuesSparse 一遍)。
+
+       本函数把三样一次算完:
+          * 非共享口径: 语义与"policySparse + qValuesSparse"逐元素相同, 但**只跑一遍
+            公共部分**没有可省的 (三张网), 所以这里只是把三件事写在一处;
+          * **共享口径: 骨干只前向一次** —— 这正是 Shared 模式在搜索侧的全部收益来源。
+        `pi` / `q1Out` / `q2Out` 的长度都等于 legalIdx.size()。
+       ================================================================
+    */
+    bool sparseLeaf(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                    std::vector<float> &pi, std::vector<float> &q1Out,
+                    std::vector<float> &q2Out);
 
     /*
        [消融] 搜索的叶子估值是否走稀疏头 (默认 true)。
@@ -734,6 +860,25 @@ public:
      * ---------------------------------------------------------------- */
     /* 按 backbone 造一个网络 (withGrad=false 用于目标网) */
     RL::Net buildNet(bool withGrad) const;
+    /*
+       共享骨干的建网 (2026-09 dev-sacmoetb): 造出**一层不重复**的骨干层与三个头层,
+       再把它们**按共享指针**组装成 actor / q1 / q2 / trunk / 目标网。
+       `buildNet` 与 `buildShare` 必须走**同一套**层构造代码 (makeTrunkLayers /
+       makeHeadLayer), 否则"两种模式除了共享关系之外逐位相同"这条前提就不成立了。
+    */
+    void buildSharedNets();
+    void makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const;
+    void makeHeadLayer(RL::Net::Layers &out, bool withGrad) const;
+    /* TB 专家那一层 (dense=true 时 TopK == 专家数); 两个口径只差 HonorHeads */
+    RL::iLayer::sptr makeTbExpertMoe(bool withGrad, bool dense) const;
+    /* 共享口径下的"唯一参数量"(骨干只算一次); 非共享口径 == actor+q1 (同构) */
+    long long uniqueParamCount() const;
+    /* TB 专家的实际头口径 (自检/测试读数; 非 TB 骨干返回 -1) —— 见 tbHonorHeads */
+    int tbHeadsRequested() const;
+    int tbHeadsUsed() const;
+    int tbHeadDim() const;
+    int tbHeadsAllocated() const;
+    long long tbAttentionElements() const;
     /* 稀疏 MoE 的坍缩诊断: actor 的第一个稀疏 MoE 层的使用计数 */
     void moeUsage(std::vector<long long> &out) const;
     void resetMoeUsage();
@@ -813,7 +958,20 @@ public:
                float cpuct = 1.5f,
                Backbone backbone_ = Backbone::Mlp,
                int expertHidden_ = 64,
-               float auxLossCoef_ = 0.1f);
+               float auxLossCoef_ = 0.1f,
+               /*
+                  [2026-09 dev-sacmoetb] 两个新增参数, 默认值 = **改动前的口径**
+                  (TrunkMode::Separate / tbHonorHeads = true):
+                    * trunkMode_ 默认 Separate —— 所有既有调用点 (test/bench/GUI 的
+                      AGENT_SACAZ) 构造出来的东西与改动前**逐位相同**;
+                    * tbHonorHeads_ 默认 **true** —— 这一条是**修 bug**, 不是开关:
+                      "请求 15 个头却只跑 3 个、还多分配 12 个"没有任何可辩护的理由,
+                      所以默认就是修好的口径; 传 false 只为 A/B 对照与历史读数复现。
+                      它只影响 SparseMoeTb / DenseMoeTb 两个骨干 (Mlp / SparseMoeMlp
+                      根本没有 TransformerBlock)。
+               */
+               TrunkMode trunkMode_ = TrunkMode::Separate,
+               bool tbHonorHeads_ = true);
     ~SACAZAgent() = default;
 
     Step getBestMove(int color) override;

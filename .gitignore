@@ -3,6 +3,9 @@ build
 # ASan 版构建目录 (2026-09: 查"对弈 x 后台训练"的堆损坏时建的, 见 issues_review C24)。
 # 保留它可以让 repro_concurrency 随时复跑而不必重新编译 (~10 分钟), 但二进制不该进仓库。
 build-asan
+# [2026-09 dev-sacmoetb] 排查这一轮两个结构缺陷时新建的对照构建目录 (Ninja + Release)。
+# 与 build/ 同级、同样是运行期产物。通配是为了以后再有 <变体> 构建目录时不必再改这里。
+build-*/
 .qt
 .vscode
 .claude

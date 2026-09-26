@@ -40,9 +40,21 @@
  *   bench_sacaz_vs_ab.exe [--games=6] [--plies=100] [--sims=16] [--depth=4]
  *                         [--opening=4] [--budget=0] [--min-sims=2] [--max-sims=64]
  *                         [--backbone=tb|dense-tb|moe-mlp|mlp]
+ *                         [--trunk=shared|separate] [--tb-heads=honor|legacy]
  *                         [--warmup-games=0] [--warmup-sims=16]
  *                         [--load=PREFIX] [--save=PREFIX] [--seed=N]
  *                         [--verbose] [--quiet]
+ *
+ * ---- [2026-09 dev-sacmoetb] 两个新开关: `--trunk` 与 `--tb-heads` ----
+ * 它们是本轮两个结构改动的 A/B 旋钮, 默认值与 GUI 一致 (shared / honor):
+ *   --trunk=separate : 五张网各背一套骨干 (改动前的口径)
+ *   --trunk=shared   : 一份骨干 + 三个头 (默认; 也是 GUI 的 AGENT_SACAZ_MOE 口径)
+ *   --tb-heads=legacy: TB 专家按"最大整除因子"切头 (d_model=1263 -> 3 个头, 改动前)
+ *   --tb-heads=honor : 按请求头数切 (15 个头, 默认)
+ * 两两组合都能跑, 因为它们**正交**: 一个改"骨干存几份", 一个改"专家内部怎么切头"。
+ * 复现本轮的读数:
+ *   bench_sacaz_vs_ab --trunk=separate --tb-heads=legacy --budget=175   (改动前)
+ *   bench_sacaz_vs_ab --trunk=shared   --tb-heads=honor  --budget=175   (改动后)
  */
 #include <algorithm>
 #include <chrono>
@@ -80,6 +92,8 @@ struct Cfg {
     int warmupGames = 0;        /* 赛前自对弈训练局数 (0 = 不热身) */
     int warmupSims = 16;
     std::string backbone = "tb";
+    std::string trunk = "shared";     /* shared | separate (见文件头) */
+    std::string tbHeads = "honor";    /* honor | legacy   (见文件头) */
     std::string loadPrefix;
     std::string savePrefix;
     unsigned seed = 20240901;
@@ -352,6 +366,8 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--warmup-games")) { g_cfg.warmupGames = std::atoi(v); }
         else if (const char *v = val("--warmup-sims"))  { g_cfg.warmupSims = std::atoi(v); }
         else if (const char *v = val("--backbone")){ g_cfg.backbone = v; }
+        else if (const char *v = val("--trunk"))   { g_cfg.trunk = v; }
+        else if (const char *v = val("--tb-heads")){ g_cfg.tbHeads = v; }
         else if (const char *v = val("--load"))    { g_cfg.loadPrefix = v; }
         else if (const char *v = val("--save"))    { g_cfg.savePrefix = v; }
         else if (const char *v = val("--seed"))    { g_cfg.seed = (unsigned)std::atoi(v); }
@@ -366,6 +382,22 @@ static void parseArgs(int argc, char **argv)
     if (g_cfg.depth < 1)    { g_cfg.depth = 1; }
     if (g_cfg.minSims < 1)  { g_cfg.minSims = 1; }
     if (g_cfg.maxSims < g_cfg.minSims) { g_cfg.maxSims = g_cfg.minSims; }
+
+    /*
+       两个结构开关的取值校验。**不许静默退回默认**: 打错一个字母
+       (--trunk=shaerd) 会让这一跑量的是另一个口径, 而报告里只差一个词 ——
+       这正是本文件反复强调的那类"看起来正常的错"。
+    */
+    if (g_cfg.trunk != "shared" && g_cfg.trunk != "separate") {
+        std::printf("[错误] --trunk 只接受 shared / separate, 收到 '%s'\n",
+                    g_cfg.trunk.c_str());
+        std::exit(2);
+    }
+    if (g_cfg.tbHeads != "honor" && g_cfg.tbHeads != "legacy") {
+        std::printf("[错误] --tb-heads 只接受 honor / legacy, 收到 '%s'\n",
+                    g_cfg.tbHeads.c_str());
+        std::exit(2);
+    }
 }
 
 } // namespace
@@ -390,23 +422,35 @@ int main(int argc, char **argv)
     const double tBuild0 = nowMs();
     /*
        参数与 GUI 的 SAC+AZ-MoE 完全一致 (SACAZ_HIDDEN/SACAZ_MOE_AUX + lr 0.001,
-       c_puct 1.5, 模拟次数见 --sims 的默认值 16)。
-       注意这个 agent 有**五个**网络 (actor + q1/q2 + 两个目标网), TB 专家下约 1.6 GB。
+       c_puct 1.5, 模拟次数见 --sims 或 --budget)。
+       `--trunk` / `--tb-heads` 两个开关直接透给构造函数 (见文件头的说明)。
+       内存: 独立口径下五个 TB 网约 1.6 GB; 共享口径下 2.50x 的参数降幅
+       (test_sacaz [17B]: 143,903,940 -> 57,586,536)。
     */
-    SACAZAgent sac(c, 64, 0.99f, 0.001f, 1.5f, backbone, 64, 0.1f);
+    const SACAZAgent::TrunkMode trunkMode =
+        (g_cfg.trunk == "shared") ? SACAZAgent::TrunkMode::Shared
+                                  : SACAZAgent::TrunkMode::Separate;
+    const bool honorHeads = (g_cfg.tbHeads == "honor");
+    SACAZAgent sac(c, 64, 0.99f, 0.001f, 1.5f, backbone, 64, 0.1f, trunkMode, honorHeads);
     ABAgent ab(c, g_cfg.depth);
     const double tBuild1 = nowMs();
 
     if (!g_cfg.quiet) {
         std::printf("=== SAC+AZ(骨干=%s) vs Alpha-Beta 静默对弈验证 ===\n",
                     SACAZAgent::backboneName(backbone));
-        std::printf("SAC+AZ  : state=%d action=%d  专家=%d topK=%d  actor 参数=%lld\n",
+        std::printf("结构    : %s | TB 头口径 %s (请求 %d / 实际 %d / 分配 %d, d_k=%d,"
+                    " 注意力元素 %lld)\n",
+                    SACAZAgent::trunkModeName(trunkMode),
+                    honorHeads ? "honor (按请求头数)" : "legacy (最大整除因子)",
+                    sac.tbHeadsRequested(), sac.tbHeadsUsed(), sac.tbHeadsAllocated(),
+                    sac.tbHeadDim(), sac.tbAttentionElements());
+        std::printf("SAC+AZ  : state=%d action=%d  专家=%d topK=%d  唯一参数量=%lld\n",
                     SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM,
-                    sac.moeExpertCount(), sac.moeTopK(), sac.actor.paramCount());
+                    sac.moeExpertCount(), sac.moeTopK(), sac.uniqueParamCount());
         std::printf("AB      : 深度 %d\n", g_cfg.depth);
         std::printf("规则    : %d 局 (交换先后手), 每局最多 %d 手, 随机开局 %d 步, seed=%u\n",
                     g_cfg.games, g_cfg.maxPlies, g_cfg.openingPlies, g_cfg.seed);
-        std::printf("构建耗时: %.1f s (五个 TB 专家网络)\n", (tBuild1 - tBuild0) / 1000.0);
+        std::printf("构建耗时: %.1f s\n", (tBuild1 - tBuild0) / 1000.0);
     }
 
     bool loaded = true;

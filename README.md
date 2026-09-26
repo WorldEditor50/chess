@@ -187,9 +187,9 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
 | **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节；每次真实决策还会**从自己的搜索学一次**（不依赖"探索+预训练"勾选框） | 256 次模拟，约 12 ms |
-| **SAC+AZ (稀疏MoE+TB专家)** | 同上，骨干换成**稀疏路由 MoE + TransformerBlock 专家** | 16 次模拟，约 160 ms |
+| **SAC+AZ (稀疏MoE+TB专家)** | 同上，骨干换成**稀疏路由 MoE + TransformerBlock 专家**。**[2026-09 dev-sacmoetb] 结构改成"共享骨干 + 三头"**（一份骨干 + 策略/Q1/Q2 三个头，而不是五张各背一套骨干的网），并且修掉了 TB 专家"请求 15 个头却只跑 3 个"的静默降级 —— 每样本训练代价 1/3.59、每模拟搜索代价 1/5.0、参数量 1/2.50，**π/Q/V 数值逐位不变**。权重文件因此换前缀（`weights/sacaz_shared_agent*`，4 个文件），旧权重载不进来 | 40 次模拟，约 160 ms |
 | **SAC+AZ (59e5233 行为还原版)** | 口径回到提交 `59e5233`：目标熵 0.98 / α 学习率 1e-3 / critic 不钳位且纯 MSE / 叶子全量估值。**独立的类** `SACAZLegacyAgent`（不继承 `SACAZAgent`），**权重文件独立**（`weights/sacaz_old_agent*`） | 256 次模拟，约 12 ms |
-| **SAC+AZ (59e5233 还原版, 稀疏MoE+TB专家)** | 同一支还原版的**另一个骨干**：同一个类、同一套 59e5233 口径，骨干换成**稀疏路由 MoE + TransformerBlock 专家**（与 SAC+AZ (稀疏MoE+TB专家) 同骨干）—— 用来把"骨干"与"口径"两个变量分开比 | 16 次模拟，约 160 ms |
+| **SAC+AZ (59e5233 还原版, 稀疏MoE+TB专家)** | 同一支还原版的**另一个骨干**：同一个类、同一套 59e5233 口径，骨干换成**稀疏路由 MoE + TransformerBlock 专家**（与 SAC+AZ (稀疏MoE+TB专家) 同骨干，但**不**继承上面那两条结构修复 —— 行为还原版必须逐位复现历史）—— 用来把"骨干"与"口径"两个变量分开比 | 16 次模拟，约 160 ms |
 
 > **"只换骨干"的三个配对**（PPO+MCTS 的 MLP/TB 专家、SAC+AZ 的 MLP/TB 专家、
 > SAC+AZ-59e5233 的 MLP/TB 专家）刻意共用同一个类与同一份搜索/训练/自检代码，构造时传
@@ -202,7 +202,10 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 > 目的是让前者的默认值/实现改动渗不进还原版），差别在口径。两者的**参数结构完全相同**
 > ⇒ 结构指纹**挡不住**串权重，所以隔离只能靠 ① 不同的类、② 不同的文件名
 > （`weights/sacaz_agent*` vs `weights/sacaz_old_agent*`；还原版的 TB 专家骨干那一支是
-> `weights/sacaz_old_moe_agent*`），并由 `test_match` [2.11]（文件名清单不同）与
+> `weights/sacaz_old_moe_agent*`；**[2026-09 dev-sacmoetb]** 改成共享骨干口径的
+> SAC+AZ-MoE 是 `weights/sacaz_shared_agent*` —— 它写 **4** 个文件
+> `_trunk/_actorhead/_q1head/_q2head`，与前面几支的 3 文件格式**语义都不同**，
+> 所以必须独立前缀，旧权重也载不进这一支），并由 `test_match` [2.11]（文件名清单不同）与
 > `test_sacaz` [14]（口径、以及"那一批开关连成员都没有"的探针）钉住。口径差异的完整表在
 > `src/sacazlegacyagent.h`，排查记录在 `docs/sac_regression_2026_09.md`。
 
@@ -491,6 +494,8 @@ chess/
 | [`docs/sac_regression_2026_09.md`](docs/sac_regression_2026_09.md) | **SAC 与 59e5233 的回归排查**：根因（隐层激活被换成 `TanhNorm<Sigmoid>`，-26 点）、等价性证明（逐手相同 + 黄金基准）、§7 方法学（评测器不可复现等） |
 | [`docs/sac_learn_reward_2026_09.md`](docs/sac_learn_reward_2026_09.md) | **"SAC 边下边学"的实测复核**：用户两份 CSV 的两个口径陷阱、奖励塑形实验（含"最终棋子数"为什么在即时奖励上不可实现）、**§9 训练为什么有害 + α 口径定位（37.5%→82.5%）** |
 | [`docs/session_2026_09_sac.md`](docs/session_2026_09_sac.md) | **本轮会话交接件**：P1~P13 问题清单（现象/根因/证据/状态）、①~⑩ 优化清单（依据与效果）、**四项待验证清单（含命令与验收标准）**、方法学教训 |
+| [`docs/dev_sacmoetb_2026_09.md`](docs/dev_sacmoetb_2026_09.md) | **分支 `dev-sacmoetb`：TB 专家骨干的结构/收敛/棋力优化** —— ① TB 专家"请求 15 个头却只跑 3 个"的静默降级（`STATE_DIM = 1263 = 3 x 421`）与修法；② "五张网各背一套骨干" → 共享骨干 + 三头；实测每样本训练 3.59x、每模拟搜索 4.99x、参数量 2.50x，**π/Q/V 逐位不变**；权重前缀/默认值的兼容性表。**§2.5 单独回答三个"为什么"**（独立骨干为什么难训练 / 共享骨干为什么有效 / 共享的 8 条代价与副作用），每条都标了【实测】/【本工程已记录的实测】/【推理】/【未测】；§6 列**本轮明确没有得出的棋力结论** |
+| [`docs/dev_sacmoetb_architecture.md`](docs/dev_sacmoetb_architecture.md) | **上面那一轮的架构图**：8 张 ASCII 图 —— 改动前（5 张独立网）与改动后（共享骨干 + 三头）的整网结构、`SparseMoE` 与 `TransformerBlock` 专家内部、头数被静默降级的机制、一次 MCTS 叶子估值的前向次数、一个训练样本的梯度流、两个口径的权重文件布局、一次决策的调用总览 |
 
 ---
 
@@ -502,6 +507,10 @@ chess/
    Alpha-Beta 在十几手内将死。这个工程的价值在**链路完整、可训练、可测量**，不在棋力。
 2. **稀疏 MoE 没有棋力结论**。等参数下稀疏路由确实快 3.85 倍（42.0 → 10.4 ms/模拟），
    但 A/B/C/D 等时对弈**全是和棋**（参赛者都是随机权重），所以只能说"机制通了、能赢棋了"。
+   **[2026-09 dev-sacmoetb]** 这条路径上的两个结构缺陷已经修掉（TB 专家的头数被静默降级 +
+   五张网各背一套骨干），每样本/每模拟的代价各降 3.59x / 4.99x，参数量降 2.50x，
+   而且**数值逐位不变** —— 但**棋力结论仍然没有**，本轮一次对局 A/B 都没跑。
+   完整实测与"本轮没有得出什么"见 `docs/dev_sacmoetb_2026_09.md`。
 3. **`bench_moe` 的对局样本太小**（每配置几局），单局偶然性足以翻转结论 —— 文档里标明了
    哪些结论能下、哪些不能下。
 4. **反向 GEMV 没有 SIMD**（`kikj`），训练步的成本几乎没被优化到，见 issues_review C8。
@@ -512,7 +521,13 @@ chess/
    走不到那条路径，但一旦改成多样本批量就是静默丢梯度的坑，见 issues_review C7。
 7. 训练量不足以谈棋力：本机实测 `learnBatch(32)` 在 28.7 M 参数的骨干上要约 0.9 s，
    "每个参数喂一个样本"这种极度乐观的预算下也要 10⁹ 秒量级，见
-   `docs/xiangqi_capacity.md`。
+   `docs/xiangqi_capacity.md`。**[2026-09 dev-sacmoetb]** 同一台机器上实测
+   `learnBatch(4)` 从 835.0 ms 降到 232.7 ms（3.59x）、`selectMove` 从 20.05 降到
+   4.02 ms/模拟（4.99x）—— 量级没变，但那一节里的墙钟估计要按 3.6 倍重算。
+8. **TB 专家的反向没有被这一轮优化到**：`ScaledDotProduct::backward` 里有一项
+   `~6 x d_model²`（qkv 的权重梯度 + 对输入的梯度）与头数无关，所以"头数口径"这条修复
+   在前向上拿到 3.07x、在反向+前向上只有 2.15x。这是下一轮最大的单点收益，见
+   `docs/dev_sacmoetb_2026_09.md` §7。
 
 ---
 

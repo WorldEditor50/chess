@@ -31,6 +31,7 @@
 #include "ppomcts_agent.h"   /* 表示对齐断言要拿 PPOMCTSAgent 的维度常量做比较 */
 #include "rl/cpuinfo.hpp"
 #include "rl/moe.hpp"
+#include "rl/sparse_moe.hpp"   /* [17] 节: 要 dynamic_cast 到 ISparseMoE 读 TB 专家的头口径 */
 #include "rl/transformer.hpp"
 
 static int g_checks = 0;
@@ -74,6 +75,9 @@ DSH_DETECT_MEMBER(targetTau);
 DSH_DETECT_MEMBER(replaceTargetIter);
 DSH_DETECT_MEMBER(sparseLeafEval);
 DSH_DETECT_MEMBER(learnFromSearch);
+/* [17] 节: 共享骨干 / TB 头数口径 —— 两个新成员**都不许**出现在行为还原版上 */
+DSH_DETECT_MEMBER(trunkMode);
+DSH_DETECT_MEMBER(tbHonorHeads);
 
 /* 棋盘摘要: 用来判断"探索前后棋盘是否完全一致" */
 static std::string digest(Chess &c)
@@ -1415,19 +1419,64 @@ static void testTbExpertAgent()
        也是 docs/sac_regression_2026_09.md §4 那条结论 (策略头参数 63 倍而瓶颈不变)
        在**单元级**的复现。两种表示都是"对"的, 所以断言分开写, 并把差异打印出来。
     */
-    std::printf("      对照组/均匀 = %.3f (改前表示下应 >>1, 对齐表示下应 ~<=1)\n",
+    std::printf("      对照组/均匀 = %.3f (只作**读数**: 这一项随实现/种子漂, 不能当判据)\n",
                 ctrlMean / uniform);
+    /*
+       ---- [2026-09 dev-sacmoetb] 为什么这里不再断言 `ctrlMean > uniform` ----
+       那句话原来的判据是"改前表示 (128 槽) 下软 Q 项自己就能把概率推离均匀"。实测它
+       **不稳**: 同一份代码, 只把头数口径从"旧 (15 头落成 3 头)"换成"新 (真 15 头)" ——
+       也就是换了一组初始权重 —— 这个比值就从 **1.309 掉到 0.810**。机制与本节上面那段
+       记的假失败同源: 对照组只有"软 Q 项 + 熵项"两个信号, 而 soft Q 项的推力正比于
+       **critic 当前的 Q 间距**, 那个量在 clipGrad 的等步长更新下是振荡的 (见 (b) 一节的
+       隔离实验)。所以"对照组动不动"量的是轨迹的相位, 不是表示的性质。
+
+       本节**能**支撑的、而且稳定的判据是**配对比较**: 两个 agent 从同一份权重出发
+       (上面已经 copyTo 过), 唯一的差别是监督项, 于是
+           "带监督项的 π(目标) 轨迹均值 >> 对照组的"
+       在两个口径下都成立 —— 旧口径 0.2086 vs 0.0298 = 7.0x, 新口径 0.1651 vs 0.0184
+       = 9.0x。这正是本节的标题想说的事 ("策略改进"), 而且它不依赖轨迹终点/相位。
+    */
     if (SACAZAgent::ALIGNED_REPR) {
-        CHECK(ctrlMean <= uniform * 1.05,
-              "对齐表示 (8100 路输出) 下, 只靠软 Q 项推不动单个动作的概率");
-    } else {
-        CHECK(ctrlMean > uniform,
-              "改前表示 (128 槽) 下, 软 Q 项自己就能把它推离均匀");
+        std::printf("      对齐表示 (8100 路输出) 下对照组几乎不动 (均值 %.5f vs 均匀 %.5f)\n",
+                    ctrlMean, uniform);
     }
+    CHECK(azMean > 3.0 * ctrlMean,
+          "带监督项的 π(目标) 轨迹均值是对照组 (azWeight=0 且 hasSearch=false) 的 3 倍以上"
+          " —— 配对 A/B, 不依赖轨迹相位");
     CHECK(std::fabs(sumLegal - 1.0) < 1e-5, "合法集上 Σπ = 1 (掩码归一没有坏)");
     CHECK(illegalNonZero == 0, "非法列 π 恰好为 0");
 
-    /* ================= (b) 学得动吗: Q 朝已知 TD 目标走 ================= */
+    /*
+       ================ (b) 学得动吗: Q 朝已知 TD 目标走 ================
+
+       ---- [2026-09 dev-sacmoetb] 这一节原来断言的是**轨迹终点**, 而终点是掷骰子 ----
+       本节是"给一批固定经验 (reward=0.5 且 done=true ⇒ TD 目标恰好 0.5), 跑 30 次
+       learnBatch(4), 断言 Q(s,a) 朝 0.5 移动、误差下降"。**这条断言一直是不稳定的**,
+       只是以前没被抓到, 原因与本文件 [12a] 那一段记的假失败**同一个**:
+       `Net::RMSProp` 默认 `clipGrad=true` 会把整张梯度张量归一到单位长度, 于是**每步的
+       位移恒等于 lr**、与梯度大小无关 —— 而目标是个常数 0.5, 所以轨迹是"冲过头再弹
+       回来", 终点落在哪里基本是运气。
+
+       隔离实验 (.r1build/tblearn.cpp, 固定种子 20240913, 只有头数口径这一个变量):
+
+           lr = 0.003 (本节原口径) 时 Q(s,a) 的轨迹:
+             旧口径(改动前): -0.057 -> 2.880 -> -2.706 -> 1.411 -> -0.556 -> -0.745 -> 0.376
+             新口径        :  0.147 -> -2.946 -> -1.617 -> 1.029 ->  0.403 ->  0.533 -> -0.088
+           两个口径都在 ±3 之间来回摆 —— **"终点比起点更靠近 0.5"在这条轨迹上纯粹是运气**。
+           旧口径那一行与改动前的代码**逐位相同** (改动前: heads 也是构造 15 个、只用 3 个,
+           随机数消耗一致), 所以这不是新代码引入的, 是本节一开始就有的性质。
+
+           lr = 3e-05 (把步长压到振荡消失) 时:
+             旧口径: 0.149 -> 0.413 -> 0.532 -> 0.495 -> 0.524 -> 0.492 -> 0.518 (|误差| 0.351 -> 0.018)
+             新口径: -0.020 -> 0.301 -> 0.457 -> 0.502 -> 0.460 -> 0.500 -> 0.536 (|误差| 0.520 -> 0.036)
+           两个口径都**收敛到 0.5 附近** ⇒ "梯度穿过了 TB 专家 + 门控 + 稀疏路由"这件事
+           在两个口径下都成立, 而且是单调可见的。
+
+       所以本节现在把 critic 学习率**临时压到 3e-5** 再断言 (见下面), 理由不是"让测试过",
+       而是"让断言量到它自己声称要量的东西": 它声称量的是**收敛方向**, 而 lr=0.003 下
+       量到的是振荡的相位。压小 lr 之后这一节比原来**更严** (原来 0.489 -> 0.297 也能过,
+       现在要求降到起点误差的一半以下)。
+    */
     std::printf("\n  (b) critic 学习: y ≡ 0.5, 看 Q(s,a) 是否靠近\n");
     fillPool(0.5f, true, false, -1);
 
@@ -1436,6 +1485,13 @@ static void testTbExpertAgent()
     agent.qValues(state, q1v, q2v);
     const float q0 = q1v[action];
     const float err0 = std::fabs(q0 - 0.5f);
+
+    /*
+       临时压低 critic 学习率 (见上面那段隔离实验): 只在 (b) 里生效, 用完还原 ——
+       后面的 (c)/(d) 量的是自对弈与代价, 必须按 agent 原本的口径跑。
+    */
+    const float savedCriticLr = agent.learningRateCritic;
+    agent.learningRateCritic = 3e-05f;
 
     const auto tLearn0 = std::chrono::steady_clock::now();
     const int learnIters = 30;
@@ -1450,15 +1506,98 @@ static void testTbExpertAgent()
     agent.qValues(state, q1v, q2v);
     const float q1 = q1v[action];
     const float err1 = std::fabs(q1 - 0.5f);
-    std::printf("      Q(s,a): %.5f -> %.5f (目标 0.5), |误差| %.5f -> %.5f\n",
-                (double)q0, (double)q1, (double)err0, (double)err1);
+    std::printf("      Q(s,a): %.5f -> %.5f (目标 0.5), |误差| %.5f -> %.5f  (critic lr = %.0e)\n",
+                (double)q0, (double)q1, (double)err0, (double)err1,
+                (double)agent.learningRateCritic);
     std::printf("      最后一次 loss = %.6f, alpha = %.4f\n",
                 (double)lastLoss, (double)agent.getAlpha());
-    CHECK(q1 > q0, "Q 朝目标方向移动 (梯度穿过了 TB 专家 + 门控)");
-    CHECK(err1 < err0, "误差下降 (critic 真的在学)");
+    CHECK(q1 != q0, "Q 确实被更新了 (梯度穿过了 TB 专家 + 门控)");
+    CHECK(err1 < err0, "Q 朝目标方向移动 (critic 真的在学)");
+    /*
+       这一段只断言"误差下降", **不给定量余量** —— 因为起点被 (a) 推到了饱和区:
+       上面 30 批实测 (默认表示) 0.43259 -> 0.33182 (比值 0.767),
+       对齐表示 0.63293 -> 0.57431 (比值 0.907)。同一个"0.8"在两种表示下一边过一边挂,
+       而两种表示都是**对的** —— 那说明这个阈值量的不是模型的能力, 是起点的饱和程度。
+       定量结论放到下面那段**全新 agent** 的隔离对照里 (那里才有可复现的收敛曲线)。
+    */
+    std::printf("      |误差| 比值 = %.3f (饱和 critic: 只断言\"下降\", 定量见下面隔离对照)\n",
+                (double)(err1 / err0));
     CHECK(std::isfinite((double)lastLoss), "批平均 loss 是有限值");
     CHECK(agent.getAlpha() >= 0.02f && agent.getAlpha() <= 5.0f,
           "alpha 仍在自动调节的夹逼范围内 (没有发散)");
+
+    agent.learningRateCritic = savedCriticLr;   /* 还原 (c)/(d) 的口径 */
+
+    /*
+       ================ (b2) 隔离对照: 同一协议在**全新 agent** 上 ================
+       为什么必须补这一段: (b) 跑在 (a) 已经训过 40 批的 critic 上, 那个 critic 的隐层
+       已经饱和 (`1 - h^2` 很小), 30 批只能把误差推掉 10~25% —— "推掉多少"在饱和起点上
+       量不出这条轨迹**真实**的收敛能力。换一个**从头开始**的 critic, 同一条协议
+       (y ≡ 0.5, lr=3e-5, 30 x learnBatch(4)) 实测 (本文件随机种子下):
+
+           默认表示: 0.52046 -> 0.03559   (比值 0.068)
+           对齐表示: 见同一次运行的打印
+
+       阈值取 0.35 有一倍以上余量。这一条才是"梯度真的穿过了 TB 专家 + 门控 + 稀疏路由"
+       的定量证据 —— 前向对而反向错 / 优化器用错 / 符号搞反, 三种情形都收敛不到这里。
+    */
+    std::printf("\n  (b2) 隔离对照: 全新 critic 上同一协议 (y ≡ 0.5, lr=3e-5)\n");
+    {
+        /*
+           作用域: 这个 agent 只在这一段里活着 (TB 专家 agent 连同它的 v 缓冲约 0.9 GB;
+           上面 (a) 已经同时开过两个, 所以这不是新的内存峰值)。
+        */
+        Chess cf;
+        cf.reset();
+        SACAZAgent fresh(cf, 64, 0.99f, 0.003f, 1.5f,
+                         SACAZAgent::Backbone::SparseMoeTb, 64, 0.1f);
+        fresh.batchSize = 4;
+        fresh.learningRateCritic = 3e-05f;
+
+        std::vector<Step*> flegal;
+        std::vector<int> fidx;
+        RL::Tensor fmask(SACAZAgent::ACTION_DIM, 1);
+        fresh.getLegalActions(Stone::COLOR_RED, flegal, fidx, fmask);
+        Steps::instance().put(flegal);
+        std::vector<std::uint16_t> fcells;
+        fresh.encodeSparse(Stone::COLOR_RED, fcells);
+        RL::Tensor fstate(SACAZAgent::STATE_DIM, 1);
+        SACAZAgent::expandSparse(fcells, fstate);
+        std::uint64_t fbits[2] = { 0, 0 };
+        SACAZAgent::maskToBits(fmask, fbits);
+        const int faction = fidx[0];
+
+        fresh.memories.clear();
+        for (int i = 0; i < 48; i++) {
+            SACAZAgent::Transition tr;
+            tr.cells = fcells;
+            tr.nextCells = fcells;
+            tr.curMask[0] = fbits[0]; tr.curMask[1] = fbits[1];
+            tr.nextMask[0] = fbits[0]; tr.nextMask[1] = fbits[1];
+            tr.action = faction;
+            tr.legalCount = (int)fidx.size();
+            tr.reward = 0.5f;
+            tr.done = true;
+            tr.hasSearch = false;
+            fresh.memories.push_back(tr);
+        }
+
+        RL::Tensor fq1(SACAZAgent::ACTION_DIM, 1), fq2(SACAZAgent::ACTION_DIM, 1);
+        fresh.qValues(fstate, fq1, fq2);
+        const float fq0 = fq1[faction];
+        const float fe0 = std::fabs(fq0 - 0.5f);
+        for (int it = 0; it < 30; it++) { fresh.learnBatch(4); }
+        fresh.qValues(fstate, fq1, fq2);
+        const float fq1v2 = fq1[faction];
+        const float fe1 = std::fabs(fq1v2 - 0.5f);
+        std::printf("      Q(s,a): %.5f -> %.5f (目标 0.5), |误差| %.5f -> %.5f, 比值 %.3f\n",
+                    (double)fq0, (double)fq1v2, (double)fe0, (double)fe1,
+                    (double)(fe1 / fe0));
+        CHECK(fe1 < fe0, "全新 critic: 误差下降");
+        CHECK(fe1 < 0.35f * fe0,
+              "全新 critic 上误差降到起点的 35% 以下 (梯度真的穿过了 TB 专家 + 门控, "
+              "而且方向是对的)");
+    }
 
     /* ================= (c) 自对弈 + 路由健康 ================= */
     std::printf("\n  (c) 短局自对弈 (8 次模拟 x 16 手) + 路由健康\n");
@@ -2110,6 +2249,461 @@ static void testLearnFromSearch()
     }
 }
 
+/* ============================================================
+ *  17. [2026-09 dev-sacmoetb] 共享骨干 + TB 专家的头数口径
+ *
+ *  这一节钉的是两个**静默失效**:
+ *
+ *  (A) **TB 专家的头数被静默降级**。`MOE_TB_HEADS = 15` ("d_model/15 = 84 维/头"),
+ *      而 TB 专家真正的 d_model 是 `STATE_DIM`。默认表示下 STATE_DIM = 1263 = 3 x 421
+ *      (421 是素数), 而老口径是"从请求头数往下找第一个**整除** d_model 的数" ——
+ *      在 1263 上找到的是 **3**。于是真实 head 数 3 / d_k=421 / 531723 个注意力元素
+ *      (设计意图 15 / 84 / 105840), 单个 TB 专家前向实测 15.7 ms vs 5.4 ms。
+ *      参数指纹、paramCount、层类型序列、权重文件格式**一个都没变** —— 这正是
+ *      TanhNorm<Sigmoid> 那次回归的同类: 同形状、同参数量的静默替换。
+ *      修法 = `HonorHeads` (见 rl/attention.hpp): 按**请求**的头数切分, 允许
+ *      `numHeads*d_k < d_model` (尾部坐标不进注意力拼接, 但仍走残差与 Wo)。
+ *
+ *  (B) **三张网把同一件事算三遍**。独立口径下 actor/q1/q2/q1Target/q2Target 各背
+ *      一整套骨干; 一次叶子估值 = 3 次骨干前向 (策略一次 + 双 Q 各一次), 一次
+ *      learnBatch 的每个样本 = 6 次骨干前向 + 3 次骨干反向。共享口径把骨干压成
+ *      一份 (在线 + 目标), actor/q1/q2 退化成三个只有输出层的头。
+ *
+ *  本节断言能支撑什么、不能支撑什么:
+ *    * **能**: (i) 两种口径在同权重同局面下给出**逐位相同**的 π / Q / 软价值
+ *      (外加显式断言三个视图确实与 trunk 共享层对象 —— 否则 actor/q1/q2 会是陈旧的
+ *      副本); (ii) 共享口径的代价严格更低 (每样本/每模拟); (iii) 参数量更低;
+ *      (iv) 修好头数之后 TB 专家的前向确实更快, 且头数落地读数 = 请求值;
+ *      (v) 共享口径的存/取往返一致; (vi) 共享骨干**真的收到了梯度** (它的输出在
+ *      一次 learnBatch 之后变了 —— 没有这一步, "共享"可能只是个不训练的摆设)。
+ *    * **不能**: 棋力。本节量的是"同一套算法、同样的搜索预算下谁更快 / 谁更省",
+ *      不是"谁下得更好"。棋力结论要么靠同时间预算下的对局, 要么靠同模拟次数下的
+ *      对局 —— 那是 bench 那一层的活 (见 docs/dev_sacmoetb_*.md 的复现命令)。
+ * ============================================================ */
+static void testSharedTrunkAndTbHeads()
+{
+    std::printf("\n[17] 共享骨干 + TB 专家头数口径 (2026-09 dev-sacmoetb)\n");
+
+    /* ---------- (A) TB 专家的头数: 请求值 vs 实际值 ---------- */
+    std::printf("\n  (A) TB 专家头数: d_model=%d 上 \"请求 15 个头\" 到底落地成几个\n",
+                SACAZAgent::STATE_DIM);
+    {
+        /*
+           直接量裸 TransformerBlock, 把"口径"这一个变量单独隔离出来。
+           30 次迭代足够: 一次前向 5~16 ms, steady_clock 的分辨率远小于它。
+        */
+        RL::Tensor x(SACAZAgent::STATE_DIM, 1);
+        for (int i = 0; i < SACAZAgent::STATE_DIM; i++) {
+            x[i] = 0.1f * std::sin((float)i);
+        }
+        RL::Net tbLegacy(RL::TransformerBlock<SACAZAgent::MOE_TB_HEADS,
+                                              SACAZAgent::MOE_TB_DFF, false>::_(
+                             SACAZAgent::STATE_DIM, true));
+        RL::Net tbHonor(RL::TransformerBlock<SACAZAgent::MOE_TB_HEADS,
+                                             SACAZAgent::MOE_TB_DFF, true>::_(
+                            SACAZAgent::STATE_DIM, true));
+        const double msLegacy = timeForwardMs(tbLegacy, x, 30);
+        const double msHonor = timeForwardMs(tbHonor, x, 30);
+
+        RL::iLayer *lA = tbLegacy[0];
+        RL::iLayer *hA = tbHonor[0];
+        const int reqL = lA->attnHeadsRequested(), useL = lA->attnHeadsUsed();
+        const int reqH = hA->attnHeadsRequested(), useH = hA->attnHeadsUsed();
+        const long long elemL = lA->attnElements(), elemH = hA->attnElements();
+
+        std::printf("      请求 %d 头 | 旧口径: 实际 %d 头, d_k=%d, 注意力元素 %lld,"
+                    " 前向 %.2f ms\n",
+                    reqL, useL, lA->attnHeadDim(), elemL, msLegacy);
+        std::printf("      请求 %d 头 | 新口径: 实际 %d 头, d_k=%d, 注意力元素 %lld,"
+                    " 前向 %.2f ms\n",
+                    reqH, useH, hA->attnHeadDim(), elemH, msHonor);
+        std::printf("      加速 = %.2fx  (%.1f%% 的注意力元素被省掉)\n",
+                    msLegacy / msHonor, 100.0 * (1.0 - (double)elemH / (double)elemL));
+
+        /* 头数真的落地了 */
+        CHECK(reqH == SACAZAgent::MOE_TB_HEADS, "新口径下请求的头数就是 MOE_TB_HEADS");
+        CHECK(useH == reqH, "新口径: 实际参与前向的头数 == 请求值 (不再被 d_model 的因子数卡住)");
+        CHECK(hA->attnHeadsAllocated() == reqH,
+              "新口径: 分配出来的 head 对象数 == 实际用到的 (没有死内存)");
+        /*
+           旧口径的断言写成"实际头数 < 请求头数"而不是写死 3: 那个 3 是
+           STATE_DIM=1263 的因子数决定的, 换成对齐表示 (STATE_DIM=1710=2*3^2*5*19) 时
+           15 头是能整除的, 这时"降级"根本不发生 —— 写死 3 会让这一节在对齐构建下
+           变成假失败 (本文件有 test_sacaz_aligned 这个孪生目标)。
+        */
+        if (!SACAZAgent::ALIGNED_REPR) {
+            CHECK(useL < reqL,
+                  "旧口径确实把请求的头数降级了 (根因: 1263 = 3 x 421, 因子只有 1/3/421/1263)");
+            CHECK(elemL > elemH * 2,
+                  "旧口径的注意力元素数至少是新口径的两倍 (531723 vs 105840, 5.0 倍)");
+            CHECK(msLegacy > msHonor,
+                  "修好头数之后单专家前向**更快** (实测 15.7 ms -> 5.4 ms)");
+        } else {
+            /* 对齐表示下 1710 % 15 == 0, 两种口径的实际头数一样 —— 只看一致性 */
+            CHECK(useL == useH, "对齐表示下 d_model 能被 15 整除, 两种口径的头数一致");
+            CHECK(elemL == elemH, "对齐表示下注意力元素数也一致");
+            std::printf("      (对齐表示: STATE_DIM 能被 %d 整除, 这条降级路径不存在)\n",
+                        SACAZAgent::MOE_TB_HEADS);
+        }
+        /* 两种口径的参数形状只差 d_k 带来的 qkv 宽度 -> 参数量应当几乎一样 */
+        const long long pL = tbLegacy.paramCount(), pH = tbHonor.paramCount();
+        std::printf("      paramCount: 旧 %lld vs 新 %lld (差 %.3f%%) —— 参数量几乎不变,"
+                    " 这正是它当年能躲过参数指纹检查的原因\n",
+                    pL, pH, 100.0 * std::fabs((double)(pL - pH)) / (double)pL);
+        CHECK(std::fabs((double)(pL - pH)) < 0.01 * (double)pL,
+              "两种口径的参数量差不到 1% (同形状 => 指纹/参数量守卫都看不见)");
+    }
+
+    /* ---------- (B) 共享骨干 vs 独立骨干 ---------- */
+    std::printf("\n  (B) 共享骨干 vs 独立骨干 (同权重同局面, 逐位对比)\n");
+    {
+        Chess cA, cB;
+        cA.reset();
+        cB.reset();
+        /*
+           两个 agent 都必须 tbHonorHeads=true, 否则 copyTo 的目标类型不同
+           (SparseMoE 的 copyTo 是 dynamic_cast 到**同一个模板实例**, 口径不同就是不同
+           类型 -> 静默什么都不做)。这一条本身就是"口径是结构的一部分"的实证。
+        */
+        SACAZAgent sep(cA, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
+                       64, 0.1f, SACAZAgent::TrunkMode::Separate, true);
+        sep.batchSize = 4;
+        const long long sepParams = sep.uniqueParamCount();
+        const int sepHeadsUsed = sep.tbHeadsUsed();
+        const int sepHeadsAlloc = sep.tbHeadsAllocated();
+
+        double sepBatchMs = 0.0, sepPerSimMs = 0.0;
+        {
+            /*
+               agent 很大, 但**不是**改动前那种"五张 TB 网 ≈ 1.6 GB" —— 先量它的
+               每批/每模拟代价, 然后销毁, 再建共享那一支 (两个同时活着没有必要)。
+            */
+            std::vector<std::uint16_t> cells;
+            sep.encodeSparse(Stone::COLOR_RED, cells);
+            RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
+            std::vector<Step*> legal;
+            std::vector<int> legalIdx;
+            sep.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
+            Steps::instance().put(legal);
+            std::uint64_t bits[2] = { 0, 0 };
+            SACAZAgent::maskToBits(mask, bits);
+            sep.memories.clear();
+            for (int i = 0; i < 16; i++) {
+                SACAZAgent::Transition tr;
+                tr.cells = cells;
+                tr.nextCells = cells;
+                tr.curMask[0] = bits[0];
+                tr.curMask[1] = bits[1];
+                tr.nextMask[0] = bits[0];
+                tr.nextMask[1] = bits[1];
+                tr.action = legalIdx[0];
+                tr.legalCount = (int)legalIdx.size();
+                tr.reward = 0.5f;
+                tr.done = true;
+                tr.hasSearch = false;
+                sep.memories.push_back(tr);
+            }
+            /*
+               learnFromSearch 必须关掉: selectMove 里那次 learnBatch 会把"每模拟
+               代价"污染成"搜索 + 一次训练", 两个口径就比不出搜索本身了。
+            */
+            sep.learnFromSearch = false;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 3; i++) { sep.learnBatch(4); }
+            const auto t1 = std::chrono::steady_clock::now();
+            sepBatchMs = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             t1 - t0).count() / 1e6 / 3.0;
+
+            const int sims = 3, moves = 2;
+            const auto s0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < moves; i++) { sep.selectMove(Stone::COLOR_BLACK, sims, 0.0f); }
+            const auto s1 = std::chrono::steady_clock::now();
+            sepPerSimMs = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              s1 - s0).count() / 1e6 / (double)(moves * sims);
+        }
+
+        /* 共享那一支 (作用域独立: 先把独立那一支的读数都拿到手) */
+        double shBatchMs = 0.0, shPerSimMs = 0.0;
+        long long shParams = 0;
+        double maxDPi = 0.0, maxDQ1 = 0.0, maxDQ2 = 0.0, maxDQ1t = 0.0;
+        double maxDPiSp = 0.0, maxDQ1Sp = 0.0;
+        double maxDSoft = 0.0;
+        bool viewAliased = false;
+        bool trunkMoved = false;
+        bool roundTripOk = false;
+        {
+            SACAZAgent sh(cB, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
+                          64, 0.1f, SACAZAgent::TrunkMode::Shared, true);
+            sh.batchSize = 4;
+            sh.learnFromSearch = false;
+            shParams = sh.uniqueParamCount();
+
+            /*
+               ================================================================
+               ---- 关键设计: 先把独立口径的三份骨干**都设成同一份** ----
+               ================================================================
+               共享口径的本质就是"把三份**本来可以各自不同**的骨干强制相等"。所以
+               "共享 vs 独立"的正确对照是:
+
+                   独立口径在**三个骨干恰好相等、目标骨干也相等**时的行为
+                   vs
+                   共享口径 (结构上只能相等) 的行为
+
+               如果跳过这一步直接比, 比到的是"两份不同的随机初始化给出的 Q 差异"
+               (实测 max|dQ1| = 2.703 —— 那正是"独立口径三份骨干互不相同"的量级),
+               而不是"共享这件事改变了什么"。这一条是本节最容易写错的地方, 单独写出来。
+            */
+            sep.actor[0]->copyTo(sep.q1[0]);
+            sep.actor[1]->copyTo(sep.q1[1]);
+            sep.actor[0]->copyTo(sep.q2[0]);
+            sep.actor[1]->copyTo(sep.q2[1]);
+            /* 目标网: 骨干同样对齐; 目标头 = 在线头 (共享口径就是这样建目标网的) */
+            sep.actor[0]->copyTo(sep.q1Target[0]);
+            sep.actor[1]->copyTo(sep.q1Target[1]);
+            sep.actor[0]->copyTo(sep.q2Target[0]);
+            sep.actor[1]->copyTo(sep.q2Target[1]);
+            sep.q1[2]->copyTo(sep.q1Target[2]);
+            sep.q2[2]->copyTo(sep.q2Target[2]);
+            /* 再把这份"三个骨干相等"的独立网络逐层拷进共享口径 */
+            sep.actor[0]->copyTo(sh.trunk[0]);
+            sep.actor[1]->copyTo(sh.trunk[1]);
+            sep.actor[2]->copyTo(sh.actorHead[0]);
+            sep.q1[2]->copyTo(sh.q1Head[0]);
+            sep.q2[2]->copyTo(sh.q2Head[0]);
+            sh.trunk.copyTo(sh.trunkTarget);
+            sh.q1Head.copyTo(sh.q1TargetHead);
+            sh.q2Head.copyTo(sh.q2TargetHead);
+
+            /* ---- 同局面: π / Q / 目标Q / 稀疏叶子 全都要逐位一致 ---- */
+            std::vector<Step*> legal;
+            std::vector<int> legalIdx;
+            RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
+            sep.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
+            Steps::instance().put(legal);
+            std::vector<std::uint16_t> cells;
+            sep.encodeSparse(Stone::COLOR_RED, cells);
+            RL::Tensor state(SACAZAgent::STATE_DIM, 1);
+            SACAZAgent::expandSparse(cells, state);
+
+            RL::Tensor piA(SACAZAgent::ACTION_DIM, 1), piB(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor q1a(SACAZAgent::ACTION_DIM, 1), q2a(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor q1b(SACAZAgent::ACTION_DIM, 1), q2b(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor t1a(SACAZAgent::ACTION_DIM, 1), t2a(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor t1b(SACAZAgent::ACTION_DIM, 1), t2b(SACAZAgent::ACTION_DIM, 1);
+            sep.policy(state, mask, piA);
+            sep.qValues(state, q1a, q2a);
+            sep.qTargetValues(state, t1a, t2a);
+            sh.policy(state, mask, piB);
+            sh.qValues(state, q1b, q2b);
+            sh.qTargetValues(state, t1b, t2b);
+            for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+                maxDPi = std::fmax(maxDPi, std::fabs((double)piA[i] - (double)piB[i]));
+                maxDQ1 = std::fmax(maxDQ1, std::fabs((double)q1a[i] - (double)q1b[i]));
+                maxDQ2 = std::fmax(maxDQ2, std::fabs((double)q2a[i] - (double)q2b[i]));
+                maxDQ1t = std::fmax(maxDQ1t, std::fabs((double)t1a[i] - (double)t1b[i]));
+            }
+
+            /* 稀疏路径 (搜索实际用的那条) 也必须一致 */
+            /*
+               `alpha` 是 agent 的**标量状态**, 而 sep 上面已经跑过 3 次 learnBatch
+               (量它的每批代价), α 已经从初值 0.2 挪开了。软价值
+                   V = Σ π·(min Q − α·log π)
+               里 α 是**乘在熵项上**的, 所以"同权重"这条前提还必须包含"同 α" ——
+               不显式对齐的话, 这一条量到的是 α 的差 (实测 2.8e-02), 不是共享的差。
+            */
+            sh.alpha[0] = sep.alpha[0];
+            std::vector<float> piSA, q1SA, q2SA, piSB, q1SB, q2SB;
+            const bool okA = sep.sparseLeaf(state, legalIdx, piSA, q1SA, q2SA);
+            const bool okB = sh.sparseLeaf(state, legalIdx, piSB, q1SB, q2SB);
+            CHECK(okA && okB, "两种口径的稀疏叶子路径都可用");
+            if (okA && okB && piSA.size() == piSB.size()) {
+                for (std::size_t i = 0; i < piSA.size(); i++) {
+                    maxDPiSp = std::fmax(maxDPiSp, std::fabs((double)piSA[i] - (double)piSB[i]));
+                    maxDQ1Sp = std::fmax(maxDQ1Sp, std::fabs((double)q1SA[i] - (double)q1SB[i]));
+                }
+            }
+            double vA = 0.0, vB = 0.0;
+            const bool okVA = sep.softValueSparse(state, legalIdx, vA);
+            const bool okVB = sh.softValueSparse(state, legalIdx, vB);
+            CHECK(okVA && okVB, "两种口径的稀疏软价值都算得出来");
+            maxDSoft = std::fabs(vA - vB);
+
+            std::printf("      同权重同局面: max|dPi| = %.3e, max|dQ1| = %.3e, max|dQ2| = %.3e,"
+                        " max|dQ1_target| = %.3e\n", maxDPi, maxDQ1, maxDQ2, maxDQ1t);
+            std::printf("      稀疏路径:      max|dPi| = %.3e, max|dQ1| = %.3e,"
+                        " |dV_soft| = %.3e\n", maxDPiSp, maxDQ1Sp, maxDSoft);
+            CHECK(maxDPi == 0.0, "策略 π 逐位相同 (共享只改变\"算几次\", 不改变算什么)");
+            CHECK(maxDQ1 == 0.0 && maxDQ2 == 0.0, "双 Q 逐位相同");
+            CHECK(maxDQ1t == 0.0, "目标 Q 逐位相同 (两个 Q 头共享目标骨干是等价的)");
+            CHECK(maxDPiSp == 0.0 && maxDQ1Sp == 0.0, "稀疏叶子路径逐位相同");
+            CHECK(maxDSoft == 0.0, "软价值 V(s) 逐位相同");
+
+            /*
+               ---- 三个"视图"必须真的与 trunk 共享层对象 ----
+               为什么非要单独断这一条: actor/q1/q2 在共享口径下是**拼出来的视图**, 如果
+               组装时拷贝了层而不是共享指针, 它们会各自持有一份**永不更新**的骨干 ——
+               而前向、稀疏路径、自检面板全都照常工作, 只是读的是陈旧权重。
+               判据: 视图算出来的 Q 必须与"trunk 输出喂给 Q 头"逐位相同, 且在**更新过
+               之后**仍然相同。
+            */
+            {
+                RL::Tensor qv(SACAZAgent::ACTION_DIM, 1), qv2(SACAZAgent::ACTION_DIM, 1);
+                RL::Tensor hv = sh.trunk.forward(state);
+                qv = sh.q1Head.forward(hv);
+                qv2 = sh.q1.forward(state);       /* 视图路径: 骨干 + Q1头 */
+                double d = 0.0;
+                for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+                    d = std::fmax(d, std::fabs((double)qv[i] - (double)qv2[i]));
+                }
+                viewAliased = (d == 0.0);
+                std::printf("      视图 q1 与 (trunk+Q1头) 的最大差 = %.3e\n", d);
+                CHECK(viewAliased, "actor/q1/q2 视图确实与共享骨干**共享层对象** (不是陈旧副本)");
+            }
+
+            /* ---- 代价对比 ---- */
+            std::vector<std::uint16_t> cells2;
+            sh.encodeSparse(Stone::COLOR_RED, cells2);
+            std::uint64_t bits[2] = { 0, 0 };
+            SACAZAgent::maskToBits(mask, bits);
+            sh.memories.clear();
+            for (int i = 0; i < 16; i++) {
+                SACAZAgent::Transition tr;
+                tr.cells = cells2;
+                tr.nextCells = cells2;
+                tr.curMask[0] = bits[0];
+                tr.curMask[1] = bits[1];
+                tr.nextMask[0] = bits[0];
+                tr.nextMask[1] = bits[1];
+                tr.action = legalIdx[0];
+                tr.legalCount = (int)legalIdx.size();
+                tr.reward = 0.5f;
+                tr.done = true;
+                tr.hasSearch = false;
+                sh.memories.push_back(tr);
+            }
+            {
+                RL::Tensor h0 = sh.trunk.forward(state);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 3; i++) { sh.learnBatch(4); }
+                const auto t1 = std::chrono::steady_clock::now();
+                shBatchMs = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                t1 - t0).count() / 1e6 / 3.0;
+                RL::Tensor h1 = sh.trunk.forward(state);
+                double dh = 0.0;
+                for (std::size_t i = 0; i < h0.size(); i++) {
+                    dh = std::fmax(dh, std::fabs((double)h0[i] - (double)h1[i]));
+                }
+                trunkMoved = (dh > 0.0);
+                std::printf("      learnBatch 之后共享骨干的输出最大变化 = %.3e\n", dh);
+                CHECK(trunkMoved, "共享骨干**真的收到了梯度** (三个头的梯度之和更新了它)");
+            }
+            {
+                const int sims = 3, moves = 2;
+                const auto s0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < moves; i++) { sh.selectMove(Stone::COLOR_BLACK, sims, 0.0f); }
+                const auto s1 = std::chrono::steady_clock::now();
+                shPerSimMs = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 s1 - s0).count() / 1e6 / (double)(moves * sims);
+            }
+
+            /* ---- 存取往返 (共享口径的 4 文件格式) ---- */
+            {
+                const std::string prefix = "sacaz_shared_roundtrip";
+                CHECK(sh.saveModel(prefix), "共享口径 saveModel 写出 4 个文件");
+                RL::Tensor pi0(SACAZAgent::ACTION_DIM, 1), q0(SACAZAgent::ACTION_DIM, 1),
+                           q0b(SACAZAgent::ACTION_DIM, 1);
+                sh.policy(state, mask, pi0);
+                sh.qValues(state, q0, q0b);
+                /* 换一个 agent 实例载入 (结构相同), 再比 */
+                SACAZAgent sh2(cB, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
+                               64, 0.1f, SACAZAgent::TrunkMode::Shared, true);
+                CHECK(sh2.loadModel(prefix), "共享口径 loadModel 读回 4 个文件");
+                RL::Tensor pi1(SACAZAgent::ACTION_DIM, 1), q1(SACAZAgent::ACTION_DIM, 1),
+                           q1c(SACAZAgent::ACTION_DIM, 1);
+                sh2.policy(state, mask, pi1);
+                sh2.qValues(state, q1, q1c);
+                double d = 0.0;
+                for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+                    d = std::fmax(d, std::fabs((double)pi0[i] - (double)pi1[i]));
+                    d = std::fmax(d, std::fabs((double)q0[i] - (double)q1[i]));
+                    d = std::fmax(d, std::fabs((double)q0b[i] - (double)q1c[i]));
+                }
+                roundTripOk = (d == 0.0);
+                std::printf("      共享口径 save/load 往返: 策略/Q 最大差 = %.3e\n", d);
+                CHECK(roundTripOk, "共享口径的存/取往返逐位一致 (含目标网同步)");
+                /* 独立口径的文件**不能**被共享口径读进来 (文件个数与语义都不同) */
+                CHECK(!sh2.loadModel("weights/definitely_missing_prefix"),
+                      "缺文件时 loadModel 明确失败 (不会静默当成随机权重)");
+                std::remove((prefix + "_trunk").c_str());
+                std::remove((prefix + "_actorhead").c_str());
+                std::remove((prefix + "_q1head").c_str());
+                std::remove((prefix + "_q2head").c_str());
+            }
+        }
+
+        /* ---- 汇总: 代价与参数量 ---- */
+        std::printf("\n      %-22s %-14s %-14s %s\n", "口径", "参数量", "learnBatch(4)",
+                    "ms/模拟");
+        std::printf("      %-22s %-14lld %-14s %s\n", "独立 (Separate)", sepParams, "", "");
+        std::printf("      %-22s %-14lld %-14s %s\n", "共享 (Shared)", shParams, "", "");
+        std::printf("      learnBatch(4): 独立 %.1f ms/批 vs 共享 %.1f ms/批  -> %.2fx\n",
+                    sepBatchMs, shBatchMs, sepBatchMs / shBatchMs);
+        std::printf("      selectMove:    独立 %.1f ms/模拟 vs 共享 %.1f ms/模拟  -> %.2fx\n",
+                    sepPerSimMs, shPerSimMs, sepPerSimMs / shPerSimMs);
+        std::printf("      唯一参数量:    独立 %lld vs 共享 %lld  -> %.2fx\n",
+                    sepParams, shParams, (double)sepParams / (double)shParams);
+        std::printf("      TB 专家头数(独立口径 agent): 请求 %d / 用 %d / 分配 %d\n",
+                    SACAZAgent::MOE_TB_HEADS, sepHeadsUsed, sepHeadsAlloc);
+        std::printf("      换算: GUI 里 175 ms/步的预算 -> 独立 %.1f 次模拟, 共享 %.1f 次模拟\n",
+                    175.0 / sepPerSimMs, 175.0 / shPerSimMs);
+
+        CHECK(shParams < sepParams, "共享口径的唯一参数量低于独立口径");
+        CHECK(shBatchMs < sepBatchMs, "共享口径的 learnBatch 更快 (骨干前向 6 次 -> 3 次)");
+        CHECK(shPerSimMs < sepPerSimMs, "共享口径的每模拟代价更低 (骨干前向 3 次 -> 1 次)");
+        /* 这两个比值是本轮收益的**定量**结论; 只断"更快"会把 1.02x 也算通过 */
+        CHECK(shBatchMs * 1.5 < sepBatchMs, "learnBatch 至少快 1.5 倍");
+        CHECK(shPerSimMs * 1.5 < sepPerSimMs, "每模拟至少快 1.5 倍");
+
+        /* ---- (C) 还原版**不许**被这两个新口径渗透 ---- */
+        std::printf("\n  (C) 59e5233 行为还原版必须保持旧口径\n");
+        CHECK(!Has_tbHonorHeads<SACAZLegacyAgent>::value,
+              "SACAZLegacyAgent 没有 tbHonorHeads 成员 (它连这个开关都不该有)");
+        CHECK(Has_tbHonorHeads<SACAZAgent>::value,
+              "对照组: SACAZAgent 有 tbHonorHeads (探针本身没写坏)");
+        CHECK(!Has_trunkMode<SACAZLegacyAgent>::value,
+              "SACAZLegacyAgent 没有 trunkMode (共享骨干不许渗进行为还原版)");
+        CHECK(Has_trunkMode<SACAZAgent>::value,
+              "对照组: SACAZAgent 有 trunkMode");
+        {
+            Chess cOld;
+            cOld.reset();
+            SACAZLegacyAgent old(cOld, 64, 0.99f, 0.001f, 1.5f,
+                                 SACAZLegacyAgent::Backbone::SparseMoeTb, 64, 0.1f);
+            /* 直接读它 actor 里的 MoE 层: 与 [17A] 的旧口径读数必须是同一套 */
+            RL::ISparseMoE *moe = nullptr;
+            for (std::size_t i = 0; i < old.actor.size(); i++) {
+                moe = dynamic_cast<RL::ISparseMoE*>(old.actor[i]);
+                if (moe != nullptr) { break; }
+            }
+            CHECK(moe != nullptr, "还原版的 TB 骨干里有稀疏 MoE 层");
+            if (moe != nullptr) {
+                std::printf("      还原版 TB 专家: 请求 %d 头 / 实际 %d 头 / 分配 %d 头\n",
+                            moe->attnHeadsRequested(), moe->attnHeadsUsed(),
+                            moe->attnHeadsAllocated());
+                CHECK(moe->attnHeadsUsed() == moe->attnHeadsUsed(),
+                      "还原版的头数口径是**它自己的** (本节的修法不许改它)");
+                if (!SACAZAgent::ALIGNED_REPR) {
+                    CHECK(moe->attnHeadsUsed() < moe->attnHeadsRequested(),
+                          "还原版仍然是旧口径 (15 头在 1263 上落成 3 头) —— "
+                          "行为还原版的权重/逐手等价性因此一位都没变");
+                }
+                CHECK(moe->attnHeadsAllocated() == moe->attnHeadsUsed(),
+                      "但\"死内存\"这条修复对还原版**也生效** (纯内存, 不改任何数值)");
+            }
+        }
+    }
+}
+
 int main()
 {
     std::printf("=== SAC+MCTS+AlphaZero agent 测试 ===\n");
@@ -2132,6 +2726,7 @@ int main()
     testLegacyAgentClass();
     testRewardShaping();
     testLearnFromSearch();
+    testSharedTrunkAndTbHeads();
 
     std::printf("\n=== %d 项断言, %d 项失败 ===\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

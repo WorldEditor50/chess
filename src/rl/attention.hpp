@@ -638,8 +638,40 @@ public:
 
     Integration with Net::backward:
         Uses LAYER_MHA type. The same broadcast + backward pattern works.
+
+    ================================================================
+      [2026-09 dev-sacmoetb] 第二个模板参数 HonorHeads: "头数必须整除 d_model" 这个
+      隐式约束曾经把本工程的 TB 专家骨干**静默降级**了 5 倍
+    ================================================================
+      症状 (实测, 见 .r1build/tbprobe.cpp 与 test_sacaz [17]): SACAZAgent 的 TB 专家
+      配置写的是 `MOE_TB_HEADS = 15`("d_model/15 = 84 维/头"), 而它真实的 d_model 是
+      `STATE_DIM = 17*90 + 3 = 1263 = 3 x 421` (421 是素数)。`numHeads` 从 15 往下找
+      第一个整除 1263 的数 —— 找到的是 **3**。于是:
+
+        * 真实 head 数 = 3, d_k = 421, 注意力矩阵元素数 = 3*421² = 531,723
+          (设计意图是 15*84² = 105,840, **多算 5 倍**);
+        * 单个 TB 专家前向实测 **17.17 ms**, 而同一个类在 d_model=1260 (可整除) 上
+          只要 **5.71 ms** —— 3.0 倍;
+        * `heads[NumHeads]` 是**定长数组**, 15 个 head 全部被构造, 只有 3 个被用到 ——
+          **80% 的 qkv 张量是死的** (每个专家分配 96 MB, 实际参与 19 MB; 算上
+          withGrad 的 g/gv/gm 三份副本, 一个 5 网 TB agent 因此常驻 1.6 GB)。
+
+      修法 (两件, 都不改变任何"能整除"情形的逐位行为):
+        1. `heads` 从定长数组改成 `std::vector`, 只装**在用**的那些 head —— 死内存归零。
+           **注意随机数流**: 构造循环仍然跑 `NumHeads` 次 (`ScaledDotProduct` 的构造
+           里会抽 wq/wk/wv 的随机数), 只是没被用到的那些构造完就丢掉 —— 这样
+           `Random` 的消耗次数与改动前**逐次相同**, 所有既有 golden / 权重不受影响。
+        2. `HonorHeads = true` 时按**请求的** head 数切分: `d_k = d_model / NumHeads`
+           (整除截断), 允许 `numHeads * d_k < d_model`, 尾部那几个坐标不进注意力拼接
+           (它们在 `a` 里恒为 0, 但仍然通过残差与 Wo 参与前向/反向)。
+           `HonorHeads = false` (默认) 保持老的"找最大整除因子"口径 —— 其余所有用户
+           (PPO / DQN+AB / RL::SAC / SACAZLegacyAgent) 一位都不动。
+
+      为什么不是"把 d_model 补到能整除": d_model 由状态编码定死 (1263), 而
+      `TransformerBlock` 是 d_model -> d_model 的层, 不能改宽度; 补宽还会改动
+      LayerNorm 的统计量。允许"头没铺满"是这里唯一不引入新层的修法。
 */
-template<int NumHeads>
+template<int NumHeads, bool HonorHeads = false>
 class MultiHeadAttention : public iLayer
 {
 public:
@@ -658,7 +690,7 @@ public:
     int d_model;       // total model dimension — NEVER modified after construction
     Tensor wo;         // output projection (d_model × d_model)
     Tensor a;          // concatenated head outputs (d_model × 1)
-    ScaledDotProduct heads[NumHeads];
+    std::vector<ScaledDotProduct> heads;   // 只用到的那些 (见类头注释)
     MHAGrad g;
     MHAGrad v;
     MHAGrad m;
@@ -669,8 +701,9 @@ public:
     {
         type = LAYER_MHA;
         /*
-         * The head count must divide d_model. Use at most NumHeads heads and
-         * pick the largest divisor of d_model that does not exceed NumHeads.
+         * The head count must divide d_model — unless HonorHeads is set, in which
+         * case the requested NumHeads is honoured and any leftover coordinates at
+         * the end of the concatenation are simply left at zero.
          *
          * The previous code did the opposite: when d_model was not divisible it
          * ROUNDED d_model UP to d_k*NumHeads (e.g. d_model=2 with NumHeads=8
@@ -685,22 +718,48 @@ public:
         if (d_model < 1) {
             d_model = 1;
         }
-        numHeads = NumHeads;
-        while (numHeads > 1 && (d_model % numHeads) != 0) {
-            --numHeads;
-        }
-        if (numHeads < 1) {
-            numHeads = 1;
-        }
-        d_k = d_model / numHeads;
-        if (d_k < 1) {
-            d_k = 1;
+        if (HonorHeads) {
+            /*
+               按请求的 head 数切分。d_model < NumHeads 时退到"一个坐标一个 head"
+               (d_k = 1), 免得出现 d_k = 0 的空 head。
+            */
+            numHeads = (NumHeads < d_model) ? NumHeads : d_model;
+            if (numHeads < 1) {
+                numHeads = 1;
+            }
+            d_k = d_model / numHeads;
+            if (d_k < 1) {
+                d_k = 1;
+            }
+        } else {
+            numHeads = NumHeads;
+            while (numHeads > 1 && (d_model % numHeads) != 0) {
+                --numHeads;
+            }
+            if (numHeads < 1) {
+                numHeads = 1;
+            }
+            d_k = d_model / numHeads;
+            if (d_k < 1) {
+                d_k = 1;
+            }
         }
 
         wo = Tensor(d_model, d_model);
         Random::uniform(wo, -1, 1);
+        /*
+           仍然构造 NumHeads 个 (而不是 numHeads 个): 每个 ScaledDotProduct 的构造
+           会从 Random 抽 wq/wk/wv —— 少构造就等于把后面所有层的初始化随机数**前移**,
+           那会改掉每一个既有 agent 的初始权重 (golden / 行为还原版都会跟着变)。
+           所以这里"多造的丢掉", 只保留 numHeads 个真正参与前向的。
+        */
+        heads.clear();
+        heads.resize((std::size_t)numHeads);
         for (int i = 0; i < NumHeads; i++) {
-            heads[i] = ScaledDotProduct(inputDim, d_k, withGrad);
+            ScaledDotProduct h(inputDim, d_k, withGrad);
+            if (i < numHeads) {
+                heads[(std::size_t)i] = h;
+            }
         }
         a = Tensor(d_model, 1);
         o = Tensor(d_model, 1);
@@ -717,6 +776,26 @@ public:
         return std::make_shared<MultiHeadAttention>(inputDim, d_model, withGrad);
     }
 
+    /* ---- 结构自检读数 (只读): 让"头被静默降级 / 死内存"当场可见 ---- */
+    int headsUsed() const { return numHeads; }              /* 实际参与前向的 head 数 */
+    int headDim() const { return d_k; }                     /* 每个 head 的 d_k */
+    int headsAllocated() const { return (int)heads.size(); }/* 分配出来的 head 数 */
+    int headsRequested() const { return NumHeads; }          /* 模板参数里请求的 head 数 */
+    /* 注意力矩阵的元素总数 = numHeads * d_k^2 —— TB 专家的单价基本由它决定 */
+    long long attentionElements() const
+    {
+        return (long long)numHeads * (long long)d_k * (long long)d_k;
+    }
+    /* 拼接缓冲里"没有 head 写"的尾部坐标数 (HonorHeads 且头没铺满时 > 0) */
+    int uncoveredCoords() const { return d_model - numHeads * d_k; }
+
+    /* iLayer 的通用自检读数 (见 ilayer.h) —— 让上层不必知道模板参数就能读出来 */
+    int attnHeadsRequested() const override { return NumHeads; }
+    int attnHeadsUsed() const override { return numHeads; }
+    int attnHeadDim() const override { return d_k; }
+    int attnHeadsAllocated() const override { return (int)heads.size(); }
+    long long attnElements() const override { return attentionElements(); }
+
     /*
         参数量 (只读诊断): 输出投影 + 每个**在用** head 的 q/k/v 投影。
 
@@ -727,7 +806,7 @@ public:
     long long paramCount() const override
     {
         long long t = (long long)wo.size();
-        for (int i = 0; i < numHeads; i++) {
+        for (std::size_t i = 0; i < heads.size(); i++) {
             t += (long long)heads[i].wq.size()
                + (long long)heads[i].wk.size()
                + (long long)heads[i].wv.size();
@@ -738,11 +817,20 @@ public:
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
         /*
-            Forward: o = Wo · concat(head₀(x), ..., head_{h-1}(x))
+            Forward: o = Wo · concat(head₀(x), ..., head_{h-1}(x), 0...)
             Each head_i(x) = softmax(Wq_i·x · (Wk_i·x)^T / √d_k) · Wv_i·x  (d_k × 1)
+
+            尾部清零: 只有 `numHeads*d_k < d_model` (HonorHeads 且头没铺满) 时才做 ——
+            那几个坐标没有任何 head 会写, 不清零就会读到**上一次前向的残留值**。
+            能整除时这一段整个跳过, 与改动前逐位相同。
         */
+        if (numHeads * d_k != d_model) {
+            for (int i = 0; i < d_model; i++) {
+                a[i] = 0.0f;
+            }
+        }
         for (int i = 0; i < numHeads; i++) {
-            Tensor &head_out = heads[i].forward(x, inference);
+            Tensor &head_out = heads[(std::size_t)i].forward(x, inference);
             a.embedding({i*d_k, 0}, head_out);
         }
         /* o = Wo · a */
@@ -772,8 +860,8 @@ public:
                 Distribute the output gradient to each head for subsequent gradient()
                 ∂L/∂head_i = block(Wo^T · e, i*d_k, d_k)
             */
-            heads[i].e = da.block({i*d_k, 0}, {d_k, 1});
-            heads[i].backward(x, ei);   /* accumulates ∂L/∂x_head into ei */
+            heads[(std::size_t)i].e = da.block({i*d_k, 0}, {d_k, 1});
+            heads[(std::size_t)i].backward(x, ei);   /* accumulates ∂L/∂x_head into ei */
         }
 
         /*
@@ -836,7 +924,15 @@ public:
     {
         MultiHeadAttention *pLayer = static_cast<MultiHeadAttention*>(layer);
         pLayer->wo = wo;
-        for (int i = 0; i < numHeads; i++) {
+        /*
+            heads 现在是 vector: 目标层若因为 d_model/head 口径不同而个数不一样,
+            `pLayer->heads[i]` 就是越界写。载入/复制失败宁可"什么都不做", 也不要
+            写坏别人的内存 (iLayer 的 copyTo 契约本来就是"失败静默")。
+        */
+        if (pLayer->heads.size() != heads.size()) {
+            return;
+        }
+        for (std::size_t i = 0; i < heads.size(); i++) {
             heads[i].copyTo(&pLayer->heads[i]);
         }
         return;
@@ -846,7 +942,10 @@ public:
     {
         MultiHeadAttention *pLayer = static_cast<MultiHeadAttention*>(layer);
         lerp(pLayer->wo, wo, alpha);
-        for (int i = 0; i < numHeads; i++) {
+        if (pLayer->heads.size() != heads.size()) {
+            return;
+        }
+        for (std::size_t i = 0; i < heads.size(); i++) {
             heads[i].softUpdateTo(&pLayer->heads[i], alpha);
         }
         return;
@@ -855,7 +954,7 @@ public:
     void write(std::ofstream &file) override
     {
         file << wo.toString() << std::endl;
-        for (int i = 0; i < numHeads; i++) {
+        for (std::size_t i = 0; i < heads.size(); i++) {
             heads[i].write(file);
         }
         return;
@@ -866,7 +965,7 @@ public:
         std::string wos;
         std::getline(file, wos);
         wo = Tensor::fromString(wos);
-        for (int i = 0; i < numHeads; i++) {
+        for (std::size_t i = 0; i < heads.size(); i++) {
             heads[i].read(file);
         }
         return;

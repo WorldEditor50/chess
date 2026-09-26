@@ -2619,6 +2619,22 @@ learner 独占带梯度的 master，把池子搬进回放池后 `learnFromReplay
 `TB<16,360>` 的口径与 `SACAZAgent` 的 TB 骨干同源：16 头 → 1440/16 = **90 维/头**，
 `d_ff = 360 = d_model/4`（注意力那 4·d² ≈ 8.3 M MAC 才是大头，FFN 只占 1/8）。
 
+> **[2026-09 dev-sacmoetb 更正]** 上面这句"同源"**在数字上不成立**，原文把它们当成
+> 同一套口径了。实际是两套：
+>
+> | | d_model | 常量 | 意图 | **实际** |
+> |---|---|---|---|---|
+> | PPO（`src/rl/ppo.h`） | 1440 = 16x90 | `PPO_MOE_TB_HEADS = 16`, `PPO_MOE_TB_DFF = 360` | 16 头 / 90 维 | 1440 能被 16 整除 → **16 头**（下表那一行是对的） |
+> | **SACAZ（`src/sacazagent.h`）** | **1263**（默认表示） | `MOE_TB_HEADS = 15`, `MOE_TB_DFF = 315` | 15 头 / 84 维 | **1263 = 3 x 421（421 是素数）→ 实际只有 3 头 / d_k = 421** |
+>
+> 也就是说 SACAZ 那一支的"15 头"在这份文档写作时就已经**不成立**了，只是当时的读数
+> （参数指纹、`paramCount`、权重文件）**没有一个会变**，所以没人发现。它让单专家前向
+> 从 6.20 ms 变成 19.06 ms（3.07x），并且 15 个 head 张量里有 12 个是死的（80%）。
+> 本轮已修（`MultiHeadAttention` 的 `HonorHeads`，见
+> `docs/dev_sacmoetb_2026_09.md` §1）。**`DenseMoeTb`/`SparseMoeTb` 在 SACAZ 上的
+> 参数与耗时读数在本次修复之前都是"3 头口径"下的数**，引用旧表时注意这一点。
+> （本文件下面表格里的 `TB<15,315>` 那一行是**PPO 的对照臂**，不是 SACAZ 的配置。）
+
 **实测**（`.r1build/bench_ppo_expert.cpp`，单网络 `state→MoE→Tanh(64)→头`，
 d=1440 / 头=8100，MSVC 2022 Release + AVX2，20 次平均）：
 

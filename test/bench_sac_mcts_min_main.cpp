@@ -43,6 +43,11 @@ struct Cfg {
     int openingPlies = 4;
     unsigned seed = 20240901;
     std::string backbone = "moe-mlp";
+    /*
+       TB 专家的头数口径 (见 main 里 --tb-heads 的说明)。默认 = `SACAZAgent` 的新默认
+       (**honor**), 与界面一致; 要复现改动前的 TB 走法序列就传 `legacy`。
+    */
+    std::string tbHeads = "honor";
     std::string load;
     std::string csv;
     bool verbose = false;
@@ -165,6 +170,23 @@ int main(int argc, char **argv)
         else if (const char *v = val("--mcts-srand")) { g.mctsSrand = (unsigned)std::atoi(v); }
         else if (const char *v = val("--dump-moves")) { g.dumpMoves = v; }
         /*
+           ================================================================
+           [2026-09 dev-sacmoetb] `--tb-heads=honor|legacy`
+           ================================================================
+           给"走法序列黄金基准"一个能**钉住头数口径**的开关。
+
+           背景: `MOE_TB_HEADS = 15` 原来在 `STATE_DIM = 1263 = 3 x 421` 上会被
+           MultiHeadAttention 的"头数必须整除 d_model"规则静默降成 **3 个头**
+           (实测单专家前向 19.06 ms vs 6.20 ms)。本轮把它修成"按请求头数切分"
+           (**honor**, 也是 `SACAZAgent` 的新默认), 于是 TB 骨干算的函数**有意地变了**
+           —— 走法序列当然会变。要复现改动前的 TB 走法序列, 用 `--tb-heads=legacy`。
+
+           `probRoot`/`legacy` 两个字面量与 `bench_sacaz_vs_ab` 的 `--tb-heads` 保持
+           同一套取值; 打错直接退 2, 不静默退回默认 (静默退回 = 量的是另一个口径,
+           而报告里只差一个词)。
+        */
+        else if (const char *v = val("--tb-heads")) { g.tbHeads = v; }
+        /*
            --legacy-net 已删除 (2026-09): 那个开关想用 `TanhNorm<Linear>` 且 r=1 复现
            59e5233 的隐层激活, 实测**不等价** (TanhNorm 的偏置加在 tanh 外面;
            max|ΔQ| = 8.9e-06)。59e5233 的那一层就是 `Layer<Tanh>`, 而当前 buildNet 用的
@@ -182,10 +204,16 @@ int main(int argc, char **argv)
         std::printf("[错误] 未知骨干 %s\n", g.backbone.c_str());
         return 1;
     }
+    if (g.tbHeads != "honor" && g.tbHeads != "legacy") {
+        std::printf("[错误] --tb-heads 只接受 honor / legacy, 收到 '%s'\n", g.tbHeads.c_str());
+        return 2;
+    }
 
     Chess board;
     board.reset();
-    SACAZAgent sac(board, 64, 0.99f, 0.001f, 1.5f, bb, 64, 0.1f);
+    const SACAZAgent::TrunkMode trunkMode = SACAZAgent::TrunkMode::Separate;
+    const bool honorHeads = (g.tbHeads == "honor");
+    SACAZAgent sac(board, 64, 0.99f, 0.001f, 1.5f, bb, 64, 0.1f, trunkMode, honorHeads);
     MCTS mcts(board, 1.414);
 
     /*

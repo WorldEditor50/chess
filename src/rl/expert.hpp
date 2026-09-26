@@ -231,8 +231,8 @@ void scaleExpertInit(Layer<Fn> &e)
     scaleFcInit(e);
 }
 
-template<int H, int DFF>
-void scaleExpertInit(TransformerBlock<H, DFF> &e)
+template<int H, int DFF, bool HonorHeads>
+void scaleExpertInit(TransformerBlock<H, DFF, HonorHeads> &e)
 {
     auto scaleTensor = [](Tensor &t, float s) {
         for (std::size_t k = 0; k < t.size(); k++) {
@@ -247,9 +247,9 @@ void scaleExpertInit(TransformerBlock<H, DFF> &e)
     /* 注意力: 每个 head 的 q/k/v 投影 fan_in 都是 d_model; 输出投影 fan_in = d_model */
     const float s = 1.0f / std::sqrt((float)(e.d_model > 1 ? e.d_model : 1));
     for (int i = 0; i < e.attn.numHeads; i++) {
-        scaleTensor(e.attn.heads[i].wq, s);
-        scaleTensor(e.attn.heads[i].wk, s);
-        scaleTensor(e.attn.heads[i].wv, s);
+        scaleTensor(e.attn.heads[(std::size_t)i].wq, s);
+        scaleTensor(e.attn.heads[(std::size_t)i].wk, s);
+        scaleTensor(e.attn.heads[(std::size_t)i].wv, s);
     }
     scaleTensor(e.attn.wo, s);
 }
@@ -261,13 +261,13 @@ void scaleExpertInit(TransformerBlock<H, DFF> &e)
 template<typename E>
 struct ExpertFactory;
 
-template<int H, int DFF>
-struct ExpertFactory<TransformerBlock<H, DFF> >
+template<int H, int DFF, bool HonorHeads>
+struct ExpertFactory<TransformerBlock<H, DFF, HonorHeads> >
 {
-    static TransformerBlock<H, DFF> make(int d_model, int hidden, bool withGrad)
+    static TransformerBlock<H, DFF, HonorHeads> make(int d_model, int hidden, bool withGrad)
     {
         (void)hidden;   /* TransformerBlock 的 FFN 宽度由模板参数 DFF 决定 */
-        return TransformerBlock<H, DFF>(d_model, withGrad);
+        return TransformerBlock<H, DFF, HonorHeads>(d_model, withGrad);
     }
 };
 

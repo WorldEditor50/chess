@@ -26,8 +26,14 @@ namespace RL {
         - All operations are element-wise residual connections
 
     Type registration: LAYER_TRANSFORMERBLOCK
+
+    [2026-09 dev-sacmoetb] 第三个模板参数 `HonorHeads` 直接透给 MultiHeadAttention:
+    false (默认) = 老的"从 NumHeads 往下找最大整除因子"口径; true = 按请求的 head 数
+    切分 (允许头没铺满 d_model)。为什么 SACAZAgent 的 TB 专家必须开它, 见 attention.hpp
+    里 MultiHeadAttention 的类头注释 (d_model=1263=3x421 把 15 头静默降成 3 头, 贵 3 倍
+    且 80% 的 head 张量是死的)。
 */
-template<int NumHeads, int d_ff = 0>
+template<int NumHeads, int d_ff = 0, bool HonorHeads = false>
 class TransformerBlock : public iLayer
 {
 public:
@@ -47,7 +53,7 @@ public:
     NormGrad g1, v1, m1;
 
     /* Multi-Head Attention */
-    MultiHeadAttention<NumHeads> attn;
+    MultiHeadAttention<NumHeads, HonorHeads> attn;
 
     /* LayerNorm 2 (pre-FFN) parameters */
     Tensor gamma2;           // scale (d_model × 1)
@@ -95,7 +101,7 @@ public:
         Random::uniform(beta2, -0.1, 0.1);
 
         /* Multi-Head Attention */
-        attn = MultiHeadAttention<NumHeads>(d_model, d_model, withGrad);
+        attn = MultiHeadAttention<NumHeads, HonorHeads>(d_model, d_model, withGrad);
 
         /* FFN layers */
         ffn_up   = Layer<Gelu>(d_model, d_ff_, true, withGrad);
@@ -144,6 +150,13 @@ public:
              + (long long)gamma2.size() + (long long)beta2.size()
              + ffn_up.paramCount() + ffn_down.paramCount();
     }
+
+    /* iLayer 的通用自检读数: 往下委派给 MHA (见 ilayer.h) */
+    int attnHeadsRequested() const override { return attn.attnHeadsRequested(); }
+    int attnHeadsUsed() const override { return attn.attnHeadsUsed(); }
+    int attnHeadDim() const override { return attn.attnHeadDim(); }
+    int attnHeadsAllocated() const override { return attn.attnHeadsAllocated(); }
+    long long attnElements() const override { return attn.attnElements(); }
 
     Tensor& forward(const Tensor& x, bool inference=false) override
     {

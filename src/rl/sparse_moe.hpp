@@ -174,6 +174,18 @@ public:
         return total;
     }
 
+    /*
+       iLayer 的通用自检读数: 委派给**第 0 个专家**。
+       本工程的所有专家都同构 (同一个 ExpertFactory 造出来的), 所以"专家内部用了几个
+       注意力头"这个问题在任何一个专家上答案都一样 —— 而它正是"MOE_TB_HEADS 被静默
+       降级成 3 个头"这件事唯一能被读出来的地方。
+    */
+    int attnHeadsRequested() const override { return experts[0].attnHeadsRequested(); }
+    int attnHeadsUsed() const override { return experts[0].attnHeadsUsed(); }
+    int attnHeadDim() const override { return experts[0].attnHeadDim(); }
+    int attnHeadsAllocated() const override { return experts[0].attnHeadsAllocated(); }
+    long long attnElements() const override { return experts[0].attnElements(); }
+
     int expertCount() const override { return NumExperts; }
     int topK() const override { return (TopK < NumExperts) ? TopK : NumExperts; }
 

@@ -15,11 +15,31 @@
     判据: 逐行 diff。失败时打印**第一处**差异及其行号 —— 因为一处走法不同会让后面
     整局都岔开, 只报"第 300 行不同"没有诊断价值。
 
+    判据之外还有两条**必须先知道**的前提。
+
+    ---- [2026-09 dev-sacmoetb] 前提一: 基准在起点提交上就已经是红的 ----
+    实测方法: 在 2e9c15e (dev-sacmoetb 的起点) 上开一棵干净的 worktree 单独构
+    bench_sac_mcts_min, 再跑本脚本 —— sac_moe_mlp (基准 258 行 / 实测 314 行)
+    与 sac_tb (第 4 行就不同) **两个用例都偏**。也就是说在本轮之前它就已经不再保护
+    任何东西了, 它红**不能**归因于 dev-sacmoetb。证据与复现命令记在
+    docs/dev_sacmoetb_2026_09.md 第 6 节。
+    **重新打基准是一个单独的决定** (打基准 = 把"当前行为"定义成"对的行为"),
+    本轮**没有**做 —— 本脚本只多了下面那个开关。
+
+    ---- 前提二: -TbHeads (TB 专家的头数口径) ----
+    SACAZAgent 的 TB 专家头数口径有两个:
+      honor  = 按请求头数切 (STATE_DIM=1263=3x421 上是真 15 个头);
+      legacy = 找最大整除因子 (同一维度上落成 3 个头)。
+    两者算的是**不同的函数**, 走法序列当然不同 —— 所以基准必须连"是哪个口径"一起钉住,
+    否则重新打基准时不知道打的是哪一支。默认 legacy = 与现有基准同口径。
+
     退出码 0 = 与基准逐手相同; 1 = 有差异; 2 = 前置条件缺失。
 #>
 param(
-    [string]$Build = 'build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release'
+    [string]$Build = 'build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release',
+    [ValidateSet('honor','legacy')][string]$TbHeads = 'legacy'
 )
+
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root "$Build\bench_sac_mcts_min.exe"
@@ -42,7 +62,8 @@ foreach ($c in $cases) {
     $got = Join-Path $out  $c.file
     if (-not (Test-Path $ref)) { Write-Host "  [跳过] 基准缺失: $($c.file)" -ForegroundColor Yellow; continue }
     & $exe --games=$($c.games) --sims=$($c.sims) --plies=$($c.plies) --opening=4 `
-           --seed=$($c.seed) --mcts-srand=12345 --backbone=$($c.backbone) --dump-moves=$got 2>&1 | Out-Null
+           --seed=$($c.seed) --mcts-srand=12345 --backbone=$($c.backbone) `
+           --tb-heads=$TbHeads --dump-moves=$got 2>&1 | Out-Null
     $a = Get-Content $ref; $b = Get-Content $got
     if ($a.Count -ne $b.Count) {
         Write-Host ("  [{0}] **行数不同**: 基准 {1} 行, 实测 {2} 行" -f $c.file, $a.Count, $b.Count) -ForegroundColor Red

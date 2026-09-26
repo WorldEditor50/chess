@@ -92,6 +92,26 @@ public:
     */
     virtual bool subsetSoftmax() const { return false; }
 
+    /*
+        ============================================================
+        注意力头口径的**只读自检读数** (2026-09 dev-sacmoetb 新增)
+        ============================================================
+        为什么必须有: `MOE_TB_HEADS = 15` 曾经在 `d_model = 1263 = 3 x 421` 上被
+        MultiHeadAttention 的"头数必须整除 d_model"规则**静默降级成 3 个头** ——
+        参数指纹、paramCount、层类型序列、权重文件格式**一个都没变**, 只有"慢了 3 倍"
+        和"80% 的 head 张量是死的"这两件事变了, 而面板上原本一个字都看不到。
+        这与 TanhNorm<Sigmoid> 那次回归是同一类: **同形状、同参数量的静默替换**。
+
+        所以把"请求了几个头 / 实际用了几个 / 每个多宽 / 分配了几个 / 注意力元素数"
+        做成 iLayer 的**通用读数**: 容器型层 (SparseMoE / TransformerBlock) 往下委派,
+        非注意力层返回 -1。上层不必 dynamic_cast 到具体模板就能印到自检面板上。
+    */
+    virtual int attnHeadsRequested() const { return -1; }   /* 模板/配置里请求的头数 */
+    virtual int attnHeadsUsed() const { return -1; }        /* 真正参与前向的头数 */
+    virtual int attnHeadDim() const { return -1; }          /* 每个头的 d_k */
+    virtual int attnHeadsAllocated() const { return -1; }   /* 分配出来的 head 对象数 */
+    virtual long long attnElements() const { return -1; }   /* numHeads * d_k^2 (单价来源) */
+
     virtual void write(std::ofstream &file){}
     virtual void read(std::ifstream &file){}
 };

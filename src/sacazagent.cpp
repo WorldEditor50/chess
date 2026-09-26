@@ -76,21 +76,80 @@ const char *SACAZAgent::backboneName(Backbone b)
     }
 }
 
+const char *SACAZAgent::trunkModeName(TrunkMode m)
+{
+    switch (m) {
+    case TrunkMode::Separate: return "独立骨干x5 (Separate)";
+    case TrunkMode::Shared:   return "共享骨干+三头 (Shared)";
+    default:                  return "?";
+    }
+}
+
+/* ----------------------------------------------------------------
+ *  共享口径的权重前缀 —— 见头文件 sharedWeightPrefix 的说明。
+ *  共享口径写 **4 个文件** (trunk + 三个头), 没有 _actor/_q1/_q2;
+ *  独立口径写 3 个 (actor/q1/q2), 目标网在载入时由在线网 copyTo 派生。
+ *  两套文件的个数、名字、语义都不同 ⇒ 绝不能共用一个前缀。
+ * ---------------------------------------------------------------- */
+const char *SACAZAgent::sharedWeightPrefix()
+{
+    return "weights/sacaz_shared_agent";
+}
+
 /*
-   按 backbone 造网络。
-   输出层始终是 `Layer<Linear>` (不是 Sigmoid): 象棋奖励含负值, Q 必须能取负
-   (docs/issues_review.md B18)。掩码 softmax 在 agent 里自己做, 所以策略头输出
-   **logits**, 不是概率。
-   两个结构上的注意点:
-     * 稀疏 MoE 层是"同维进出"的 (专家的输入输出必须同维才能做门控加权和),
-       所以后面必须再接一层 Tanh(d_model -> h) 把 1260 维压到 h 维, 再进 Linear 头。
-     * 专家权重由 SparseMoE 的构造函数调用 scaleExpertInit 缩放; 其余普通层由
-       scaleLayerInit 缩放 (两者的依据都是 1/sqrt(fan_in))。
+ * 一个 SparseMoE 层 -> iLayer::sptr 的小工厂。
+ *
+ * 为什么要它: 稀疏/稠密两种 TopK 是两个不同的模板实例 (TopK 是模板参数), 而它们的
+ * 共同基类 ISparseMoE 不是 shared_ptr 能直接 covariant 转换的类型 ——
+ * 显式 static_pointer_cast 一次, 调用点就不必写 4 份几乎相同的 make_shared。
+ */
+namespace {
+
+template<typename Expert, int E, int K>
+RL::iLayer::sptr makeMoeLayer(int d, bool withGrad, int hidden)
+{
+    return std::static_pointer_cast<RL::iLayer>(
+        std::make_shared<RL::SparseMoE<Expert, E, K> >(d, withGrad, hidden));
+}
+
+} // namespace
+
+/*
+   造 TB 专家那一层。**两个口径的模板实参只差 HonorHeads** —— 这正是它存在的理由:
+   `MOE_TB_HEADS = 15` 在 `STATE_DIM = 1263 = 3 x 421` 上会被"头数必须整除 d_model"
+   的规则降成 3 个头 (实测 15.71 ms vs 5.37 ms, 3.0 倍), 而 `tbHonorHeads = true`
+   用"按请求头数切分、允许头不铺满"的口径把这个降级去掉。见 sacazagent.h 的说明。
 */
-RL::Net SACAZAgent::buildNet(bool withGrad) const
+RL::iLayer::sptr SACAZAgent::makeTbExpertMoe(bool withGrad, bool dense) const
+{
+    typedef RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF, true>  TbHonor;
+    typedef RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF, false> TbLegacy;
+    if (tbHonorHeads) {
+        return dense ? makeMoeLayer<TbHonor, MOE_TB_EXPERTS, MOE_TB_EXPERTS>(STATE_DIM, withGrad, 0)
+                     : makeMoeLayer<TbHonor, MOE_TB_EXPERTS, MOE_TB_TOPK>(STATE_DIM, withGrad, 0);
+    }
+    return dense ? makeMoeLayer<TbLegacy, MOE_TB_EXPERTS, MOE_TB_EXPERTS>(STATE_DIM, withGrad, 0)
+                 : makeMoeLayer<TbLegacy, MOE_TB_EXPERTS, MOE_TB_TOPK>(STATE_DIM, withGrad, 0);
+}
+
+/*
+ * ================================================================
+ *  建网: 拆成"骨干层"与"输出头层"两半 (2026-09 dev-sacmoetb)
+ * ================================================================
+ *  为什么拆: 独立口径要的是"骨干 + 头"拼成一张完整的网 (与改动前逐字相同的构造
+ *  顺序与随机数消耗); 共享口径要的是"骨干造**一次**、三个头各造一次、然后按
+ *  shared_ptr 组装成多张视图"。两种需求共用同一段层构造代码 —— 否则"两种模式除了
+ *  共享关系之外逐位相同"这条前提会在下一次改结构时静默失效。
+ *
+ *  **构造顺序是契约的一部分**: 每一层在构造时会从 RL::Random 抽初始化权重, 谁先谁后
+ *  决定了后面所有层的初始值。makeTrunkLayers 必须在 makeHeadLayer 之前调用, 且
+ *  SparseMoE 内部专家的构造顺序不变 —— 独立口径因此与改动前**逐位相同**。
+ * ================================================================
+ */
+void SACAZAgent::makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const
 {
     const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
-    RL::Net::Layers layers;
+    out.clear();
 
     /*
        隐层激活 = `Layer<RL::Tanh>` (与 59e5233 **逐字相同**的代码)。
@@ -101,37 +160,52 @@ RL::Net SACAZAgent::buildNet(bool withGrad) const
     */
     switch (backbone) {
     case Backbone::Mlp:
-        layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
-        layers.push_back(RL::Layer<RL::Tanh>::_(h, h, true, withGrad));
+        out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
+        out.push_back(RL::Layer<RL::Tanh>::_(h, h, true, withGrad));
         break;
     case Backbone::SparseMoeMlp:
-        layers.push_back(std::make_shared<RL::SparseMoE<RL::MlpExpert,
-                                                        MOE_MLP_EXPERTS,
-                                                        MOE_MLP_TOPK> >(
+        out.push_back(makeMoeLayer<RL::MlpExpert, MOE_MLP_EXPERTS, MOE_MLP_TOPK>(
             STATE_DIM, withGrad, expertHidden > 0 ? expertHidden : 64));
-        layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
+        out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     case Backbone::SparseMoeTb:
-        layers.push_back(std::make_shared<RL::SparseMoE<RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>,
-                                                        MOE_TB_EXPERTS,
-                                                        MOE_TB_TOPK> >(STATE_DIM, withGrad, 0));
-        layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
+        out.push_back(makeTbExpertMoe(withGrad, false));
+        out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     case Backbone::DenseMoeTb:
         /* TopK == NumExperts => 门控照旧, 但四个专家全算 (等参数不等算力的对照) */
-        layers.push_back(std::make_shared<RL::SparseMoE<RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>,
-                                                        MOE_TB_EXPERTS,
-                                                        MOE_TB_EXPERTS> >(STATE_DIM, withGrad, 0));
-        layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
+        out.push_back(makeTbExpertMoe(withGrad, true));
+        out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     default:
-        layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
-        layers.push_back(RL::Layer<RL::Tanh>::_(h, h, true, withGrad));
+        out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
+        out.push_back(RL::Layer<RL::Tanh>::_(h, h, true, withGrad));
         break;
     }
+}
 
-    layers.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, withGrad));
-    RL::Net net(layers);
+void SACAZAgent::makeHeadLayer(RL::Net::Layers &out, bool withGrad) const
+{
+    const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
+    out.clear();
+    /*
+       输出层始终是 `Layer<Linear>` (不是 Sigmoid): 象棋奖励含负值, Q 必须能取负
+       (docs/issues_review.md B18)。掩码 softmax 在 agent 里自己做, 所以策略头输出
+       **logits**, 不是概率。三个头 (策略 / Q1 / Q2) 结构完全相同 —— 差别只在各自的
+       权重与各自收到的梯度。
+    */
+    out.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, withGrad));
+}
+
+RL::Net SACAZAgent::buildNet(bool withGrad) const
+{
+    RL::Net::Layers all;
+    makeTrunkLayers(all, withGrad);
+    RL::Net::Layers head;
+    makeHeadLayer(head, withGrad);
+    all.insert(all.end(), head.begin(), head.end());
+
+    RL::Net net(all);
     /*
        只缩放普通的 iFcLayer。稀疏 MoE 层本身不是 iFcLayer (dynamic_cast 会返回
        nullptr), 它的专家权重已经在 SparseMoE 的构造函数里用 scaleExpertInit 缩过了。
@@ -143,6 +217,89 @@ RL::Net SACAZAgent::buildNet(bool withGrad) const
     scaleLayerInit(net);
     return net;
 }
+
+/*
+ * ================================================================
+ *  共享骨干口径的建网 (TrunkMode::Shared)
+ * ================================================================
+ *  层对象只造 **一次**, 然后用 shared_ptr 组装成多张"视图"网:
+ *
+ *      trunk        = [骨干层]                       (在线, 有梯度)
+ *      trunkTarget  = [骨干层]                       (目标, 无梯度)
+ *      actorHead / q1Head / q2Head                    (在线三个头)
+ *      q1TargetHead / q2TargetHead                    (目标两个 Q 头)
+ *
+ *      actor   = [骨干层 + 策略头]    <- 与独立口径同名同义的**完整网**, 只是与
+ *      q1      = [骨干层 + Q1头]         q2/trunk 共享同一批层对象
+ *      q2      = [骨干层 + Q2头]
+ *      q1Target= [目标骨干 + Q1目标头]
+ *      q2Target= [目标骨干 + Q2目标头]
+ *
+ *  三个"为什么":
+ *   1. **actor/q1/q2 仍必须是完整的 Net**: test / GUI / selfCheckReport 里到处是
+ *      `agent.actor.paramCount()` / `agent.actor.copyTo(...)` / `forwardTrunk()`。
+ *      共享的是**层对象**, 不是接口 —— 所以那些用法一行都不用改, 而且语义仍然正确
+ *      (actor.forward(state) 就是"骨干+策略头", 与独立口径数值一致)。
+ *   2. **目标骨干只有一份** (独立口径是 q1Target/q2Target 各一份)。softValueFrom 用的是
+ *      min(Q1,Q2), 两个 Q 头共享同一份目标骨干完全等价, 而目标网本来只前向不训练,
+ *      于是训练侧每样本的骨干前向从 6 次降到 3 次。
+ *   3. **热路径不再走 actor/q1/q2 这三个视图**: learnBatch / selectMove 显式地
+ *      "trunk.forward 一次 + 三个头各 forward 一次"。走视图也能得到**正确**结果,
+ *      只是会把骨干跑三遍 (那就是独立口径的开销)。
+ * ================================================================
+ */
+void SACAZAgent::buildSharedNets()
+{
+    const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
+    (void)h;
+
+    RL::Net::Layers trunkL, trunkTL;
+    makeTrunkLayers(trunkL, true);      /* 顺序契约: 骨干先造 */
+    makeTrunkLayers(trunkTL, false);
+
+    RL::Net::Layers hA, hQ1, hQ2, hQ1T, hQ2T;
+    makeHeadLayer(hA, true);
+    makeHeadLayer(hQ1, true);
+    makeHeadLayer(hQ2, true);
+    makeHeadLayer(hQ1T, false);
+    makeHeadLayer(hQ2T, false);
+
+    /*
+       初始化缩放: 与 buildNet 同一套 (scaleLayerInit 只做缩放、**不抽随机数**,
+       所以"分几次调"不改变任何权重, 也不改变随机数流)。
+    */
+    {
+        RL::Net t(trunkL);   scaleLayerInit(t);
+        RL::Net t2(trunkTL); scaleLayerInit(t2);
+        RL::Net a(hA);       scaleLayerInit(a);
+        RL::Net b(hQ1);      scaleLayerInit(b);
+        RL::Net c(hQ2);      scaleLayerInit(c);
+        RL::Net d(hQ1T);     scaleLayerInit(d);
+        RL::Net e(hQ2T);     scaleLayerInit(e);
+    }
+
+    trunk       = RL::Net(trunkL);
+    trunkTarget = RL::Net(trunkTL);
+    actorHead   = RL::Net(hA);
+    q1Head      = RL::Net(hQ1);
+    q2Head      = RL::Net(hQ2);
+    q1TargetHead = RL::Net(hQ1T);
+    q2TargetHead = RL::Net(hQ2T);
+
+    /* 组装完整视图 (共享同一批层对象: Net 的 Layers 就是 shared_ptr 的 vector) */
+    RL::Net::Layers all;
+    all = trunkL;  all.insert(all.end(), hA.begin(),  hA.end());  actor = RL::Net(all);
+    all = trunkL;  all.insert(all.end(), hQ1.begin(), hQ1.end()); q1    = RL::Net(all);
+    all = trunkL;  all.insert(all.end(), hQ2.begin(), hQ2.end()); q2    = RL::Net(all);
+    all = trunkTL; all.insert(all.end(), hQ1T.begin(), hQ1T.end()); q1Target = RL::Net(all);
+    all = trunkTL; all.insert(all.end(), hQ2T.begin(), hQ2T.end()); q2Target = RL::Net(all);
+
+    /* 目标网必须从在线网拷一份 (与独立口径同一条理由: 否则目标网从另一个随机点开始) */
+    trunk.copyTo(trunkTarget);
+    q1Head.copyTo(q1TargetHead);
+    q2Head.copyTo(q2TargetHead);
+}
+
 
 /*
  * 实际生效的隐层激活 —— **读建好的网络**, 不是回显某个开关。
@@ -230,6 +387,62 @@ void SACAZAgent::resetMoeUsage()
     }
 }
 
+/* ----------------------------------------------------------------
+ *  TB 专家的实际注意力头口径 (只读自检) —— 见 sacazagent.h 的 tbHonorHeads。
+ *
+ *  两个入口都试: `actor` 在共享口径下是与 q1/q2 共享层对象的完整视图, 所以从它身上
+ *  读到的就是同一个 MoE 层; 独立口径下 actor 自己那张网里也有。返回 -1 = 这个骨干
+ *  里没有 TransformerBlock 专家 (Mlp / 稀疏MoE(MLP专家))。
+ * ---------------------------------------------------------------- */
+static RL::ISparseMoE *findSparseMoeOf(const RL::Net &net)
+{
+    RL::Net &self = const_cast<RL::Net &>(net);
+    return findSparseMoe(self);
+}
+
+int SACAZAgent::tbHeadsRequested() const
+{
+    RL::ISparseMoE *m = findSparseMoeOf(actor);
+    return (m != nullptr) ? m->attnHeadsRequested() : -1;
+}
+int SACAZAgent::tbHeadsUsed() const
+{
+    RL::ISparseMoE *m = findSparseMoeOf(actor);
+    return (m != nullptr) ? m->attnHeadsUsed() : -1;
+}
+int SACAZAgent::tbHeadDim() const
+{
+    RL::ISparseMoE *m = findSparseMoeOf(actor);
+    return (m != nullptr) ? m->attnHeadDim() : -1;
+}
+int SACAZAgent::tbHeadsAllocated() const
+{
+    RL::ISparseMoE *m = findSparseMoeOf(actor);
+    return (m != nullptr) ? m->attnHeadsAllocated() : -1;
+}
+long long SACAZAgent::tbAttentionElements() const
+{
+    RL::ISparseMoE *m = findSparseMoeOf(actor);
+    return (m != nullptr) ? m->attnElements() : -1;
+}
+
+/*
+ * 唯一参数量: 共享口径下骨干只算一次。
+ * 为什么不能直接用 actor.paramCount(): 共享时 actor/q1/q2 是**同一批层对象的三张
+ * 视图**, 各自都会把整份骨干数进去 —— 三个数相加等于把骨干算了三遍, 那正是这次要
+ * 消掉的东西。独立口径下三张网本来就不共享, actor+q1 (同构) 就是全部。
+ */
+long long SACAZAgent::uniqueParamCount() const
+{
+    if (trunkMode != TrunkMode::Shared) {
+        /* 独立口径: actor/q1/q2 同构, 目标网无梯度但同样占内存 -> 5 份 */
+        return 5LL * actor.paramCount();
+    }
+    return trunk.paramCount() + trunkTarget.paramCount()
+           + actorHead.paramCount() + q1Head.paramCount() + q2Head.paramCount()
+           + q1TargetHead.paramCount() + q2TargetHead.paramCount();
+}
+
 SACAZAgent::SACAZAgent(Chess &chess_,
                        int hiddenDim_,
                        float gamma_,
@@ -237,15 +450,20 @@ SACAZAgent::SACAZAgent(Chess &chess_,
                        float cpuct,
                        Backbone backbone_,
                        int expertHidden_,
-                       float auxLossCoef_)
+                       float auxLossCoef_,
+                       TrunkMode trunkMode_,
+                       bool tbHonorHeads_)
     : chess(chess_),
       backbone(backbone_),
+      tbHonorHeads(tbHonorHeads_),
+      trunkMode(trunkMode_),
       expertHidden(expertHidden_ > 0 ? expertHidden_ : 64),
       auxLossCoef(auxLossCoef_),
       hiddenDim(hiddenDim_ > 0 ? hiddenDim_ : 64),
       gamma(gamma_),
       learningRateActor(lr),
       learningRateCritic(lr),
+      learningRateTrunk(lr),
       learningRateAlpha(1e-3f),
       c_puct(cpuct),
       azWeight(1.0f),
@@ -293,19 +511,27 @@ SACAZAgent::SACAZAgent(Chess &chess_,
     totalWins[0] = 0;
     totalWins[1] = 0;
 
-    actor = buildNet(true);
-    q1 = buildNet(true);
-    q2 = buildNet(true);
-    q1Target = buildNet(false);
-    q2Target = buildNet(false);
+    if (trunkMode == TrunkMode::Shared) {
+        /*
+           共享骨干: 层对象只造一次, actor/q1/q2 退化成"骨干 + 各自一个头"的视图。
+           目标网在 buildSharedNets 里已经 copyTo 过 (见那边的注释)。
+        */
+        buildSharedNets();
+    } else {
+        actor = buildNet(true);
+        q1 = buildNet(true);
+        q2 = buildNet(true);
+        q1Target = buildNet(false);
+        q2Target = buildNet(false);
 
-    /*
-       目标网构建时 withGrad=false, 但参数仍然是随机初始化的 —— 必须从在线网拷一份
-       过去, 否则目标网从"另一个随机点"开始, 自举项一开始就是纯噪声。
-       (Net 的拷贝是**浅拷贝**: 共享层指针; 深拷贝必须走 copyTo。)
-    */
-    q1.copyTo(q1Target);
-    q2.copyTo(q2Target);
+        /*
+           目标网构建时 withGrad=false, 但参数仍然是随机初始化的 —— 必须从在线网拷一份
+           过去, 否则目标网从"另一个随机点"开始, 自举项一开始就是纯噪声。
+           (Net 的拷贝是**浅拷贝**: 共享层指针; 深拷贝必须走 copyTo。)
+        */
+        q1.copyTo(q1Target);
+        q2.copyTo(q2Target);
+    }
 
     /* 温度 α: 标量, 自动调节 (SAC-Discrete 的做法) */
     alpha = RL::GradValue(1, 1);
@@ -717,17 +943,32 @@ void SACAZAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
 
 /* ============================================================
  *  前向 / 软价值
+ *
+ *  [2026-09 dev-sacmoetb] 这三个函数都有一句 `if (trunkMode == Shared)` 的分支。
+ *  共享口径下 actor / q1 / q2 这三张"视图"仍然可用且语义正确 (它们与 trunk/头共享
+ *  同一批层对象), 但**走视图 = 骨干被跑三遍** —— 那正是独立口径的开销。
+ *  所以热路径显式地"trunk.forward 一次 + 头各 forward 一次"。
  * ============================================================ */
 void SACAZAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
                         RL::Tensor &pi)
 {
     /* actor 的输出缓冲会被下一次 forward 覆盖, 先拷出来再做掩码归一化 */
-    m_logits = actor.forward(state);
+    if (trunkMode == TrunkMode::Shared) {
+        m_logits = actorHead.forward(trunk.forward(state));
+    } else {
+        m_logits = actor.forward(state);
+    }
     maskedSoftmax(m_logits, mask, pi);
 }
 
 void SACAZAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor &q2Out)
 {
+    if (trunkMode == TrunkMode::Shared) {
+        RL::Tensor &h = trunk.forward(state);
+        q1Out = q1Head.forward(h);
+        q2Out = q2Head.forward(h);
+        return;
+    }
     q1Out = q1.forward(state);
     q2Out = q2.forward(state);
 }
@@ -738,8 +979,19 @@ void SACAZAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor 
  * ------------------------------------------------------------------ */
 namespace {
 
-/* 把某个 Q 网络在 legalIdx 上的列抽出来 (affine: 故意不传激活, 因为 Q 头是无激活的
-   Linear —— 与 iFcLayer::sparseLogits 的注释一致: 它返回的是**激活前**的值)。 */
+/*
+   把**已经算好的骨干输出 h** 在 legalIdx 上的列抽出来。
+   affine: 故意不传激活, 因为三个头都是无激活的 Linear —— 与 iFcLayer::sparseLogits
+   的注释一致: 它返回的是**激活前**的值 (策略的归一化由调用方在合法集上做)。
+*/
+bool sparseHeadCols(const RL::iLayer *head, const RL::Tensor &h,
+                    const std::vector<int> &idx, std::vector<float> &out)
+{
+    if (head == nullptr || !head->supportsSparseLogits()) { return false; }
+    return head->sparseLogits(h, idx, out);
+}
+
+/* 独立口径: 网络自己跑一次骨干, 再取头的合法列 */
 bool sparseCols(RL::Net &net, const RL::Tensor &state, const std::vector<int> &idx,
                 std::vector<float> &out)
 {
@@ -750,23 +1002,10 @@ bool sparseCols(RL::Net &net, const RL::Tensor &state, const std::vector<int> &i
     return head->sparseLogits(h, idx, out);
 }
 
-} // namespace
-
-bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
-                               std::vector<float> &q1Out, std::vector<float> &q2Out)
+/* 合法集上的数值稳定 softmax (与 maskedSoftmax 的 Z≡1 口径等价) */
+bool softmaxOnSubset(const std::vector<float> &logits, std::vector<float> &piOut)
 {
-    return sparseCols(q1, state, legalIdx, q1Out)
-           && sparseCols(q2, state, legalIdx, q2Out);
-}
-
-bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
-                              std::vector<float> &piOut)
-{
-    std::vector<float> logits;
-    if (!sparseCols(actor, state, legalIdx, logits) || logits.size() != legalIdx.size()) {
-        return false;
-    }
-    /* 合法集上的数值稳定 softmax (与 maskedSoftmax 的 Z≡1 口径等价) */
+    if (logits.empty()) { return false; }
     const std::size_t n = logits.size();
     float m = logits[0];
     for (std::size_t i = 1; i < n; i++) {
@@ -787,12 +1026,88 @@ bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &l
     return true;
 }
 
+} // namespace
+
+/*
+ * ================================================================
+ *  sparseLeaf: 一次叶子求值的**完整**稀疏路径 (搜索热路径)
+ * ================================================================
+ *  共享口径下骨干**只前向一次** —— 这是 Shared 模式在搜索侧的全部收益来源:
+ *    * 独立口径: policySparse (actor 骨干) + qValuesSparse (q1 骨干 + q2 骨干)
+ *                = 三次全网前向;
+ *    * 共享口径: trunk.forward 一次 + 三个头各算一遍合法列 (头是 64->128 的一层,
+ *                代价可以忽略)。
+ *  返回 false = 走不了稀疏路径, 调用方**必须**回退全量口径 (与改动前同一条契约)。
+ * ================================================================
+ */
+bool SACAZAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                            std::vector<float> &pi, std::vector<float> &q1Out,
+                            std::vector<float> &q2Out)
+{
+    if (legalIdx.empty()) { return false; }
+    std::vector<float> logits, l1, l2;
+
+    if (trunkMode == TrunkMode::Shared) {
+        if (actorHead.size() < 1 || q1Head.size() < 1 || q2Head.size() < 1) {
+            return false;
+        }
+        RL::Tensor &h = trunk.forward(state);   /* 唯一的一次骨干前向 */
+        if (!sparseHeadCols(actorHead[actorHead.size() - 1], h, legalIdx, logits)) { return false; }
+        if (!sparseHeadCols(q1Head[q1Head.size() - 1], h, legalIdx, l1)) { return false; }
+        if (!sparseHeadCols(q2Head[q2Head.size() - 1], h, legalIdx, l2)) { return false; }
+    } else {
+        if (!sparseCols(actor, state, legalIdx, logits)) { return false; }
+        if (!sparseCols(q1, state, legalIdx, l1)) { return false; }
+        if (!sparseCols(q2, state, legalIdx, l2)) { return false; }
+    }
+
+    if (logits.size() != legalIdx.size() || l1.size() != logits.size()
+        || l2.size() != logits.size()) {
+        return false;
+    }
+    if (!softmaxOnSubset(logits, pi)) { return false; }
+    q1Out.swap(l1);
+    q2Out.swap(l2);
+    return true;
+}
+
+bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                               std::vector<float> &q1Out, std::vector<float> &q2Out)
+{
+    if (trunkMode == TrunkMode::Shared) {
+        if (q1Head.size() < 1 || q2Head.size() < 1) { return false; }
+        RL::Tensor &h = trunk.forward(state);
+        return sparseHeadCols(q1Head[q1Head.size() - 1], h, legalIdx, q1Out)
+               && sparseHeadCols(q2Head[q2Head.size() - 1], h, legalIdx, q2Out);
+    }
+    return sparseCols(q1, state, legalIdx, q1Out)
+           && sparseCols(q2, state, legalIdx, q2Out);
+}
+
+bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+                              std::vector<float> &piOut)
+{
+    std::vector<float> logits;
+    if (trunkMode == TrunkMode::Shared) {
+        if (actorHead.size() < 1) { return false; }
+        RL::Tensor &h = trunk.forward(state);
+        if (!sparseHeadCols(actorHead[actorHead.size() - 1], h, legalIdx, logits)) { return false; }
+    } else {
+        if (!sparseCols(actor, state, legalIdx, logits)) { return false; }
+    }
+    if (logits.size() != legalIdx.size()) { return false; }
+    return softmaxOnSubset(logits, piOut);
+}
+
 bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
                                  double &valueOut)
 {
     std::vector<float> pi, qa, qb;
-    if (!policySparse(state, legalIdx, pi)) { return false; }
-    if (!qValuesSparse(state, legalIdx, qa, qb)) { return false; }
+    /*
+       走 sparseLeaf 而不是 policySparse + qValuesSparse: 后两者各跑一遍骨干, 在共享
+       口径下等于把唯一的那次前向白做一遍 (而且两边看到的 h 是同一个, 结果一样)。
+    */
+    if (!sparseLeaf(state, legalIdx, pi, qa, qb)) { return false; }
     if (qa.size() != pi.size() || qb.size() != pi.size()) { return false; }
 
     const float a = alpha[0];
@@ -809,6 +1124,17 @@ bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int>
 void SACAZAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
                                RL::Tensor &q2Out)
 {
+    if (trunkMode == TrunkMode::Shared) {
+        /*
+           目标侧两个 Q 头共享**同一份**目标骨干 —— 独立口径下它们是两份各自的目标网。
+           数学上完全等价: softValueFrom 用的就是 min(Q1,Q2), 而两个头吃的是同一个 h;
+           代价上少一次骨干前向 (learnBatch 每样本从 6 次骨干前向降到 3 次)。
+        */
+        RL::Tensor &h = trunkTarget.forward(state);
+        q1Out = q1TargetHead.forward(h);
+        q2Out = q2TargetHead.forward(h);
+        return;
+    }
     q1Out = q1Target.forward(state);
     q2Out = q2Target.forward(state);
 }
@@ -1130,11 +1456,15 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
                    稀疏头路径 (只算合法列): 动作空间 8100 之后这是必须的 —— 否则每次叶子
                    估值要算 8100 个 Q 值, 而这一步只有 ~44 个合法着法 (实测 216 ms/步 ->
                    见 sacazagent.h 的说明)。取不到 (头不支持/下标越界) 就回退全量口径。
+
+                   [2026-09 dev-sacmoetb] 用 sparseLeaf 而不是 policySparse +
+                   qValuesSparse: 后者在**共享骨干**口径下会把唯一的那次骨干前向白做
+                   两遍 (三次前向里两次的结果完全一样), 那正好把 Shared 的 3 倍收益
+                   全吃掉。语义与"两次分开调"逐元素相同 (同一个 h, 同一套合法集归一)。
                 */
                 std::vector<float> piSp, qaSp, qbSp;
                 bool sparseOk = sparseLeafEval
-                                && policySparse(m_stateBuf, childIdx, piSp)
-                                && qValuesSparse(m_stateBuf, childIdx, qaSp, qbSp);
+                                && sparseLeaf(m_stateBuf, childIdx, piSp, qaSp, qbSp);
                 if (sparseOk) {
                     for (std::size_t i = 0; i < childIdx.size(); i++) {
                         child.untriedActionIndices.push_back(childIdx[i]);
@@ -1372,9 +1702,22 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
         bitsToMask(tr.curMask, mask);
         bitsToMask(tr.nextMask, nextMask);
 
-        /* ---- 目标侧: 用目标网算下一局面的软价值 ---- */
-        policy(nextState, nextMask, piNext);
-        qTargetValues(nextState, q1n, q2n);
+        /* ---- 目标侧: 用目标网算下一局面的软价值 ----
+           [2026-09 dev-sacmoetb] 共享口径下这两件事各跑**一次**骨干 (在线一次、目标
+           一次), 而独立口径是三次 (actor / q1Target / q2Target 各一次)。
+           π(s') 仍然取**在线**骨干+策略头, V(s') 仍然取**目标**骨干+两个 Q 头 ——
+           口径一个字没改, 只是"同一个 h 不再算两遍"。 */
+        if (trunkMode == TrunkMode::Shared) {
+            RL::Tensor &hNext = trunk.forward(nextState);
+            m_logits = actorHead.forward(hNext);
+            maskedSoftmax(m_logits, nextMask, piNext);
+            RL::Tensor &hNextT = trunkTarget.forward(nextState);
+            q1n = q1TargetHead.forward(hNextT);
+            q2n = q2TargetHead.forward(hNextT);
+        } else {
+            policy(nextState, nextMask, piNext);
+            qTargetValues(nextState, q1n, q2n);
+        }
         const float vNext = softValueFrom(piNext, nextMask, q1n, q2n);
 
         /*
@@ -1396,9 +1739,21 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
                                    : y;
         m_maxAbsTarget = std::max(m_maxAbsTarget, std::fabs((double)yClamped));
 
-        /* ---- 当前局面 ---- */
-        policy(state, mask, pi);
-        qValues(state, q1o, q2o);
+        /* ---- 当前局面 ----
+           [2026-09 dev-sacmoetb] 共享口径: **骨干只前向一次**, 三个头各算一遍。
+           这一次前向同时是后面 trunk.backward(state, ...) 要用的那次 —— 顺序上它必须是
+           反向之前**最后一次**在线骨干前向 (独立口径下 actor/q1/q2 各跑一次, 但三次的
+           输入都是同一个 state, 所以哪一次的缓存都等价)。 */
+        if (trunkMode == TrunkMode::Shared) {
+            RL::Tensor &hCur = trunk.forward(state);
+            m_logits = actorHead.forward(hCur);
+            maskedSoftmax(m_logits, mask, pi);
+            q1o = q1Head.forward(hCur);
+            q2o = q2Head.forward(hCur);
+        } else {
+            policy(state, mask, pi);
+            qValues(state, q1o, q2o);
+        }
 
         /* critic 损失: 只对实际走的那一步回归 (SAC 的标准做法, 其余动作误差为 0)。
            Huber: |err| <= delta 时与 MSE 完全一致, 超出后转线性 —— 单个离群样本不会
@@ -1415,10 +1770,22 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
                                : 0.5 * ae * ae);
 
         for (int ci = 0; ci < 2; ci++) {
-            RL::Net &qnet = (ci == 0) ? q1 : q2;
-            RL::Tensor target = (ci == 0) ? q1o : q2o;
-            target[tr.action] = yClamped;
-            qnet.backward(state, RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
+            /*
+               共享口径: 两个 Q 头各自的梯度, 反向时把梯度累加到**同一个骨干**上
+               (见下面 gh 那一段)。独立口径: 两张完整的网各自反向。
+            */
+            if (trunkMode == TrunkMode::Shared) {
+                RL::Tensor target = (ci == 0) ? q1o : q2o;
+                target[tr.action] = yClamped;
+                RL::Net &head = (ci == 0) ? q1Head : q2Head;
+                head.backward(trunk.output(),
+                              RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
+            } else {
+                RL::Net &qnet = (ci == 0) ? q1 : q2;
+                RL::Tensor target = (ci == 0) ? q1o : q2o;
+                target[tr.action] = yClamped;
+                qnet.backward(state, RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
+            }
         }
 
         /*
@@ -1441,7 +1808,27 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             g[i] = gi;
         }
         maskedSoftmaxBackward(pi, g, dz);
-        actor.backward(state, dz);
+        if (trunkMode == TrunkMode::Shared) {
+            /*
+               ---- 共享骨干: 三份梯度在骨干处**相加**, 然后只反向一次 ----
+               顺序是硬约束:
+                 1. 三个头的 backward 都要在 trunk.backward 之前 (它们读的是骨干的
+                    缓存输出 h, 而 Layer<Tanh>::backward 结束时会把 o 清掉);
+                 2. 每个头 backward 之后, 它对输入的梯度就在 `Net::inputGrad` 里
+                    (Net::backwardFrom 把 layers[0]->backward 的结果存在那里) ——
+                    三个 inputGrad 相加就是 dL/dh。
+               为什么是"相加"而不是"三次反向": 骨干只有一份, 它的梯度本来就应该等于
+               三条损失路径各自对它的梯度之和; 分三次反向 = 三次更新同一份权重, 那等于
+               把学习率乘 3。
+            */
+            actorHead.backward(trunk.output(), dz);
+            RL::Tensor gh = actorHead.inputGrad;
+            gh += q1Head.inputGrad;
+            gh += q2Head.inputGrad;
+            trunk.backward(state, gh);
+        } else {
+            actor.backward(state, dz);
+        }
 
         /*
            α 自动调节:
@@ -1557,21 +1944,46 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
        和 test/test_sparse_moe_main.cpp [6][7]。
     */
     if (auxLossCoef > 0.0f) {
-        RL::Net *nets[3] = {&actor, &q1, &q2};
-        for (int ni = 0; ni < 3; ni++) {
-            for (std::size_t li = 0; li < nets[ni]->size(); li++) {
-                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+        /*
+           [2026-09 dev-sacmoetb] 共享口径下 actor/q1/q2 是**同一个 MoE 层对象**的
+           三张视图: 照旧遍历三个 Net 会让同一个层被 addAuxGradient 调三次。今天"碰巧"
+           是对的 (第一次调用末尾就把 batchForwardCount 清 0, 后两次直接返回), 但那
+           依赖 addAuxGradient 的实现细节 —— 显式只调一次, 不靠运气。
+        */
+        if (trunkMode == TrunkMode::Shared) {
+            for (std::size_t li = 0; li < trunk.size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
                 if (moe != nullptr) {
                     moe->addAuxGradient(auxLossCoef);
+                }
+            }
+        } else {
+            RL::Net *nets[3] = {&actor, &q1, &q2};
+            for (int ni = 0; ni < 3; ni++) {
+                for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                    RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                    if (moe != nullptr) {
+                        moe->addAuxGradient(auxLossCoef);
+                    }
                 }
             }
         }
     }
 
-    /* ---- 应用梯度 ---- */
-    actor.RMSProp(learningRateActor, 0.9f, 0.0f);
-    q1.RMSProp(learningRateCritic, 0.9f, 0.0f);
-    q2.RMSProp(learningRateCritic, 0.9f, 0.0f);
+    /* ---- 应用梯度 ----
+       共享口径: 骨干只更新**一次** (用 learningRateTrunk)。若照旧对 actor/q1/q2 各调
+       一次 RMSProp, 同一份骨干权重会被同一个累积梯度更新三次 = 学习率乘 3 ——
+       一个完全静默、只让训练变坏的写法。 */
+    if (trunkMode == TrunkMode::Shared) {
+        trunk.RMSProp(learningRateTrunk, 0.9f, 0.0f);
+        actorHead.RMSProp(learningRateActor, 0.9f, 0.0f);
+        q1Head.RMSProp(learningRateCritic, 0.9f, 0.0f);
+        q2Head.RMSProp(learningRateCritic, 0.9f, 0.0f);
+    } else {
+        actor.RMSProp(learningRateActor, 0.9f, 0.0f);
+        q1.RMSProp(learningRateCritic, 0.9f, 0.0f);
+        q2.RMSProp(learningRateCritic, 0.9f, 0.0f);
+    }
 
     /* α 的梯度是整批累加的, 取平均后再更新 */
     alpha.g[0] = alphaGrad / (float)n;
@@ -1584,11 +1996,19 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
        "每 64 步一次"在"一次会话几千步"的尺度上等于不更新 (实测 20 局只移动 2~4%,
        目标网一直停在随机初始化尺度 0.07~0.10), 于是自举项里没有任何游戏信息。
        `targetTau >= 1` 时 softUpdateTo 等价于硬拷贝 (对照臂)。
+       共享口径: 骨干只同步**一次**到唯一的目标骨干 (照旧写两遍会是同一个源的两次
+       Polyak —— 第二次把刚写进去的值又往同一处推一次, 相当于步长变了)。
     */
     learnSteps++;
     if (learnSteps % (replaceTargetIter > 0 ? replaceTargetIter : 1) == 0) {
-        q1.softUpdateTo(q1Target, targetTau);
-        q2.softUpdateTo(q2Target, targetTau);
+        if (trunkMode == TrunkMode::Shared) {
+            trunk.softUpdateTo(trunkTarget, targetTau);
+            q1Head.softUpdateTo(q1TargetHead, targetTau);
+            q2Head.softUpdateTo(q2TargetHead, targetTau);
+        } else {
+            q1.softUpdateTo(q1Target, targetTau);
+            q2.softUpdateTo(q2Target, targetTau);
+        }
     }
 
     /* ---- 回放缓冲上限 ---- */
@@ -1793,10 +2213,30 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPoli
 }
 
 /* ============================================================
- *  存取: 一个路径前缀 -> 三个文件
+ *  存取
+ *  ------------------------------------------------------------
+ *  两个口径的**文件个数与语义都不同**, 所以各写一份, 且靠前缀区分 (见头文件
+ *  sharedWeightPrefix 的说明):
+ *    Separate: 3 个文件 —— actor / q1 / q2, 目标网在载入时由在线网 copyTo 派生;
+ *    Shared  : 4 个文件 —— trunk / actorhead / q1head / q2head。
+ *
+ *  为什么共享口径**不**写成"_trunk + _q1 + _q2"这种"看起来兼容"的形式: 共享口径没有
+ *  独立的 actor 网, 而独立口径的 `_q1` 里含着一整份骨干。两种文件的**第 2 个文件**
+ *  语义完全不同 (一个是 Q1 头, 一个是"骨干+Q1"), 共用一个前缀就等于给"载错文件"
+ *  留门 —— 而载错的后果不是报错, 是把一份 28.8 M 的骨干当成 64x128 的头去用。
  * ============================================================ */
 bool SACAZAgent::saveModel(const std::string &filepath)
 {
+    if (trunkMode == TrunkMode::Shared) {
+        trunk.save(filepath + "_trunk");
+        actorHead.save(filepath + "_actorhead");
+        q1Head.save(filepath + "_q1head");
+        q2Head.save(filepath + "_q2head");
+        return weightFileWritten(filepath + "_trunk")
+               && weightFileWritten(filepath + "_actorhead")
+               && weightFileWritten(filepath + "_q1head")
+               && weightFileWritten(filepath + "_q2head");
+    }
     actor.save(filepath + "_actor");
     q1.save(filepath + "_q1");
     q2.save(filepath + "_q2");
@@ -1807,6 +2247,30 @@ bool SACAZAgent::saveModel(const std::string &filepath)
 
 bool SACAZAgent::loadModel(const std::string &filepath)
 {
+    if (trunkMode == TrunkMode::Shared) {
+        if (!weightFileReadable(filepath + "_trunk")
+            || !weightFileReadable(filepath + "_actorhead")
+            || !weightFileReadable(filepath + "_q1head")
+            || !weightFileReadable(filepath + "_q2head")) {
+            return false;
+        }
+        const int rt = trunk.load(filepath + "_trunk");
+        const int ra = actorHead.load(filepath + "_actorhead");
+        const int r1 = q1Head.load(filepath + "_q1head");
+        const int r2 = q2Head.load(filepath + "_q2head");
+        if (rt != 0 || ra != 0 || r1 != 0 || r2 != 0) {
+            std::cerr << "[weights] SACAZAgent(Shared)::loadModel 失败 (trunk=" << rt
+                      << ", actorHead=" << ra << ", q1Head=" << r1 << ", q2Head=" << r2
+                      << "), 未同步目标网" << std::endl;
+            return false;
+        }
+        /* 与独立口径同一条纪律: 载入成功后**才**把目标网同步成在线网的副本 */
+        trunk.copyTo(trunkTarget);
+        q1Head.copyTo(q1TargetHead);
+        q2Head.copyTo(q2TargetHead);
+        return true;
+    }
+
     if (!weightFileReadable(filepath + "_actor")
         || !weightFileReadable(filepath + "_q1")
         || !weightFileReadable(filepath + "_q2")) {
@@ -1967,6 +2431,52 @@ std::string SACAZAgent::selfCheckReport() const
     */
     std::snprintf(buf, sizeof(buf), "隐层激活(实测) %s\n", hiddenActivationName());
     out += buf;
+    /*
+       ---- 0b. 骨干共享口径 + TB 专家的**实际头数** (2026-09 dev-sacmoetb) ----
+       这两行是本次改动唯一能在面板上看见的东西, 而它们各自对应一个"原本完全看不见"
+       的失效:
+         * 骨干口径: Shared 与 Separate 的权重文件**互不通用**, 不写出来就没法解释
+           "为什么这个 agent 的权重载入失败了";
+         * 头数: `MOE_TB_HEADS=15` 曾在 d_model=1263 上被静默降成 3 个头 ——
+           参数指纹/paramCount/层类型/文件格式**一个都没变**, 变的只有速度。
+           所以报**实测值** (读建好的层), 而不是回显 tbHonorHeads 这个开关。
+    */
+    std::snprintf(buf, sizeof(buf),
+                  "骨干口径 %s | 唯一参数量 %lld (actor.paramCount=%lld 在共享口径下会把"
+                  "骨干重复计入三张视图)\n",
+                  trunkModeName(trunkMode), uniqueParamCount(), actor.paramCount());
+    out += buf;
+    {
+        const int hReq = tbHeadsRequested();
+        if (hReq < 0) {
+            out += "TB 专家头数: 本骨干没有 TransformerBlock 专家 (Mlp / 稀疏MoE(MLP专家))\n";
+        } else {
+            const int hUse = tbHeadsUsed();
+            const int hAlloc = tbHeadsAllocated();
+            const char *verdict = (hUse == hReq && hAlloc == hReq)
+                                      ? "[请求的头数全部落地]"
+                                      : ((hUse < hReq) ? "**头数被降级 (tbHonorHeads?) —— 实测慢 ~3 倍**"
+                                                       : "[异常]");
+            std::snprintf(buf, sizeof(buf),
+                          "TB 专家头数(实测): 请求 %d / 实际参与 %d / 分配 %d, d_k=%d,"
+                          " 注意力元素 %lld, d_model=%d %s\n",
+                          hReq, hUse, hAlloc, tbHeadDim(), tbAttentionElements(),
+                          STATE_DIM, verdict);
+            out += buf;
+            /*
+               为什么把 STATE_DIM 摆在这行: 头数被降级的**根因**就是"请求的头数不整除
+               d_model"。1263 = 3 x 421 (421 是素数) 时只有 1/3/421/1263 四个因子 ——
+               "15 个头"这件事在旧口径下**根本不可能成立**。把两个数印在同一行, 下次
+               换表示 (STATE_DIM 变了) 时一眼就能看出该重新挑头数。
+            */
+            if (hUse != hReq) {
+                out += "  为什么: 旧口径是\"从请求头数往下找第一个整除 d_model 的数\","
+                       " 而 d_model 的因子只有 1/3/421/1263 -> 15 个头落成 3 个;\n"
+                       "  代价: 3 x 421^2 = 531723 个注意力元素 (设计意图 15 x 84^2 = 105840),"
+                       " 单专家前向 15.7 ms vs 5.4 ms\n";
+            }
+        }
+    }
 
     /* ---- 1. 表示层: 状态编码 ----
        这一节的两行**必须随 SACAZ_ALIGNED_REPR 分支**: 默认构建是 1263 维 / 128 槽,

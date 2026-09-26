@@ -279,12 +279,20 @@ static constexpr long long EVAB_BUDGET_MS = 800;
 static constexpr int SACAZ_SIMS = 256;
 static constexpr int SACAZ_HIDDEN = 64;       /* SAC+AZ 的网络隐层宽度 */
 /*
- * 稀疏 MoE (TB 专家) 骨干的那个变体: 一次模拟 ~10.9 ms (实测, test_sacaz [10]),
- * 所以模拟次数只能给到 16 (约 175 ms/步)。这是"容量换算力"的直接后果 ——
- * 同样的参数量下, 稀疏路由让它比全算 4 个专家快 3.8 倍 (42.0 -> 10.9 ms/模拟),
- * 但要和 0.07 ms/模拟的 MLP 骨干比算力, 无论如何都差两个数量级。
- */
-static constexpr int SACAZ_MOE_SIMS = 16;
+   稀疏 MoE (TB 专家) 骨干的那个变体。
+   ---- [2026-09 dev-sacmoetb] 这一档从 16 提到 40, 依据是同机实测 ----
+   提出 16 时的一次模拟是 ~10.9 ms (老口径: 请求 15 个头却只跑 3 个, 而且一次叶子估值要
+   把骨干前向三遍)。本轮两处改动把这两个数都压下来了 (test_sacaz [17A]/[17B]):
+     * TB 专家头数口径修复: 单专家前向 15.7 ms -> 5.4 ms (2.9x);
+     * 共享骨干: 一次叶子估值的骨干前向 3 次 -> 1 次 (selectMove 实测 9.3 -> 4.1 ms/模拟);
+   于是同样 175 ms/步的预算能跑的模拟数从 ~19 变成 ~42。取 **40** (约 165 ms/步),
+   留一点余量给"棋盘恢复 / 合法着法生成"这些不随模拟数伸缩的开销。
+   **这条数字必须能复跑**: `bench_sacaz_vs_ab --budget=175 --trunk=shared` 会现场标定
+   ms/模拟 并回算模拟次数; 换机器/换编译器之后以那个读数为准。
+   为什么值得提: 16 < 分支数 (~39) 意味着**一次深挖都没有** —— π 目标退化成"把自己
+   先验前 16 名抹平" (issues_review C16)。40 刚过分支数地板, 才开始有真正的深挖。
+*/
+static constexpr int SACAZ_MOE_SIMS = 40;
 /*
  * 负载均衡辅助损失的系数。0.1 是实测选出来的 (bench_moe --cases=B --pretrain=3):
  *   aux=0     -> 8 个专家里有 3 个一次都没被选中 (路由塌了)
@@ -382,7 +390,13 @@ static constexpr int BG_TRAIN_SACAZ_MOE_SIMS = 64;
 static const char *TMP_WEIGHTS       = "weights/_temp_train.dat";        /* 单文件 + PPO(TB) */
 static const char *TMP_WEIGHTS_PPOMCTS_MLP = "weights/_temp_train_ppomcts_mlp";
 static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
-static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe";
+/*
+   [2026-09 dev-sacmoetb] AGENT_SACAZ_MOE 改成共享骨干口径 ⇒ 临时文件前缀也跟着换。
+   不换的后果与正式前缀那条一样 (共享口径写 _trunk/_actorhead/..., 独立口径写
+   _actor/_q1/_q2): 上一次会话留下的 _actor/_q1/_q2 会被新一轮的 loadModel 找不到
+   _trunk 而失败 —— 或者在有人补了回退之后被**静默当成共享骨干**读进来。
+*/
+static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe_shared";
 /*
    行为还原版 SAC (AGENT_SACAZ_OLD = 独立类 SACAZLegacyAgent) 的临时前缀。
    **必须有独立前缀**: 与 AGENT_SACAZ 共用会让两个 agent 的后台训练互相覆盖权重
@@ -443,14 +457,45 @@ static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
         return a;
     }
     case ChessBoard::AGENT_SACAZ_MOE: {
+        /*
+           [2026-09 dev-sacmoetb] 这一支改用**共享骨干 + 三头**口径 (TrunkMode::Shared)。
+           两个改动一起进, 它们的账要分开记:
+
+           (1) **TB 专家的头数口径** (tbHonorHeads: 默认就是修好的口径, 这里不传)。
+               `MOE_TB_HEADS = 15` 原来在 `d_model = STATE_DIM = 1263 = 3 x 421` 上被
+               "头数必须整除 d_model" 的规则**静默降成 3 个头** (实测单专家前向
+               15.7 ms vs 5.4 ms, 3.0 倍; 而且 15 个 head 对象全都分配、只用 3 个)。
+               这是修 bug, 所以默认就是修好的; 想复现旧读数要显式传 false。
+
+           (2) **共享骨干**: 原来五张网各自背一整套骨干 (TB 专家下 28.8 M 参数/张,
+               合计 144 M)。现在骨干只留在线/目标各一份, actor/q1/q2 退化成三个只有
+               输出层的头。实测 (test_sacaz [17B], 同权重同局面):
+                   参数量      143,903,940 -> 57,586,536   (2.50x 少)
+                   learnBatch  649.9 ms/批 -> 225.6 ms/批  (2.88x 快)
+                   selectMove  9.3 ms/模拟 -> 4.1 ms/模拟   (2.24x 快)
+               而且 π / Q / V **逐位相同** (把独立口径的三个骨干也设成同一份之后)。
+               于是"同一套算法、同样的预算"下能跑的模拟次数从 ~19 变成 ~42。
+
+           **权重文件必须换前缀** (weights/sacaz_moe_shared_agent): 共享口径写 4 个文件
+           (trunk + 三个头), 独立口径写 3 个 (_actor/_q1/_q2), 两者的 `_q1` 语义完全
+           不同 —— 共用一个前缀等于给"载错文件"留门。见 sacazagent.h 的
+           sharedWeightPrefix 说明。**旧权重载不进这一支**, 它要从头训练。
+        */
         SACAZAgent *a = new SACAZAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                       SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX);
+                                       SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX,
+                                       SACAZAgent::TrunkMode::Shared);
         /*
            ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
            一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
            32 条就是 **7.3 s/手** —— 加上界面本来就有的那一轮, 一步要十几秒。MLP 骨干那一支
            是 0.95 ms/样本(32 条约 30 ms), 所以那条路径的开销可以忽略, 这一条不行。
            等它有了便宜的头/批(见 docs 里的待办)再一起打开。
+
+           ---- [2026-09 dev-sacmoetb] 那个"待办"已经做了一半, 但这一行仍然保留 ----
+           共享骨干 + 头数口径之后, 同一台机器上实测 learnBatch 从 649.9 降到 225.6 ms/批
+           (2.88x, test_sacaz [17B])。但 32 条仍然要 ~1.8 s/手 —— 对 175 ms/步的界面预算
+           还是太贵, 所以这一行**不动**。要开就删掉它, 并用
+           `bench_sacaz_vs_ab --trunk=shared --budget=175` 复核一步的真实耗时。
         */
         a->learnFromSearch = false;
         return a;
@@ -3991,9 +4036,17 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     case AGENT_PPOMCTS_MLP: return "weights/ppomcts_mlp_agent.dat";
     case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
     case AGENT_EVAB:      return "weights/evab_agent.dat";
-    /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 */
+    /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 (共享口径那一支是 _trunk + 三个头) */
     case AGENT_SACAZ:     return SACAZAgent::defaultWeightPrefix();
-    case AGENT_SACAZ_MOE: return "weights/sacaz_moe_agent";
+    /*
+       [2026-09 dev-sacmoetb] SAC+AZ-MoE 改用**共享骨干**口径 ⇒ 必须换前缀。
+       为什么不能继续用 "weights/sacaz_moe_agent": 两个口径写出的文件**个数与语义都
+       不同** (独立: _actor/_q1/_q2 三份完整网络; 共享: _trunk/_actorhead/_q1head/_q2head),
+       共用一个前缀时 `loadModel` 会去找 _trunk 而找不到 -> 返回 false (还算看得见),
+       但更坏的是"有人为了兼容而补一条回退": 那会把独立口径的 `_actor/_q1/_q2` 里的
+       **第一份骨干**当成共享骨干、另外两份直接丢掉 —— 静默、不报错、训练还在继续。
+    */
+    case AGENT_SACAZ_MOE: return SACAZAgent::sharedWeightPrefix();
     /*
        59e5233 行为还原版: **独立前缀**, 由那个类自己给出 (weights/sacaz_old_agent)。
        绝不能用 SACAZAgent::defaultWeightPrefix() —— 那是"当前口径"那一支的文件,
