@@ -1002,6 +1002,36 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_sac_mcts_min)
 
+    # ---- [2026-09 dev-sacmoetb] bench_sacmoetb_train: TB 专家 SAC+AZ 的
+    #      "自对弈训练 -> 对锚点(MCTS / ABAgent level=1)评测" 闭环。
+    # 为什么单独一个目标 (而不是塞进 bench_sacaz_vs_ab):
+    #   * 那个工具每跑一次都是**新进程、随机权重、不训练**, 只能回答"机制通不通";
+    #     这个工具要回答"训练之后棋力有没有涨", 所以必须带训练阶段、固定开局集、
+    #     成对换先、以及 95% 区间 (与 bench_anchor 同一套方法学)。
+    #   * 它的全部旋钮都写在**这一个实例**上 (Backbone 固定 SparseMoeTb), 一行都不改
+    #     SACAZAgent 的默认值 —— 这是"不许污染 MLP 专家代码逻辑"那条约束的落地方式。
+    add_executable(bench_sacmoetb_train
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sacmoetb_train_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/sacazagent.cpp)
+    target_include_directories(bench_sacmoetb_train PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sacmoetb_train PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sacmoetb_train PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sacmoetb_train PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sacmoetb_train)
+
     # ---- bench_sac_learn: "SAC 边下边学" 的受控复现 + 奖励塑形 A/B (2026-09) ----
     # 与上面那个的区别: 这个工具**每手都调 exploreAndTrain** (界面 preTrainThenDecide 的
     # 那一步) 并统计胜负和的成因/奖励累计/损失曲线/critic 尺度 —— 也就是用户报的
