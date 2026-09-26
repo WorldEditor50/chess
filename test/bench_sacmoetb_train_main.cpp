@@ -156,6 +156,15 @@ struct Cfg {
        **它会改变 MDP 的最优策略** (更贪子), 所以这是一个需要实测的取舍, 不是白拿。
     */
     float rewardScale = 1.0f;
+    /*
+       ---- [2026-09 实验轮] 用户提议的三个旋钮 + 两个"修好版" (全部默认关) ----
+       详见 src/sacazagent.h 里各成员的注释与 docs/dev_sacmoetb_strength_2026_09.md。
+    */
+    bool criticTanh = false;         /* 提议①: Q = tanh(z) */
+    float rewardTanhGain = 0.0f;     /* 提议②: 即时奖励 -> tanh(gain * r) */
+    float alphaGumbelSigma = 0.0f;   /* 提议③: α 每样本乘 exp(sigma*(G-gamma)) */
+    float alphaCeiling = 5.0f;       /* α 上界 (默认 5.0 = 改动前) */
+    bool entropyCenter = false;      /* V 里熵项改成 alpha*(H - log n) */
     bool sparseLeaf = true;
     /*
        [2026-09 ①] 熵项的**去处**。这是本工具最想 A/B 的一个旋钮, 因为本机的训练诊断
@@ -590,6 +599,11 @@ bool parseArgs(int argc, char **argv)
         else if (const char *v = val("--reward-shape")){ g_cfg.rewardShape = std::atoi(v); }
         else if (const char *v = val("--value-scale")){ g_cfg.valueScale = (float)std::atof(v); }
         else if (const char *v = val("--reward-scale")){ g_cfg.rewardScale = (float)std::atof(v); }
+        else if (const char *v = val("--critic-tanh")){ g_cfg.criticTanh = (std::atoi(v) != 0); }
+        else if (const char *v = val("--reward-tanh")){ g_cfg.rewardTanhGain = (float)std::atof(v); }
+        else if (const char *v = val("--alpha-gumbel")){ g_cfg.alphaGumbelSigma = (float)std::atof(v); }
+        else if (const char *v = val("--alpha-ceiling")){ g_cfg.alphaCeiling = (float)std::atof(v); }
+        else if (const char *v = val("--entropy-center")){ g_cfg.entropyCenter = (std::atoi(v) != 0); }
         else if (const char *v = val("--sparse-leaf")){ g_cfg.sparseLeaf = (std::atoi(v) != 0); }
         else if (const char *v = val("--entropy-in-target")){ g_cfg.entropyInTarget = (float)std::atof(v); }
         else if (const char *v = val("--entropy-slots")){ g_cfg.entropySlots = (std::atoi(v) != 0); }
@@ -650,11 +664,15 @@ void printConfig(const SACAZAgent &sac)
                 (double)g_cfg.entropyRatio, (double)g_cfg.alphaLr,
                 (double)g_cfg.azWeight, (double)g_cfg.cpuct);
     std::printf("            : clamp=%.3g huber=%.3g aux=%.3g rewardShape=%d valueScale=%.3g rewardScale=%.3g "
-                "sparseLeaf=%d learnFromSearch=%d entropyInTarget=%.3g entropySlots=%d\n",
+                "sparseLeaf=%d learnFromSearch=%d entropyInTarget=%.3g entropySlots=%d\n"
+                "            : [实验轮] criticTanh=%d rewardTanhGain=%.3g alphaGumbel=%.3g alphaCeiling=%.3g entropyCenter=%d\n",
                 (double)g_cfg.clampTarget, (double)g_cfg.huberDelta, (double)g_cfg.aux,
                 g_cfg.rewardShape, (double)g_cfg.valueScale, (double)g_cfg.rewardScale,
                 (int)g_cfg.sparseLeaf, (int)g_cfg.learnFromSearch,
-                (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots);
+                (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots,
+                (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
+                (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
+                (int)g_cfg.entropyCenter);
     std::printf("参数量    : 唯一 %lld (actor.paramCount()=%lld, 共享口径下它会把骨干重复计入三张视图)\n",
                 sac.uniqueParamCount(), sac.actor.paramCount());
 }
@@ -759,6 +777,19 @@ int main(int argc, char **argv)
     sac.rewardShape = g_cfg.rewardShape;
     sac.valueScale = g_cfg.valueScale;
     sac.rewardScale = g_cfg.rewardScale;
+    sac.criticTanh = g_cfg.criticTanh;
+    sac.rewardTanhGain = g_cfg.rewardTanhGain;
+    sac.alphaGumbelSigma = g_cfg.alphaGumbelSigma;
+    sac.alphaCeiling = g_cfg.alphaCeiling;
+    sac.entropyCenter = g_cfg.entropyCenter;
+    /*
+       `alphaCeiling` 必须在**构造时**就生效 (见 agent 构造函数的注释), 所以这里
+       再夹一次: harness 是先构造、后设旋钮的, 构造那一刻用的还是默认上界 5.0。
+       只在"上界确实比初值 0.2 小"时才改变——否则这一行是空操作。
+    */
+    if (g_cfg.alphaCeiling > 0.0f && sac.alpha[0] > g_cfg.alphaCeiling) {
+        sac.alpha[0] = g_cfg.alphaCeiling;
+    }
     sac.sparseLeafEval = g_cfg.sparseLeaf;
     sac.learnFromSearch = g_cfg.learnFromSearch;
     sac.entropyInTarget = g_cfg.entropyInTarget;
@@ -953,7 +984,10 @@ int main(int argc, char **argv)
                     g_cfg.rewardShape, (double)g_cfg.valueScale,
                     (double)g_cfg.rewardScale, (int)g_cfg.sparseLeaf, (int)g_cfg.learnFromSearch,
                     g_cfg.trunk.c_str(), g_cfg.tbHeads.c_str(),
-                    (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots);
+                    (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots,
+                (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
+                (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
+                (int)g_cfg.entropyCenter);
             }
             std::fclose(fp);
             std::printf("\nCSV       : %s\n", g_cfg.csvPath.c_str());

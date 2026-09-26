@@ -500,11 +500,147 @@ public:
     */
     float valueScale = 1.0f;
 
+    /* ================================================================
+     *  [2026-09 实验轮] 三组"用户提议"的旋钮 + 两个"修好版"
+     * ================================================================
+     * **全部默认关闭 ⇒ 与改动前逐位相同**；只作用于建这个 agent 的进程/实例，
+     * 所以 MLP 专家 (Backbone::Mlp / SparseMoeMlp) 的代码路径一位都不动。
+     *
+     * 背景是实测出来的那一条耦合 (见 docs/dev_sacmoetb_strength_2026_09.md §3.1/§6.1):
+     *     V(s') = E_π[min Q] + α·H,   y = r − γ·V(s')
+     *   实测 α·H ≈ 1.9, 而游戏真实值域只有 ±1（终局）±0.35（满材质）——
+     *   熵偏置是值域的**两倍** ⇒ 44% 的 TD 目标被 clampTarget 夹住、
+     *   0.029 量级的子力信号被淹没; 而把 α·H 拿掉, critic 又会塌成 0
+     *   （没有别的自举信号）。三组提议各自会撞上这条耦合的哪一边，见各成员的注释。
+     * ================================================================ */
+
+    /*
+       ---- 提议① critic 输出用 tanh: Q = tanh(z) (z 是 Linear 头的原始输出) ----
+       实现方式刻意**不改网络结构**（不把输出层换成 `Layer<Tanh>`）：只在产出 Q 的地方
+       套 tanh，并在反向时按链式法则乘 `1 − Q²`。这样权重文件格式、结构指纹、
+       参数计数全部不变 —— 一个实验旋钮不该顺带改掉可载入性。
+
+       **先算一遍**: TD 目标 `y = r − γ·V(s')`，而 `V(s') = E[minQ] + α·H`。
+       在 α·H ≈ 1.9 的现状下 |y| 常在 1~2（44% 超过 clampTarget=2）。
+       而 tanh 把 Q 限在 (−1, 1) ⇒ **critic 结构上就拟合不上 y**，
+       而且残差最大的那批样本恰好落在 tanh 的饱和区（`1 − Q² → 0`），
+       梯度也一起消失。所以**单开这一条应当更差** —— 这正是要实测的预测。
+       它与 `clampTarget` 是同一类东西（都是"把 Q 夹进值域"），
+       但 `clampTarget` 夹的是**目标**（不改变模型的表达力），tanh 夹的是**输出**（会）。
+       **修好版**：tanh 输出 + 把熵项移出目标（`entropyInTarget = 0`）⇒
+       `V(s') = E[minQ] ∈ (−1,1)`、`y ∈ (−1.35, 1.35)`，这时 tanh 与值域天然匹配。
+    */
+    bool criticTanh = false;
+
+    /*
+       ---- 提议② 奖励用 tanh 塑形: 即时奖励 r → tanh(gain · r) ----
+       gain <= 0 = 关（默认）。
+
+       **先算一遍**: 现在的即时奖励里，吃一个马/炮是 **0.029**
+       （REWARD_MATERIAL_COEF=0.1 × 子力），每步代价 −0.001。
+       `tanh(0.029) = 0.02899` —— **就是恒等**，gain=1 等于什么都没做。
+       要让 tanh 起作用必须先放大（gain 十几以上），而那正好**已经测过**：
+       `rewardScale` 5x / 20x 对 critic 读数与得分率都**没有效果**
+       （docs/dev_sacmoetb_strength_2026_09.md §6），因为 TD 目标的主项是
+       `−γ·V(s')` 而不是 `r`。
+       所以这一条要么是恒等、要么是已测过的负结果；仍然实测，因为"算出来的"不算数。
+       **注意终局不参与**：终局 ±1 是环境的真值，`tanh(±1) = ±0.7616` 会把它压小，
+       只会让棋局信号相对熵偏置更小（更坏）。
+    */
+    float rewardTanhGain = 0.0f;
+
+    /*
+       ---- 提议③ α 用 Gumbel 方法调整 ----
+       `sigma > 0` 时，每个训练样本把 α 换成一个被 Gumbel 噪声扰动的随机量：
+           α_eff = α · exp( sigma · (G − γ) ),   G = −log(−log U),  γ = 0.5772
+       （指数形式保证 α_eff > 0；减掉 γ 让它零均值。）
+
+       **说清楚它不是什么**: `rl/util.hpp` 的 `gumbelSoftmax(x, tau)` 是
+       **可微采样器**（给 logits 加 Gumbel 噪声再 softmax，用来从 categorical 里
+       可微地采样），它不是一个"控制器"。α 也不是一个 categorical 分布 ——
+       它是标量温度。所以"用 gumbelSoftMax 调 α"没有现成的对应物，
+       这里实现的是**最接近的读法**：把 α 当成随机量、用 Gumbel 噪声去做探索。
+
+       **先算一遍**: α·H 是**线性**进 TD 目标的，所以给 α 加噪 = **给每个 TD 目标加噪**。
+       而当前的问题恰恰是目标被一个常数偏置顶住、排序信息被淹没 ——
+       加噪只会让回归更难。所以**单开这一条应当不改善甚至更差**。
+
+       **但它背后的直觉是对的**，而且已经实测：α 的自动调节**没有在工作** ——
+       实测 `H均 = 3.39 < H̄ = 0.98·log(38.7) = 3.59` ⇒ α 的梯度 `(H − H̄)` 恒为负
+       ⇒ α 被单向推到上界（5.0），`α·H` 因此可以涨到 17。
+       **修好版**用不着 Gumbel，而是直接对付那件事：`alphaCeiling`（把上界压下来）
+       与 `entropyCenter`（让熵项不再是一个大常数）—— 两个都实现了，见下。
+    */
+    float alphaGumbelSigma = 0.0f;
+
+    /* 当前样本实际用的 α（`alphaSample >= 0` 时覆盖 `alpha[0]`；Gumbel 噪声走这里） */
+    float alphaSample = -1.0f;
+
+    /*
+       ---- α 的**上界**（默认 5.0 = 改动前逐位相同）----
+       实测 α 会被推到上界，而 `α·H` 是 TD 目标里的主项之一 ⇒ 上界直接决定
+       "目标被顶多远"。把它压到 0.1 会让 `α·H ≈ 0.34`（而不是 1.9），
+       于是目标不再被夹、但熵项还留着一个**小的、随局面变化**的分量
+       —— 这是"1.9 淹没一切"与"0 让 critic 塌掉"之间的中间点，本轮之前没测过。
+    */
+    float alphaCeiling = 5.0f;
+
+    /*
+       ---- 熵项**居中**（默认 false = 改动前逐位相同）----
+       `true` 时软价值里的熵项从 `α·H` 改成 `α·(H − log(合法槽位数))`，
+       也就是"超出该局面编码能容纳的最大熵的那一部分"。
+
+       为什么这可能同时避开两个极端：
+         * `α·H`（现状）：几乎是个常数（H 随局面的变化很小），
+           `V(s')` 被顶到 1.07 而 `E[minQ]` 只有 −0.85 ⇒ 目标里 97.7% 与棋局无关；
+         * `α·H → 0`（第二轮测过）：自举项只剩 `E[minQ]`，60 局来不及把终局值传回来
+           ⇒ critic 塌成 0（Q 间距 0.083）;
+         * **居中**：把那个大常数减掉（实测 `H − log n ≈ −0.27` ⇒ 项变成 −0.15 量级），
+           但保留 H **随局面变化**的那一部分 ⇒ 目标既不被顶飞、又不恒等于 0。
+       搜索侧 (`sparseLeaf`) 与学习侧 (`softValueFrom`) **必须同口径** —— 两边都改了，
+       否则"搜索估的"与"训练学的"会是两个游戏（本文件反复强调的那条纪律）。
+    */
+    bool entropyCenter = false;
+
     /* 搜索用: valueScale · softValueFrom(...) */
     float searchValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
                           const RL::Tensor &q1In, const RL::Tensor &q2In) const
     {
         return valueScale * softValueFrom(pi, mask, q1In, q2In);
+    }
+
+    /* ----------------------------------------------------------------
+     *  [2026-09 实验轮] 上面那批旋钮的内部支撑
+     * ---------------------------------------------------------------- */
+    /* 当前实际生效的 α: `alphaSample >= 0` 时用采样值 (Gumbel), 否则用学到的 alpha[0] */
+    float effectiveAlpha() const
+    {
+        return (alphaSample >= 0.0f) ? alphaSample : alpha[0];
+    }
+    /* 提议① 的单点形式: Q = tanh(z) 或不改 */
+    float squashQ(float z) const { return criticTanh ? std::tanh(z) : z; }
+    /* 把一整块 Q 就地套上同一个 squash (只作用于模型**输出**, 不改网络结构) */
+    void squashQInPlace(RL::Tensor &q) const
+    {
+        if (!criticTanh) { return; }
+        for (std::size_t i = 0; i < q.size(); i++) { q[i] = std::tanh(q[i]); }
+    }
+    void squashQInPlace(std::vector<float> &q) const
+    {
+        if (!criticTanh) { return; }
+        for (std::size_t i = 0; i < q.size(); i++) { q[i] = std::tanh(q[i]); }
+    }
+    /*
+       提议① 的反向: 给定 dL/dQ, 乘上链式因子 dQ/dz = 1 − Q²。
+       **必须在 backward 之前做**: 对 `Layer<Tanh>` 那种"把激活写进层里"的写法,
+       squeeze 是层自己算的; 这里刻意不改结构, 所以因子由 agent 自己乘。
+    */
+    void squashQBackward(RL::Tensor &dq, const RL::Tensor &q) const
+    {
+        if (!criticTanh) { return; }
+        for (std::size_t i = 0; i < dq.size() && i < q.size(); i++) {
+            dq[i] *= (1.0f - q[i] * q[i]);
+        }
     }
 
     /*

@@ -535,7 +535,13 @@ SACAZAgent::SACAZAgent(Chess &chess_,
 
     /* 温度 α: 标量, 自动调节 (SAC-Discrete 的做法) */
     alpha = RL::GradValue(1, 1);
-    alpha[0] = 0.2f;
+    /*
+       [2026-09 实验轮] `alphaCeiling` (默认 5.0 = 改动前逐位相同)。
+       为什么需要在**构造时**也夹一次: 初值 0.2 可能已经高于调用方给的上界
+       (例如测试想固定 α ≤ 0.1) —— 只在 learnBatch 末尾夹的话, 第一个 batch
+       用的还是 0.2, 那会让"这个上界到底生效没有"变得不可复现。
+    */
+    alpha[0] = std::min(0.2f, alphaCeiling > 0.0f ? alphaCeiling : 0.2f);
 
     m_stateBuf = RL::Tensor(STATE_DIM, 1);
     m_logits = RL::Tensor(ACTION_DIM, 1);
@@ -826,7 +832,21 @@ float SACAZAgent::computeReward(const Step &s, int color)
     if (rewardShape == 1) {
         return stepReward(false, false, 0.0);
     }
-    return (rewardScale == 1.0f) ? base : (rewardScale * base);
+    const float scaled = (rewardScale == 1.0f) ? base : (rewardScale * base);
+    /*
+       [2026-09 实验轮] 提议②: `rewardTanhGain > 0` 时把**即时**奖励换成
+       `tanh(gain · r)`。gain<=0 (默认) 直接返回上面的原式 —— 默认路径一位不变。
+
+       两条先算好的预期 (见 sacazagent.h 的说明):
+         * gain = 1 是**恒等**: 即时奖励只有 0.029, tanh(0.029)=0.02899;
+         * 要起作用必须先放大, 而那等于 `rewardScale`, 已经实测过 5x/20x **无效果**
+           (TD 目标的主项是 −γ·V(s') 而不是 r)。
+       终局**不参与** tanh (terminalReward 是另一个出口), 因为压小 ±1 只会更坏。
+    */
+    if (rewardTanhGain > 0.0f) {
+        return std::tanh(rewardTanhGain * scaled);
+    }
+    return scaled;
 }
 
 /*
@@ -967,10 +987,14 @@ void SACAZAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor 
         RL::Tensor &h = trunk.forward(state);
         q1Out = q1Head.forward(h);
         q2Out = q2Head.forward(h);
+        squashQInPlace(q1Out);
+        squashQInPlace(q2Out);
         return;
     }
     q1Out = q1.forward(state);
     q2Out = q2.forward(state);
+    squashQInPlace(q1Out);
+    squashQInPlace(q2Out);
 }
 
 /* ------------------------------------------------------------------
@@ -1060,6 +1084,8 @@ bool SACAZAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &leg
         if (!sparseCols(q1, state, legalIdx, l1)) { return false; }
         if (!sparseCols(q2, state, legalIdx, l2)) { return false; }
     }
+    squashQInPlace(l1);
+    squashQInPlace(l2);
 
     if (logits.size() != legalIdx.size() || l1.size() != logits.size()
         || l2.size() != logits.size()) {
@@ -1068,6 +1094,8 @@ bool SACAZAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &leg
     if (!softmaxOnSubset(logits, pi)) { return false; }
     q1Out.swap(l1);
     q2Out.swap(l2);
+    squashQInPlace(q1Out);
+    squashQInPlace(q2Out);
     return true;
 }
 
@@ -1077,11 +1105,15 @@ bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &
     if (trunkMode == TrunkMode::Shared) {
         if (q1Head.size() < 1 || q2Head.size() < 1) { return false; }
         RL::Tensor &h = trunk.forward(state);
-        return sparseHeadCols(q1Head[q1Head.size() - 1], h, legalIdx, q1Out)
-               && sparseHeadCols(q2Head[q2Head.size() - 1], h, legalIdx, q2Out);
+        const bool ok = sparseHeadCols(q1Head[q1Head.size() - 1], h, legalIdx, q1Out)
+                        && sparseHeadCols(q2Head[q2Head.size() - 1], h, legalIdx, q2Out);
+        if (ok) { squashQInPlace(q1Out); squashQInPlace(q2Out); }
+        return ok;
     }
-    return sparseCols(q1, state, legalIdx, q1Out)
-           && sparseCols(q2, state, legalIdx, q2Out);
+    const bool ok = sparseCols(q1, state, legalIdx, q1Out)
+                    && sparseCols(q2, state, legalIdx, q2Out);
+    if (ok) { squashQInPlace(q1Out); squashQInPlace(q2Out); }
+    return ok;
 }
 
 bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
@@ -1110,12 +1142,26 @@ bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int>
     if (!sparseLeaf(state, legalIdx, pi, qa, qb)) { return false; }
     if (qa.size() != pi.size() || qb.size() != pi.size()) { return false; }
 
-    const float a = alpha[0];
+    const float a = effectiveAlpha();
+    /*
+       熵项居中时与 softValueFrom 同口径: 在 H 上减去 log(合法着法数)。
+       **默认路径走下面那个分支的原式** —— 不写成 `+ 0.0`, 免得在"逐位复现"的场合
+       多一次浮点运算 (本工程对默认路径的纪律)。
+    */
     double v = 0.0;
-    for (std::size_t i = 0; i < pi.size(); i++) {
-        if (!(pi[i] > 0.0f)) { continue; }
-        const double qmin = (double)std::min(qa[i], qb[i]);
-        v += (double)pi[i] * (qmin - (double)a * std::log((double)pi[i]));
+    if (entropyCenter) {
+        const double logSlots = std::log((double)((pi.size() > 1) ? pi.size() : 2));
+        for (std::size_t i = 0; i < pi.size(); i++) {
+            if (!(pi[i] > 0.0f)) { continue; }
+            const double qmin = (double)std::min(qa[i], qb[i]);
+            v += (double)pi[i] * (qmin - (double)a * (std::log((double)pi[i]) + logSlots));
+        }
+    } else {
+        for (std::size_t i = 0; i < pi.size(); i++) {
+            if (!(pi[i] > 0.0f)) { continue; }
+            const double qmin = (double)std::min(qa[i], qb[i]);
+            v += (double)pi[i] * (qmin - (double)a * std::log((double)pi[i]));
+        }
     }
     valueOut = (double)valueScale * v;
     return true;
@@ -1133,16 +1179,33 @@ void SACAZAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
         RL::Tensor &h = trunkTarget.forward(state);
         q1Out = q1TargetHead.forward(h);
         q2Out = q2TargetHead.forward(h);
+        squashQInPlace(q1Out);
+        squashQInPlace(q2Out);
         return;
     }
     q1Out = q1Target.forward(state);
     q2Out = q2Target.forward(state);
+    squashQInPlace(q1Out);
+    squashQInPlace(q2Out);
 }
 
 float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
                                 const RL::Tensor &q1In, const RL::Tensor &q2In) const
 {
-    const float a = alpha[0];
+    const float a = effectiveAlpha();
+    /*
+       [2026-09 实验轮] 熵项的**居中**: `entropyCenter` 时用 α·(H − log(合法槽位数))
+       代替 α·H —— 也就是"超出这个局面编码能容纳的最大熵的那一部分"。
+       下面先数一次合法槽位 (只在开关打开时算, 默认路径一次都不多走)。
+    */
+    float logSlots = 0.0f;
+    if (entropyCenter) {
+        int slots = 0;
+        for (int i = 0; i < ACTION_DIM; i++) {
+            if (mask[i] > 0.5f) { slots++; }
+        }
+        logSlots = std::log((float)((slots > 1) ? slots : 2));
+    }
     float v = 0.0f;
     for (int i = 0; i < ACTION_DIM; i++) {
         if (mask[i] <= 0.5f || pi[i] <= 0.0f) {
@@ -1150,14 +1213,24 @@ float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
         }
         const float qmin = std::min(q1In[i], q2In[i]);
         /*
-           `entropyInTarget == 1.0f` 走**原式** (不改动前逐位一致; 这里刻意不写成
-           `* entropyInTarget`, 免得后人以为默认路径有额外运算) —— 见头文件对该开关的说明:
-           熵项一旦进 V(s'), 它就以 −γ·α·H(s') 的形式进了 critic 的回归目标,
+           `entropyInTarget == 1.0f` 且未居中时走**原式** (不改动前逐位一致; 这里刻意
+           不写成 `* entropyInTarget`, 免得后人以为默认路径有额外运算) —— 见头文件对该
+           开关的说明: 熵项一旦进 V(s'), 它就以 −γ·α·H(s') 的形式进了 critic 的回归目标,
            而那是一个与棋局无关的常数偏置。
         */
-        const float ent = (entropyInTarget == 1.0f)
-                              ? (a * std::log(pi[i]))
-                              : (entropyInTarget * a * std::log(pi[i]));
+        float ent;
+        if (entropyCenter) {
+            /*
+               居中: V = E[min Q] + α·(H − log n)。
+               写成 `α·(log π_i + log n)` 是**对的**: 循环累加的是 Σ_i π_i·(...)，
+               而 Σ_i π_i = 1 ⇒ 减去 α·log n 恰好只减一次，与"在 H 上减"等价。
+            */
+            ent = a * (std::log(pi[i]) + logSlots);
+        } else if (entropyInTarget == 1.0f) {
+            ent = a * std::log(pi[i]);
+        } else {
+            ent = entropyInTarget * a * std::log(pi[i]);
+        }
         v += pi[i] * (qmin - ent);
     }
     return v;
@@ -1690,11 +1763,29 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     float lossSum = 0.0f;
     int n = 0;
     float alphaGrad = 0.0f;
-    const float a = alpha[0];
 
     for (int ep = 0; ep < epochs; ep++) {
     for (int it = 0; it < batchSize_; it++) {
         const Transition &tr = memories[(std::size_t)pick(RL::Random::engine)];
+
+        /*
+           ---- [2026-09 实验轮] 提议③: α 的 Gumbel 扰动 ----
+           `alphaGumbelSigma > 0` 时, **每个样本**把 α 换成一个随机量
+               α_eff = α · exp( σ·(G − γ) ),  G = −log(−log U),  γ = 0.5772
+           并让**目标侧与策略梯度侧用同一个 α_eff** —— 两边分开抽等于
+           "搜索估的"与"训练学的"不是一个数 (与本文件反复强调的同一条纪律)。
+           注意它**不进** α 的学习: `alphaGrad` 仍然按真实 α 的梯度累加,
+           否则我们会把一个被噪声扰动的量当成策略熵的函数去求导。
+           默认 σ=0 ⇒ 这一整段被跳过, 与改动前逐位相同。
+        */
+        alphaSample = -1.0f;
+        if (alphaGumbelSigma > 0.0f) {
+            const double u = std::max(1e-12, (double)std::uniform_real_distribution<float>(0.0f, 1.0f)(RL::Random::engine));
+            const double g = -std::log(-std::log(u));
+            alphaSample = (float)((double)alpha[0] * std::exp((double)alphaGumbelSigma * (g - 0.5772156649)));
+        }
+        const float a = effectiveAlpha();
+
         expandSparse(tr.cells, state);
         writeContext(state, tr.ctx);
         expandSparse(tr.nextCells, nextState);
@@ -1714,6 +1805,8 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             RL::Tensor &hNextT = trunkTarget.forward(nextState);
             q1n = q1TargetHead.forward(hNextT);
             q2n = q2TargetHead.forward(hNextT);
+            squashQInPlace(q1n);
+            squashQInPlace(q2n);
         } else {
             policy(nextState, nextMask, piNext);
             qTargetValues(nextState, q1n, q2n);
@@ -1750,6 +1843,8 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             maskedSoftmax(m_logits, mask, pi);
             q1o = q1Head.forward(hCur);
             q2o = q2Head.forward(hCur);
+            squashQInPlace(q1o);
+            squashQInPlace(q2o);
         } else {
             policy(state, mask, pi);
             qValues(state, q1o, q2o);
@@ -1773,18 +1868,25 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
             /*
                共享口径: 两个 Q 头各自的梯度, 反向时把梯度累加到**同一个骨干**上
                (见下面 gh 那一段)。独立口径: 两张完整的网各自反向。
+
+               [2026-09 实验轮] 提议① 的反向: `criticTanh` 打开时 Q = tanh(z),
+               所以 `dL/dz = dL/dQ · (1 − Q²)` —— 在 backward **之前**乘上去
+               (`squashQBackward` 在开关关着时是空操作, 默认路径逐位相同)。
             */
             if (trunkMode == TrunkMode::Shared) {
                 RL::Tensor target = (ci == 0) ? q1o : q2o;
                 target[tr.action] = yClamped;
                 RL::Net &head = (ci == 0) ? q1Head : q2Head;
-                head.backward(trunk.output(),
-                              RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
+                RL::Tensor dq = RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target);
+                squashQBackward(dq, (ci == 0) ? q1o : q2o);
+                head.backward(trunk.output(), dq);
             } else {
                 RL::Net &qnet = (ci == 0) ? q1 : q2;
                 RL::Tensor target = (ci == 0) ? q1o : q2o;
                 target[tr.action] = yClamped;
-                qnet.backward(state, RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target));
+                RL::Tensor dq = RL::Loss::MSE::df((ci == 0) ? q1o : q2o, target);
+                squashQBackward(dq, (ci == 0) ? q1o : q2o);
+                qnet.backward(state, dq);
             }
         }
 
@@ -1988,7 +2090,12 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     /* α 的梯度是整批累加的, 取平均后再更新 */
     alpha.g[0] = alphaGrad / (float)n;
     alpha.RMSProp(learningRateAlpha, 0.9f, 0.0f);
-    alpha.clamp(0.02f, 0.02f, 5.0f);
+    /*
+       [2026-09 实验轮] `alphaCeiling` 默认 5.0 = 改动前逐位相同。
+       实测 α 会被推到上界, 而 α·H 是 TD 目标里的主项之一 ⇒ 上界决定"目标被顶多远"。
+    */
+    alpha.clamp(0.02f, 0.02f, (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f);
+    alphaSample = -1.0f;   /* 批结束后清掉采样值 (批外一律用学到的 alpha[0]) */
 
     /*
        ---- 目标网 Polyak 同步 ----
