@@ -337,6 +337,22 @@ cmake --build .r1build/head-baseline/build --target bench_sac_mcts_min -j 8
 :: 两边同命令导走法序列后逐行 diff: mlp / moe-mlp 逐手相同, 只有 tb 变 (有意)
 ```
 
+### 7.1 实测结果（`--games=2 --sims=16 --plies=30 --opening=4 --seed=20240901 --mcts-srand=12345`）
+
+把分支起点 `2e9c15e` 单独开一棵 worktree 构建，与本分支的当前 HEAD 逐行 diff 走法序列：
+
+| 骨干 | 起点 | 当前 HEAD | 逐手相同 |
+|---|---|---|---|
+| `mlp` | 61 行 | 61 行 | **True** |
+| `moe-mlp`（稀疏 MoE + **MLP 专家**） | 61 行 | 61 行 | **True** |
+| `tb`（默认新口径 `--tb-heads=honor`） | 61 行 | 61 行 | False（**有意**：头数口径修好了） |
+| `tb --tb-heads=legacy`（钉回起点口径） | 61 行 | 61 行 | **True** |
+
+**最后一行是这条约束最强的证据**：把 TB 的头数口径显式钉回旧口径之后，
+**整个分支与起点逐手相同** —— 也就是说这两轮改动在这条路径上**唯一**的行为差异
+就是"TB 专家的头数口径"这一个变量，此外一位都没动。MLP 专家（`mlp` / `moe-mlp`）
+两条骨干的走法序列从头到尾一致。
+
 ---
 
 ## 8. 一句话收尾 + 本轮**没有**得出的结论
