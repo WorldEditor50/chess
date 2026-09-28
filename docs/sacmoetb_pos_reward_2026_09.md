@@ -369,3 +369,97 @@ matBoost  0  vs  matBoost  0.5     ->  trunk / actorhead 哈希**不同**   （�
 5. **`matBoost` 的最优点没扫**（只测了 0.5 与 0 两档，上界是 1.857）。
 
 
+## 11. 【2026-09 漏洞修复】人机对弈的终局通道：人把 AI 将死时，学习器原来收不到 −1
+
+### 11.1 洞的形态（用户问"人机对弈里 agent 能不能从中学习"时核对出来的）
+
+SAC+AZ 的终局值只有一个写入点：`learnFromSearchStep` 里 `moveForward` 之后
+`getResult()` 非 `ONGOING` 时才写 `done=true + terminalReward(...)`。
+也就是说 —— **只有"它自己那一手结束了对局"才算终局**。
+
+人机对弈里 AI 执黑，而结束一局的那一手是**人**走的。全工程只有三处
+`emit sendResult`（`chessboard.cpp` 的 `mousePressEvent` 一处 + `process()` 两处），
+全在人机那条路上 —— 而它们原来只改 `state` 并发信号给界面，**一句话都没告诉学习器**。
+
+后果不是"信号弱"，是**信号断**：
+
+* 人把 AI 将死 ⇒ 学习器最后那条决策样本仍然是 `done=false`，
+  价值目标 `y = r + γV(s')` 只能靠搜索**估**；
+* 人机对弈里**没有任何一方是学习者**（人没有可训练参数）——
+  所以连"对手那一手带一个 ±1 进池"这种间接信号也不存在。
+  这一点与 `matchAgents` / `trainSelfPlay` 不同（那里双方都是学习者，赢家那一手会
+  带终局值进池），见 §11.5。
+
+### 11.2 修法
+
+| 层 | 改动 |
+|---|---|
+| 接口 | `AgentBase::notifyGameResult(chessResult, perspective)`：默认 no-op 且**返回 false**（"接不住"必须能被调用方看见，不能静默） |
+| 三支 SAC+AZ | 从池尾往前找**最后一条真实决策样本**（`hasSearch=true`）→ 写 `done=true` + `terminalReward(result, 视角方)` → 立刻 `learnBatch` 一次；**幂等** |
+| 棋盘 | `ChessBoard::notifyHumanGameEnd(result)`：闸门 = `updateEnabledForSide(sideRoleForHumanGame())`（人机里 AI 固定是冻结方），三个终局点统一调它 |
+| 读数 | agent 侧 `TrainDiag::externalTerminals`；棋盘侧 `humanEndFedCount()` / `humanEndMissedCount()`；工具侧 `bench_*` 的"终局通道"行多一列 `外部补入=` |
+
+三条设计细节（每一条都对应一个具体的错法）：
+
+1. **不能取 `memories.back()`**：池里混着 rollout / 自对弈写进来的样本
+   （`hasSearch=false`），`back()` 可能是一条几手之前的探索样本 —— 把 `done=true`
+   挂到**别的局面**上，比不挂更坏（价值目标会在一个与胜负无关的局面上变成 ±1）。
+2. **幂等**："AI 自己将死对方"那一手本来就带终局（`learnFromSearchStep` 写的），
+   而三个终局点都会通知 —— 重复通知不许写第二遍、不许多更新一次。
+3. **闸门复用同一判据**：评估 / 只对弈模式下**不写** —— 那两个模式承诺的是
+   "权重也不变"，而挂终局会立刻触发一次 `learnBatch`。
+
+### 11.3 实测（三层证据，各自钉不同的东西）
+
+| 证据 | 命令 | 读数 |
+|---|---|---|
+| agent 侧三条契约（值 / 幂等 / 接不住要说出来），三个类各跑一遍 + 还原版对照 | `build-sacmoetb\test_sacaz.exe` | `[18]` 节；**452 项断言 0 失败**（改动前 385） |
+| 棋盘侧接线 + 模式闸门（训练交 / 评估不交 / 只对弈不交 / 别的 agent 不交 / ONGOING 不交） | `build-sacmoetb\test_match.exe` | `[2.21]` 节；**332 项断言 0 失败**（改动前 318） |
+| **端到端：真实点击路径** | `build-sacmoetb\probe_hvai_flow.exe` | `[D]`：人走车 `(1,0)→(0,0)` 一步杀 ⇒ `终局通道计数: 交出 0 -> 1, 没交出 2 -> 2`，失败项 0 |
+
+`[D]` 那一节值得单独说：它走的是 `mousePressEvent` 里的终局分支 —— 也就是**只有真实
+点击才到得了**的那一支（测试里够不到，只能直接调 `notifyHumanGameEnd`）。所以这一层
+证据回答的是"接线到底接上没有"，而前两层回答的是"调了之后发生了什么"。
+
+"没交出 2" 不是噪声：那是前面 `[A]`/`[B]` 用 Alpha-Beta 结束的两局（纯搜索 agent
+没有可训练参数）—— 通道如实把它们记成"没交出"，正说明计数不是恒涨的假读数。
+
+**为什么断言不读日志**：`[human] 终局 ...` 那几行走的是本工程既有的 `qInfo` 业务日志
+口径，而 `qInfo` 在控制台测试里不落 stderr（实测：`chess.exe` 启动自己会打印
+"[log] 诊断输出走 stderr (直接 printf); 业务日志仍走 Qt 的 qInfo"）。所以三处证据一律
+读**计数**，不读日志 —— 计数不依赖"日志去了哪里"。
+
+### 11.4 与"后期重杀将"这个旋钮的关系
+
+§10 的结论"终局通道极稀疏（0 ~ 0.14%）"说的是**自对弈**。人机对弈这条路修好之后，
+"人把 AI 将死 / AI 把人将死"这一局的终局样本会**必然**带上 `terminalReward`
+（`rewardShape=3` 时就是那个带 `mateWeightMul` 的杀将奖励）—— 也就是说 `mateBoost`
+在人机对弈里从此有样本可作用。
+
+它**仍然不是棋力旋钮**（§9 的四条臂全部落在噪声里），但"这条通道在人机对弈里是通的"
+现在是可以断言的：`externalTerminals > 0` 就是"这条路真的交付过"的直接读数。
+
+### 11.5 同一类洞的另外两处（本轮**没有**改，理由写在明处）
+
+同一个"输的那一方最后一条样本不是 done"的形状，还存在于两处：
+
+| 位置 | 现象 | 为什么这一轮没改 |
+|---|---|---|
+| `SACAZAgent::trainSelfPlay`（自对弈） | 一局结束时**输家**最后那一条样本仍 `done=false`（只有赢家那一手带终局） | 自对弈里赢家**也是学习者**：那条 ±1 会进同一个池，价值目标能靠 bootstrap 传过去 —— 信号是"弱"，不是"断" |
+| `ChessBoard::matchAgents`（A/B 对弈） | 同上 | 同上（A/B 双方都可能是学习者） |
+
+两者的关键区别就是 §11.1 的第二条：人机对弈里"人"不是学习者，终局那一手**没有任何
+一条样本进池** —— 补它才是补一个真的洞。那两处要动的话会改变自对弈 / 对弈的训练行为
+（§9 的四条臂与 `doneSamples` 那些读数都得重测），所以单独排一轮。
+
+### 11.6 复现命令
+
+```powershell
+cmake --build build-sacmoetb --target test_sacaz test_match probe_hvai_flow -j 6
+.\build-sacmoetb\test_sacaz.exe        # [18]  agent 侧三条契约 × 三个类 + 还原版对照
+.\build-sacmoetb\test_match.exe        # [2.21] 棋盘侧接线 + 模式闸门
+.\build-sacmoetb\probe_hvai_flow.exe   # [D]   端到端（真实点击把 AI 将死）
+```
+
+
+

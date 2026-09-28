@@ -2559,6 +2559,92 @@ int main(int argc, char *argv[])
               "每局明细那一行里带上本局的吃子数 (逐局才能看出它是不是均匀分布)");
     }
 
+    /* ---------------------------------------------------------------- 2.21 人机终局通道 */
+    /*
+       ================================================================
+        [2.21] 人机对弈的终局反馈: 棋盘侧的接线 (2026-09)
+       ================================================================
+       洞 (用户问"人机对弈里 agent 能不能从中学习"时核对出来的):
+         SAC+AZ 的终局值只在"**它自己**那一手结束了对局"时才写进学习回路, 而人机对弈里
+         结束一局的那一手是**人**走的 (AI 执黑)。全工程只有三处 `emit sendResult`, 全在
+         人机那条路上, 而它们原来**只**更新界面 —— 学习器一句话都没听到, 于是 AI 输掉的
+         一局连 −1 都收不到。
+
+       本节的判据 = "棋盘在**什么时候**把结果交给 agent":
+         (1) 训练模式 + 有实例 + 有真实决策样本 -> 交出去了 (返回 true);
+         (2) 评估 / 只对弈不学习 -> **不交** (返回 false)。理由不是"省一点算力", 而是那
+             两个模式承诺的是**权重也不变** —— 挂终局会立刻触发一次 learnBatch;
+         (3) 未终局 (ONGOING) -> 不交 (兜底: 三个调用点都不会传它);
+         (4) 别的 agent (没有"真实决策样本"这条通道) -> 不交。
+       agent 侧的三条契约 (值/幂等/接不住要说出来) 钉在 test_sacaz 的 [18] 节 ——
+       两节合起来才是完整的: 这里证明**棋盘真的调了**, 那里证明**调了之后发生了什么**。
+    */
+    std::printf("\n[2.21] 人机终局通道: 棋盘把结果交给 agent (人把 AI 将死的那个洞)\n");
+    {
+        const bool savedPreTrain = board.isPreTrainEnabled();
+        const int savedSteps = board.getPreTrainSteps();
+        /* 本节的样本来源是 learnFromSearch (与 rollout 勾选框无关), 关掉预训省时间 */
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setAgentType(ChessBoard::AGENT_SACAZ);
+        board.reset();
+
+        /*
+           接线计数 (见 chessboard.h 的 humanEndFedCount):
+           agent 收到终局反馈之后什么都不会打印, 所以"交出去了"与"没交出去"只能靠这两个
+           数分开 —— 而它们同时也是"这条通道有没有被**多余地**触发"的证据 (每次断言都看
+           两个方向: 该涨的涨了, 不该涨的没涨)。
+        */
+        const long long fed0 = board.humanEndFedCount();
+        const long long missed0 = board.humanEndMissedCount();
+
+        /* 走一步**人机路径**的真实决策 -> agent 池里出现一条 hasSearch 样本 */
+        const Step s = board.humanTurnAiMoveForTest(Stone::COLOR_BLACK);
+        CHECK(s.valid, "人机路径的这一步返回了合法走法 (钩子走到了决策)");
+
+        /* (1) 训练模式: 交出去 */
+        const bool fed = board.notifyHumanGameEnd(Chess::RESULT_RED_WIN);
+        std::printf("    训练模式  : 终局反馈 %s (交出 %lld -> %lld)\n",
+                    fed ? "已交给学习器" : "**没交**",
+                    fed0, board.humanEndFedCount());
+        CHECK(fed, "训练模式下「人把 AI 将死」的终局反馈交到了 agent 手里");
+        CHECK(board.humanEndFedCount() == fed0 + 1, "接线计数\"交出\"正好 +1");
+        CHECK(board.humanEndMissedCount() == missed0, "...而且没有被同时记成\"没交出\"");
+
+        /* (3) 未终局: 什么都不做 (兜底口径) */
+        CHECK(!board.notifyHumanGameEnd(Chess::RESULT_ONGOING),
+              "ONGOING 不是终局 -> 不交 (这个值代表「还有棋可走」)");
+        CHECK(board.humanEndFedCount() == fed0 + 1
+                  && board.humanEndMissedCount() == missed0,
+              "ONGOING 那一支两个计数都不动 (连\"没交出\"都不该记)");
+
+        /* (2) 评估 / 只对弈: **不交** —— 这两个模式承诺权重也不变 */
+        board.setMatchMode(ChessBoard::MATCH_EVAL);
+        CHECK(!board.notifyHumanGameEnd(Chess::RESULT_RED_WIN),
+              "评估模式下不交 (AI 是人机里的冻结方): 权重保持不变这条承诺要成立");
+        CHECK(board.humanEndMissedCount() == missed0 + 1, "评估模式这次被记成\"没交出\"");
+        board.setMatchMode(ChessBoard::MATCH_NO_LEARN);
+        CHECK(!board.notifyHumanGameEnd(Chess::RESULT_RED_WIN),
+              "只对弈不学习模式下同样不交 (一个控件一种语义, 与人机两条学习路径同一判据)");
+        CHECK(board.humanEndMissedCount() == missed0 + 2, "只对弈模式这次也被记成\"没交出\"");
+        CHECK(board.humanEndFedCount() == fed0 + 1,
+              "两种模式都没有偷偷多交一次 (\"权重不变\"不是靠\"少学一点\"做的)");
+
+        /* (4) 别的 agent: 没有这条通道 -> 不交 */
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setAgentType(ChessBoard::AGENT_PPOMCTS);
+        CHECK(!board.notifyHumanGameEnd(Chess::RESULT_RED_WIN),
+              "rollout 系 agent 没有「真实决策样本」这条通道 -> 一律不接 (默认实现)");
+        CHECK(board.humanEndMissedCount() == missed0 + 3,
+              "它也如实记成\"没交出\" (不是静默地什么都不做)");
+
+        /* 复原 (后面的小节接着用同一个 board) */
+        board.setAgentType(ChessBoard::AGENT_ALPHABETA);
+        board.setPreTrainEnabled(savedPreTrain);
+        board.setPreTrainSteps(savedSteps);
+    }
+
     /* ---------------------------------------------------------------- 3. 中止 */
     std::printf("\n[3] 中止: 请求 50 局, 跑一会儿后叫停\n");
     board.setMaxPliesPerGame(300);

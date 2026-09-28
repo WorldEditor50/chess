@@ -513,6 +513,105 @@ int main(int argc, char **argv)
               "再按一次\"开局\"又回到当前选中的 agent");
     }
 
+    /* ================================================================
+     *  [D] 人机终局通道: 人把 AI 将死之后, 学习器收没收到 −1 (2026-09 补的洞)
+     * ================================================================
+     *
+     * 洞: SAC+AZ 的终局值只在"**它自己**那一手结束了对局"时才写进学习回路
+     * (learnFromSearchStep 里的 getResult), 而人机对弈里结束一局的那一手是**人**走的
+     * —— 于是 AI 输掉的一局, 学习器连 −1 都收不到 (详见 chessboard.h 的
+     * notifyHumanGameEnd)。
+     *
+     * 为什么这一节必须在本探针里 (而不是测试里): 这个终局点在
+     * `mousePressEvent` 里 (人落子之后判 getResult), 也就是**只有真实点击路径才走得到**
+     * 的那一支 —— test_match 只能直接调 notifyHumanGameEnd, 够不到"接线接没接上"。
+     *
+     * 观测手段 = 棋盘自己的接线计数 humanEndFedCount()/humanEndMissedCount():
+     * agent 收到终局反馈之后什么都不会打印, 所以"交出去了"与"没交出去"只能靠这两个数
+     * 分开 (与 matchLearningBlockedCount 同一条理由)。
+     */
+    std::printf("\n[D] 人机终局通道: 人把 AI 将死之后, 学习器收没收到 -1\n");
+    {
+        board.setAgentType(ChessBoard::AGENT_SACAZ);
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setPreTrainEnabled(false);
+        board.reset();
+        quiesce(board, 400);
+
+        const long long fedBefore = board.humanEndFedCount();
+        const long long missedBefore = board.humanEndMissedCount();
+
+        /*
+           ---- 第一步: 让 AI 真的决策一次 ----
+           终局反馈挂在"最后一条**真实决策**样本"上, 而那种样本是 learnFromSearch 在它
+           自己决策之后写进去的 —— 所以必须先让它走一手。这里用标准开局的第一步
+           (兵七进一), 顺便覆盖"随机权重下的 SAC 也给出合法着法"。
+        */
+        const BlackSnapshot black0 = snapshotBlack(board);
+        playMove(board, 6, 4, 5, 4);
+        long long aiMs = -1;
+        const bool replied = waitForBlackChange(board, black0, 60000, &aiMs);
+        check(replied, "AI 应手了一次 (池里因此有一条真实决策样本)");
+        if (replied) {
+            std::printf("    AI 应手耗时 %.0f ms\n", (double)aiMs);
+        }
+        quiesce(board, 600);
+
+        /*
+           ---- 第二步: 摆一个"红方一步杀", 用真实点击走那一手 ----
+           局面: 红帅 (9,4); 黑将 (0,4); 红兵 (6,4) 挡在两将中间 (两将不能照面);
+                 红车1 (1,0) 与红车2 (1,8) 都在黑将的"下一排" (x=1)。
+             (本工程的坐标: x = 排/横线, 0 = 黑方底线, 9 = 红方底线; y = 纵线/列。)
+           红走 车1 (1,0)->(0,0): 车1 与黑将同在 x=0 这一排 -> 将军; 黑将的出路
+             (0,3)/(0,5) 仍在 x=0 排上 (仍被车1 攻), (1,4) 被 x=1 排上的车2 攻
+             -> **一步杀**。走杀之前黑方没有被将军, 所以这一手确实是"杀"而不是"逃"。
+        */
+        board.reset();
+        quiesce(board, 400);
+        const std::vector<std::pair<int, Pos>> matePos = {
+            { Stone::ID_RED_JIANG,   Pos(9, 4) },
+            { Stone::ID_RED_CHE1,    Pos(1, 0) },
+            { Stone::ID_RED_CHE2,    Pos(1, 8) },
+            { Stone::ID_RED_BING3,   Pos(6, 4) },
+            { Stone::ID_BLACK_JIANG, Pos(0, 4) },
+        };
+        rigBoard(board, matePos, 0);
+        check(!board.boardForTest().isInCheck(Stone::COLOR_BLACK),
+              "[摆局面自检] 走杀之前黑方没有被将军");
+        {
+            std::vector<Step *> legal;
+            board.boardForTest().sample(Stone::COLOR_RED, legal);
+            bool mateMoveLegal = false;
+            for (Step *s : legal) {
+                if (s != nullptr && s->id == Stone::ID_RED_CHE1 && s->nextPos == Pos(0, 0)) {
+                    mateMoveLegal = true;
+                }
+            }
+            Steps::instance().put(legal);
+            check(mateMoveLegal, "[摆局面自检] 车 (1,0)->(0,0) 在红方合法着法里");
+        }
+
+        int mateResult = Chess::RESULT_ONGOING;
+        QMetaObject::Connection mateConn =
+            QObject::connect(&board, &ChessBoard::sendResult, &board,
+                             [&](int r) { mateResult = r; });
+        playMove(board, 1, 0, 0, 0);      /* 车1 (1,0)->(0,0): 杀 */
+        check(mateResult == Chess::RESULT_RED_WIN,
+              "[点击] 这一手被引擎判成红胜 (黑方无解 —— 所以这一局是**人**结束的)");
+        QObject::disconnect(mateConn);
+        quiesce(board, 400);
+
+        const long long fedAfter = board.humanEndFedCount();
+        const long long missedAfter = board.humanEndMissedCount();
+        std::printf("    终局通道计数: 交出 %lld -> %lld, 没交出 %lld -> %lld\n",
+                    fedBefore, fedAfter, missedBefore, missedAfter);
+        check(fedAfter == fedBefore + 1,
+              "**人把 AI 将死之后终局反馈交到了学习器手里** "
+              "(端到端: 走的是真实点击路径, 不是直接调函数)");
+        check(missedAfter == missedBefore,
+              "而且没有被同时记成\"没交出\" (两个计数严格互斥)");
+    }
+
     std::printf("\n==== 失败项: %d ====\n", gFailed);
     return gFailed == 0 ? 0 : 1;
 }

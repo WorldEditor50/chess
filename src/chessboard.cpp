@@ -1632,6 +1632,13 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
     int result = chess.getResult(chess.sideToMove);
     if (result != Chess::RESULT_ONGOING) {
         state = STATE_TERMINATE;
+        /*
+           [P1 人机终局通道] 先把结果交给学习器 (AI 执黑, 这一手是**人**把它将死的 ——
+           而它自己的 learnFromSearchStep 只在"它自己那一手结束对局"时才写终局, 于是
+           这一局的 −1 原来谁都收不到)。必须在 state/update 之前调用: agent 要按**当前**
+           棋盘 (终局局面) 算终局奖励, 而 reset() 会把它推回开局。
+        */
+        notifyHumanGameEnd(result);
         update();
         emit sendResult(result);
         return;
@@ -1774,6 +1781,9 @@ void ChessBoard::process()
             /* 确实没有合法走法 -> 红方胜 */
             state = STATE_TERMINATE;
             emit aiThinkingStopped();
+            /* [P1 人机终局通道] AI 被将死/困毙在这一手之前就发生了 (它没棋可走) ——
+               终局反馈要挂在它**上一步**的决策样本上, 见 notifyHumanGameEnd。 */
+            notifyHumanGameEnd(Chess::RESULT_RED_WIN);
             emit sendResult(Chess::RESULT_RED_WIN);
             QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
             continue;
@@ -1805,6 +1815,10 @@ void ChessBoard::process()
             emit aiThinkFinished(elapsedMs);
             state = STATE_TERMINATE;
             emit aiThinkingStopped();
+            /* [P1 人机终局通道] 这一手是 AI 自己走完的 —— 它的 learnFromSearchStep 已经
+               写过终局 (幂等, 重复通知不会写第二遍/不会多更新一次)。仍然统一在这里调:
+               "凡终局必通知"只有一条规则, 才不会将来漏掉某一支 (例如和棋那一路)。 */
+            notifyHumanGameEnd(result);
             emit sendResult(result);
             QMetaObject::invokeMethod(this, [this](){ update(); }, Qt::QueuedConnection);
             continue;
@@ -2844,6 +2858,104 @@ Step ChessBoard::humanTurnAiMoveForTest(int color)
     const double waited = dbgNowMs() - t0;
     dbgWait(QStringLiteral("aiThink 结束 (valid=%1)").arg((int)step.valid), waited);
     return legalStepOrFallback(color, step, agentDisplayName(m_agentType));
+}
+
+/* ================================================================
+ *  notifyHumanGameEnd - 把"人机这一局的结果"交给当前 agent
+ * ================================================================
+ *
+ * 洞的形态、为什么必须有它、以及闸门口径见 chessboard.h 的同名声明 (那里是唯一的
+ * 说明处)。这里是三件事的实现要点:
+ *
+ *  1. **闸门只有一处**: `updateEnabledForSide(sideRoleForHumanGame())` —— 与两条在线
+ *     学习路径同一个判据。人机里 AI 固定是 SIDE_FROZEN, 所以"评估对局 / 只对弈不学习"
+ *     下这条反馈不写 (那两个模式承诺"权重也不变", 而挂终局会立刻触发一次 learnBatch)。
+ *  2. **锁**: 要改 agent 的回放池 (还可能做一次 learnBatch), 与"决策 / 权重保存 /
+ *     后台训练同步回主 agent"共用 `m_agentMutex`。调用方不持有棋盘 mutex, 锁序与别处
+ *     一致。对局线程 / GUI 线程都会调它 (三个终局点分别在 process() 与人落子的那条路)。
+ *  3. **agent 决定接不接**: 三支 SAC+AZ 会接 (把终局挂到最后一条真实决策样本上, 幂等);
+ *     纯搜索与 rollout 系 agent 默认 no-op 返回 false。**返回 false 必须打日志** ——
+ *     否则这条通道会静默地什么都不做, 而"没生效"与"没输过"在读数上长得一样。
+ */
+bool ChessBoard::notifyHumanGameEnd(int result)
+{
+    if (result == Chess::RESULT_ONGOING) {
+        return false;      /* 还有棋可走: 三个调用点都不会传它, 这是兜底 */
+    }
+    const char *resText = (result == Chess::RESULT_RED_WIN)   ? "红胜 (人赢了)"
+                        : (result == Chess::RESULT_BLACK_WIN) ? "黑胜 (AI 赢了)"
+                        : (result == Chess::RESULT_DRAW)      ? "和棋"
+                                                              : "未知结果";
+    if (!updateEnabledForSide(sideRoleForHumanGame())) {
+        m_humanEndMissed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: 本模式 (%2) 下不写入学习回路 —— "
+                              "评估/只对弈要的是权重也不变")
+                   .arg(QString::fromUtf8(resText), matchModeName(m_matchMode.load()));
+        return false;
+    }
+
+    /* AI 执黑是 process() 的既有约定; 终局反馈挂在**它**那一方最后那次决策上 */
+    const int aiColor = Stone::COLOR_BLACK;
+    /*
+       "这个类型有没有终局通道" 与 "这个类型的实例建出来了没有" 是两件事, 必须分开报:
+         * AGENT_SACAZ 系但实例还没建 (这一局一步没走过) -> "没有实例";
+         * AB / MCTS / PPO 系 -> "这个 agent 没有这条通道"。
+       混成一句话会在排查时把人带错方向 (而这条通道的失效本来就是**静默**的)。
+    */
+    const bool channelClass = (m_agentType == AGENT_SACAZ
+                               || m_agentType == AGENT_SACAZ_MOE
+                               || m_agentType == AGENT_SACAZ_MOE_MLP);
+    bool instanceExists = false;
+
+    bool taken = false;
+    {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        AgentBase *agent = nullptr;
+        switch (m_agentType) {
+        /*
+           只有这三支有"真实决策样本"这条通道 (learnFromSearch 写进去的
+           hasSearch=true 样本)。别的 agent 不在这里列举: 它们要么没有可训练参数
+           (AB / MCTS), 要么终局值本来就随 rollout 一起进了池 (PPO / DQN / EVAB),
+           对它们调用没有意义 —— 默认实现返回 false 已经表达了这件事。
+        */
+        case AGENT_SACAZ:         agent = m_sfSACAZ;         break;
+        case AGENT_SACAZ_MOE:     agent = m_sfSACAZMoe;      break;
+        case AGENT_SACAZ_MOE_MLP: agent = m_sfSACAZMoeMlp;   break;
+        default:                                             break;
+        }
+        instanceExists = (agent != nullptr);
+        if (agent != nullptr) {
+            taken = agent->notifyGameResult(result, aiColor);
+        }
+    }
+
+    if (taken) {
+        m_humanEndFed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: 已交给 %2 —— 它最后那一步的决策样本"
+                              "按此改写 (done + 终局奖励), 并已更新一次")
+                   .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
+    } else if (!channelClass) {
+        m_humanEndMissed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: %2 没有终局通道 (纯搜索 / 终局值随 rollout "
+                              "进池的那几支), 无需反馈")
+                   .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
+    } else if (!instanceExists) {
+        m_humanEndMissed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: %2 还没有实例 (这一局它一步没走过), 无需反馈")
+                   .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
+    } else {
+        m_humanEndMissed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: %2 没有可挂的真实决策样本 "
+                              "(learnFromSearch 关着 / 这局还没走过一手) —— "
+                              "这一局的输赢没有进学习回路")
+                   .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
+    }
+    return taken;
 }
 
 /* ================================================================

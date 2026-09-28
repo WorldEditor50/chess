@@ -737,9 +737,10 @@ void printDiag(const SACAZMoETbAgent &sac, const char *tag)
            (和棋的终局值恒 0)。实测: 60 局自对弈里 decisive 只有几十条 (占比 <0.1%),
            把 mateBoost 从 0 开到 10 权重逐字节相同 —— 旋钮在训练里是死的。
         */
-        std::printf("  终局通道: done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%)\n",
+        std::printf("  终局通道: done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%) 外部补入=%lld\n",
                     D.doneSamples, 100.0 * (double)D.doneSamples / (double)D.n,
-                    D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n);
+                    D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n,
+                    D.externalTerminals);
     }
 }
 

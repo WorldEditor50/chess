@@ -834,6 +834,18 @@ public:
         */
         long long doneSamples = 0;
         long long decisiveSamples = 0;
+        /*
+           [2026-09 人机对弈的终局通道] 棋盘从**外面**补进来的终局反馈条数
+           (`notifyGameResult` 真的改写了一条款样本时 +1)。
+
+           为什么它是独立的第三个计数器: 上面两个数只统计"进过训练批次的 done 样本",
+           而人机对弈那条终局反馈的**来源**是棋盘 (人走的那一手把 AI 将死了), 不是 agent
+           自己的搜索。没有这个数就分不清"人机对弈输掉的局真的变成了学习信号"与"这条
+           通道压根没通" —— 两种情况下 doneSamples 都可能非 0, 单看它归因不出来。
+           口径: 一次成功的"挂终局"记 1; 幂等重复通知、池里没有真实决策样本
+           (learnFromSearch 关着) 都不计数。见 aiagent.h 的 AgentBase::notifyGameResult。
+        */
+        long long externalTerminals = 0;
     };
     TrainDiag trainDiag;
     const TrainDiag &getTrainDiag() const { return trainDiag; }
@@ -1020,6 +1032,27 @@ public:
     */
     bool learnFromSearchStep(int color, int actionIdx, const Step &step,
                              const RL::Tensor &piVisit);
+
+    /*
+       ================================================================
+        终局反馈 (见 aiagent.h 的 `AgentBase::notifyGameResult`)
+       ================================================================
+       把"这一局的结果"挂到**最后一条真实决策样本** (hasSearch=true) 上 —— 也就是 AI
+       自己走的最后一步。返回 true = 接住了 (真的改写了一条款样本)。
+
+       ⚠ 为什么不直接取 `memories.back()`: 池里还混着 rollout / 自对弈写进来的样本
+       (hasSearch=false), back() 可能是一条几手之前的探索样本; 把 done=true 挂到**别的
+       局面**上, 比不挂更坏 —— 价值目标会在一个与胜负无关的局面上变成 ±1。所以从池尾
+       往前找第一条 hasSearch=true 且 done=false 的样本, 那条才是"这一局的最后一步"。
+    */
+    bool notifyGameResult(int chessResult, int perspective) override;
+
+    /*
+       测试/诊断: 读出"最后一条真实决策样本"的 (reward, done)。
+       返回 false = 池里没有真实决策样本 (那时两个出参不改)。
+       **只读**, 不改任何状态; 存在理由见 sacazagent.h 的同名声明。
+    */
+    bool lastDecisionSample(float &reward, bool &done) const;
 
     /*
        诊断 (只读上界面/自检, 不参与任何计算): 最近一次 learnBatch 里

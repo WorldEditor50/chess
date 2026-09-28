@@ -823,9 +823,12 @@ void MainWindow::populateAgentComboBox()
             "⚠ 三条边界 (实测, 不是推测):\n"
             "  1. **它不是棋力旋钮**: 四条训练臂 (各 60 局自对弈 + 16 局/锚点) 的得分率\n"
             "     全部落在噪声里 (docs/sacmoetb_pos_reward_2026_09.md §9)。\n"
-            "  2. **\"杀将\"那一半目前不生效**: 自对弈训练里 done 样本 = 0\n"
-            "     (一局走到手数上限被截断, 截断那一步 done 仍是 false), 而终局倍率只作用在\n"
-            "     terminalReward() 上 ⇒ 打开它实际只改到\"吃子那一半\"。\n"
+            "  2. **\"杀将\"那一半的作用面很窄**: 终局倍率只作用在 terminalReward() 上, 而\n"
+            "     自对弈里一局大多走到手数上限被截断 (截断那一步 done 仍是 false) ——\n"
+            "     实测 60 局自对弈里\"分胜负的终局样本\"只占 ~0.14% (53/37504)。\n"
+            "     [2026-09 更正] 但它**不是死的**: 把 mateBoost 从 0 开到 10, 两次存下来的\n"
+            "     权重不同 (221FB956… vs D419EF76…); 而人机对弈那条终局通道补上之后\n"
+            "     (人把 AI 将死也会交给学习器), 这个旋钮在人机对弈里也会被碰到。\n"
             "  3. **它改变训练出来的权重**: 两套奖励训出的不是同一个东西, 别共用权重文件。\n\n"
             "要做对照实验请用 bench 工具 (固定开局集 + 配对 + 区间):\n"
             "  bench_sacaz_vs_ab --backbone=moe-mlp --reward-shape=3 --warmup-games=60 ...\n"
@@ -907,7 +910,8 @@ void MainWindow::onDynamicRewardToggled(bool on)
     qInfo().noquote() << QStringLiteral("[reward] 动态奖励 = %1 (%2)")
                              .arg(on ? QStringLiteral("开") : QStringLiteral("关"))
                              .arg(on ? QStringLiteral("rewardShape=3: 按局面在吃子/杀将间分配固定预算; "
-                                                      "⚠ 杀将那一半因 done 样本=0 目前不生效")
+                                                      "杀将那一半只在\"分胜负的终局样本\"上生效 "
+                                                      "(自对弈里约 0.14%, 人机对弈里由终局通道补上)")
                                      : QStringLiteral("rewardShape=0: 旧奖励, 与历史读数一致"));
 }
 

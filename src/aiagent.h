@@ -123,6 +123,45 @@ public:
                                    : std::string("引擎口径(材质x1)");
     }
 
+    /*
+     * ================================================================
+     *  ---- 终局反馈: "这一局结束了, 结果是这样" (2026-09, 补人机对弈的洞) ----
+     * ================================================================
+     *
+     * 洞的形态 (用户问"人机对弈, agent 能不能从中学习?"时核对出来的):
+     *   SAC+AZ 的终局值来自它**自己走的那一手**——learnFromSearchStep 里
+     *   `moveForward` 之后 `getResult()` 非 ONGOING 时才写 done=true + terminalReward。
+     *   而人机对弈里"结束这一局"的那一手是**人**走的 (AI 执黑, 见 process()):
+     *     * AI 被将死 / 困毙 -> 终局发生在人的落子上, 学习器根本看不到;
+     *     * 棋局对象也不会有人 notify agent (对弈循环里那条 `r != RESULT_ONGOING`
+     *       只在 matchAgents 里存在)。
+     *   于是 AI 输掉的那一局, 学习器拿不到 −1: 它最后一条决策样本仍旧是 done=false,
+     *   y = r + γV(s') —— 价值目标只能靠搜索**估**出来, 而不是真实的胜负。
+     *   "杀将"这个信号在人机对弈里因此是**断的**, 而不是"弱"的。
+     *
+     * 这个虚函数就是那条通道: 棋盘在终局时把结果告诉 agent, 由 agent 决定接不接。
+     *   参数与 learningTerminalReward() 完全一致 (同一个 terminalReward 出口):
+     *     chessResult : Chess::RESULT_* (ONGOING 表示还有棋, 实现应当直接忽略)
+     *     perspective : **视角方**颜色 —— 终局反馈挂在"这一方最后那次决策"上。
+     *                   人机对弈里就是 AI 那一方 (黑)。
+     *   返回 true = 这个 agent **接住了** (它真的把终局写进了自己的学习回路)。
+     *   默认 false: 纯搜索 agent (AB 各档 / MCTS) 本来就没有可训练参数; 而
+     *   PPO/DQN/EVAB 那几支的样本来自 rollout (rollout 自己在局面内滚到终局, 终局值
+     *   本来就进去了), 它们**没有存"真实决策"这条样本**, 所以这里无事可做。
+     *   调用方 (ChessBoard::notifyHumanGameEnd) 只看返回值决定要不要记一行日志 ——
+     *   "没接住"必须与"接住了"在读数上分得开, 否则这条通道会静默地什么都不做。
+     *
+     * 契约: 幂等。同一局的终局可能被通知多次 (三个终局点都调; 而且"AI 自己将死对方"
+     * 那一手已经在 learnFromSearchStep 里写过终局), 重复通知不许把同一个样本的奖励
+     * 变成两份、也不许重复更新。
+     */
+    virtual bool notifyGameResult(int chessResult, int perspective)
+    {
+        (void)chessResult;
+        (void)perspective;
+        return false;
+    }
+
     /* --- 决策流程: 先探索环境 + 预训练, 再决策 (仿 snakeAI) --- */
 
     /*

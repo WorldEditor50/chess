@@ -628,6 +628,10 @@ int runSacVsAb(A &sac, Chess &c, sacazx::Variant variant)
         /*
            [2026-09 奖励复核] 终局通道的样本量: 判"后期杀将加权"这类旋钮活/死的唯一读数
            (只有 done 且分胜负的样本携带杀将奖励; 和棋的终局值恒 0)。
+           [2026-09 人机终局通道] "外部补入" = 棋盘 (人走的那一手结束了对局) 交给 agent 的
+           终局反馈条数 (TrainDiag::externalTerminals)。本工具是 agent 之间对弈 / 自对弈,
+           棋盘侧那条通道不会触发, 所以这里应当恒为 0 —— 它非 0 就说明棋盘侧的接线错了
+           (唯一的调用点是 ChessBoard::notifyHumanGameEnd)。
         */
         {
             const auto &D = sacazx::diagOf(sac);
@@ -637,9 +641,11 @@ int runSacVsAb(A &sac, Chess &c, sacazx::Variant variant)
                             D.n, D.clamped, 100.0 * (double)D.clamped / (double)D.n,
                             D.yPreAbsSum / (double)D.n, D.qAbsMeanSum / (double)D.n,
                             D.qSpreadSum / (double)D.n);
-                std::printf("  终局通道  : done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%)\n",
+                std::printf("  终局通道  : done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%) "
+                            "外部补入=%lld\n",
                             D.doneSamples, 100.0 * (double)D.doneSamples / (double)D.n,
-                            D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n);
+                            D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n,
+                            D.externalTerminals);
             }
         }
         std::printf("  总耗时    : %.1f s\n", elapsed);

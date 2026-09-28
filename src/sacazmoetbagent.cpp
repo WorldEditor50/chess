@@ -1524,6 +1524,56 @@ bool SACAZMoETbAgent::learnFromSearchStep(int color, int actionIdx, const Step &
     return true;
 }
 
+/* ============================================================
+ *  notifyGameResult / lastDecisionSample —— 人机对弈的终局通道
+ * ============================================================
+ *
+ * 洞与修法见 aiagent.h 的 `AgentBase::notifyGameResult` 长注释。实现与另外两支 SAC+AZ
+ * (纯 MLP / MoE+MLP专家) **逐行同形** —— 这一族是互不继承的独立类, 同一段逻辑每个类
+ * 各持一份 (隔离的代价, 见 test/sacaz_variants.h 的说明)。
+ *
+ *  1. **幂等**: "AI 自己将死对方"那一手已经在 learnFromSearchStep 里写过终局, 而棋盘的
+ *     终局通知三个点都会发 —— 同一条样本被通知两次是常态。
+ *  2. **奖励走 terminalReward()**: 与搜索叶子、rollout、自对弈同一个出口, 塑形
+ *     (`rewardShape=2/3`) 因此对这条通道同样生效。前提是调用时棋盘停在终局那一手**之后**
+ *     (ChessBoard::notifyHumanGameEnd 的三个调用点全部满足)。
+ */
+bool SACAZMoETbAgent::notifyGameResult(int chessResult, int perspective)
+{
+    if (chessResult == Chess::RESULT_ONGOING) {
+        return false;      /* 还有棋可走: 不是终局 */
+    }
+    for (auto it = memories.rbegin(); it != memories.rend(); ++it) {
+        if (!it->hasSearch) {
+            continue;      /* rollout / 自对弈样本: 不是"这一局的真实决策" */
+        }
+        if (it->done) {
+            return true;   /* 已带终局: 幂等, 不重复写 */
+        }
+        it->done = true;
+        it->reward = terminalReward(chessResult, perspective);
+        trainDiag.externalTerminals++;
+        const int onlineBatch = std::min(batchSize, (int)memories.size());
+        if (onlineBatch >= 1) {
+            learnBatch(onlineBatch);
+        }
+        return true;
+    }
+    return false;          /* 池里没有真实决策样本 (learnFromSearch 关着 / 一步没走) */
+}
+
+bool SACAZMoETbAgent::lastDecisionSample(float &reward, bool &done) const
+{
+    for (auto it = memories.rbegin(); it != memories.rend(); ++it) {
+        if (it->hasSearch) {
+            reward = it->reward;
+            done = it->done;
+            return true;
+        }
+    }
+    return false;
+}
+
 Step SACAZMoETbAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
 {
     nodes.clear();

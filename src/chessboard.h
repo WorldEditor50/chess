@@ -403,6 +403,39 @@ public:
     Step humanTurnAiMoveForTest(int color);
 
     /*
+     * ================================================================
+     *  ---- 人机对弈的终局反馈 (2026-09, 用户问"人机对弈 agent 能不能学"时补的洞) ----
+     * ================================================================
+     *
+     * 洞的形态 (代码核对, 不是猜的):
+     *   SAC+AZ 的终局值只在"**它自己**那一手结束了对局"时写进学习回路
+     *   (learnFromSearchStep 里 moveForward 之后 getResult() 非 ONGOING 才写
+     *   done=true + terminalReward)。而人机对弈里 AI 执黑, **结束这一局的那一手是
+     *   人**走的:
+     *     * 人把 AI 将死 / 困毙 -> 终局发生在人的落子上 (mouseReleaseEvent);
+     *     * AI 自己没棋可走 -> process() 判红胜, 而 AI 最后那条决策样本仍是 done=false;
+     *     * 全工程只有三处 `emit sendResult`, 全在人机那条路上, 而它们原来**只**更新
+     *       界面 (state / sendResult), 一句话都没告诉学习器。
+     *   于是 AI 输掉的一局, 学习器拿不到 −1: 价值目标 y = r + γV(s') 只能靠搜索**估**,
+     *   "杀将"这个信号在人机对弈里是**断的**而不是"弱"的。
+     *
+     * 修法: 三个终局点统一调本函数, 由它把结果交给当前 agent
+     * (`AgentBase::notifyGameResult`, 见 aiagent.h) —— agent 自己决定接不接:
+     *   * 三支 SAC+AZ: 把终局挂到"最后一条真实决策样本"(hasSearch=true) 上, 幂等;
+     *   * 纯搜索 / rollout 系 agent: 默认 no-op, 返回 false (它们没有这条样本)。
+     *
+     * 闸门: 与两条在线学习路径**同一个判据** —— 人机里 AI 固定是 SIDE_FROZEN
+     * (sideRoleForHumanGame()), 于是"评估对局 / 只对弈不学习"下这条反馈同样不写
+     * (那两个模式承诺的是"权重也不变", 而这条反馈会立刻触发一次 learnBatch)。
+     * 一个控件一种语义: 想让 AI 学, 模式就得是"训练对局"。
+     *
+     * 返回值 = agent 真的接住了 (调用方据此决定打不打日志, 以及测试据此断言)。
+     * ⚠ 必须在**落子之后、reset 之前**调用 (agent 要按当前棋盘算终局奖励), 且
+     *   三个调用点都在 `emit sendResult` 旁边 —— 位置错了会静默地什么都不发生。
+     */
+    bool notifyHumanGameEnd(int result);
+
+    /*
      * ---- 测试钩子: 内部局面 (2026-09, 人机对弈流程的回归用) ----
      *
      * 为什么需要它: 用户报障的那条链路是**整块 UI 状态机** ——
@@ -940,8 +973,28 @@ private:
      * 被踩下的次数直接数出来, 才能区分这两种情况 (第一版 [2.7d] 就卡在这里)。
      */
     std::atomic<int> m_matchLearningBlocked{0};
+    /*
+     * ---- 人机终局通道的接线读数 (2026-09, 见 notifyHumanGameEnd) ----
+     *
+     * 为什么这两个计数必须有 (与上面 matchLearningBlocked 同一条理由):
+     *   "终局反馈交出去了没有"**在读数上分辨不出来** —— agent 收到 −1 之后什么都不会
+     *   打印, 而"没收到"在界面上长得一模一样: 棋局照样结束、比分照样对。
+     *   于是接线写错 (调早了/调晚了/漏了某个终局点) 的表现是**完全静默**的。
+     *   把"交出去了几次 / 该交而没交几次"直接数出来, 才分得清:
+     *     * fed > 0                : 这条通道真的在工作;
+     *     * missed > 0 且 fed = 0  : 通道在, 但一次也没交出去 (模式闸门 / 没有实例 /
+     *                                没有可挂的样本);
+     *     * 两个都是 0             : 这一局还没结束 (或者压根没走到终局点)。
+     *   missed 的口径 = "终局发生了, 但学习回路没拿到东西", 四种原因各有一条日志
+     *   (模式不允许 / 这个 agent 类型没有这条通道 / 还没有实例 / 没有可挂的样本) ——
+     *   计数告诉你"有没有漏", 日志告诉你"漏在哪一处"。
+     */
+    std::atomic<long long> m_humanEndFed{0};
+    std::atomic<long long> m_humanEndMissed{0};
 public:
     int matchLearningBlockedCount() const { return m_matchLearningBlocked.load(); }
+    long long humanEndFedCount() const { return m_humanEndFed.load(); }
+    long long humanEndMissedCount() const { return m_humanEndMissed.load(); }
 private:
     /*
      * 当前这一手在替谁决策 (对弈里 "这一手是 A 方还是 B 方"; 人机里 AI 固定是冻结方)。

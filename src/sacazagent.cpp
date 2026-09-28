@@ -1435,6 +1435,64 @@ bool SACAZAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
     return true;
 }
 
+/* ============================================================
+ *  notifyGameResult / lastDecisionSample —— 人机对弈的终局通道
+ * ============================================================
+ *
+ * 洞与修法见 aiagent.h 的 `AgentBase::notifyGameResult` 长注释。这里只说明本实现的两处
+ * 细节:
+ *
+ *  1. **幂等**: 先找出"最后一条真实决策样本"; 它已经是 done=true 就直接返回 true 而
+ *     什么都不做 —— "AI 自己把对方将死"那一手在 learnFromSearchStep 里已经写过终局,
+ *     而棋盘的终局通知在三个点上都会发 (人走的一手 / AI 没有合法走法 / AI 落子之后),
+ *     同一条样本被通知两次是常态, 不是异常。
+ *  2. **奖励走 terminalReward()**: 与搜索叶子、rollout、自对弈同一个出口, 于是塑形
+ *     (`rewardShape=2/3`) 对这条通道同样生效。它读的是**当前**棋盘 (= 终局局面), 与
+ *     learnFromSearchStep 内部那一支的口径一致。
+ *       ⚠ 前提: 调用时棋盘停在终局那一手**之后**。ChessBoard::notifyHumanGameEnd 的
+ *       三个调用点全部满足 (都在落子之后、reset 之前)。
+ */
+bool SACAZAgent::notifyGameResult(int chessResult, int perspective)
+{
+    if (chessResult == Chess::RESULT_ONGOING) {
+        return false;      /* 还有棋可走: 不是终局, 什么都不该发生 */
+    }
+    for (auto it = memories.rbegin(); it != memories.rend(); ++it) {
+        if (!it->hasSearch) {
+            continue;      /* rollout / 自对弈样本: 不是"这一局的真实决策", 跳过 */
+        }
+        if (it->done) {
+            return true;   /* 已经带终局 (自己将死对方那一手): 幂等, 不重复写 */
+        }
+        it->done = true;
+        it->reward = terminalReward(chessResult, perspective);
+        trainDiag.externalTerminals++;
+        /*
+           立刻学一次 (与 learnFromSearchStep 同一个做法)。池里条数不足一个批时
+           learnBatch 故意直接返回 —— 那条样本先躺在池里等后面的批次抽到它, 这是既有
+           行为, 不在这里另造一条旁路。
+        */
+        const int onlineBatch = std::min(batchSize, (int)memories.size());
+        if (onlineBatch >= 1) {
+            learnBatch(onlineBatch);
+        }
+        return true;
+    }
+    return false;          /* 池里没有真实决策样本 (learnFromSearch 关着 / 一步没走) */
+}
+
+bool SACAZAgent::lastDecisionSample(float &reward, bool &done) const
+{
+    for (auto it = memories.rbegin(); it != memories.rend(); ++it) {
+        if (it->hasSearch) {
+            reward = it->reward;
+            done = it->done;
+            return true;
+        }
+    }
+    return false;
+}
+
 Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
 {
     nodes.clear();

@@ -3120,6 +3120,106 @@ static void testSharedTrunkAndTbHeads()
     }
 }
 
+/* ================================================================
+ *  [18] 人机对弈的终局通道 (AgentBase::notifyGameResult)
+ * ================================================================
+ *
+ * 洞 (用户问"人机对弈里 agent 能不能从中学习"时核对出来的):
+ *   SAC+AZ 的终局值只在"**它自己**那一手结束了对局"时才写进学习回路
+ *   (learnFromSearchStep 里 moveForward 之后 getResult() 非 ONGOING)。而人机对弈里
+ *   结束一局的那一手是**人**走的 —— 于是 AI 输掉的一局, 学习器连 −1 都收不到:
+ *   它最后那条决策样本仍然是 done=false, 价值目标只能靠搜索**估**出来。
+ *
+ * 修法: 棋盘在终局调 AgentBase::notifyGameResult (见 chessboard.h 的
+ * notifyHumanGameEnd)。这一节只钉 **agent 侧**的三条契约 (棋盘侧的接线在
+ * test_match 的 [3.9] 里钉):
+ *   (1) 值: 输 = −1 / 赢 = +1 / 和 = 0, 而且挂在"最后一条**真实决策**样本"
+ *       (hasSearch=true) 上 —— 不是挂在池尾随手一条 rollout 样本上;
+ *   (2) 幂等: 重复通知不写第二遍、不重复计数、不重复更新
+ *       (人机里三个终局点都会通知, 而"AI 自己将死对方"那一手本来就带终局);
+ *   (3) 接不接得住: 池里没有真实决策样本时返回 false, 而不是"静默地挂个 0";
+ *       对照组 = 还原版 SACAZLegacyAgent (59e5233 口径), 它没有这条通道 -> 一律 false。
+ */
+static void testHumanGameTerminalChannel()
+{
+    std::printf("\n[18] 人机对弈的终局通道 (notifyGameResult)\n");
+
+    const sacazx::Variant variants[3] = { sacazx::Variant::Mlp,
+                                          sacazx::Variant::MoeMlp,
+                                          sacazx::Variant::MoeTb };
+    for (sacazx::Variant v : variants) {
+        Chess c;
+        c.reset();
+        sacazx::Opts o;
+        o.hidden = 32;          /* 只测通道, 不测容量: 小网络快得多 */
+        o.expertHidden = 32;
+        std::printf("  -- %s --\n", sacazx::variantKey(v));
+        sacazx::withSacazAgent(c, v, o, [&](auto &sac) {
+            CHECK(sac.rewardShape == 0,
+                  "默认 rewardShape=0 (本节按未塑形的 ±1 口径断言)");
+
+            /* ---- (3) 池里没有真实决策样本: 必须"明说接不住" ---- */
+            float r = 123.0f;
+            bool done = true;
+            CHECK(!sac.lastDecisionSample(r, done),
+                  "没决策过 -> 池里没有真实决策样本");
+            CHECK(!sac.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+                  "此时终局反馈返回 false (接不住就说接不住, 不静默挂个 0)");
+            CHECK(sac.getTrainDiag().externalTerminals == 0, "...并且不计数");
+            CHECK(!sac.notifyGameResult(Chess::RESULT_ONGOING, Stone::COLOR_BLACK),
+                  "ONGOING 不是终局 -> 什么都不做, 返回 false");
+
+            /* ---- (1) 输: 人走的那一手把 AI 将死 ---- */
+            const Step s1 = sac.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+            CHECK(s1.valid, "selectMove 给出合法走法 (真实决策 = 一条 hasSearch 样本)");
+            CHECK(sac.lastDecisionSample(r, done), "决策过一次 -> 有真实决策样本");
+            CHECK(!done, "...它还不是终局 (人还没走那一手)");
+            CHECK(sac.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+                  "AI 被将死: 终局反馈被接住");
+            CHECK(sac.lastDecisionSample(r, done), "...那条样本还在");
+            CHECK(done, "...它的 done 被写成 true");
+            CHECK(std::fabs((double)r + 1.0) < 1e-6,
+                  "...奖励是 −1 (输), 不是即时奖励也不是 0");
+            const long long ext = sac.getTrainDiag().externalTerminals;
+            CHECK(ext == 1, "外部补入计数 +1 (棋盘侧那条通道真的动了池子)");
+
+            /* ---- (2) 幂等: 同一局的另一个终局点再通知一次 ---- */
+            CHECK(sac.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+                  "再通知一次仍然返回 true (这条样本已经带终局)");
+            CHECK(sac.getTrainDiag().externalTerminals == ext,
+                  "...但**不重复计数** (幂等: 不写第二遍, 也不多更新一次)");
+            sac.lastDecisionSample(r, done);
+            CHECK(done && std::fabs((double)r + 1.0) < 1e-6, "...奖励还是 −1");
+
+            /* ---- 赢: 终局值 +1 ---- */
+            const Step s2 = sac.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+            CHECK(s2.valid, "再走一步真实决策");
+            CHECK(sac.notifyGameResult(Chess::RESULT_BLACK_WIN, Stone::COLOR_BLACK),
+                  "AI 赢了: 同样被接住");
+            sac.lastDecisionSample(r, done);
+            CHECK(done && std::fabs((double)r - 1.0) < 1e-6, "奖励是 +1 (赢)");
+
+            /* ---- 和棋: 值是 0, 但 done 必须是 true (不能读成"没终局") ---- */
+            const Step s3 = sac.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+            CHECK(s3.valid, "再走一步真实决策");
+            CHECK(sac.notifyGameResult(Chess::RESULT_DRAW, Stone::COLOR_BLACK),
+                  "和棋: 被接住");
+            sac.lastDecisionSample(r, done);
+            CHECK(done && r == 0.0f, "和棋的终局值是 0, 但 done 必须是 true");
+        });
+    }
+
+    /* ---- 对照组: 还原版没有这条通道 (默认实现, 行为一位没变) ---- */
+    {
+        Chess c;
+        c.reset();
+        SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f,
+                             SACAZLegacyAgent::Backbone::Mlp);
+        CHECK(!old.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+              "对照组: 还原版 (59e5233 口径) 一律接不住 —— 那条通道不属于它");
+    }
+}
+
 int main()
 {
     std::printf("=== SAC+MCTS+AlphaZero agent 测试 ===\n");
@@ -3144,6 +3244,7 @@ int main()
     testPosReward();
     testLearnFromSearch();
     testSharedTrunkAndTbHeads();
+    testHumanGameTerminalChannel();
 
     std::printf("\n=== %d 项断言, %d 项失败 ===\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

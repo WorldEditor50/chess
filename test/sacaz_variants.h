@@ -332,6 +332,8 @@ public:
     /* 训练诊断 (类型擦除版): 字段与三个类一致, 这里统一成"一份副本" */
     struct Diag {
         long long n = 0, clamped = 0, doneSamples = 0, decisiveSamples = 0;
+        /* [2026-09 人机终局通道] 棋盘从外面补进来的终局反馈条数 (见 aiagent.h) */
+        long long externalTerminals = 0;
         double yPreAbsSum = 0.0, qAbsMeanSum = 0.0, qSpreadSum = 0.0;
     };
     Diag diag() const
@@ -341,6 +343,7 @@ public:
             Diag o;
             o.n = d.n; o.clamped = d.clamped;
             o.doneSamples = d.doneSamples; o.decisiveSamples = d.decisiveSamples;
+            o.externalTerminals = d.externalTerminals;
             o.yPreAbsSum = d.yPreAbsSum; o.qAbsMeanSum = d.qAbsMeanSum;
             o.qSpreadSum = d.qSpreadSum;
             return o;
