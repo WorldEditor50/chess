@@ -39,7 +39,7 @@
 #include <vector>
 
 #include "chess.h"
-#include "sacazagent.h"
+#include "sacaz_variants.h"
 #include "rl/sparse_moe.hpp"
 
 using namespace RL;
@@ -68,28 +68,28 @@ static Cfg g_cfg;
 
 /* 参赛者: 一个骨干 + 它的权重前缀 (只用于报告) */
 struct Case {
-    SACAZAgent::Backbone b;
+    sacazx::Variant b;
     const char *tag;
 };
 
 static const Case kCases[4] = {
-    { SACAZAgent::Backbone::Mlp,         "A  MLP            " },
-    { SACAZAgent::Backbone::SparseMoeMlp, "B  稀疏MoE(MLP专家)" },
-    { SACAZAgent::Backbone::SparseMoeTb,  "C  稀疏MoE(TB专家) " },
-    { SACAZAgent::Backbone::DenseMoeTb,   "D  稠密MoE(TB专家) " }
+    { sacazx::Variant::Mlp,          "A  MLP            " },
+    { sacazx::Variant::MoeMlp,       "B  稀疏MoE(MLP专家)" },
+    { sacazx::Variant::MoeTb,        "C  稀疏MoE(TB专家) " },
+    { sacazx::Variant::DenseMoeTb,   "D  稠密MoE(TB专家) " }
 };
 
 /* 分析式参数量 (只用来在报告里说明"等参数"这件事) */
-static double paramCount(SACAZAgent::Backbone b, int hidden)
+static double paramCount(sacazx::Variant b, int hidden)
 {
     const double D = (double)SACAZAgent::STATE_DIM;
     const double A = (double)SACAZAgent::ACTION_DIM;
     const double h = (double)hidden;
     const double mlp = D * h + h + h * h + h + h * A + A;   /* 1260->h->h->A */
     switch (b) {
-    case SACAZAgent::Backbone::Mlp:
+    case sacazx::Variant::Mlp:
         return mlp;
-    case SACAZAgent::Backbone::SparseMoeMlp: {
+    case sacazx::Variant::MoeMlp: {
         const double eh = 64.0;
         /* 每个专家: D->eh->eh->D */
         const double expert = D * eh + eh + eh * eh + eh + eh * D + D;
@@ -98,8 +98,8 @@ static double paramCount(SACAZAgent::Backbone b, int hidden)
         /* MoE 层 + Tanh(D->h) + Linear(h->A) */
         return (double)SACAZAgent::MOE_MLP_EXPERTS * expert + gate + D * h + h + h * A + A;
     }
-    case SACAZAgent::Backbone::SparseMoeTb:
-    case SACAZAgent::Backbone::DenseMoeTb: {
+    case sacazx::Variant::MoeTb:
+    case sacazx::Variant::DenseMoeTb: {
         const double dff = (double)SACAZAgent::MOE_TB_DFF;
         /* 一个 TB 专家: 4 个 d x d 的投影 + LN(2*2*d) + FFN(d->dff->d) */
         const double expert = 4.0 * D * D + 4.0 * D + (D * dff + dff) + (dff * D + D);
@@ -126,7 +126,7 @@ struct GameResult {
     bool aborted;
 };
 
-static GameResult playGame(Chess &c, SACAZAgent &caseAgent, SACAZAgent &refAgent,
+static GameResult playGame(Chess &c, sacazx::AnySac &caseAgent, sacazx::AnySac &refAgent,
                            int simsCase, int simsRef, bool caseIsRed, int maxPlies,
                            int openingPlies)
 {
@@ -167,7 +167,7 @@ static GameResult playGame(Chess &c, SACAZAgent &caseAgent, SACAZAgent &refAgent
             break;
         }
         const bool isCaseTurn = (turn == Stone::COLOR_RED) == caseIsRed;
-        SACAZAgent &me = isCaseTurn ? caseAgent : refAgent;
+        sacazx::AnySac &me = isCaseTurn ? caseAgent : refAgent;
         const int sims = isCaseTurn ? simsCase : simsRef;
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -265,13 +265,16 @@ int main(int argc, char **argv)
     c.reset();
 
     const int hidden = 64;
-    SACAZAgent::Backbone backs[4] = {
+    sacazx::Variant backs[4] = {
         kCases[0].b, kCases[1].b, kCases[2].b, kCases[3].b
     };
-    SACAZAgent *agents[4] = { nullptr, nullptr, nullptr, nullptr };
+    sacazx::AnySac *agents[4] = { nullptr, nullptr, nullptr, nullptr };
     for (int i = 0; i < 4; i++) {
-        agents[i] = new SACAZAgent(c, hidden, 0.99f, 0.001f, 1.5f, backs[i], 64, g_cfg.aux);
-        agents[i]->batchSize = 8;
+        sacazx::Opts o;
+        o.hidden = hidden;
+        o.aux = g_cfg.aux;
+        agents[i] = new sacazx::AnySac(c, backs[i], o);
+        agents[i]->visit([](auto &s) { s.batchSize = 8; });
     }
     if (!g_cfg.sel[0]) {
         std::printf("注意: A (MLP 参照) 不在 --cases 里, 它不会被预训练 —— 这种跑法\n"
@@ -367,8 +370,8 @@ int main(int argc, char **argv)
             continue;
         }
         /* i == 0 是 A 对 A 的对照: 两边完全一样, 胜率应当接近 50% —— 这就是噪声底 */
-        SACAZAgent &caseAgent = *agents[i];
-        SACAZAgent &refAgent = *agents[0];
+        sacazx::AnySac &caseAgent = *agents[i];
+        sacazx::AnySac &refAgent = *agents[0];
         const int simsCase = simsFor[i];
         const int simsRef = simsFor[0];
         tally[i].games = g_cfg.games;

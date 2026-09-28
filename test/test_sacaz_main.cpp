@@ -27,6 +27,7 @@
 #include "chess.h"
 #include "chessstate.h"
 #include "sacazagent.h"
+#include "sacaz_variants.h"     /* [2026-09 独立类] 按骨干选类 + 抹平只有某些骨干才有的读数 */
 #include "sacazlegacyagent.h"   /* [14] 节: 59e5233 行为还原版是**独立的类** */
 #include "ppomcts_agent.h"   /* 表示对齐断言要拿 PPOMCTSAgent 的维度常量做比较 */
 #include "rl/cpuinfo.hpp"
@@ -66,6 +67,10 @@ static int g_failed = 0;
 
 DSH_DETECT_MEMBER(rewardShape);
 DSH_DETECT_MEMBER(rewardScale);
+/* [15b] 节: 动态奖励分配 (rewardShape=3) 的三个成员 —— 只有当前口径那一支有 */
+DSH_DETECT_MEMBER(mateScoreMode);
+DSH_DETECT_MEMBER(matRewardBoost);
+DSH_DETECT_MEMBER(mateRewardBoost);
 DSH_DETECT_MEMBER(clampTarget);
 DSH_DETECT_MEMBER(huberDelta);
 DSH_DETECT_MEMBER(valueScale);
@@ -420,7 +425,7 @@ static void testCriticLearning()
     SACAZAgent::maskToBits(mask, bits);
 
     for (int i = 0; i < 48; i++) {
-        SACAZAgent::Transition tr;
+            typename std::decay<decltype(agent)>::type::Transition tr;
         tr.cells = cells;
         tr.nextCells = cells;
         tr.curMask[0] = bits[0];
@@ -762,7 +767,13 @@ static void testBackboneSweep()
     std::printf("\n[10] 骨干扫描 (真实 agent 路径: 建网 / 决策 / 探索 / 学习)\n");
 
     struct Case {
-        SACAZAgent::Backbone b;
+        /*
+           [2026-09 独立类拆分] 原来是 `SACAZAgent::Backbone b` (一个类 + 一个枚举值)。
+           现在骨干 = **类型**, 所以这里存"变体", 由 `sacazx::withSacazAgent` 建出对应
+           那个类的实例 —— 四个骨干四份独立实现, 而这段测试代码对它们是**同形**的
+           (公共 API + `sacazx::MoeInfo` 抹平"只有 MoE 才有的读数")。
+        */
+        sacazx::Variant v;
         int sims;             /* 决策用的模拟次数 (TB 专家只能给很少) */
         int expectExperts;    /* 期望的专家数 (0 = 不是 MoE) */
         int expectTopK;
@@ -775,12 +786,12 @@ static void testBackboneSweep()
         bool roundTrip;
     };
     const Case cases[4] = {
-        { SACAZAgent::Backbone::Mlp,         64, 0, 0, true },
-        { SACAZAgent::Backbone::SparseMoeMlp, 32, SACAZAgent::MOE_MLP_EXPERTS,
+        { sacazx::Variant::Mlp,        64, 0, 0, true },
+        { sacazx::Variant::MoeMlp,     32, SACAZAgent::MOE_MLP_EXPERTS,
           SACAZAgent::MOE_MLP_TOPK, true },
-        { SACAZAgent::Backbone::SparseMoeTb,   4, SACAZAgent::MOE_TB_EXPERTS,
+        { sacazx::Variant::MoeTb,       4, SACAZAgent::MOE_TB_EXPERTS,
           SACAZAgent::MOE_TB_TOPK, false },
-        { SACAZAgent::Backbone::DenseMoeTb,    4, SACAZAgent::MOE_TB_EXPERTS,
+        { sacazx::Variant::DenseMoeTb,  4, SACAZAgent::MOE_TB_EXPERTS,
           SACAZAgent::MOE_TB_EXPERTS, false }
     };
 
@@ -792,15 +803,19 @@ static void testBackboneSweep()
           每轮都重新建 agent (构造里就建了 5 个网络, 这就是在测 buildNet 的各种
            分支)。注意目标网的 withGrad=false —— 载入/前向路径与在线网不同。
         */
-        SACAZAgent agent(c, 64, 0.99f, 0.001f, 1.5f, cs.b, 64, 0.01f);
+        sacazx::Opts o;
+        o.expertHidden = 64;
+        o.aux = 0.01f;
+        sacazx::withSacazAgent(c, cs.v, o, [&](auto &agent) {
+        using A = typename std::decay<decltype(agent)>::type;
         agent.batchSize = 4;
 
         std::printf("    %-22s 专家数=%d topK=%d\n",
-                    SACAZAgent::backboneName(cs.b),
-                    agent.moeExpertCount(), agent.moeTopK());
-        CHECK(agent.moeExpertCount() == cs.expectExperts,
+                    agent.backboneName(),
+                    sacazx::MoeInfo<A>::expertCount(agent), sacazx::MoeInfo<A>::topK(agent));
+        CHECK(sacazx::MoeInfo<A>::expertCount(agent) == cs.expectExperts,
               "骨干的专家数符合预期 (非 MoE 骨干为 0)");
-        CHECK(agent.moeTopK() == cs.expectTopK, "骨干的 topK 符合预期");
+        CHECK(sacazx::MoeInfo<A>::topK(agent) == cs.expectTopK, "骨干的 topK 符合预期");
 
         /* ---- 决策: 必须给出合法走法 ---- */
         const std::string before = digest(c);
@@ -825,14 +840,14 @@ static void testBackboneSweep()
         CHECK(agent.getLearnSteps() > 0, "learnBatch 真的更新了参数");
 
         /* ---- 参数必须是有限值 (稀疏 MoE 的辅助梯度写错就会在这里露出来) ---- */
-        RL::Tensor state(SACAZAgent::STATE_DIM, 1);
+        RL::Tensor state(A::STATE_DIM, 1);
         agent.encodeStateFor(Stone::COLOR_RED, state);
-        RL::Tensor q1v(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor q2v(SACAZAgent::ACTION_DIM, 1);
+        RL::Tensor q1v(A::ACTION_DIM, 1);
+        RL::Tensor q2v(A::ACTION_DIM, 1);
         agent.qValues(state, q1v, q2v);
         bool finite = true;
         double qmax = 0;
-        for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+        for (int i = 0; i < A::ACTION_DIM; i++) {
             if (!std::isfinite(q1v[i]) || !std::isfinite(q2v[i])) {
                 finite = false;
             }
@@ -843,7 +858,7 @@ static void testBackboneSweep()
 
         /* ---- 稀疏 MoE 的使用分布 (坍缩诊断): 一共只给了几次前向, 不苛求均衡 ---- */
         std::vector<long long> usage;
-        agent.moeUsage(usage);
+        sacazx::MoeInfo<A>::usage(agent, usage);
         if (!usage.empty()) {
             long long tot = 0;
             std::printf("        专家使用计数 = {");
@@ -858,8 +873,8 @@ static void testBackboneSweep()
             std::printf("        (非 MoE 骨干, 没有使用计数)\n");
             CHECK(cs.expectExperts == 0, "只有非 MoE 骨干才没有使用计数");
         }
-        agent.resetMoeUsage();
-        agent.moeUsage(usage);
+        sacazx::MoeInfo<A>::resetUsage(agent);
+        sacazx::MoeInfo<A>::usage(agent, usage);
         long long after = 0;
         for (std::size_t i = 0; i < usage.size(); i++) {
             after += usage[i];
@@ -875,27 +890,33 @@ static void testBackboneSweep()
         if (cs.roundTrip) {
             const std::string prefix = std::string("test_sacaz_bb") + (char)('a' + ci);
             CHECK(agent.saveModel(prefix), "saveModel 报告成功 (三个文件)");
-            SACAZAgent fresh(c, 64, 0.99f, 0.001f, 1.5f, cs.b, 64, 0.01f);
-            CHECK(fresh.loadModel(prefix), "loadModel 报告成功");            RL::Tensor p1(SACAZAgent::ACTION_DIM, 1);
-            RL::Tensor p2(SACAZAgent::ACTION_DIM, 1);
-            RL::Tensor m1(SACAZAgent::ACTION_DIM, 1);
+            /*
+               [2026-09 独立类拆分] "另一个全新的同类 agent" 也要按**同一个变体**建
+               (以前是同一个类 + 同一个枚举值) —— 否则量到的是"两个不同的类能不能互相
+               载入权重", 而不是"同一个类的读写顺序对不对"。
+            */
+            sacazx::withSacazAgent(c, cs.v, o, [&](auto &fresh) {
+            CHECK(fresh.loadModel(prefix), "loadModel 报告成功");
+            RL::Tensor p1(A::ACTION_DIM, 1);
+            RL::Tensor p2(A::ACTION_DIM, 1);
+            RL::Tensor m1(A::ACTION_DIM, 1);
             agent.policy(state, m1, p1);
             fresh.policy(state, m1, p2);
             double dp = 0;
-            for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+            for (int i = 0; i < A::ACTION_DIM; i++) {
                 dp = std::fmax(dp, std::fabs((double)p1[i] - (double)p2[i]));
             }
             std::printf("        save/load 往返: 策略最大差 = %.3e\n", dp);
             CHECK(dp < 1e-6, "载入后的策略与保存前一致 (层结构/权重的读写顺序正确)");
             /* Q 网是独立的两个文件, 也顺手比一下 */
-            RL::Tensor qa(SACAZAgent::ACTION_DIM, 1);
-            RL::Tensor qb(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor qa(A::ACTION_DIM, 1);
+            RL::Tensor qb(A::ACTION_DIM, 1);
             agent.qValues(state, qa, qb);
-            RL::Tensor f1(SACAZAgent::ACTION_DIM, 1);
-            RL::Tensor f2(SACAZAgent::ACTION_DIM, 1);
+            RL::Tensor f1(A::ACTION_DIM, 1);
+            RL::Tensor f2(A::ACTION_DIM, 1);
             fresh.qValues(state, f1, f2);
             double dq = 0;
-            for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+            for (int i = 0; i < A::ACTION_DIM; i++) {
                 dq = std::fmax(dq, std::fabs((double)qa[i] - (double)f1[i]));
                 dq = std::fmax(dq, std::fabs((double)qb[i] - (double)f2[i]));
             }
@@ -911,7 +932,9 @@ static void testBackboneSweep()
             std::remove((prefix + "_actor").c_str());
             std::remove((prefix + "_q1").c_str());
             std::remove((prefix + "_q2").c_str());
+            });   /* withSacazAgent: fresh (同一个变体) */
         }
+        });       /* withSacazAgent: 本轮的 agent */
     }
 }
 
@@ -955,7 +978,7 @@ static void testPpoPort()
 
     /* 用**同一个掩码**造一批经验: 于是"某个动作在所有样本里都非法"是可判定的 */
     for (int i = 0; i < 64; i++) {
-        SACAZAgent::Transition tr;
+            typename std::decay<decltype(agent)>::type::Transition tr;
         tr.cells = cells;
         tr.nextCells = cells;
         tr.curMask[0] = bits[0];
@@ -1228,12 +1251,16 @@ static void testTbExpertAgent()
        输出 ≈ gate·expert, 量级被 gate ≈ 0.25 压小), 同样的步数下学得更慢。
        辅助损失系数 0.1 与 RL::PPO / RL::SAC 的默认值一致。
     */
-    SACAZAgent agent(c, 64, 0.99f, 0.003f, 1.5f,
-                     SACAZAgent::Backbone::SparseMoeTb, 64, 0.1f);
+    /*
+       [2026-09 独立类拆分] 这一节现在建的是**独立类** `SACAZMoETbAgent`
+       (拆分前是 `SACAZAgent` + `Backbone::SparseMoeTb`): TB 专家那一支有自己的文件,
+       与纯 MLP / MoE-MLP 互不继承 —— 本节的断言因此同时是"那一支自己的回归"。
+    */
+    SACAZMoETbAgent agent(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
     agent.batchSize = 4;
 
     std::printf("  骨干=%s  专家=%d  topK=%d\n",
-                SACAZAgent::backboneName(agent.backbone),
+                agent.backboneName(),
                 agent.moeExpertCount(), agent.moeTopK());
     std::printf("  参数: actor=%lld  q1=%lld  (target 网同构但无梯度)\n",
                 agent.actor.paramCount(), agent.q1.paramCount());
@@ -1263,7 +1290,7 @@ static void testTbExpertAgent()
     auto fillPool = [&](float reward, bool done, bool hasSearch, int target) {
         agent.memories.clear();
         for (int i = 0; i < 48; i++) {
-            SACAZAgent::Transition tr;
+            typename std::decay<decltype(agent)>::type::Transition tr;
             tr.cells = cells;
             tr.nextCells = cells;
             tr.curMask[0] = bits[0];
@@ -1316,8 +1343,7 @@ static void testTbExpertAgent()
            对照组 agent **只在这一块里活着**: 一个 TB 专家 agent 是五个网络 ≈ 1.6 GB,
            两个同时存在已经到顶 —— 不能让它跟后面的 (c)/(d) 一起活着。
         */
-        SACAZAgent ctrl(c, 64, 0.99f, 0.003f, 1.5f,
-                        SACAZAgent::Backbone::SparseMoeTb, 64, 0.1f);
+        SACAZMoETbAgent ctrl(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
         ctrl.batchSize = 4;
         /* 五个网络全部 copyTo (Net 的拷贝语义是**浅拷贝**: 共享层指针, 深拷贝只能走 copyTo) */
         agent.actor.copyTo(ctrl.actor);
@@ -1345,7 +1371,7 @@ static void testTbExpertAgent()
         }
 
         struct Traj { double mean, peak, last; };
-        auto runTraj = [&](SACAZAgent &a, int iters) {
+        auto runTraj = [&](auto &a, int iters) {
             RL::Tensor p(SACAZAgent::ACTION_DIM, 1);
             a.policy(state, mask, p);
             Traj t;
@@ -1549,8 +1575,7 @@ static void testTbExpertAgent()
         */
         Chess cf;
         cf.reset();
-        SACAZAgent fresh(cf, 64, 0.99f, 0.003f, 1.5f,
-                         SACAZAgent::Backbone::SparseMoeTb, 64, 0.1f);
+        SACAZMoETbAgent fresh(cf, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
         fresh.batchSize = 4;
         fresh.learningRateCritic = 3e-05f;
 
@@ -1569,7 +1594,7 @@ static void testTbExpertAgent()
 
         fresh.memories.clear();
         for (int i = 0; i < 48; i++) {
-            SACAZAgent::Transition tr;
+            typename std::decay<decltype(fresh)>::type::Transition tr;
             tr.cells = fcells;
             tr.nextCells = fcells;
             tr.curMask[0] = fbits[0]; tr.curMask[1] = fbits[1];
@@ -1674,8 +1699,7 @@ static void testTbExpertAgent()
     {
         Chess c2;
         c2.reset();
-        SACAZAgent mlp(c2, 64, 0.99f, 0.003f, 1.5f,
-                       SACAZAgent::Backbone::Mlp, 64, 0.1f);
+        SACAZAgent mlp(c2, 64, 0.99f, 0.003f, 1.5f);
         mlp.batchSize = 4;
         std::vector<Step*> lg;
         std::vector<int> li;
@@ -1687,7 +1711,7 @@ static void testTbExpertAgent()
         std::uint64_t mbits[2] = { 0, 0 };
         SACAZAgent::maskToBits(mk, mbits);
         for (int i = 0; i < 48; i++) {
-            SACAZAgent::Transition tr;
+            typename std::decay<decltype(mlp)>::type::Transition tr;
             tr.cells = cl;
             tr.nextCells = cl;
             tr.curMask[0] = mbits[0];
@@ -1763,6 +1787,148 @@ static void testTbExpertAgent()
  *      这条也解释了为什么当时"测不出来": 那个开关是普通成员, 赋值发生在构造函数建网
  *      **之后** ⇒ 静默空操作, 于是任何"回显开关"的检查都会通过。见 §7 第 2 条。
  * ============================================================ */
+/*
+   [2026-09 独立类拆分] 这一节原来是"当前口径那一支" (一个类 + 骨干枚举) 对 59e5233 还原版。
+   "当前口径"现在是**两个不同的类**: 纯 MLP 的 SACAZAgent 与 MoE-MLP 的 SACAZMoEMlpAgent ——
+   所以比较体抽成模板: 骨架与断言一字不改, 只是换一个类实例化。
+   还原版那边**没有**这个分裂 (它自带两支骨干, 见 sacazlegacyagent.h), 所以它照旧按
+   SACAZLegacyAgent::Backbone 选骨干。
+*/
+template <class Cur>
+static void compareCurrentVsLegacy(Chess &c, Cur &cur, SACAZLegacyAgent &old,
+                                   SACAZLegacyAgent::Backbone oldB, const char *caseName)
+{
+        (void)c;   /* 比较体不再自己建 agent: 两个实例由调用方按骨干各自构造 */
+
+        std::printf("  骨干 %s: 隐层激活 当前='%s' / 59e5233='%s'\n", caseName,
+                    cur.hiddenActivationName(), old.hiddenActivationName());
+
+        /* ---- (a) 口径 ---- */
+        CHECK(std::string(cur.hiddenActivationName()).find("Layer<Tanh>")
+                  != std::string::npos
+                  && std::string(old.hiddenActivationName()).find("Layer<Tanh>")
+                         != std::string::npos,
+              "两支的隐层激活都是 Layer<Tanh> (= 59e5233 那一层, 由**同一行代码**保证)");
+        /*
+           α 口径 (目标熵 / alpha 学习率) 现在是**相同**的: 2026-09 的受控实验把当前实现
+           改回了 59e5233 的值 (0.5/5e-3 -> 0.98/1e-3, 对 MCTS 37.5% -> 82.5%,
+           见 docs/sac_learn_reward_2026_09.md §9)。这里钉住"两边一致"这个**事实**,
+           免得以后有人只改一边、还以为两支的差别是"新旧口径"。
+        */
+        CHECK(cur.entropyRatio == old.entropyRatio
+                  && cur.entropyRatio == SACAZLegacyAgent::LEGACY_ENTROPY_RATIO,
+              "目标熵: 两支都是 0.98 (当前实现已按实测改回 59e5233 的值)");
+        CHECK(cur.learningRateAlpha == old.learningRateAlpha
+                  && cur.learningRateAlpha == SACAZLegacyAgent::LEGACY_ALPHA_LR,
+              "alpha 学习率: 两支都是 1e-3 (同上)");
+        /*
+           奖励口径: "没有塑形"这件事现在是**行为**可查的 —— 终局值必须与引擎真值
+           (outcomeForMover) **逐位相同**, 而不是"某个开关取 0"。当前口径那一支反过来
+           有这个开关 (上面的探针已经钉住了名字存在), 所以两支不是同一个配置。
+        */
+        CHECK(old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == 1.0f
+                  && old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK) == -1.0f
+                  && old.terminalReward(Chess::RESULT_DRAW, Stone::COLOR_RED) == 0.0f,
+              "终局值 = 引擎真值 ±1/0 (本类不含奖励塑形/放大, 连开关都没有)");
+        CHECK(old.rewardCaliperName() == std::string("学习口径") && old.hasLearningReward(),
+              "奖励曲线的口径来自本 agent 自己的出口 (学习口径, 与它学的是同一个游戏)");
+        /*
+           当前实现这一支: 默认值 = 61a974d 的口径 (F1 的实测最好档 p = 0.43 不显著 ⇒
+           不作为默认; 要开就传 --target-tau/--target-iter)。这里把"默认值是什么"钉住,
+           免得它被下一次实验顺手改掉 (默认值也是结论)。
+           **注意**: 还原版连这两个成员都没有, 它的同步率是编译期常数 (上面已断言)。
+        */
+        CHECK(cur.targetTau == 1e-3f && cur.replaceTargetIter == 64,
+              "当前实现的默认目标网同步率 = 61a974d 口径 (tau=1e-3 / 每 64 步)");
+        CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix())
+                  != std::string(Cur::defaultWeightPrefix()),
+              "**权重前缀不同** (用户口径: 新旧 SAC 的权重文件必须用不同名字)");
+        CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix()).find("sacaz_old") != std::string::npos,
+              "还原版前缀是 weights/sacaz_old_agent*");
+        /*
+           ---- 身份标签: 每个骨干都要有 59e5233, 且要说出**本实例**的骨干 ----
+           这两条原来只有"标签里有 59e5233"一句, 而实现当时只认 Mlp / SparseMoeTb 两个骨干,
+           其余返回 `bench/测试构造 (界面不为它建实例)` ⇒ 本节构造的 moe-mlp 实例上如实失败。
+           用户口径是"两支 GUI agent 都要能看出 (a) 是 59e5233 还原口径 + (b) 是哪个骨干" ,
+           所以修的是**实现** (标签按骨干给各自的变体后缀, 但一律保留 59e5233), 断言改成
+           对**每个构造出来的骨干**分别查这两件事。
+        */
+        CHECK(std::string(old.guiAgentLabel()).find("59e5233") != std::string::npos,
+              "自检面板能认出这是哪一支 (每个骨干的标签里都有 59e5233)");
+        CHECK(std::string(old.guiAgentLabel())
+                  == std::string(SACAZLegacyAgent::guiAgentLabelFor(oldB)),
+              "实例报的标签就是**本实例骨干**那一句 (标签与骨干同一来源, 不会各说各话)");
+        /*
+           把这两件验收读数**原样打出来** (标签 + 报告里那一行权重文件名): 断言只说明
+           "成不成立", 人读的时候要能直接看到这一支在面板上到底显示成什么 ——
+           上一版标签在三支骨干上是同一句"bench/测试构造", 只有把原文打出来才一眼看得出。
+        */
+        std::printf("      面板标签: %s\n", old.guiAgentLabel());
+        {
+            const std::string rep = old.selfCheckReport();
+            CHECK(rep.find("59e5233") != std::string::npos,
+                  "自检报告开头带 59e5233 差异说明");
+            const std::string key = "权重文件独立";
+            const std::size_t kp = rep.find(key);
+            if (kp != std::string::npos) {
+                const std::size_t ke = rep.find('\n', kp);
+                std::printf("      报告: %s\n",
+                            rep.substr(kp, (ke == std::string::npos ? rep.size() : ke)
+                                               - kp).c_str());
+            } else {
+                std::printf("      报告: (**没有** '权重文件独立' 那一行)\n");
+            }
+            /*
+               报告里的权重前缀必须是**这个实例自己的骨干**那一个
+               (= defaultWeightPrefix(this->backbone)): 原来这里写死查 "sacaz_old_agent",
+               那是单骨干时代的写法 —— moe-mlp 骨干的实例实际会写
+               weights/sacaz_old_moemlp_agent, 报告里也确实是它 (断言如实失败)。
+               判据改成"报告里出现该骨干自己的前缀", 于是这条断言在**任何**骨干上都成立,
+               而且仍然能把"报告写的是别的骨干的前缀"这种错钉住。
+            */
+            CHECK(rep.find(SACAZLegacyAgent::defaultWeightPrefix(oldB)) != std::string::npos,
+                  "自检报告写明**本骨干**实际会用的权重文件名 (与 defaultWeightPrefix 一致)");
+            CHECK(rep.find(SACAZLegacyAgent::backboneName(oldB)) != std::string::npos,
+                  "自检报告第二行写明本实例的骨干 (读数归到哪一支一目了然)");
+        }
+
+        /* ---- (b) 同权重同局面 -> 逐位相同 ---- */
+        cur.actor.copyTo(old.actor);
+        cur.q1.copyTo(old.q1);
+        cur.q2.copyTo(old.q2);
+
+        std::vector<Step *> legal;
+        std::vector<int> legalIdx;
+        RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
+        cur.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
+        Steps::instance().put(legal);
+        CHECK(legalIdx.size() >= 3, "开局红方有足够多的合法走法");
+
+        std::vector<std::uint16_t> cells;
+        cur.encodeSparse(Stone::COLOR_RED, cells);
+        RL::Tensor state(SACAZAgent::STATE_DIM, 1);
+        SACAZAgent::expandSparse(cells, state);
+
+        RL::Tensor p1(SACAZAgent::ACTION_DIM, 1), p2(SACAZAgent::ACTION_DIM, 1);
+        RL::Tensor q1a(SACAZAgent::ACTION_DIM, 1), q2a(SACAZAgent::ACTION_DIM, 1);
+        RL::Tensor q1b(SACAZAgent::ACTION_DIM, 1), q2b(SACAZAgent::ACTION_DIM, 1);
+        cur.policy(state, mask, p1);
+        old.policy(state, mask, p2);
+        cur.qValues(state, q1a, q2a);
+        old.qValues(state, q1b, q2b);
+
+        double dPi = 0.0, dQ = 0.0;
+        for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
+            dPi = std::max(dPi, std::fabs((double)p1[i] - (double)p2[i]));
+            dQ = std::max(dQ, std::fabs((double)q1a[i] - (double)q1b[i]));
+            dQ = std::max(dQ, std::fabs((double)q2a[i] - (double)q2b[i]));
+        }
+        std::printf("       同权重同局面: max|Δπ| = %.3g, max|ΔQ| = %.3g\n", dPi, dQ);
+        CHECK(dPi == 0.0,
+              "策略输出**逐位相同** (独立类没有改网络, 只改了训练/搜索口径)");
+        CHECK(dQ == 0.0, "双 Q 输出**逐位相同**");
+}
+
 static void testLegacyAgentClass()
 {
     std::printf("\n[14] AGENT_SACAZ_OLD: 59e5233 行为还原版 (**独立类**, 不继承)\n");
@@ -1789,6 +1955,17 @@ static void testLegacyAgentClass()
           "还原版**没有** rewardShape (本类不含奖励塑形)");
     CHECK(!Has_rewardScale<SACAZLegacyAgent>::value,
           "还原版**没有** rewardScale (即时奖励不缩放)");
+    /*
+       [2026-09 动态奖励分配] 三个新成员同样只有当前口径那一支有 —— 还原版是 59e5233 的
+       行为快照, 它的奖励恒为"材质 x0.1 + 每步代价 + 终局 ±1", **没有**按局面分配的权重。
+    */
+    CHECK(!Has_mateScoreMode<SACAZLegacyAgent>::value
+              && !Has_matRewardBoost<SACAZLegacyAgent>::value
+              && !Has_mateRewardBoost<SACAZLegacyAgent>::value,
+          "还原版**没有** mateScoreMode / matRewardBoost / mateRewardBoost (无按局面分配的权重)");
+    CHECK(Has_mateScoreMode<SACAZAgent>::value && Has_matRewardBoost<SACAZAgent>::value
+              && Has_mateRewardBoost<SACAZAgent>::value,
+          "[对照] 探针能在 SACAZAgent 上探到动态奖励分配的三个成员");
     /* critic 值域抑制: 连名字都没有 */
     CHECK(!Has_clampTarget<SACAZLegacyAgent>::value,
           "还原版**没有** clampTarget (critic 目标不夹)");
@@ -1891,141 +2068,21 @@ static void testLegacyAgentClass()
            两个类**各自的** Backbone 是**不同的枚举类型** (互不能赋值) —— 这是拆分的直接
            后果, 所以这里各取一次; 枚举项与 59e5233 逐字相同 (同一骨干、同一表示)。
         */
-        const SACAZAgent::Backbone curB = (cs.backbone == 0)
-            ? SACAZAgent::Backbone::Mlp : SACAZAgent::Backbone::SparseMoeMlp;
-        const SACAZLegacyAgent::Backbone oldB = (cs.backbone == 0)
-            ? SACAZLegacyAgent::Backbone::Mlp : SACAZLegacyAgent::Backbone::SparseMoeMlp;
-        /* 小隐层: 这一节只比"同权重同局面的输出", 与容量无关 */
-        SACAZAgent cur(c, 32, 0.99f, 0.001f, 1.5f, curB, 64, 0.01f);
-        SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f, oldB, 64, 0.01f);
-
-        std::printf("  骨干 %s: 隐层激活 当前='%s' / 59e5233='%s'\n", cs.name,
-                    cur.hiddenActivationName(), old.hiddenActivationName());
-
-        /* ---- (a) 口径 ---- */
-        CHECK(std::string(cur.hiddenActivationName()).find("Layer<Tanh>")
-                  != std::string::npos
-                  && std::string(old.hiddenActivationName()).find("Layer<Tanh>")
-                         != std::string::npos,
-              "两支的隐层激活都是 Layer<Tanh> (= 59e5233 那一层, 由**同一行代码**保证)");
         /*
-           α 口径 (目标熵 / alpha 学习率) 现在是**相同**的: 2026-09 的受控实验把当前实现
-           改回了 59e5233 的值 (0.5/5e-3 -> 0.98/1e-3, 对 MCTS 37.5% -> 82.5%,
-           见 docs/sac_learn_reward_2026_09.md §9)。这里钉住"两边一致"这个**事实**,
-           免得以后有人只改一边、还以为两支的差别是"新旧口径"。
+           [2026-09 独立类拆分] 按骨干分别构造"当前口径"那一支, 再交给同一个模板比较体
+           (compareCurrentVsLegacy) —— 断言一字不改, 换的只是类。
         */
-        CHECK(cur.entropyRatio == old.entropyRatio
-                  && cur.entropyRatio == SACAZLegacyAgent::LEGACY_ENTROPY_RATIO,
-              "目标熵: 两支都是 0.98 (当前实现已按实测改回 59e5233 的值)");
-        CHECK(cur.learningRateAlpha == old.learningRateAlpha
-                  && cur.learningRateAlpha == SACAZLegacyAgent::LEGACY_ALPHA_LR,
-              "alpha 学习率: 两支都是 1e-3 (同上)");
-        /*
-           奖励口径: "没有塑形"这件事现在是**行为**可查的 —— 终局值必须与引擎真值
-           (outcomeForMover) **逐位相同**, 而不是"某个开关取 0"。当前口径那一支反过来
-           有这个开关 (上面的探针已经钉住了名字存在), 所以两支不是同一个配置。
-        */
-        CHECK(old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == 1.0f
-                  && old.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK) == -1.0f
-                  && old.terminalReward(Chess::RESULT_DRAW, Stone::COLOR_RED) == 0.0f,
-              "终局值 = 引擎真值 ±1/0 (本类不含奖励塑形/放大, 连开关都没有)");
-        CHECK(old.rewardCaliperName() == std::string("学习口径") && old.hasLearningReward(),
-              "奖励曲线的口径来自本 agent 自己的出口 (学习口径, 与它学的是同一个游戏)");
-        /*
-           当前实现这一支: 默认值 = 61a974d 的口径 (F1 的实测最好档 p = 0.43 不显著 ⇒
-           不作为默认; 要开就传 --target-tau/--target-iter)。这里把"默认值是什么"钉住,
-           免得它被下一次实验顺手改掉 (默认值也是结论)。
-           **注意**: 还原版连这两个成员都没有, 它的同步率是编译期常数 (上面已断言)。
-        */
-        CHECK(cur.targetTau == 1e-3f && cur.replaceTargetIter == 64,
-              "当前实现的默认目标网同步率 = 61a974d 口径 (tau=1e-3 / 每 64 步)");
-        CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix())
-                  != std::string(SACAZAgent::defaultWeightPrefix()),
-              "**权重前缀不同** (用户口径: 新旧 SAC 的权重文件必须用不同名字)");
-        CHECK(std::string(SACAZLegacyAgent::defaultWeightPrefix()).find("sacaz_old") != std::string::npos,
-              "还原版前缀是 weights/sacaz_old_agent*");
-        /*
-           ---- 身份标签: 每个骨干都要有 59e5233, 且要说出**本实例**的骨干 ----
-           这两条原来只有"标签里有 59e5233"一句, 而实现当时只认 Mlp / SparseMoeTb 两个骨干,
-           其余返回 `bench/测试构造 (界面不为它建实例)` ⇒ 本节构造的 moe-mlp 实例上如实失败。
-           用户口径是"两支 GUI agent 都要能看出 (a) 是 59e5233 还原口径 + (b) 是哪个骨干" ,
-           所以修的是**实现** (标签按骨干给各自的变体后缀, 但一律保留 59e5233), 断言改成
-           对**每个构造出来的骨干**分别查这两件事。
-        */
-        CHECK(std::string(old.guiAgentLabel()).find("59e5233") != std::string::npos,
-              "自检面板能认出这是哪一支 (每个骨干的标签里都有 59e5233)");
-        CHECK(std::string(old.guiAgentLabel())
-                  == std::string(SACAZLegacyAgent::guiAgentLabelFor(oldB)),
-              "实例报的标签就是**本实例骨干**那一句 (标签与骨干同一来源, 不会各说各话)");
-        /*
-           把这两件验收读数**原样打出来** (标签 + 报告里那一行权重文件名): 断言只说明
-           "成不成立", 人读的时候要能直接看到这一支在面板上到底显示成什么 ——
-           上一版标签在三支骨干上是同一句"bench/测试构造", 只有把原文打出来才一眼看得出。
-        */
-        std::printf("      面板标签: %s\n", old.guiAgentLabel());
-        {
-            const std::string rep = old.selfCheckReport();
-            CHECK(rep.find("59e5233") != std::string::npos,
-                  "自检报告开头带 59e5233 差异说明");
-            const std::string key = "权重文件独立";
-            const std::size_t kp = rep.find(key);
-            if (kp != std::string::npos) {
-                const std::size_t ke = rep.find('\n', kp);
-                std::printf("      报告: %s\n",
-                            rep.substr(kp, (ke == std::string::npos ? rep.size() : ke)
-                                               - kp).c_str());
-            } else {
-                std::printf("      报告: (**没有** '权重文件独立' 那一行)\n");
-            }
-            /*
-               报告里的权重前缀必须是**这个实例自己的骨干**那一个
-               (= defaultWeightPrefix(this->backbone)): 原来这里写死查 "sacaz_old_agent",
-               那是单骨干时代的写法 —— moe-mlp 骨干的实例实际会写
-               weights/sacaz_old_moemlp_agent, 报告里也确实是它 (断言如实失败)。
-               判据改成"报告里出现该骨干自己的前缀", 于是这条断言在**任何**骨干上都成立,
-               而且仍然能把"报告写的是别的骨干的前缀"这种错钉住。
-            */
-            CHECK(rep.find(SACAZLegacyAgent::defaultWeightPrefix(oldB)) != std::string::npos,
-                  "自检报告写明**本骨干**实际会用的权重文件名 (与 defaultWeightPrefix 一致)");
-            CHECK(rep.find(SACAZLegacyAgent::backboneName(oldB)) != std::string::npos,
-                  "自检报告第二行写明本实例的骨干 (读数归到哪一支一目了然)");
+        if (cs.backbone == 0) {
+            SACAZAgent cur(c, 32, 0.99f, 0.001f, 1.5f);
+            SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f,
+                                 SACAZLegacyAgent::Backbone::Mlp, 64, 0.01f);
+            compareCurrentVsLegacy(c, cur, old, SACAZLegacyAgent::Backbone::Mlp, cs.name);
+        } else {
+            SACAZMoEMlpAgent cur(c, 32, 0.99f, 0.001f, 1.5f, 64, 0.01f);
+            SACAZLegacyAgent old(c, 32, 0.99f, 0.001f, 1.5f,
+                                 SACAZLegacyAgent::Backbone::SparseMoeMlp, 64, 0.01f);
+            compareCurrentVsLegacy(c, cur, old, SACAZLegacyAgent::Backbone::SparseMoeMlp, cs.name);
         }
-
-        /* ---- (b) 同权重同局面 -> 逐位相同 ---- */
-        cur.actor.copyTo(old.actor);
-        cur.q1.copyTo(old.q1);
-        cur.q2.copyTo(old.q2);
-
-        std::vector<Step *> legal;
-        std::vector<int> legalIdx;
-        RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
-        cur.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
-        Steps::instance().put(legal);
-        CHECK(legalIdx.size() >= 3, "开局红方有足够多的合法走法");
-
-        std::vector<std::uint16_t> cells;
-        cur.encodeSparse(Stone::COLOR_RED, cells);
-        RL::Tensor state(SACAZAgent::STATE_DIM, 1);
-        SACAZAgent::expandSparse(cells, state);
-
-        RL::Tensor p1(SACAZAgent::ACTION_DIM, 1), p2(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor q1a(SACAZAgent::ACTION_DIM, 1), q2a(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor q1b(SACAZAgent::ACTION_DIM, 1), q2b(SACAZAgent::ACTION_DIM, 1);
-        cur.policy(state, mask, p1);
-        old.policy(state, mask, p2);
-        cur.qValues(state, q1a, q2a);
-        old.qValues(state, q1b, q2b);
-
-        double dPi = 0.0, dQ = 0.0;
-        for (int i = 0; i < SACAZAgent::ACTION_DIM; i++) {
-            dPi = std::max(dPi, std::fabs((double)p1[i] - (double)p2[i]));
-            dQ = std::max(dQ, std::fabs((double)q1a[i] - (double)q1b[i]));
-            dQ = std::max(dQ, std::fabs((double)q2a[i] - (double)q2b[i]));
-        }
-        std::printf("       同权重同局面: max|Δπ| = %.3g, max|ΔQ| = %.3g\n", dPi, dQ);
-        CHECK(dPi == 0.0,
-              "策略输出**逐位相同** (独立类没有改网络, 只改了训练/搜索口径)");
-        CHECK(dQ == 0.0, "双 Q 输出**逐位相同**");
     }
 }
 
@@ -2143,6 +2200,356 @@ static void testRewardShaping()
           "**搜索叶子与训练目标的终局值逐位相同** (三个出口只走 terminalReward)");
 
     agent.rewardShape = 0;
+}
+
+/* ============================================================
+ *  15b. [2026-09 用户提议] **动态奖励分配** rewardShape = 3
+ *
+ *  用户口径 (两轮):
+ *    ① "前期应该加强吃棋子的奖励权重, 后期应该重杀将奖励, 或者说这两者都不应忽视奖励";
+ *    ② "分阶段太过思维定势, 因为局势是反复变化的, 是否可以参考棋子的数量和价值来
+ *       评估局面动态调整杀棋杀将的奖励比例"。
+ *
+ *  ② 把 ① 的"阶段钟"换成了**局面评估** e (同时读棋子的数量 / 价值 / 双方优势),
+ *  于是"同一个吃子在两种局面下拿到的权重不同", 而且局势反复时权重会**回摆**。
+ *  设计见 src/sacazagent.h 的 `rewardShape = 3`。这里钉八件事:
+ *
+ *   (1) **默认路径逐位不变**: shape=3 + 两个 boost = 0 时与 shape=0 完全同值;
+ *   (2) 满盘均势: e=0 -> 吃子 x1.5 / 终局 x1.0;
+ *   (3) **数量是独立的一维**: 价值相同、个数不同的两个局面 -> e 不同;
+ *   (4) **局势反复**: 同一总子力/同一子数, 一边倒 -> e 升; 落后方吃回一个子 -> e 回落;
+ *   (5) **与手数无关**: 局面不变只把 history 推长 -> e 一位不变 (不许再引阶段钟);
+ *   (6) 调用顺序无关 (被吃子算回"走子前") / 两个倍数之和恒定 (= 固定预算按局面分配);
+ *   (7) 零和对称 / 和棋 0 / 搜索叶子与训练目标同值 (倍率 != 1 时);
+ *   (8) 量纲不变量 (吃光对方 < 赢棋) 与三种因子口径的接线。
+ * ============================================================ */
+/*
+   [2026-09 独立类拆分 + 用户口径] "新的奖励方法 (rewardShape=3 的动态分配) 也要应用到
+   **MoE+MLP 专家**那一支" —— 这句话在代码上已经成立 (两个独立类是 **SACAZAgent 的逐字
+   副本**, 奖励代码原样带过去); 但"代码里有"不等于"跑得对", 所以这一段改成**对三个类
+   各跑一遍同一批断言**:
+       SACAZAgent (纯 MLP) / SACAZMoEMlpAgent (MoE+MLP 专家) / SACAZMoETbAgent (MoE+TB 专家)
+   断言一字不改 —— 于是"三支的奖励口径逐项一致"是**跑出来的**, 不是看出来的。
+*/
+template <class A>
+static void posRewardChecks(A &agent, Chess &c, const char *clsName)
+{
+    std::printf("  ---- %s ----\n", clsName);
+
+    /* ---- 摆局面的两个小工具 (直接改 alive, 不动走子规则) ---- */
+    auto clearBoard = [&c]() {
+        c.reset();     /* 保留双方将, 其余全部下掉 */
+        for (int i = 0; i < 32; i++) {
+            Stone *s = c.stones[i];
+            if (s != nullptr && s->type != Stone::TYPE_JIANG) {
+                s->alive = false;
+            }
+        }
+    };
+    auto put = [&c](int color, int type, int n) {
+        int left = n;
+        for (int i = 0; i < 32 && left > 0; i++) {
+            Stone *s = c.stones[i];
+            if (s == nullptr || s->color != color || s->type != type) {
+                continue;
+            }
+            s->alive = true;
+            left--;
+        }
+        return left == 0;
+    };
+    /* 摆一个局面的可读描述 (测试报告里印出来, 便于手算对账) */
+    auto describe = [&c]() -> std::string {
+        double red = 0.0, black = 0.0;
+        int cnt = 0;
+        for (int i = 0; i < 32; i++) {
+            Stone *s = c.stones[i];
+            if (s == nullptr || !s->alive || s->type == Stone::TYPE_JIANG) {
+                continue;
+            }
+            if (s->color == Stone::COLOR_RED) { red += s->value; } else { black += s->value; }
+            cnt++;
+        }
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "红%.2f/黑%.2f/%d子", red, black, cnt);
+        return std::string(buf);
+    };
+    auto quiet = [](Step &s) { s.nextId = Stone::ID_NONE; s.valid = true; };
+
+    /* ---- (1) shape=0 是参照; shape=3 且 boost 全 0 必须与它逐位相同 ---- */
+    c.reset();
+    int maId = -1;
+    for (int i = 0; i < 32; i++) {
+        Stone *s = c.stones[i];
+        if (s != nullptr && s->alive && s->color == Stone::COLOR_BLACK
+            && s->type == Stone::TYPE_MA) {
+            maId = s->id;
+            break;
+        }
+    }
+    CHECK(maId >= 0, "开局能找到黑马 (用来构造一次吃子奖励)");
+    Step cap;
+    cap.nextId = maId;
+    cap.valid = true;
+
+    agent.rewardShape = 0;
+    const float baseCap = agent.computeReward(cap, Stone::COLOR_RED);
+    const float baseTerm = agent.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED);
+
+    agent.rewardShape = 3;
+    agent.mateScoreMode = 0;
+    agent.matRewardBoost = 0.0f;
+    agent.mateRewardBoost = 0.0f;
+    CHECK(agent.computeReward(cap, Stone::COLOR_RED) == baseCap,
+          "shape=3 + boost=0 的即时奖励与 shape=0 **逐位相同** (倍数恒为 1.0)");
+    CHECK(agent.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == baseTerm,
+          "shape=3 + boost=0 的终局值与 shape=0 逐位相同");
+
+    /* ---- (2) 满盘均势: e=0 -> 吃子 x1.5, 终局 x1.0 ---- */
+    agent.matRewardBoost = 0.5f;
+    agent.mateRewardBoost = 0.5f;
+    const double eOpen = agent.mateProximity(&cap);
+    std::printf("  满盘均势 (%s): e = %.9f (期望 0)\n", describe().c_str(), eOpen);
+    CHECK(std::fabs(eOpen) < 1e-9, "满盘均势时 e = 0 (价值 7.0 / 数量 30 / 优势 0)");
+    CHECK(agent.materialWeightMul(&cap) == 1.5f, "满盘均势: 材质倍数 = 1 + matBoost = 1.5");
+    CHECK(agent.mateWeightMul() == 1.0f, "满盘均势: 终局倍数 = 1.0 (**不**放大: 这时该惦记吃子)");
+
+    const float earlyCap = agent.computeReward(cap, Stone::COLOR_RED);
+    const float expectEarly = REWARD_MATERIAL_COEF * (0.3f * 1.5f) + REWARD_STEP_COST;
+    std::printf("  满盘吃马 = %.6f (默认口径 %.6f, 期望 %.6f)\n",
+                (double)earlyCap, (double)baseCap, (double)expectEarly);
+    CHECK(earlyCap == expectEarly, "满盘吃子 = 材质 x0.1 x1.5 + 每步代价, 数值与手算一致");
+    CHECK(earlyCap > baseCap, "**均势局面里吃子奖励被加强** (用户口径的前半句)");
+    CHECK(agent.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED) == REWARD_TERMINAL,
+          "满盘均势的将局仍是 ±1 (没有被材质加权带跑)");
+
+    /* ---- (5) 与手数无关: 局面不变, 只把 history 推长 ---- */
+    const double eBefore = agent.mateProximity(nullptr);
+    for (int i = 0; i < 40; i++) {
+        c.pushHistory();              /* 只加"手数", 一个子都不动 */
+    }
+    const double eAfter = agent.mateProximity(nullptr);
+    std::printf("  推长 40 手 history: e %.9f -> %.9f\n", eBefore, eAfter);
+    CHECK(eBefore == eAfter,
+          "**e 只由棋盘决定, 与手数无关** (第二版不许再把阶段钟引回来)");
+
+    /* ---- (3) 数量是独立的一维: 价值/优势相同, 个数不同 -> e 不同 ---- */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_CHE, 1);
+    put(Stone::COLOR_BLACK, Stone::TYPE_CHE, 1);
+    const double eBig = agent.mateProximity(nullptr);      /* 1 车 vs 1 车: 价值 1.0, 2 子 */
+    const std::string dBig = describe();
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_BING, 5);
+    put(Stone::COLOR_BLACK, Stone::TYPE_BING, 5);
+    const double ePawns = agent.mateProximity(nullptr);    /* 5 兵 vs 5 兵: 价值 1.0, 10 子 */
+    std::printf("  同为价值 1.0: %s e=%.9f  /  %s e=%.9f\n",
+                dBig.c_str(), eBig, describe().c_str(), ePawns);
+    CHECK(std::fabs(eBig - 0.596825397) < 1e-6,
+          "1 车 vs 1 车: e = (1-1/7 + 1-2/30 + 0)/3 = 0.596825 与手算一致");
+    CHECK(eBig > ePawns,
+          "**同样的价值、不同的个数 -> 评估不同**: 子少 (开阔、易杀) 的 e 更大");
+
+    /* ---- (4) 局势反复: 同一总子力/同一子数, 一边倒 -> e 升; 吃回一个子 -> e 回落 ---- */
+    /* 均势: 红 马+2兵 (0.5) vs 黑 马+2兵 (0.5) -> 价值 1.0, 6 子, 优势 0 */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_BING, 2);
+    put(Stone::COLOR_BLACK, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_BLACK, Stone::TYPE_BING, 2);
+    const double eEven = agent.mateProximity(nullptr);
+    const std::string dEven = describe();
+    /* 一边倒 (总子力与子数**完全相同**, 只把两个兵从黑方挪到红方) */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_BING, 3);
+    put(Stone::COLOR_BLACK, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_BLACK, Stone::TYPE_BING, 1);
+    const double eLopsided = agent.mateProximity(nullptr);
+    const std::string dLopsided = describe();
+    /* 落后方吃回红方一个兵 -> 优势收窄 */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_BING, 2);
+    put(Stone::COLOR_BLACK, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_BLACK, Stone::TYPE_BING, 1);
+    const double eBack = agent.mateProximity(nullptr);
+    std::printf("  均势 %s e=%.9f / 一边倒 %s e=%.9f / 吃回一子 %s e=%.9f\n",
+                dEven.c_str(), eEven, dLopsided.c_str(), eLopsided,
+                describe().c_str(), eBack);
+    CHECK(std::fabs(eEven - 0.552380952) < 1e-6,
+          "均势局面: e = (1-1/7 + 1-6/30 + 0)/3 = 0.552381 与手算一致");
+    CHECK(eLopsided > eEven,
+          "**总子力与子数相同、只有优势不同 -> e 不同** (优势这一维真的在参与评估)");
+    CHECK(eBack < eLopsided,
+          "**落后方吃回一个子, e 回落** —— 这就是'局势反复'时权重跟着回摆");
+    CHECK(agent.mateWeightMul() < agent.materialWeightMul(&cap) + 1.0f,
+          "两个倍数都还在各自的区间里 (e 变化不产生越界值)");
+
+    /* ---- (6) 调用顺序无关 + 固定预算 ---- */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_CHE, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);
+    put(Stone::COLOR_BLACK, Stone::TYPE_CHE, 1);
+    int victimId = -1;
+    for (int i = 0; i < 32; i++) {
+        Stone *s = c.stones[i];
+        if (s != nullptr && s->alive && s->color == Stone::COLOR_BLACK
+            && s->type == Stone::TYPE_CHE) {
+            victimId = s->id;
+            break;
+        }
+    }
+    CHECK(victimId >= 0, "残局里能找到黑车 (构造一次吃子)");
+    Step capCar;
+    capCar.nextId = victimId;
+    capCar.valid = true;
+    const double eBeforeCap = agent.mateProximity(&capCar);
+    const float rBefore = agent.computeReward(capCar, Stone::COLOR_RED);
+    Stone *victim = c.stones[victimId];
+    victim->alive = false;            /* 模拟 moveForward 之后的状态 */
+    const double eAfterCap = agent.mateProximity(&capCar);
+    const float rAfter = agent.computeReward(capCar, Stone::COLOR_RED);
+    std::printf("  走子前 e=%.9f r=%.9f / 走子后 e=%.9f r=%.9f\n",
+                eBeforeCap, (double)rBefore, eAfterCap, (double)rAfter);
+    CHECK(eBeforeCap == eAfterCap && rBefore == rAfter,
+          "**同一步在 moveForward 之前/之后求奖励给出同一个值** (被吃子按走子前计入)");
+    victim->alive = true;             /* 还原 */
+
+    const float mMat = agent.materialWeightMul(&capCar);
+    const float mMate = agent.mateWeightMul();
+    std::printf("  该局面: 材质倍数 %.9f + 终局倍数 %.9f = %.9f (期望 2.5)\n",
+                (double)mMat, (double)mMate, (double)mMat + (double)mMate);
+    CHECK(std::fabs((double)mMat + (double)mMate - 2.5) < 1e-6,
+          "**两个倍数之和恒定 = 2.5** (固定奖励预算按局面动态分配 —— 用户说的'比例')");
+
+    /* ---- (7) 残局/定局: 终局被放大, 材质回到基准但不归零 ---- */
+    clearBoard();                     /* 只剩双方光将: 价值 0 / 数量 0 / 优势 0 */
+    const double eBare = agent.mateProximity(nullptr);
+    std::printf("  只剩双方光将: e = %.9f (期望 2/3)\n", eBare);
+    CHECK(std::fabs(eBare - 2.0 / 3.0) < 1e-9,
+          "光将局面 e = (1 + 1 + 0)/3 = 2/3 (优势分母为 0 时按 0 处理)");
+    const float mMatBare = agent.materialWeightMul(nullptr);
+    std::printf("  光将局面: 材质倍数 %.6f (期望 %.6f) —— **不为 0**\n",
+                (double)mMatBare, 1.0 + 0.5 * (1.0 - 2.0 / 3.0));
+    CHECK(std::fabs((double)mMatBare - (1.0 + 0.5 / 3.0)) < 1e-6,
+          "光将局面材质倍数 = 1 + 0.5x(1-2/3) = 1.1667: 权重是**降到基准附近**, 不是清零");
+    CHECK(mMatBare > 1.0f,
+          "**材质项永远留着一份** (倍数恒 ≥ 1: 用户那句'两者都不应忽视')");
+    const float bareWin = agent.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_RED);
+    const float bareLose = agent.terminalReward(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK);
+    std::printf("  光将局面将局: 胜方 +%.6f / 败方 %.6f (期望 %.6f)\n",
+                (double)bareWin, (double)bareLose, 1.0 + 0.5 * 2.0 / 3.0);
+    CHECK(std::fabs((double)bareWin - (1.0 + 0.5 * 2.0 / 3.0)) < 1e-6,
+          "残局将局 = ±1 x (1 + 0.5 x 2/3) = ±1.3333 与手算一致 (**后期杀将更重**)");
+    CHECK(bareWin > REWARD_TERMINAL, "残局将局严格大于满盘的 ±1");
+    CHECK(std::fabs((double)bareWin + (double)bareLose) < 1e-6,
+          "胜负两侧**对称** (同一个倍率 -> 零和性质不被破坏)");
+    CHECK(agent.terminalReward(Chess::RESULT_DRAW, Stone::COLOR_RED) == 0.0f,
+          "和棋恒为 0 (动态分配也不奖励'别输')");
+
+    /* 必胜残局 (红车马 vs 光将): e 接近 1 —— 两个倍数在上端的行为 */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_CHE, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);
+    const double eWon = agent.mateProximity(nullptr);
+    std::printf("  必胜残局 (%s): e = %.6f / 材质倍数 %.6f / 终局倍数 %.6f\n",
+                describe().c_str(), eWon, (double)agent.materialWeightMul(nullptr),
+                (double)agent.mateWeightMul());
+    CHECK(eWon > 0.9 && eWon <= 1.0, "必胜残局 (车马 vs 光将) 的 e 接近上限但不越界");
+    CHECK(agent.materialWeightMul(nullptr) > 1.0f,
+          "e 再大, 材质倍数也**保持 ≥ 1** —— 材质项永不清零");
+    CHECK(agent.mateWeightMul() > 1.4f,
+          "e 接近 1 时终局倍数接近上限 1 + mateBoost = 1.5");
+
+    /* ---- (8) 三个终局出口: 搜索叶子与训练目标同值 (倍率 != 1 时也要同值) ---- */
+    for (int i = 0; i < 32; i++) {
+        Stone *s = c.stones[i];
+        if (s != nullptr && s->alive && s->color == Stone::COLOR_RED
+            && s->type == Stone::TYPE_JIANG) {
+            s->alive = false;
+            break;
+        }
+    }
+    const int res = c.getResult(Stone::COLOR_RED);
+    double leaf = 0.0;
+    const bool isTerm = agent.terminalValue(Stone::COLOR_RED, leaf);
+    const float train = agent.terminalReward(res, Stone::COLOR_RED);
+    std::printf("  终局局面: 搜索叶子 %.6f / 训练目标 %.6f (result=%d)\n",
+                leaf, (double)train, res);
+    CHECK(isTerm && std::fabs(leaf - (double)train) < 1e-9,
+          "**搜索叶子与训练目标的终局值逐位相同** (倍率 != 1 时也只有一个出口)");
+    CHECK(std::fabs((double)train) > (double)REWARD_TERMINAL,
+          "这个终局值确实走了动态倍率 (不是恰好等于 ±1 的假通过)");
+
+    /* ---- (9) 量纲不变量 + 因子口径切换 ---- */
+    const double fullSide = REWARD_FULL_MATERIAL_DIFF * (double)REWARD_MATERIAL_COEF;
+    const double boosted = fullSide * (1.0 + (double)agent.matRewardBoost);
+    const double boostCap = (fullSide > 0.0) ? (1.0 / fullSide - 1.0) : 0.0;
+    std::printf("  不变量: 吃光对方 %.3f < 终局 %.3f (matBoost 上界 %.3f)\n",
+                boosted, (double)REWARD_TERMINAL, boostCap);
+    CHECK(boosted < (double)REWARD_TERMINAL,
+          "**吃光对方仍不如赢棋** (默认 matBoost=0.5: 0.525 < 1.000)");
+    CHECK(std::fabs(boosted - 0.525) < 1e-6, "材质上界与手算一致 (3.5 x 0.1 x 1.5 = 0.525)");
+
+    /* 同一个局面下, 四种因子口径各自读到的是不是它该读的那一维 */
+    clearBoard();
+    put(Stone::COLOR_RED, Stone::TYPE_CHE, 1);
+    put(Stone::COLOR_RED, Stone::TYPE_MA, 1);       /* 红 0.8 / 黑 0.5: 价值 1.3, 3 子, 优势 0.3/1.3 */
+    put(Stone::COLOR_BLACK, Stone::TYPE_CHE, 1);
+    Step none;
+    quiet(none);
+    agent.mateScoreMode = 1;
+    const double eVal = agent.mateProximity(&none);
+    agent.mateScoreMode = 2;
+    const double eCnt = agent.mateProximity(&none);
+    agent.mateScoreMode = 4;
+    const double eLead = agent.mateProximity(&none);
+    agent.mateScoreMode = 3;
+    const double eVC = agent.mateProximity(&none);
+    agent.mateScoreMode = 0;
+    const double eAll = agent.mateProximity(&none);
+    std::printf("  口径切换 (%s): 价值 %.6f / 数量 %.6f / 优势 %.6f / 数量+价值 %.6f / 三因子 %.6f\n",
+                describe().c_str(), eVal, eCnt, eLead, eVC, eAll);
+    CHECK(std::fabs(eVal - (1.0 - 1.3 / 7.0)) < 1e-9, "mode 1 读到的就是价值因子");
+    CHECK(std::fabs(eCnt - (1.0 - 3.0 / 30.0)) < 1e-9, "mode 2 读到的就是数量因子");
+    CHECK(std::fabs(eLead - (0.3 / 1.3)) < 1e-9, "mode 4 读到的就是优势因子 (相对子力差)");
+    CHECK(std::fabs(eVC - (eVal + eCnt) * 0.5) < 1e-9, "mode 3 = 数量与价值的平均");
+    CHECK(std::fabs(eAll - (eVal + eCnt + eLead) / 3.0) < 1e-9, "mode 0 = 三因子等权 (默认)");
+    CHECK(eAll < eCnt && eAll > eLead,
+          "三因子等权落在最小因子 (优势) 与最大因子 (数量) 之间 —— 均值该有的位置");
+
+    /* 恢复默认, 让后面的测试拿到出厂口径 */
+    agent.rewardShape = 0;
+    agent.mateScoreMode = 0;
+    agent.matRewardBoost = 0.5f;
+    agent.mateRewardBoost = 0.5f;
+}
+
+/*
+   [15b] 的入口: **三个类各跑一遍** (纯 MLP / MoE+MLP 专家 / MoE+TB 专家)。
+   用户口径: "新的奖励方法也应用到 SAC+MCTS+AlphaZero+MoE+MLP 专家" —— 这一段就是
+   那个口径的**证据**: 同一个模板, 三份实例化, 同一批断言。
+*/
+static void testPosReward()
+{
+    std::printf("\n[15b] 动态奖励分配 rewardShape=3 (按局面评估分配吃子/杀将权重)\n");
+    std::printf("      **三个类各跑一遍同一批断言** (奖励口径必须逐项一致)\n");
+
+    Chess c;
+    c.reset();
+    sacazx::Opts o;
+    o.hidden = 32;
+
+    sacazx::withSacazAgent(c, sacazx::Variant::Mlp, o, [&](auto &ag) {
+        posRewardChecks(ag, c, "SACAZAgent (纯 MLP)");
+    });
+    sacazx::withSacazAgent(c, sacazx::Variant::MoeMlp, o, [&](auto &ag) {
+        posRewardChecks(ag, c, "SACAZMoEMlpAgent (稀疏 MoE + MLP 专家)");
+    });
+    sacazx::withSacazAgent(c, sacazx::Variant::MoeTb, o, [&](auto &ag) {
+        posRewardChecks(ag, c, "SACAZMoETbAgent (稀疏 MoE + TB 专家)");
+    });
 }
 
 /* ============================================================
@@ -2365,8 +2772,8 @@ static void testSharedTrunkAndTbHeads()
            (SparseMoE 的 copyTo 是 dynamic_cast 到**同一个模板实例**, 口径不同就是不同
            类型 -> 静默什么都不做)。这一条本身就是"口径是结构的一部分"的实证。
         */
-        SACAZAgent sep(cA, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
-                       64, 0.1f, SACAZAgent::TrunkMode::Separate, true);
+        SACAZMoETbAgent sep(cA, 64, 0.99f, 0.001f, 1.5f, 64, 0.1f,
+                           SACAZMoETbAgent::TrunkMode::Separate, true);
         sep.batchSize = 4;
         const long long sepParams = sep.uniqueParamCount();
         const int sepHeadsUsed = sep.tbHeadsUsed();
@@ -2389,7 +2796,7 @@ static void testSharedTrunkAndTbHeads()
             SACAZAgent::maskToBits(mask, bits);
             sep.memories.clear();
             for (int i = 0; i < 16; i++) {
-                SACAZAgent::Transition tr;
+            typename std::decay<decltype(sep)>::type::Transition tr;
                 tr.cells = cells;
                 tr.nextCells = cells;
                 tr.curMask[0] = bits[0];
@@ -2432,8 +2839,8 @@ static void testSharedTrunkAndTbHeads()
         bool trunkMoved = false;
         bool roundTripOk = false;
         {
-            SACAZAgent sh(cB, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
-                          64, 0.1f, SACAZAgent::TrunkMode::Shared, true);
+            SACAZMoETbAgent sh(cB, 64, 0.99f, 0.001f, 1.5f, 64, 0.1f,
+                           SACAZMoETbAgent::TrunkMode::Shared, true);
             sh.batchSize = 4;
             sh.learnFromSearch = false;
             shParams = sh.uniqueParamCount();
@@ -2567,7 +2974,7 @@ static void testSharedTrunkAndTbHeads()
             SACAZAgent::maskToBits(mask, bits);
             sh.memories.clear();
             for (int i = 0; i < 16; i++) {
-                SACAZAgent::Transition tr;
+            typename std::decay<decltype(sh)>::type::Transition tr;
                 tr.cells = cells2;
                 tr.nextCells = cells2;
                 tr.curMask[0] = bits[0];
@@ -2615,8 +3022,8 @@ static void testSharedTrunkAndTbHeads()
                 sh.policy(state, mask, pi0);
                 sh.qValues(state, q0, q0b);
                 /* 换一个 agent 实例载入 (结构相同), 再比 */
-                SACAZAgent sh2(cB, 64, 0.99f, 0.001f, 1.5f, SACAZAgent::Backbone::SparseMoeTb,
-                               64, 0.1f, SACAZAgent::TrunkMode::Shared, true);
+                SACAZMoETbAgent sh2(cB, 64, 0.99f, 0.001f, 1.5f, 64, 0.1f,
+                           SACAZMoETbAgent::TrunkMode::Shared, true);
                 CHECK(sh2.loadModel(prefix), "共享口径 loadModel 读回 4 个文件");
                 RL::Tensor pi1(SACAZAgent::ACTION_DIM, 1), q1(SACAZAgent::ACTION_DIM, 1),
                            q1c(SACAZAgent::ACTION_DIM, 1);
@@ -2668,12 +3075,21 @@ static void testSharedTrunkAndTbHeads()
         std::printf("\n  (C) 59e5233 行为还原版必须保持旧口径\n");
         CHECK(!Has_tbHonorHeads<SACAZLegacyAgent>::value,
               "SACAZLegacyAgent 没有 tbHonorHeads 成员 (它连这个开关都不该有)");
-        CHECK(Has_tbHonorHeads<SACAZAgent>::value,
-              "对照组: SACAZAgent 有 tbHonorHeads (探针本身没写坏)");
+        /*
+           [2026-09 独立类拆分] 这个开关的**归属**变了: 它只对 TB 专家那一支有意义, 所以
+           现在住在 `SACAZMoETbAgent` 里 —— 纯 MLP 的 SACAZAgent 与 MoE-MLP 都**没有**它。
+           (拆分前一个类背四种骨干, 于是纯 MLP 实例上也挂着一个永远不生效的开关。)
+        */
+        CHECK(Has_tbHonorHeads<SACAZMoETbAgent>::value,
+              "对照组: SACAZMoETbAgent (TB 专家那一支) 有 tbHonorHeads (探针本身没写坏)");
+        CHECK(!Has_tbHonorHeads<SACAZAgent>::value
+                  && !Has_tbHonorHeads<SACAZMoEMlpAgent>::value,
+              "另外两支**没有** tbHonorHeads (MLP 专家里没有 MultiHeadAttention)");
         CHECK(!Has_trunkMode<SACAZLegacyAgent>::value,
               "SACAZLegacyAgent 没有 trunkMode (共享骨干不许渗进行为还原版)");
-        CHECK(Has_trunkMode<SACAZAgent>::value,
-              "对照组: SACAZAgent 有 trunkMode");
+        CHECK(Has_trunkMode<SACAZAgent>::value && Has_trunkMode<SACAZMoETbAgent>::value
+                  && Has_trunkMode<SACAZMoEMlpAgent>::value,
+              "对照组: 三个当前口径的类都有 trunkMode");;
         {
             Chess cOld;
             cOld.reset();
@@ -2725,6 +3141,7 @@ int main()
     testTbExpertAgent();
     testLegacyAgentClass();
     testRewardShaping();
+    testPosReward();
     testLearnFromSearch();
     testSharedTrunkAndTbHeads();
 

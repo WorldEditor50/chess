@@ -2,6 +2,8 @@
 #include "rl/cpuinfo.hpp"
 /* AGENT_SACAZ_OLD 用的是这个**独立类** (不是 SACAZAgent + 开关, 也不是它的派生类), 见头注释 */
 #include "sacazlegacyagent.h"
+#include "sacazmoetbagent.h"   /* AGENT_SACAZ_MOE = 稀疏 MoE + TB 专家 (独立类) */
+#include "sacazmoemlpagent.h"  /* AGENT_SACAZ_MOE_MLP = 稀疏 MoE + MLP 专家 (独立类) */
 #include <QDebug>
 #include <QDir>
 #include <QFile>        /* 冻结快照的清理 (releaseFrozenOpponent) 与审计比对 */
@@ -46,6 +48,8 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:      return QStringLiteral("EVAB");
     case ChessBoard::AGENT_SACAZ:     return QStringLiteral("SAC+AZ");
     case ChessBoard::AGENT_SACAZ_MOE: return QStringLiteral("SAC+AZ-MoE");
+    /* [2026-09 独立类] 稀疏 MoE + **MLP 专家**那一支 (SACAZMoEMlpAgent) */
+    case ChessBoard::AGENT_SACAZ_MOE_MLP: return QStringLiteral("SAC+AZ-MoE-MLP");
     /* 59e5233 行为还原版 (独立类 SACAZLegacyAgent): MLP 骨干 / 稀疏 MoE+TB 专家骨干 */
     case ChessBoard::AGENT_SACAZ_OLD: return QStringLiteral("SAC+AZ-59e5233");
     case ChessBoard::AGENT_SACAZ_OLD_MOE: return QStringLiteral("SAC+AZ-59e5233-MoE");
@@ -66,6 +70,7 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_MOE_MLP:
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
@@ -97,6 +102,7 @@ bool agentHasLearningRewardTable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_DQNMCTS:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_MOE_MLP:
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
@@ -294,6 +300,29 @@ static constexpr int SACAZ_HIDDEN = 64;       /* SAC+AZ 的网络隐层宽度 */
 */
 static constexpr int SACAZ_MOE_SIMS = 40;
 /*
+   [2026-09 独立类 + 实测] MoE+MLP 专家那一支的界面模拟次数。
+   原来照抄 TB 那一档 (40), 但**实测它根本不吃模拟预算** —— 本机 Release/AVX2,
+   `bench_sacaz_vs_ab --backbone=moe-mlp --trunk=shared --games=8 --plies=80`:
+
+     模拟/步   每步墙钟 (界面口径, 每手还跑一次 learnBatch)   每步墙钟 (只搜索)
+        40              50.1 ms                                 3.3 ms
+        64              52.8 ms                                 5.2 ms
+        96              55.5 ms                                 8.0 ms
+       128              58.0 ms                                10.0 ms
+       256              67.8 ms                                19.3 ms
+
+   两条读法:
+     * **一次模拟只要 ~0.08 ms** (共享骨干 + 稀疏路由, 比 TB 的 ~5.4 ms 便宜 65 倍);
+     * **每步的大头是"从自己的搜索学一次"那次 learnBatch (~47 ms), 不是搜索**。
+   所以把这个常数抬到 **256 (= `SACAZ_SIMS`, 与 AGENT_SACAZ 同档)** 只多花 ~18 ms/步,
+   总墙钟 67.8 ms/步 —— 仍在界面那条 175 ms 的预算以内。
+   为什么值得抬: 用户口径是"这两支在界面上应当能公平比较", 而原来 256 vs 40 的差
+   会被读成"MLP 骨干比 MoE-MLP 强" (实测:A 臂 mlp@256 = 57.5% vs B 臂 moe-mlp@40 = 51.2%,
+   而把 MoE 的模拟数也抬到 256 它回到 56.2% —— 差距跟着预算走, 不跟着骨干走,
+   见 docs/sacmoetb_independent_classes_2026_09.md §8.4)。
+*/
+static constexpr int SACAZ_MOE_MLP_SIMS = 256;
+/*
  * 负载均衡辅助损失的系数。0.1 是实测选出来的 (bench_moe --cases=B --pretrain=3):
  *   aux=0     -> 8 个专家里有 3 个一次都没被选中 (路由塌了)
  *   aux=0.01  -> 都被用到, 但最大/均值仍是 4.00
@@ -397,6 +426,8 @@ static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
    _trunk 而失败 —— 或者在有人补了回退之后被**静默当成共享骨干**读进来。
 */
 static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe_shared";
+/* [2026-09 独立类] MoE+MLP 那一支的临时前缀: **必须独立** (与另外几支共用会让后台训练互相覆盖) */
+static const char *TMP_WEIGHTS_SACAZ_MOE_MLP = "weights/_temp_train_sacaz_moe_mlp_shared";
 /*
    行为还原版 SAC (AGENT_SACAZ_OLD = 独立类 SACAZLegacyAgent) 的临时前缀。
    **必须有独立前缀**: 与 AGENT_SACAZ 共用会让两个 agent 的后台训练互相覆盖权重
@@ -418,11 +449,38 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
     case ChessBoard::AGENT_PPOMCTS_MLP: return TMP_WEIGHTS_PPOMCTS_MLP;
     case ChessBoard::AGENT_SACAZ:     return TMP_WEIGHTS_SACAZ;
     case ChessBoard::AGENT_SACAZ_MOE: return TMP_WEIGHTS_SACAZ_MOE;
+    /* [2026-09 独立类] MoE+MLP 专家那一支的临时前缀: 与另外三支**必须不同** (同一条纪律) */
+    case ChessBoard::AGENT_SACAZ_MOE_MLP: return TMP_WEIGHTS_SACAZ_MOE_MLP;
     case ChessBoard::AGENT_SACAZ_OLD: return TMP_WEIGHTS_SACAZ_OLD;
     case ChessBoard::AGENT_SACAZ_OLD_MOE: return TMP_WEIGHTS_SACAZ_OLD_MOE;
     case ChessBoard::AGENT_DQNAB:     return TMP_WEIGHTS_DQNAB;
     default:                          return TMP_WEIGHTS;
     }
+}
+
+/*
+ * ================================================================
+ *  applyRewardMethod —— "用哪一套奖励"的唯一一处写法
+ * ================================================================
+ *  用户口径: **保留旧的奖励方法**, 新的那一套只在显式打开时生效。
+ *
+ *  这个模板对**任何**带那四个旋钮的 SAC 类都成立（三个当前口径的类同名同义）:
+ *    * `dynamic = false` -> `rewardShape = 0` = 旧奖励（材质 ×0.1 + 每步代价 + 终局 ±1）。
+ *      这一支的代码一个字没动, 历史读数与它逐位对得上。
+ *    * `dynamic = true`  -> `rewardShape = 3` + 出厂参数（三因子等权 / 0.5 / 0.5）。
+ *
+ *  三个按钮/克隆点都调它: 两个构造工厂、后台训练的 clone。
+ *  写在同一处是刻意的 —— 三份实现各自手抄一遍, 迟早有一支漏掉,
+ *  而"漏掉"的表现只是"这一支还在用旧奖励", 面板上完全看不出来。
+ * ================================================================
+ */
+template <class A>
+static void applyRewardMethod(A &a, bool dynamic)
+{
+    a.rewardShape = dynamic ? 3 : 0;
+    a.mateScoreMode = 0;                 /* 0 = 数量+价值+优势 三因子等权 (出厂口径) */
+    a.matRewardBoost = 0.5f;             /* 均势满盘时材质 ×1.5, 永不归零 */
+    a.mateRewardBoost = 0.5f;            /* 残局/大势已定时终局 ×1.5, 永不归零 */
 }
 
 /*
@@ -449,60 +507,116 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
  *
  * 返回 nullptr = 这个 agent 类型不是**本函数负责的那一支** (调用方不该走到这里)。
  */
-static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type)
+static SACAZAgent *createSACAZAgent(Chess &board, ChessBoard::AgentType type,
+                                   bool dynamicReward = false)
 {
     switch (type) {
     case ChessBoard::AGENT_SACAZ: {
         SACAZAgent *a = new SACAZAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
-        return a;
-    }
-    case ChessBoard::AGENT_SACAZ_MOE: {
-        /*
-           [2026-09 dev-sacmoetb] 这一支改用**共享骨干 + 三头**口径 (TrunkMode::Shared)。
-           两个改动一起进, 它们的账要分开记:
-
-           (1) **TB 专家的头数口径** (tbHonorHeads: 默认就是修好的口径, 这里不传)。
-               `MOE_TB_HEADS = 15` 原来在 `d_model = STATE_DIM = 1263 = 3 x 421` 上被
-               "头数必须整除 d_model" 的规则**静默降成 3 个头** (实测单专家前向
-               15.7 ms vs 5.4 ms, 3.0 倍; 而且 15 个 head 对象全都分配、只用 3 个)。
-               这是修 bug, 所以默认就是修好的; 想复现旧读数要显式传 false。
-
-           (2) **共享骨干**: 原来五张网各自背一整套骨干 (TB 专家下 28.8 M 参数/张,
-               合计 144 M)。现在骨干只留在线/目标各一份, actor/q1/q2 退化成三个只有
-               输出层的头。实测 (test_sacaz [17B], 同权重同局面):
-                   参数量      143,903,940 -> 57,586,536   (2.50x 少)
-                   learnBatch  649.9 ms/批 -> 225.6 ms/批  (2.88x 快)
-                   selectMove  9.3 ms/模拟 -> 4.1 ms/模拟   (2.24x 快)
-               而且 π / Q / V **逐位相同** (把独立口径的三个骨干也设成同一份之后)。
-               于是"同一套算法、同样的预算"下能跑的模拟次数从 ~19 变成 ~42。
-
-           **权重文件必须换前缀** (weights/sacaz_moe_shared_agent): 共享口径写 4 个文件
-           (trunk + 三个头), 独立口径写 3 个 (_actor/_q1/_q2), 两者的 `_q1` 语义完全
-           不同 —— 共用一个前缀等于给"载错文件"留门。见 sacazagent.h 的
-           sharedWeightPrefix 说明。**旧权重载不进这一支**, 它要从头训练。
-        */
-        SACAZAgent *a = new SACAZAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                       SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX,
-                                       SACAZAgent::TrunkMode::Shared);
-        /*
-           ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
-           一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
-           32 条就是 **7.3 s/手** —— 加上界面本来就有的那一轮, 一步要十几秒。MLP 骨干那一支
-           是 0.95 ms/样本(32 条约 30 ms), 所以那条路径的开销可以忽略, 这一条不行。
-           等它有了便宜的头/批(见 docs 里的待办)再一起打开。
-
-           ---- [2026-09 dev-sacmoetb] 那个"待办"已经做了一半, 但这一行仍然保留 ----
-           共享骨干 + 头数口径之后, 同一台机器上实测 learnBatch 从 649.9 降到 225.6 ms/批
-           (2.88x, test_sacaz [17B])。但 32 条仍然要 ~1.8 s/手 —— 对 175 ms/步的界面预算
-           还是太贵, 所以这一行**不动**。要开就删掉它, 并用
-           `bench_sacaz_vs_ab --trunk=shared --budget=175` 复核一步的真实耗时。
-        */
-        a->learnFromSearch = false;
+        /* [2026-09 奖励方法开关] 新建的实例按当前开关写一遍 (默认 = 旧奖励) */
+        applyRewardMethod(*a, dynamicReward);
         return a;
     }
     default:
         return nullptr;
     }
+}
+
+/*
+ * createSACAZMoETbAgent —— 稀疏 MoE + **TB 专家**那一支的**唯一**构造点
+ * (界面类型 AGENT_SACAZ_MOE)。
+ *
+ * **[2026-09 独立类拆分]** 这一支原来是 `SACAZAgent` + `Backbone::SparseMoeTb`,
+ * 现在它是**自己的类** `SACAZMoETbAgent` (src/sacazmoetbagent.h/.cpp):
+ * 骨干在那边硬编码, 与纯 MLP / MoE-MLP / 59e5233 还原版**互不继承** —— 改一个文件
+ * 碰不到另一个。构造参数与拆分前**逐字对应** (只是少了一个 Backbone 实参)。
+ *
+ * 这里只给**形状参数**: hidden 64 / gamma 0.99 / lr 0.001 / cpuct 1.5, 与 AGENT_SACAZ
+ * 那一支逐字相同, 于是"口径 vs 骨干"这两个变量不会混在一起。
+ *
+ * `shared` = 是否用**共享骨干 + 三头**口径 (TrunkMode::Shared):
+ *   * AGENT_SACAZ_MOE (界面那一支) 用 Shared;
+ *   * 后台自对弈快照 / 兜底构造用 Separate (与拆分前 m_sfSACAZMoe 那条路径一致)。
+ */
+static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
+                                            bool dynamicReward = false)
+{
+    /*
+       [2026-09 dev-sacmoetb] 这一支用**共享骨干 + 三头**口径 (TrunkMode::Shared)。
+       两个改动一起进, 它们的账要分开记:
+
+       (1) **TB 专家的头数口径** (tbHonorHeads: 默认就是修好的口径, 这里不传)。
+           `MOE_TB_HEADS = 15` 原来在 `d_model = STATE_DIM = 1263 = 3 x 421` 上被
+           "头数必须整除 d_model" 的规则**静默降成 3 个头** (实测单专家前向
+           15.7 ms vs 5.4 ms, 3.0 倍; 而且 15 个 head 对象全都分配、只用 3 个)。
+           这是修 bug, 所以默认就是修好的; 想复现旧读数要显式传 false。
+
+       (2) **共享骨干**: 原来五张网各自背一整套骨干 (TB 专家下 28.8 M 参数/张,
+           合计 144 M)。现在骨干只留在线/目标各一份, actor/q1/q2 退化成三个只有
+           输出层的头。实测 (test_sacaz [17B], 同权重同局面):
+               参数量      143,903,940 -> 57,586,536   (2.50x 少)
+               learnBatch  649.9 ms/批 -> 225.6 ms/批  (2.88x 快)
+               selectMove  9.3 ms/模拟 -> 4.1 ms/模拟   (2.24x 快)
+           而且 π / Q / V **逐位相同** (把独立口径的三个骨干也设成同一份之后)。
+           于是"同一套算法、同样的预算"下能跑的模拟次数从 ~19 变成 ~42。
+
+       **权重文件必须换前缀** (weights/sacaz_moe_shared_agent): 共享口径写 4 个文件
+       (trunk + 三个头), 独立口径写 3 个 (_actor/_q1/_q2), 两者的 `_q1` 语义完全
+       不同 —— 共用一个前缀等于给"载错文件"留门。见 sacazagent.h 的
+       sharedWeightPrefix 说明。**旧权重载不进这一支**, 它要从头训练。
+    */
+    SACAZMoETbAgent *a = new SACAZMoETbAgent(
+        board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f, 64, SACAZ_MOE_AUX,
+        shared ? SACAZMoETbAgent::TrunkMode::Shared
+               : SACAZMoETbAgent::TrunkMode::Separate);
+    /*
+       ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
+       一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
+       32 条就是 **7.3 s/手** —— 加上界面本来就有的那一轮, 一步要十几秒。MLP 骨干那一支
+       是 0.95 ms/样本(32 条约 30 ms), 所以那条路径的开销可以忽略, 这一条不行。
+       等它有了便宜的头/批(见 docs 里的待办)再一起打开。
+
+       ---- [2026-09 dev-sacmoetb] 那个"待办"已经做了一半, 但这一行仍然保留 ----
+       共享骨干 + 头数口径之后, 同一台机器上实测 learnBatch 从 649.9 降到 225.6 ms/批
+       (2.88x, test_sacaz [17B])。但 32 条仍然要 ~1.8 s/手 —— 对 175 ms/步的界面预算
+       还是太贵, 所以这一行**不动**。要开就删掉它, 并用
+       `bench_sacaz_vs_ab --trunk=shared --budget=175` 复核一步的真实耗时。
+    */
+    a->learnFromSearch = false;
+    /* [2026-09 奖励方法开关] 同上 (默认 = 旧奖励) */
+    applyRewardMethod(*a, dynamicReward);
+    return a;
+}
+
+/*
+ * createSACAZMoEMlpAgent —— 稀疏 MoE + **MLP 专家**那一支的**唯一**构造点
+ * (界面类型 AGENT_SACAZ_MOE_MLP)。
+ *
+ * **[2026-09 独立类拆分]** 它是独立类 `SACAZMoEMlpAgent`。这一支以前**只能在 bench 里
+ * 跑到** (拆分前它是 `Backbone::SparseMoeMlp` 的取值), 现在接进界面下拉框 ——
+ * "两个独立类都在产品路径上"这句话才算成立。
+ *
+ * 口径与另外两支**逐字对齐**: hidden 64 / gamma 0.99 / lr 0.001 / cpuct 1.5、
+ * expertHidden 64 + aux = SACAZ_MOE_AUX; `shared` = 共享骨干 + 三头口径。
+ * 实测这一支比 TB 便宜得多 (2.90 M 参数 / ~2.9 ms/模拟 vs 57.6 M / ~5.4 ms),
+ * 所以界面模拟次数按 SACAZ_MOE_MLP_SIMS 给。
+ */
+static SACAZMoEMlpAgent *createSACAZMoEMlpAgent(Chess &board, bool shared,
+                                              bool dynamicReward = false)
+{
+    SACAZMoEMlpAgent *a = new SACAZMoEMlpAgent(
+        board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f, 64, SACAZ_MOE_AUX,
+        shared ? SACAZMoEMlpAgent::TrunkMode::Shared
+               : SACAZMoEMlpAgent::TrunkMode::Separate);
+    /*
+       "从自己的搜索学一次"这一支**开着**: MoE-MLP 的 learnBatch 便宜得多
+       (TB 那一支实测 225.6 ms/批 ⇒ 32 条约 1.8 s/手, 所以那边必须关掉)。
+       开着的收益是 AlphaZero 的核心信号 (π_MCTS 进策略目标), 见 sacazagent.h 那段说明。
+    */
+    a->learnFromSearch = true;
+    /* [2026-09 奖励方法开关] 同上 (默认 = 旧奖励) */
+    applyRewardMethod(*a, dynamicReward);
+    return a;
 }
 
 /*
@@ -605,6 +719,11 @@ static const ChessBoard::AgentType kWeightAgents[] = {
     ChessBoard::AGENT_SACAZ,
     ChessBoard::AGENT_DQNAB,
     ChessBoard::AGENT_SACAZ_MOE,
+  /*
+     [2026-09 独立类] MoE + MLP 专家那一支: 排在 TB 那一组之后、还原版之前。
+     它比 TB 小得多 (2.9 M 参数), 但也属于"稀疏 MoE 那一组", 所以紧跟其后读起来最清楚。
+  */
+  ChessBoard::AGENT_SACAZ_MOE_MLP,
     /*
        行为还原版 SAC 排在最后: 它与 AGENT_SACAZ 是"两份独立实现 + 另一套口径",
        启动日志里紧跟大的 MoE 那一组之后读起来最清楚。
@@ -638,6 +757,7 @@ static std::vector<std::string> weightFilesOf(ChessBoard::AgentType type)
     /* 一个模型三个文件: actor + 双 critic */
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_MOE_MLP:
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
         return { p + "_actor", p + "_q1", p + "_q2" };
@@ -658,7 +778,8 @@ PPOMCTSAgent *ChessBoard::m_sfPPOMCTSMLP = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
-SACAZAgent *ChessBoard::m_sfSACAZMoe = nullptr;
+SACAZMoETbAgent *ChessBoard::m_sfSACAZMoe = nullptr;   /* 独立类: 稀疏 MoE + TB 专家 */
+SACAZMoEMlpAgent *ChessBoard::m_sfSACAZMoeMlp = nullptr; /* 独立类: 稀疏 MoE + MLP 专家 */
 SACAZLegacyAgent *ChessBoard::m_sfSACAZOld = nullptr;      /* 独立类, 不是 SACAZAgent 的派生类 */
 SACAZLegacyAgent *ChessBoard::m_sfSACAZOldMoe = nullptr;   /* 同一口径 + TB 专家骨干 */
 DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
@@ -789,9 +910,7 @@ void ChessBoard::startupLoad()
         */
         emit busyMessage(QStringLiteral("正在载入 SAC+AZ (稀疏MoE) 权重… (3 个 146 MB 文件)"));
         if (m_sfSACAZMoe == nullptr)
-            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                          SACAZAgent::Backbone::SparseMoeTb,
-                                          64, SACAZ_MOE_AUX);
+            m_sfSACAZMoe = createSACAZMoETbAgent(env, false, m_dynamicReward);
         /* 拆开量: 5 个网络 x 28.7 M 参数的"分配 + 随机初始化"本身就不是小数目 */
         logLoad("SAC+AZ-MoE 建网(5 x 28.7M 参数)");
         std::string prefix = s_weightPaths[AGENT_SACAZ_MOE];
@@ -802,6 +921,24 @@ void ChessBoard::startupLoad()
         }
         m_sfSACAZMoe->loadModel(prefix);
         logLoad("SAC+AZ-MoE 读权重(3 x 146 MB)");
+    }    if (s_weightPaths.count(AGENT_SACAZ_MOE_MLP)) {
+        /*
+           [2026-09 独立类] MoE+MLP 那一支的预加载: 与 TB 那一块对称, 只换类/前缀/文件数。
+           共享口径写 4 个文件 (trunk + 三个头), 所以拨掉的是 "_actorhead" 后缀
+           (不是独立口径的 "_actor")。
+        */
+        emit busyMessage(QStringLiteral("正在载入 SAC+AZ (稀疏MoE-MLP) 权重…"));
+        if (m_sfSACAZMoeMlp == nullptr)
+            m_sfSACAZMoeMlp = createSACAZMoEMlpAgent(env, false, m_dynamicReward);
+        logLoad("SAC+AZ-MoE-MLP 建网(稀疏 MoE + MLP 专家)");
+        std::string prefix = s_weightPaths[AGENT_SACAZ_MOE_MLP];
+        const std::string suffix = "_actorhead";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfSACAZMoeMlp->loadModel(prefix);
+        logLoad("SAC+AZ-MoE-MLP 读权重(4 个文件)");
     }
     if (s_weightPaths.count(AGENT_SACAZ_OLD)) {
         /*
@@ -1742,6 +1879,39 @@ void ChessBoard::setAgentType(AgentType type)
     m_agentType = type;
 }
 
+/*
+ * setDynamicRewardEnabled —— 界面上的"动态奖励"开关（用户口径: 保留旧的奖励方法）
+ *
+ * 说明、边界与三条警告都写在 chessboard.h 的那一段里。这里只说实现上的两点:
+ *
+ *  1. **四个旋钮是普通成员**（不是建网期参数）⇒ 对**已经建好的实例**当场生效。
+ *     所以这个 setter 不需要重建任何 agent（重建会让"这一局下到一半"的实例被换掉,
+ *     而 `moeDense` 那类建网期参数才必须走构造参数 —— 两者的区别见
+ *     sacazmoetbagent.h 里那条警告）。
+ *  2. **要遍历三支**：三个类各有自己的实例（`m_sfSACAZ` / `m_sfSACAZMoe` /
+ *     `m_sfSACAZMoeMlp`），漏一支的表现是"那一支还在用旧奖励"而在面板上完全看不出来。
+ *     59e5233 还原版**不在**这里 —— 它连这几个成员都没有（刻意的, 见 sacazlegacyagent.h）。
+ */
+void ChessBoard::setDynamicRewardEnabled(bool on)
+{
+    m_dynamicReward = on;
+    if (m_sfSACAZ != nullptr) {
+        applyRewardMethod(*m_sfSACAZ, on);
+    }
+    if (m_sfSACAZMoe != nullptr) {
+        applyRewardMethod(*m_sfSACAZMoe, on);
+    }
+    if (m_sfSACAZMoeMlp != nullptr) {
+        applyRewardMethod(*m_sfSACAZMoeMlp, on);
+    }
+    qInfo().noquote() << QStringLiteral("[reward] 奖励方法 = %1%2")
+                             .arg(on ? QStringLiteral("动态奖励 (rewardShape=3, 材质 ×1.5 / 终局 ×1.5)")
+                                     : QStringLiteral("旧奖励 (rewardShape=0, 材质 ×0.1 + 终局 ±1)"))
+                             .arg(on ? QStringLiteral("  ⚠ 自对弈训练里 done 样本=0 ⇒ 杀将那一半目前不生效, "
+                                                      "实测只改到吃子那一半")
+                                     : QString());
+}
+
 /* ================================================================
  *  aiThink - 根据当前选中的agent类型选择走法
  *
@@ -2054,6 +2224,7 @@ AgentBase *ChessBoard::agentInstance(AgentType type) const
     case AGENT_EVAB:        return m_sfEVAB;
     case AGENT_SACAZ:       return m_sfSACAZ;
     case AGENT_SACAZ_MOE:   return m_sfSACAZMoe;
+    case AGENT_SACAZ_MOE_MLP: return m_sfSACAZMoeMlp;
     case AGENT_SACAZ_OLD:   return m_sfSACAZOld;
     case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe;
     case AGENT_DQNAB:       return m_sfDQNAB;
@@ -2128,8 +2299,15 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
                                 true, RL::PPO::Backbone::MlpExperts);
     case AGENT_DQNMCTS:   return new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
     case AGENT_EVAB:      return new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
-    case AGENT_SACAZ:     return createSACAZAgent(env, AGENT_SACAZ);
-    case AGENT_SACAZ_MOE: return createSACAZAgent(env, AGENT_SACAZ_MOE);
+    case AGENT_SACAZ:     return createSACAZAgent(env, AGENT_SACAZ, m_dynamicReward);
+    /*
+       [2026-09 独立类] AGENT_SACAZ_MOE 走它自己的构造点 (`SACAZMoETbAgent`) ——
+       与 AGENT_SACAZ (纯 MLP 的 SACAZAgent) 已经不是同一个类了, 手写
+       `new SACAZAgent(...)` 也建不出这支骨干 (它会静默变成纯 MLP)。
+    */
+    case AGENT_SACAZ_MOE: return createSACAZMoETbAgent(env, true, m_dynamicReward);
+    /* [2026-09 独立类] MoE+MLP 那一支: 同样走它自己的构造点 (手写 new SACAZAgent 建不出这个骨干) */
+    case AGENT_SACAZ_MOE_MLP: return createSACAZMoEMlpAgent(env, true, m_dynamicReward);
     /* 还原版是**独立类**: 必须走它自己那个构造点, 手写 new SACAZAgent 会静默换口径 */
     case AGENT_SACAZ_OLD:     return createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
     case AGENT_SACAZ_OLD_MOE: return createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
@@ -2164,7 +2342,8 @@ bool ChessBoard::saveWeightsOf(AgentBase *inst, AgentType type, const std::strin
     case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->saveModel(filepath);
     case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->saveModel(filepath);
     case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->saveModel(filepath);
-    case AGENT_SACAZ_MOE:   return static_cast<SACAZAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ_MOE:   return static_cast<SACAZMoETbAgent *>(inst)->saveModel(filepath);
+    case AGENT_SACAZ_MOE_MLP: return static_cast<SACAZMoEMlpAgent *>(inst)->saveModel(filepath);
     case AGENT_SACAZ_OLD:
         return static_cast<SACAZLegacyAgent *>(inst)->saveModel(filepath);
     case AGENT_SACAZ_OLD_MOE:
@@ -2187,7 +2366,8 @@ bool ChessBoard::loadWeightsInto(AgentBase *inst, AgentType type, const std::str
     case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->loadModel(filepath);
     case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->loadModel(filepath);
     case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->loadModel(filepath);
-    case AGENT_SACAZ_MOE:   return static_cast<SACAZAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ_MOE:   return static_cast<SACAZMoETbAgent *>(inst)->loadModel(filepath);
+    case AGENT_SACAZ_MOE_MLP: return static_cast<SACAZMoEMlpAgent *>(inst)->loadModel(filepath);
     case AGENT_SACAZ_OLD:
         return static_cast<SACAZLegacyAgent *>(inst)->loadModel(filepath);
     case AGENT_SACAZ_OLD_MOE:
@@ -2513,6 +2693,12 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
     case AGENT_SACAZ_MOE:
         if (m_sfSACAZMoe != nullptr) {
             return m_sfSACAZMoe->selfCheckReport();
+        }
+        break;
+    /* [2026-09 独立类] MoE+MLP 那一支有自己的实例与自检报告 (不能落到上面那一支去) */
+    case AGENT_SACAZ_MOE_MLP:
+        if (m_sfSACAZMoeMlp != nullptr) {
+            return m_sfSACAZMoeMlp->selfCheckReport();
         }
         break;
     case AGENT_SACAZ_OLD:
@@ -2895,9 +3081,7 @@ Step ChessBoard::aiThinkRaw(int color)
                或者以后有人又把预加载改掉时, 至少能构造出一个可用 agent, 而不是
                空指针崩掉。
             */
-            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                          SACAZAgent::Backbone::SparseMoeTb,
-                                          64, SACAZ_MOE_AUX);
+            m_sfSACAZMoe = createSACAZMoETbAgent(env, false, m_dynamicReward);
             auto it = s_weightPaths.find(AGENT_SACAZ_MOE);
             if (it != s_weightPaths.end()) {
                 /*
@@ -2923,6 +3107,37 @@ Step ChessBoard::aiThinkRaw(int color)
                 return m_sfSACAZMoe->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
             });
         }
+    }
+    /*
+       [2026-09 独立类] **MoE + MLP 专家**那一支 (AGENT_SACAZ_MOE_MLP)。与上面那一支
+       完全对称 —— 同一个算法、同一套口径, 只有骨干与类不同。它自己那些参数:
+         * 模拟次数 SACAZ_MOE_MLP_SIMS (比 TB 大一档: 一次模拟 ~2.9 ms vs ~5.4 ms);
+         * 权重是**共享口径的 4 个文件** (trunk + 三个头), 前缀由它自己的类给出
+           (weights/sacaz_moe_mlp_shared_agent) —— 与 TB 那一支**不同前缀**。
+    */
+    case AGENT_SACAZ_MOE_MLP: {
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfSACAZMoeMlp == nullptr) {
+            /* 兜底构造 (正常路径由 startupLoad() 预加载, 同上面那一支) */
+            m_sfSACAZMoeMlp = createSACAZMoEMlpAgent(env, false, m_dynamicReward);
+            auto it = s_weightPaths.find(AGENT_SACAZ_MOE_MLP);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ (稀疏MoE-MLP): 读取权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actorhead";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfSACAZMoeMlp->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(m_sfSACAZMoeMlp, color);
+        return finishDecisionSearch(m_sfSACAZMoeMlp, [&] {
+            return m_sfSACAZMoeMlp->selectMove(color, SACAZ_MOE_MLP_SIMS, 0.0f);
+        });
     }
     case AGENT_SACAZ_OLD: {
         /*
@@ -3178,11 +3393,10 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         });
     }
     case AGENT_SACAZ_MOE: {
-        SACAZAgent *ag = decisionInstance(m_sfSACAZMoe, AGENT_SACAZ_MOE);
+        /* [2026-09 独立类] 决策实例的类型 = SACAZMoETbAgent (不再是 SACAZAgent) */
+        SACAZMoETbAgent *ag = decisionInstance(m_sfSACAZMoe, AGENT_SACAZ_MOE);
         if (ag == nullptr) {
-            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                          SACAZAgent::Backbone::SparseMoeTb,
-                                          64, SACAZ_MOE_AUX);
+            m_sfSACAZMoe = createSACAZMoETbAgent(env, false, m_dynamicReward);
             ag = m_sfSACAZMoe;
             /*
                以前这里**只建对象、不载权重** —— 于是对弈里用到这个 agent 时跑的是
@@ -3212,6 +3426,34 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
                 return ag->selectMove(color, SACAZ_MOE_SIMS, 0.0f);
             });
         }
+    }
+    /*
+       [2026-09 独立类] **MoE + MLP 专家**那一支 (与上面那一支对称: 同一条兜底约定
+       "建了对象就把权重载上", 只有骨干/类/前缀/模拟次数不同)。
+    */
+    case AGENT_SACAZ_MOE_MLP: {
+        SACAZMoEMlpAgent *ag = decisionInstance(m_sfSACAZMoeMlp, AGENT_SACAZ_MOE_MLP);
+        if (ag == nullptr) {
+            m_sfSACAZMoeMlp = createSACAZMoEMlpAgent(env, false, m_dynamicReward);
+            ag = m_sfSACAZMoeMlp;
+            auto it = s_weightPaths.find(AGENT_SACAZ_MOE_MLP);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 SAC+AZ (稀疏MoE-MLP): 读取权重文件…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_actorhead";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                ag->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        preTrainThenDecide(ag, color);
+        return finishDecisionSearch(ag, [&] {
+            return ag->selectMove(color, SACAZ_MOE_MLP_SIMS, 0.0f);
+        });
     }
     case AGENT_SACAZ_OLD: {
         /*
@@ -4046,7 +4288,17 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
        但更坏的是"有人为了兼容而补一条回退": 那会把独立口径的 `_actor/_q1/_q2` 里的
        **第一份骨干**当成共享骨干、另外两份直接丢掉 —— 静默、不报错、训练还在继续。
     */
-    case AGENT_SACAZ_MOE: return SACAZAgent::sharedWeightPrefix();
+    /*
+       [2026-09 独立类] TB 那一支的前缀现在由**它自己的类**给出 (拆分前借的是
+       SACAZAgent 的静态函数, 因为两个骨干挤在一个类里)。值不变 = 界面存量模型照旧能载入。
+    */
+    case AGENT_SACAZ_MOE: return SACAZMoETbAgent::sharedWeightPrefix();
+    /*
+       MoE+MLP 那一支: 它自己的前缀 (weights/sacaz_moe_mlp_shared_agent)。
+       **绝不能用 TB 那个值**: 两者骨干不同 ⇒ 权重结构不同, 共用前缀会让一个骨干
+       静默覆盖另一个 (见 sacazmoemlpagent.cpp 里 sharedWeightPrefix 的说明)。
+    */
+    case AGENT_SACAZ_MOE_MLP: return SACAZMoEMlpAgent::sharedWeightPrefix();
     /*
        59e5233 行为还原版: **独立前缀**, 由那个类自己给出 (weights/sacaz_old_agent)。
        绝不能用 SACAZAgent::defaultWeightPrefix() —— 那是"当前口径"那一支的文件,
@@ -4075,6 +4327,7 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     case AGENT_EVAB:      return m_sfEVAB != nullptr;
     case AGENT_SACAZ:     return m_sfSACAZ != nullptr;
     case AGENT_SACAZ_MOE: return m_sfSACAZMoe != nullptr;
+    case AGENT_SACAZ_MOE_MLP: return m_sfSACAZMoeMlp != nullptr;
     case AGENT_SACAZ_OLD: return m_sfSACAZOld != nullptr;
     case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe != nullptr;
     case AGENT_DQNAB:  return m_sfDQNAB != nullptr;
@@ -4215,11 +4468,16 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
     }
     case AGENT_SACAZ_MOE: {
         if (m_sfSACAZMoe == nullptr) {
-            m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                          SACAZAgent::Backbone::SparseMoeTb,
-                                          64, SACAZ_MOE_AUX);
+            m_sfSACAZMoe = createSACAZMoETbAgent(env, false, m_dynamicReward);
         }
         return m_sfSACAZMoe->loadModel(filepath);
+    }
+    /* [2026-09 独立类] MoE+MLP 那一支: 自己的实例 + 自己的 loadModel (shared 口径 4 个文件) */
+    case AGENT_SACAZ_MOE_MLP: {
+        if (m_sfSACAZMoeMlp == nullptr) {
+            m_sfSACAZMoeMlp = createSACAZMoEMlpAgent(env, false, m_dynamicReward);
+        }
+        return m_sfSACAZMoeMlp->loadModel(filepath);
     }
     case AGENT_SACAZ_OLD: {
         /* 必须走 createSACAZLegacyAgent: 手写 new SACAZAgent 会静默退回当前口径 */
@@ -4420,6 +4678,7 @@ void ChessBoard::backgroundTrainLoop()
            接上了** (AB / MCTS 没有权重, 不在此列)。 */
         case AGENT_SACAZ:
         case AGENT_SACAZ_MOE:
+        case AGENT_SACAZ_MOE_MLP:
         case AGENT_SACAZ_OLD:
         case AGENT_SACAZ_OLD_MOE:
         case AGENT_DQNAB:
@@ -4498,9 +4757,13 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_SACAZ_MOE:
                 if (m_sfSACAZMoe == nullptr)
-                    m_sfSACAZMoe = new SACAZAgent(env, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                                  SACAZAgent::Backbone::SparseMoeTb,
-                                                  64, SACAZ_MOE_AUX);
+                    m_sfSACAZMoe = createSACAZMoETbAgent(env, false, m_dynamicReward);
+                break;
+            /* [2026-09 独立类] MoE+MLP 那一支: 自己的实例 + 自己的构造点
+               (落到上面那一支去就会**用 TB 的骨干**建出来, 而且一声不响) */
+            case AGENT_SACAZ_MOE_MLP:
+                if (m_sfSACAZMoeMlp == nullptr)
+                    m_sfSACAZMoeMlp = createSACAZMoEMlpAgent(env, false, m_dynamicReward);
                 break;
             /*
                ---- 59e5233 行为还原版 ----
@@ -4558,6 +4821,10 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_SACAZ_MOE:
                 if (m_sfSACAZMoe) seeded = m_sfSACAZMoe->saveModel(tmpWeights);
+                break;
+            /* [2026-09 独立类] MoE+MLP: 自己的实例 + **自己的临时前缀** (TMP_WEIGHTS_*) */
+            case AGENT_SACAZ_MOE_MLP:
+                if (m_sfSACAZMoeMlp) seeded = m_sfSACAZMoeMlp->saveModel(tmpWeights);
                 break;
             case AGENT_SACAZ_OLD:
                 if (m_sfSACAZOld) seeded = m_sfSACAZOld->saveModel(tmpWeights);
@@ -4737,14 +5004,37 @@ void ChessBoard::backgroundTrainLoop()
             */
             case AGENT_SACAZ: {
                 SACAZAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f);
+                /* [2026-09 奖励方法开关] 克隆体与主 agent 必须同一套奖励, 否则训出来的
+                   权重与"面板上那一支"不是同一个东西 */
+                applyRewardMethod(clone, m_dynamicReward);
                 roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
                                              roundEpisodes, sacazTrainSims(type),
                                              roundMaxMoves, roundLoss);
                 break;
             }
             case AGENT_SACAZ_MOE: {
-                SACAZAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                 SACAZAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX);
+                /*
+                   [2026-09 独立类] 克隆体也是**独立类** `SACAZMoETbAgent` ——
+                   与 AGENT_SACAZ_MOE 的构造点同一套形状参数 (Separate 口径),
+                   否则"训练用的克隆"与"决策用的实例"就是两支不同的网。
+                */
+                SACAZMoETbAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                      64, SACAZ_MOE_AUX);
+                roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
+                                             roundEpisodes, sacazTrainSims(type),
+                                             roundMaxMoves, roundLoss);
+                break;
+            }
+            /*
+               [2026-09 独立类] MoE+MLP 那一支的克隆体: 同样是**独立类**、
+               同一套形状参数 (Separate 口径 + expertHidden 64 + aux SACAZ_MOE_AUX)。
+               形状参数必须与 createSACAZMoEMlpAgent(env, false, m_dynamicReward) 逐字一致, 否则
+               "训练用的克隆"与"回主 agent 的权重"两边结构对不上 (loadModel 当场失败 = 每轮白跑)。
+            */
+            case AGENT_SACAZ_MOE_MLP: {
+                SACAZMoEMlpAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                                       64, SACAZ_MOE_AUX,
+                                       SACAZMoEMlpAgent::TrunkMode::Separate);
                 roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
                                              roundEpisodes, sacazTrainSims(type),
                                              roundMaxMoves, roundLoss);
@@ -4878,6 +5168,12 @@ void ChessBoard::backgroundTrainLoop()
             case AGENT_SACAZ_MOE:
                 if (m_sfSACAZMoe && !m_sfSACAZMoe->loadModel(tmpWeights)) {
                     qWarning() << "[train] SAC+AZ-MoE 权重同步回主 agent 失败";
+                }
+                break;
+            /* [2026-09 独立类] MoE+MLP: 从**自己的**临时文件同步回**自己的**实例 */
+            case AGENT_SACAZ_MOE_MLP:
+                if (m_sfSACAZMoeMlp && !m_sfSACAZMoeMlp->loadModel(tmpWeights)) {
+                    qWarning() << "[train] SAC+AZ-MoE-MLP 权重同步回主 agent 失败";
                 }
                 break;
             case AGENT_SACAZ_OLD:

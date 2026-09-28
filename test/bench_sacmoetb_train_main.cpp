@@ -27,14 +27,14 @@
  *      "没测出差别"。只报一个数字必然被当成结论（`bench_anchor` 的同一套理由）。
  *
  *   4. **先训练再评测，且两头都可复现**：`--train-games=N` 先自对弈 N 局
- *      （`SACAZAgent::trainSelfPlay`），再评测。训练侧与评测侧的每一个旋钮都是
- *      命令行参数，默认值 = `SACAZAgent` 的当前默认 —— 于是"默认口径"是一个可复现的
+ *      （`SACAZMoETbAgent::trainSelfPlay`），再评测。训练侧与评测侧的每一个旋钮都是
+ *      命令行参数，默认值 = `SACAZMoETbAgent` 的当前默认 —— 于是"默认口径"是一个可复现的
  *      基线，而不是一个藏在源代码里的魔数。
  *
  * 与 MLP 专家的隔离（用户口径：**不许污染 MLP 专家相关的代码逻辑**）
  * ---------------------------------------------------------------
  * 本工具建的 agent 永远是 `Backbone::SparseMoeTb`（TB 专家），所有旋钮都写在
- * **这个进程里这个实例上**，一行都不改 `SACAZAgent` 的默认值、也不碰
+ * **这个进程里这个实例上**，一行都不改 `SACAZMoETbAgent` 的默认值、也不碰
  * `MlpExpert` / `SparseMoE<MlpExpert,...>` / `MOE_MLP_*` 的任何代码路径。
  * 回归证据：`mlp` 与 `moe-mlp` 两个骨干的走法序列与改动前逐行相同（见
  * `docs/dev_sacmoetb_2026_09.md` §6.0.1 的复现命令）。
@@ -74,7 +74,7 @@
 #include "abagent.h"
 #include "chess.h"
 #include "mcts.h"
-#include "sacazagent.h"
+#include "sacazmoetbagent.h"   /* [2026-09 独立类] 本工具固定跑 TB 专家那一支 */
 #include "rl/util.hpp"
 
 /*
@@ -103,7 +103,7 @@ struct Cfg {
     float tempFinal = 0.25f;         /* 自对弈末段温度 */
     /*
        `learnFromSearch` 默认 **关**。为什么 (一个必须写清楚的交互):
-       `SACAZAgent::trainSelfPlay` 自己就会 `selectMove(..., &piTarget)` 并把
+       `SACAZMoETbAgent::trainSelfPlay` 自己就会 `selectMove(..., &piTarget)` 并把
        (s, π_MCTS, a, r, s', done) 存进回放池、每 `learnEveryMoves` 手更新一次。
        而 `learnFromSearch=true` 会让 `selectMove` **再**存一条同样的经验并**再**跑一次
        `learnBatch` —— 于是每个手都更新一次、池里每条经验都存两份, 训练节拍变成
@@ -120,7 +120,7 @@ struct Cfg {
     int evalSims = 40;               /* 评测每步模拟数 (GUI 的 SACAZ_MOE_SIMS = 40) */
     double simsTimeMs = 0.0;         /* >0 = 等时间: 标定 ms/模拟 后反推 evalSims */
 
-    /* ---- 训练侧旋钮 (默认全部 = SACAZAgent 的当前默认) ---- */
+    /* ---- 训练侧旋钮 (默认全部 = SACAZMoETbAgent 的当前默认) ---- */
     float lr = 0.001f;
     int batch = 32;
     int epochs = 1;                  /* replayEpochs */
@@ -136,6 +136,24 @@ struct Cfg {
     float gamma = 0.99f;
     int memory = 4096;
     int rewardShape = 0;
+    /*
+       ---- [2026-09 动态奖励分配] rewardShape=3 的三个旋钮 ----
+       用户口径 (两轮): ① "前期加强吃子奖励 / 后期重杀将奖励, 两者都不应忽视";
+       ② "分阶段太过思维定势, 因为局势是反复变化的, 是否可以参考棋子的数量和价值来
+       评估局面动态调整杀棋杀将的奖励比例"。
+       所以这一版**没有阶段钟**: 权重由一个局面评估 e ∈ [0,1] 决定 (同时读棋子的
+       **数量** / **价值** / 双方**子力差**), 局势反复时 e 会退回, 权重跟着回摆。
+       设计、量纲不变量与已知代价见 src/sacazagent.h 的 `rewardShape = 3` 一节,
+       实测见 docs/sacmoetb_pos_reward_2026_09.md。
+         mateScoreMode   0 = 数量+价值+子力差 (默认) / 1 = 只用价值 / 2 = 只用数量 / 3 = 数量+价值
+         matRewardBoost  均势满盘 (e=0) 时材质系数 x (1+boost)
+         mateRewardBoost 残局/大势已定 (e=1) 时终局值 x (1+boost)
+       默认 0.5 / 0.5 -> 两个倍数之和恒为 2.5 = "固定预算按局面动态分配"。
+       只有 `--reward-shape=3` 才读这三个数; 其它 shape 下一位都不变。
+    */
+    int mateScoreMode = 0;
+    float matRewardBoost = 0.5f;
+    float mateRewardBoost = 0.5f;
     float valueScale = 1.0f;
     /*
        ------------------------------------------------------------------
@@ -373,7 +391,7 @@ void materialOf(Chess &c, double &red, double &black)
     }
 }
 
-GameRec playGame(Chess &c, SACAZAgent &sac, Opponent &opp,
+GameRec playGame(Chess &c, SACAZMoETbAgent &sac, Opponent &opp,
                  const Opening &op, bool sacIsRed, int simsForSac)
 {
     GameRec g;
@@ -467,7 +485,7 @@ struct EvalResult {
     int sacMates = 0, oppMates = 0;
 };
 
-EvalResult evaluate(Chess &c, SACAZAgent &sac, Opponent &opp,
+EvalResult evaluate(Chess &c, SACAZMoETbAgent &sac, Opponent &opp,
                     const std::vector<Opening> &book, int simsForSac)
 {
     EvalResult r;
@@ -597,6 +615,9 @@ bool parseArgs(int argc, char **argv)
         else if (const char *v = val("--gamma"))     { g_cfg.gamma = (float)std::atof(v); }
         else if (const char *v = val("--memory"))    { g_cfg.memory = std::atoi(v); }
         else if (const char *v = val("--reward-shape")){ g_cfg.rewardShape = std::atoi(v); }
+        else if (const char *v = val("--pos-score-mode")){ g_cfg.mateScoreMode = std::atoi(v); }
+        else if (const char *v = val("--pos-mat-boost")){ g_cfg.matRewardBoost = (float)std::atof(v); }
+        else if (const char *v = val("--pos-mate-boost")){ g_cfg.mateRewardBoost = (float)std::atof(v); }
         else if (const char *v = val("--value-scale")){ g_cfg.valueScale = (float)std::atof(v); }
         else if (const char *v = val("--reward-scale")){ g_cfg.rewardScale = (float)std::atof(v); }
         else if (const char *v = val("--critic-tanh")){ g_cfg.criticTanh = (std::atoi(v) != 0); }
@@ -650,11 +671,11 @@ bool parseArgs(int argc, char **argv)
 /* ============================================================
  *  一份配置快照 (打印用: "这一跑到底用的是哪一套口径")
  * ============================================================ */
-void printConfig(const SACAZAgent &sac)
+void printConfig(const SACAZMoETbAgent &sac)
 {
     std::printf("口径      : %s | trunk=%s tb-heads=%s | 头 请求%d/实际%d/分配%d d_k=%d 元素%lld\n",
-                SACAZAgent::backboneName(sac.backbone),
-                SACAZAgent::trunkModeName(sac.trunkMode), g_cfg.tbHeads.c_str(),
+                sac.backboneName(),
+                SACAZMoETbAgent::trunkModeName(sac.trunkMode), g_cfg.tbHeads.c_str(),
                 sac.tbHeadsRequested(), sac.tbHeadsUsed(), sac.tbHeadsAllocated(),
                 sac.tbHeadDim(), sac.tbAttentionElements());
     std::printf("训练口径  : lr=%.4g batch=%d epochs=%d memory=%d gamma=%.3f | "
@@ -665,11 +686,14 @@ void printConfig(const SACAZAgent &sac)
                 (double)g_cfg.azWeight, (double)g_cfg.cpuct);
     std::printf("            : clamp=%.3g huber=%.3g aux=%.3g rewardShape=%d valueScale=%.3g rewardScale=%.3g "
                 "sparseLeaf=%d learnFromSearch=%d entropyInTarget=%.3g entropySlots=%d\n"
+                "            : [动态奖励] mateScoreMode=%d matBoost=%.3g mateBoost=%.3g (只有 rewardShape=3 读)\n"
                 "            : [实验轮] criticTanh=%d rewardTanhGain=%.3g alphaGumbel=%.3g alphaCeiling=%.3g entropyCenter=%d\n",
                 (double)g_cfg.clampTarget, (double)g_cfg.huberDelta, (double)g_cfg.aux,
                 g_cfg.rewardShape, (double)g_cfg.valueScale, (double)g_cfg.rewardScale,
                 (int)g_cfg.sparseLeaf, (int)g_cfg.learnFromSearch,
                 (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots,
+                g_cfg.mateScoreMode, (double)g_cfg.matRewardBoost,
+                (double)g_cfg.mateRewardBoost,
                 (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
                 (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
                 (int)g_cfg.entropyCenter);
@@ -678,7 +702,7 @@ void printConfig(const SACAZAgent &sac)
 }
 
 /* 训练完/评测完的 agent 诊断 (只读) */
-void printDiag(const SACAZAgent &sac, const char *tag)
+void printDiag(const SACAZMoETbAgent &sac, const char *tag)
 {
     std::vector<long long> usage;
     sac.moeUsage(usage);
@@ -698,7 +722,7 @@ void printDiag(const SACAZAgent &sac, const char *tag)
     }
     std::printf(" 没用到的专家=%d max/min=%.2f\n", unused,
                 (lo > 0) ? (double)hi / (double)lo : 0.0);
-    const SACAZAgent::TrainDiag &D = sac.getTrainDiag();
+    const SACAZMoETbAgent::TrainDiag &D = sac.getTrainDiag();
     if (D.n > 0) {
         std::printf("  训练诊断: 样本=%lld 被夹=%lld(%.1f%%) |y|均=%.4f |Q|均=%.4f "
                     "Q间距均=%.4f H均=%.4f H目标均=%.4f V(s')均=%.4f (其中熵项均=%.4f)\n",
@@ -707,6 +731,15 @@ void printDiag(const SACAZAgent &sac, const char *tag)
                     D.qSpreadSum / (double)D.n, D.hSum / (double)D.n,
                     D.hBarSum / (double)D.n, D.vNextSum / (double)D.n,
                     D.vEntSum / (double)D.n);
+        /*
+           [2026-09 动态奖励分配] **终局通道的样本量** —— 这一行是判"后期重杀将加权"
+           这类旋钮活/死的唯一读数: 只有 done 且**分胜负**的样本携带杀将奖励
+           (和棋的终局值恒 0)。实测: 60 局自对弈里 decisive 只有几十条 (占比 <0.1%),
+           把 mateBoost 从 0 开到 10 权重逐字节相同 —— 旋钮在训练里是死的。
+        */
+        std::printf("  终局通道: done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%)\n",
+                    D.doneSamples, 100.0 * (double)D.doneSamples / (double)D.n,
+                    D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n);
     }
 }
 
@@ -722,8 +755,8 @@ int main(int argc, char **argv)
 
     std::printf("=== bench_sacmoetb_train: TB 专家 SAC+AZ 的训练 + 对锚点评测 ===\n");
     std::printf("SIMD=%s  STATE_DIM=%d ACTION_DIM=%d seed=%u\n",
-                RL::simdops::instructionSet(), SACAZAgent::STATE_DIM,
-                SACAZAgent::ACTION_DIM, g_cfg.seed);
+                RL::simdops::instructionSet(), SACAZMoETbAgent::STATE_DIM,
+                SACAZMoETbAgent::ACTION_DIM, g_cfg.seed);
 
     /*
        MCTS 的对局随机性走 `std::rand()`, 而 `std::srand` 默认播的是 time(nullptr)
@@ -754,15 +787,15 @@ int main(int argc, char **argv)
     Chess c;
     c.reset();
 
-    const SACAZAgent::TrunkMode trunkMode =
-        (g_cfg.trunk == "shared") ? SACAZAgent::TrunkMode::Shared
-                                  : SACAZAgent::TrunkMode::Separate;
+    const SACAZMoETbAgent::TrunkMode trunkMode =
+        (g_cfg.trunk == "shared") ? SACAZMoETbAgent::TrunkMode::Shared
+                                  : SACAZMoETbAgent::TrunkMode::Separate;
     const bool honorHeads = (g_cfg.tbHeads == "honor");
 
     const double tBuild0 = nowMs();
-    SACAZAgent sac(c, 64, g_cfg.gamma, g_cfg.lr, g_cfg.cpuct,
-                   SACAZAgent::Backbone::SparseMoeTb, 64, g_cfg.aux,
-                   trunkMode, honorHeads);
+    /* [2026-09 独立类] 骨干硬编码在类里 —— 构造签名少了一个 Backbone 实参 */
+    SACAZMoETbAgent sac(c, 64, g_cfg.gamma, g_cfg.lr, g_cfg.cpuct,
+                        64, g_cfg.aux, trunkMode, honorHeads);
     /* 训练/评测侧旋钮: 只写在**这个实例**上, 不改任何默认值 */
     sac.batchSize = g_cfg.batch;
     sac.replayEpochs = g_cfg.epochs;
@@ -775,6 +808,9 @@ int main(int argc, char **argv)
     sac.huberDelta = g_cfg.huberDelta;
     sac.maxMemorySize = (std::size_t)g_cfg.memory;
     sac.rewardShape = g_cfg.rewardShape;
+    sac.mateScoreMode = g_cfg.mateScoreMode;
+    sac.matRewardBoost = g_cfg.matRewardBoost;
+    sac.mateRewardBoost = g_cfg.mateRewardBoost;
     sac.valueScale = g_cfg.valueScale;
     sac.rewardScale = g_cfg.rewardScale;
     sac.criticTanh = g_cfg.criticTanh;
@@ -963,7 +999,9 @@ int main(int argc, char **argv)
                              "target_tau,target_iter,entropy_ratio,alpha_lr,lr,batch,epochs,"
                              "az_weight,cpuct,clamp,huber,aux,memory,reward_shape,"
                              "value_scale,reward_scale,sparse_leaf,learn_from_search,trunk,tb_heads,"
-                             "entropy_in_target,entropy_slots\n");
+                             "entropy_in_target,entropy_slots,"
+                             "mate_score_mode,mat_boost,mate_boost,"
+                             "critic_tanh,reward_tanh_gain,alpha_gumbel,alpha_ceiling,entropy_center\n");
             for (std::size_t i = 0; i < results.size(); i++) {
                 const EvalResult &r = results[i];
                 std::fprintf(fp,
@@ -971,7 +1009,14 @@ int main(int argc, char **argv)
                     "%d,%d,%d,%u,%016llx,"
                     "%.6g,%d,%.6g,%.6g,%.6g,%d,%d,"
                     "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,"
-                    "%.6g,%d,%d,%s,%s\n",
+                    /*
+                       ---- [2026-09 修复] 这一段的**格式串原来比表头少三列**
+                       (`reward_scale` / `entropy_in_target` / `entropy_slots` 只有名字没有
+                       转换符), 后面五个 [实验轮] 旋钮则完全没有列 —— 于是 CSV 的**表头与
+                       数据行、数据行与数据行之间全部错位**, 而且不报任何错。现在把
+                       表头列名、转换符、实参**一一对齐** (顺序 = 表头顺序)。
+                    */
+                    "%.6g,%.6g,%d,%d,%s,%s,%.6g,%d,%d,%.6g,%.6g,%d,%.6g,%.6g,%.6g,%d\n",
                     r.oppName.c_str(), r.games, r.wins, r.draws, r.losses, r.broken,
                     r.score, r.scoreLo, r.scoreHi, eloFromScore(r.score),
                     r.sacMsPerMove, r.oppMsPerMove, r.avgPlies, r.avgMaterialDiff,
@@ -985,9 +1030,11 @@ int main(int argc, char **argv)
                     (double)g_cfg.rewardScale, (int)g_cfg.sparseLeaf, (int)g_cfg.learnFromSearch,
                     g_cfg.trunk.c_str(), g_cfg.tbHeads.c_str(),
                     (double)g_cfg.entropyInTarget, (int)g_cfg.entropySlots,
-                (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
-                (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
-                (int)g_cfg.entropyCenter);
+                    g_cfg.mateScoreMode, (double)g_cfg.matRewardBoost,
+                    (double)g_cfg.mateRewardBoost,
+                    (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
+                    (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
+                    (int)g_cfg.entropyCenter);
             }
             std::fclose(fp);
             std::printf("\nCSV       : %s\n", g_cfg.csvPath.c_str());

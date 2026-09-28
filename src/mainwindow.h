@@ -44,6 +44,14 @@ private slots:
      */
     void onOpponentRolloutToggled(bool on);
     void onOpponentRolloutPliesChanged(int n);
+    /*
+     * [2026-09 奖励方法开关] "动态奖励" 勾选框 (默认不勾 = **保留旧奖励**)。
+     * 语义见 ChessBoard::setDynamicRewardEnabled —— 它不是棋力旋钮, 而且"杀将"那一半
+     * 在当前训练协议下没有样本 (done=0), 所以打开它目前只改到吃子那一半。
+     */
+    void onDynamicRewardToggled(bool on);
+    /* [2026-09] "每轮训练局数": 先训练 N 局再对弈 (后台训练一轮的规模) */
+    void onBgTrainEpisodesChanged(int n);
 
 private:
     void refreshGameList();

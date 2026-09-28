@@ -76,6 +76,13 @@ const AgentChoice kAgents[] = {
     */
     { "SAC+MCTS+AlphaZero (稀疏MoE+TB专家)", ChessBoard::AGENT_SACAZ_MOE },
     /*
+       [2026-09 独立类] 同算法、骨干换成**稀疏 MoE + MLP 专家** (E=8, top-2) 的那一支,
+       也就是独立类 `SACAZMoEMlpAgent`。它以前**只能在 bench 里跑到**; 现在接进下拉框。
+       实测比上面那一支便宜 (2.90 M 参数 / ~2.9 ms/模拟 vs 57.6 M / ~5.4 ms),
+       所以模拟次数给到 SACAZ_MOE_MLP_SIMS = 40。
+    */
+    { "SAC+MCTS+AlphaZero (稀疏MoE+MLP专家)", ChessBoard::AGENT_SACAZ_MOE_MLP },
+    /*
        SAC+MCTS+AlphaZero 的**行为还原版** (提交 59e5233)。它是一个**独立的 C++ 类**
        (SACAZLegacyAgent, src/sacazlegacyagent.h), 不是同一个类里的运行时开关 ——
        与上面两项放在一起是为了能直接对弈比较"当前口径 vs 59e5233 口径"。
@@ -141,6 +148,7 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_EVAB:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
+    case ChessBoard::AGENT_SACAZ_MOE_MLP:
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
@@ -791,6 +799,72 @@ void MainWindow::populateAgentComboBox()
         QObject::connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this,
                          &MainWindow::onOpponentRolloutPliesChanged);
     }
+
+    /*
+       ---- [2026-09 奖励方法开关] "动态奖励" (默认不勾 = 保留旧奖励) ----
+       用户口径: "保留旧的奖励方法" —— 所以默认**不勾**, 勾上才切到 `rewardShape = 3`
+       (按局面评估在"吃子 / 杀将"之间分配一个固定预算)。
+       为什么也放进 matchModeRow 程序化建: 与上面两个控件同一套理由 (语义要贴着控件走),
+       而且三条边界必须写进工具提示 —— 否则它会被读成"变强的旋钮"。
+    */
+    {
+        QCheckBox *rcb = new QCheckBox(QStringLiteral("动态奖励"), this);
+        rcb->setObjectName(QStringLiteral("dynamicRewardCheck"));
+        rcb->setChecked(ui->gameWidget->isDynamicRewardEnabled());
+        rcb->setToolTip(QStringLiteral(
+            "奖励方法开关 (默认**不勾** = 保留旧奖励)\n\n"
+            "不勾 = 旧奖励 (rewardShape=0):\n"
+            "  即时 = 材质 x0.1 + 每步代价(-0.001); 终局 = 引擎真值 ±1。\n"
+            "  这一支的代码一个字没动, 历史读数与它逐位对得上。\n\n"
+            "勾上 = 动态奖励 (rewardShape=3):\n"
+            "  按**局面评估** e (剩余价值 / 剩余个数 / 相对子力差, 三因子等权) 在\n"
+            "  \"吃子\"与\"杀将\"之间分配一个**固定预算**: 材质倍数 1+0.5(1-e),\n"
+            "  终局倍数 1+0.5e, 两者之和恒为 2.5; 两条都**永不归零**。\n\n"
+            "⚠ 三条边界 (实测, 不是推测):\n"
+            "  1. **它不是棋力旋钮**: 四条训练臂 (各 60 局自对弈 + 16 局/锚点) 的得分率\n"
+            "     全部落在噪声里 (docs/sacmoetb_pos_reward_2026_09.md §9)。\n"
+            "  2. **\"杀将\"那一半目前不生效**: 自对弈训练里 done 样本 = 0\n"
+            "     (一局走到手数上限被截断, 截断那一步 done 仍是 false), 而终局倍率只作用在\n"
+            "     terminalReward() 上 ⇒ 打开它实际只改到\"吃子那一半\"。\n"
+            "  3. **它改变训练出来的权重**: 两套奖励训出的不是同一个东西, 别共用权重文件。\n\n"
+            "要做对照实验请用 bench 工具 (固定开局集 + 配对 + 区间):\n"
+            "  bench_sacaz_vs_ab --backbone=moe-mlp --reward-shape=3 --warmup-games=60 ...\n"
+            "  bench_sacmoetb_train --reward-shape=3 ..."));
+        ui->matchModeRow->addWidget(rcb);
+        QObject::connect(rcb, &QCheckBox::toggled, this,
+                         &MainWindow::onDynamicRewardToggled);
+    }
+
+    /*
+       ---- [2026-09] "每轮训练局数" (先训练 N 局再对弈) ----
+       后台训练本来就在跑 (startBackgroundTraining), 但一轮的规模写死在
+       BG_TRAIN_EPISODES x BG_TRAIN_MAX_MOVES。这个框让"先练多少再打"变成可调的。
+       用户口径: **先用 MCTS 当对手练, 才谈得上对 AB 有胜率** —— 实测支持它:
+       对 AB level=1 时 SAC 四臂一局都没赢 (0/23/57 等), 得分率只能在"输多输少"之间动;
+       换 MCTS 锚点才有胜/负 (8 胜 / 2 负 / 30 和)。
+       见 docs/sacmoetb_independent_classes_2026_09.md §9。
+    */
+    {
+        QLabel *lb = new QLabel(QStringLiteral("每轮训练局数"), this);
+        ui->matchModeRow->addWidget(lb);
+        QSpinBox *tb = new QSpinBox(this);
+        tb->setObjectName(QStringLiteral("bgTrainEpisodesSpin"));
+        tb->setRange(1, 200);
+        tb->setValue(ui->gameWidget->getBackgroundTrainEpisodes());
+        tb->setToolTip(QStringLiteral(
+            "后台自对弈训练**每轮**跑几局 (默认 1)。\n\n"
+            "一轮 = 克隆权重 -> 独立棋盘上自对弈 N 局 -> 训好写回 -> 同步回主 agent。\n"
+            "调大 = 每轮练得更多; 但\"同步回主 agent\"那一步的等待也更长\n"
+            "(关窗时会等这一轮跑完, 见 stopBackgroundTraining 的说明)。\n\n"
+            "为什么要有它 (用户口径: \"先使用 MCTS agent 对弈, 才有可能在与 AB agent 对弈有胜率\"):\n"
+            "  对 AB level=1 的实测里, SAC 四臂**一局都没赢** (0/23/57 等), 得分率只能在\n"
+            "  \"输多输少\"之间动 —— 那个锚点量不出胜率; 换成 MCTS 锚点才有胜/负\n"
+            "  (8 胜 / 2 负 / 30 和)。所以**练棋与量棋都优先拿 MCTS 当对手**。\n"
+            "  做法: 这一栏选 MCTS 当对手 + 下拉框选\"训练对局\"模式 (+ 需要时勾\"对手入训\")。"));
+        ui->matchModeRow->addWidget(tb);
+        QObject::connect(tb, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         &MainWindow::onBgTrainEpisodesChanged);
+    }
 }
 
 /*
@@ -813,6 +887,28 @@ void MainWindow::onOpponentRolloutPliesChanged(int n)
 {
     ui->gameWidget->setOpponentRolloutPlies(n);
     qInfo().noquote() << QStringLiteral("[P1] 每次探索最多问对手 %1 手").arg(n);
+}
+
+/*
+ * [2026-09 奖励方法开关] "动态奖励" 勾选框回调。
+ * 口径与三条边界见 chessboard.h 的 setDynamicRewardEnabled 与那个复选框的工具提示。
+ * 注意它**不会**重建任何 agent —— 四个旋钮是普通成员, setter 直接写到现有实例上
+ * (对比: moeDense 那种建网期参数必须走构造参数)。
+ */
+void MainWindow::onBgTrainEpisodesChanged(int n)
+{
+    ui->gameWidget->setBackgroundTrainRound(n, ui->gameWidget->getBackgroundTrainMaxMoves());
+    qInfo().noquote() << QStringLiteral("[train] 后台训练每轮 %1 局").arg(n);
+}
+
+void MainWindow::onDynamicRewardToggled(bool on)
+{
+    ui->gameWidget->setDynamicRewardEnabled(on);
+    qInfo().noquote() << QStringLiteral("[reward] 动态奖励 = %1 (%2)")
+                             .arg(on ? QStringLiteral("开") : QStringLiteral("关"))
+                             .arg(on ? QStringLiteral("rewardShape=3: 按局面在吃子/杀将间分配固定预算; "
+                                                      "⚠ 杀将那一半因 done 样本=0 目前不生效")
+                                     : QStringLiteral("rewardShape=0: 旧奖励, 与历史读数一致"));
 }
 
 /*

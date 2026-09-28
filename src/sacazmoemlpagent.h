@@ -1,5 +1,5 @@
-#ifndef SACAZ_AGENT_H
-#define SACAZ_AGENT_H
+#ifndef SACAZ_MOEMLP_AGENT_H
+#define SACAZ_MOEMLP_AGENT_H
 
 #include <vector>
 #include <string>
@@ -24,7 +24,7 @@ class ISparseMoE;
 }
 
 /*
- * SACAZAgent - SAC + MCTS + AlphaZero
+ * SACAZMoEMlpAgent - SAC + MCTS + AlphaZero
  * ================================================================
  *
  * 一句话: 用**最大熵 critic (SAC)** 给**AlphaZero 式 PUCT 搜索**提供叶子估值,
@@ -71,7 +71,7 @@ class ISparseMoE;
  *   所以落子本身仍然正确; 受影响的是策略目标的精度。要彻底解决就换成无碰撞的
  *   id*90 + x*9 + y (32x90=2880) 动作空间, 见 docs/agents_design.md §11。
  */
-class SACAZAgent : public AgentBase
+class SACAZMoEMlpAgent : public AgentBase
 {
 public:
     /* ================================================================
@@ -137,26 +137,28 @@ public:
     bool legacyHashAction = false;
 
     /* ----------------------------------------------------------------
-     *  骨干: **本类只有一种** —— 纯 MLP (1260 -> h -> h -> out)
+     *  骨干: **本类只有一种** —— 稀疏 MoE (E=8, top-2) + MLP 专家
      *
-     *  [2026-09 独立类] 这个类原来是"一个类背四种骨干" (Mlp / SparseMoeMlp /
-     *  SparseMoeTb / DenseMoeTb), 靠 `Backbone` 枚举 + 运行时 switch 选层。现在
-     *  **一个骨干一个类、互不继承**:
+     *  [2026-09 独立类] 这一支原来和另外三种骨干挤在 `SACAZAgent` 一个类里, 靠
+     *  `Backbone` 枚举 + 运行时 switch 选层。现在它是**自己的类**
+     *  (`SACAZMoEMlpAgent`), 骨干在 `makeTrunkLayers` 里硬编码:
      *
-     *      SACAZAgent          纯 MLP                       (AGENT_SACAZ)
-     *      SACAZMoEMlpAgent    稀疏 MoE(E=8, top-2) + MLP 专家 (AGENT_SACAZ_MOE_MLP)
-     *      SACAZMoETbAgent     稀疏 MoE(E=4, top-1) + TB 专家  (AGENT_SACAZ_MOE)
-     *      SACAZLegacyAgent    59e5233 行为还原版 (独立类, 自己的两支骨干)
+     *      稀疏 MoE (E=8, top-2, 专家 = MLP) + h -> out
      *
-     *  为什么 (用户口径, 同 59e5233 还原版那一套理由):
-     *    * **隔离是结构性的**: "改一支不许影响另一支"原来只能靠 git diff 自证,
-     *      现在改一个文件碰不到另一个;
-     *    * **一个类 = 一个骨干**: 不再有"同一个类背着两个界面 agent 类型"的坑;
-     *    * 四个骨干的参数量/算力对比 (实测见 docs/agents_design.md §11.4 与
-     *      test_sparse_moe) 仍然可以在 bench 里横向跑 —— 工具按骨干选**类**。
+     *  为什么拆成独立类 (用户口径, 与 59e5233 还原版 `SACAZLegacyAgent` 同一套理由):
+     *    * **隔离是结构性的, 不是约定**: "改 TB 专家那一支不许影响 MLP 专家那一支"
+     *      原来只能靠 git diff 自证 (而 diff 只证明"这一次没改"); 现在两支在**不同的
+     *      类、不同的文件**里, 改一个文件碰不到另一个。
+     *    * **一个类 = 一个骨干**: 不再有"同一个类背着两个界面 agent 类型"的坑。
+     *    * 全部实验旋钮**照旧保留** (trunkMode / rewardShape=3 的动态奖励分配 /
+     *      目标网 / 熵项 / α …), 所以 A/B 能力一位没丢。
+     *
+     *  本类**没有**的东西 (它们只属于 TB 那一支, 见 sacazmoetbagent.h):
+     *    `tbHonorHeads` / TB 头数读数 / `moeDense` (EqualParameter 对照组是 TB 才有的)。
      * ---------------------------------------------------------------- */
     /* 本类骨干的**名字** (自检面板/工具报告第一行要能回答"我是哪一支").
-       与两个 MoE 独立类同名同签名, 于是工具的报告代码对四支是同形的。 */
+       非静态: 与 TB 那一支保持同一套调用写法 (`sac.backboneName()`) —— 工具的报告
+       代码对四个骨干是同形的, 少一个特例。 */
     const char *backboneName() const;
 
     /*
@@ -210,11 +212,13 @@ public:
        ================================================================
         [2026-09 独立类] 本类**没有** TB 专家的头数口径开关 (`tbHonorHeads`)
        ================================================================
-       纯 MLP 骨干里没有 `MultiHeadAttention`, 所以"请求 15 个头却只跑 3 个"那条静默
-       降级与本类无关 —— 那个开关、四个头数读数与三个 MoE 路由读数
-       (`moeExpertCount / moeTopK / moeUsage / resetMoeUsage`) 都**只留在两个 MoE
-       独立类**里 (`SACAZMoETbAgent` / `SACAZMoEMlpAgent`)。
+       MLP 专家里没有 `MultiHeadAttention`, 所以那条"请求 15 个头却只跑 3 个"的静默
+       降级与本类无关 —— 那个开关、那四个头数读数 (`tbHeadsRequested/Used/Dim/
+       Allocated`) 以及 `tbAttentionElements()` 都**只留在 `SACAZMoETbAgent`** 里。
 
+       这条正是"独立类"想买到的东西: 拆分前它们在一个类里, MLP 专家那一支也要背着
+       一个恒为 -1 的读数与一个恒不生效的开关 (读面板的人还得先判断骨干才知道该不该
+       看那几行)。现在**结构上就没有**: 本类的自检报告里不会出现"TB 专家头数"这一节。
        来龙去脉 (降级机制 / 为什么参数指纹没报警 / 实测 15.71 ms vs 5.37 ms) 见
        `src/sacazmoetbagent.h` 的同名小节与 `docs/dev_sacazmoetb_2026_09.md`。
        ================================================================
@@ -396,12 +400,11 @@ public:
     RL::GradValue alpha;      /* 温度 α (标量, 自动调节) */
 
     /*
-       [2026-09 独立类] 这里原来还有 `Backbone backbone;` / `expertHidden` /
-       `auxLossCoef` 三个成员 —— 它们都只服务于 MoE 骨干, 现在在**两个 MoE 独立类**里
-       (`SACAZMoEMlpAgent` 用 expertHidden/auxLossCoef; `SACAZMoETbAgent` 用 auxLossCoef)。
-       本类是纯 MLP: 层形状由 `hiddenDim` 一个人决定。
+       [2026-09 独立类] 这里原来还有一个 `Backbone backbone;` 成员 —— 现在没有了:
+       本类的骨干在 `makeTrunkLayers()` 里硬编码 (稀疏 MoE(MLP 专家))。
     */
-    int hiddenDim;
+    int expertHidden;         /* MLP 专家的隐层宽度 (本类**用得上**: 专家就是 MlpExpert) */
+    float auxLossCoef;        /* 稀疏 MoE 负载均衡辅助损失的系数 (0 = 关掉) */    int hiddenDim;
     float gamma;
     float learningRateActor;
     float learningRateCritic;
@@ -492,8 +495,10 @@ public:
     /* ================================================================
      *  [2026-09 实验轮] 三组"用户提议"的旋钮 + 两个"修好版"
      * ================================================================
-     * **全部默认关闭 ⇒ 与改动前逐位相同**；只作用于建这个 agent 的进程/实例，
-     * 所以 MLP 专家 (Backbone::Mlp / SparseMoeMlp) 的代码路径一位都不动。
+     * **全部默认关闭 ⇒ 与改动前逐位相同**；只作用于建这个 agent 的进程/实例。
+     * [2026-09 独立类] 这些旋钮现在写在**本类自己的文件**里 —— 所以"只作用于本实例"
+     * 这件事从"约定"变成了**结构事实**: TB 专家那一支在 `SACAZMoETbAgent` 里,
+     * 两边连文件都不同, 改这里改不到那里。
      *
      * 背景是实测出来的那一条耦合 (见 docs/dev_sacmoetb_strength_2026_09.md §3.1/§6.1):
      *     V(s') = E_π[min Q] + α·H,   y = r − γ·V(s')
@@ -1098,7 +1103,7 @@ public:
     /* ----------------------------------------------------------------
      *  网络前向 / 软价值
      * ---------------------------------------------------------------- */
-    /* 造一个完整网络 (withGrad=false 用于目标网)。骨干已硬编码在本类里 (纯 MLP)。 */
+    /* 造一个完整网络 (withGrad=false 用于目标网)。骨干已硬编码在本类里, 无参数可选。 */
     RL::Net buildNet(bool withGrad) const;
     /*
        共享骨干的建网 (2026-09 dev-sacmoetb): 造出**一层不重复**的骨干层与三个头层,
@@ -1110,14 +1115,18 @@ public:
     void makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const;
     void makeHeadLayer(RL::Net::Layers &out, bool withGrad) const;
     /*
-       [2026-09 独立类] 这里原来还有 `makeTbExpertMoe()`、四个 TB 头数读数
-       (`tbHeadsRequested/Used/Dim/Allocated` / `tbAttentionElements`) 与四个 MoE 路由
-       读数 (`moeUsage/resetMoeUsage/moeExpertCount/moeTopK`) —— 它们**只属于 MoE 骨干**,
-       现在在两个 MoE 独立类里。本类没有 MoE 层, 这些读数在本类里恒为 0/-1, 留着只是
-       让调用方多一层"其实没东西可读"的分支。
+       [2026-09 独立类] 这里原来还有 `makeTbExpertMoe()` 与四个 TB 头数读数
+       (`tbHeadsRequested/Used/Dim/Allocated`) —— 它们**只属于 TB 那一支**, 现在
+       在 `SACAZMoETbAgent` 里。本类没有 TransformerBlock 专家, 所以结构上不存在
+       "头数被降级"这件事, 自检报告也不会再出现那一节。
     */
     /* 共享口径下的"唯一参数量"(骨干只算一次); 非共享口径 == actor+q1 (同构) */
     long long uniqueParamCount() const;
+    /* 稀疏 MoE 的坍缩诊断: actor 的第一个稀疏 MoE 层的使用计数 */
+    void moeUsage(std::vector<long long> &out) const;
+    void resetMoeUsage();
+    int moeExpertCount() const;
+    int moeTopK() const;
     /* 掩码策略 π(·|s) */
     void policy(const RL::Tensor &state, const RL::Tensor &mask, RL::Tensor &pi);
     /* 在线双 Q (搜索与策略损失用) */
@@ -1185,20 +1194,22 @@ public:
     /* ----------------------------------------------------------------
      *  AgentBase
      * ---------------------------------------------------------------- */
-    SACAZAgent(Chess &chess_,
+    SACAZMoEMlpAgent(Chess &chess_,
                int hiddenDim_ = 64,
                float gamma_ = 0.99f,
                float lr = 0.001f,
                float cpuct = 1.5f,
+               int expertHidden_ = 64,
+               float auxLossCoef_ = 0.1f,
                /*
-                  [2026-09 独立类] 构造签名里**去掉了 `Backbone` / `expertHidden` /
-                  `auxLossCoef` / `tbHonorHeads`** —— 本类是纯 MLP 骨干, 那四个参数
-                  服务的是 MoE 专家 (它们现在在 `SACAZMoEMlpAgent` / `SACAZMoETbAgent`
-                  的构造函数里)。剩下的默认值 = **改动前的口径**:
+                  [2026-09 独立类] 构造签名里**去掉了 `Backbone` 与 `tbHonorHeads_`**:
+                  本类只有一种骨干 (稀疏 MoE(MLP 专家)), 而 MLP 专家里没有
+                  MultiHeadAttention, 所以"头数口径"这个开关在本类里**不存在**
+                  (它在 `SACAZMoETbAgent` 里)。剩下的默认值 = **改动前的口径**:
                     * trunkMode_ 默认 Separate —— 既有调用点构造出来的东西与改动前**逐位相同**。
                */
                TrunkMode trunkMode_ = TrunkMode::Separate);
-    ~SACAZAgent() = default;
+    ~SACAZMoEMlpAgent() = default;
 
     Step getBestMove(int color) override;
     std::string getName() const override;
@@ -1208,12 +1219,13 @@ public:
     /* ----------------------------------------------------------------
      *  自检 (界面"模型自检"面板) —— 契约与口径见 aiagent.h 的 selfCheckReport
      *
-     *  为什么这个类特别需要它: **一个类背着两个界面 agent 类型** ——
-     *  AGENT_SACAZ (backbone = Mlp) 与 AGENT_SACAZ_MOE (backbone = SparseMoeTb,
-     *  GUI 标签 SAC+AZ-MoE)。两者的参数量、每次前向的耗时、有没有路由都完全不同,
-     *  所以报告**第一行**就报 backboneName(backbone) 与它对应的界面类型: 没有这一行,
-     *  看面板的人会把两个骨干的差别记到错的账上 (例如把 TB 专家贵 3 ms/前向 读成
-     *  "这个 agent 就是慢", 而同一份代码配 MLP 骨干并不慢)。
+     *  为什么这个类特别需要它: **[2026-09 独立类] 本类现在只对应一个界面 agent 类型**
+     *  (AGENT_SACAZ_MOE_MLP, GUI 标签 SAC+AZ-MoE-MLP, 骨干 = 稀疏 MoE(MLP 专家)) ——
+     *  原来这一支和 AGENT_SACAZ (Mlp) / AGENT_SACAZ_MOE (TB 专家) 挤在同一个类里,
+     *  几支的参数量、每次前向的耗时、有没有路由、有没有注意力头都不同, 所以报告
+     *  **第一行**必须自报家门 (`backboneName()` + `guiAgentLabel()`): 没有这一行,
+     *  看面板的人会把骨干之间的差别记到错的账上 (例如把 TB 专家贵 3 ms/前向 读成
+     *  "这个 agent 就是慢")。拆分之后这条纪律仍然保留 —— 面板上还有别的 agent。
      *
      *  报告三类事实 (全是**结构 / 口径**, 一条棋力结论都没有):
      *    1. **表示健康度**: 状态 = 14 棋子平面 x 90 格 + 3 个规则上下文标量
@@ -1254,4 +1266,4 @@ public:
     int getLastBatchSamples() const { return m_lastBatchSamples; }
 };
 
-#endif // SACAZ_AGENT_H
+#endif // SACAZ_MOEMLP_AGENT_H

@@ -67,7 +67,7 @@
 
 #include "chess.h"
 #include "abagent.h"
-#include "sacazagent.h"
+#include "sacaz_variants.h"
 #include "rl/util.hpp"
 
 /*
@@ -96,6 +96,23 @@ struct Cfg {
     std::string tbHeads = "honor";    /* honor | legacy   (见文件头) */
     std::string loadPrefix;
     std::string savePrefix;
+    /*
+       [2026-09 动态奖励分配] 四个奖励旋钮 (默认 = 出厂口径)。为什么加在这里:
+       这是唯一同时支持**四个骨干变体** + 赛前自对弈 (`--warmup-games`) + 存盘的工具,
+       所以"奖励 A/B"要覆盖 MoE-MLP 那一支就得走它 (TB 的对应实验由
+       bench_sacmoetb_train 做)。旋钮语义与那个工具**逐字相同**。
+    */
+    /*
+       [2026-09 强度对照] 评测/对弈期间是否继续"从自己的搜索学一次"。
+       默认 1 = 与界面同一口径 (界面对话里的 SAC 会在对局中继续学)。
+       做**棋力对照**时应当传 0: 那种实验要量的是"训练完之后这一版权重有多强",
+       对局中再学就把"对手也在改权重"混进来了 —— bench_sacmoetb_train 就是关着的。
+    */
+    bool learnFromSearch = true;
+    int rewardShape = 0;
+    int mateScoreMode = 0;
+    float matRewardBoost = 0.5f;
+    float mateRewardBoost = 0.5f;
     unsigned seed = 20240901;
     bool verbose = false;       /* 打印每一手 */
     bool quiet = false;         /* 只打最终一行结论 (静默验证) */
@@ -110,15 +127,11 @@ static double nowMs()
                clock::now().time_since_epoch()).count() / 1e6;
 }
 
-/* SACAZAgent::backboneName() 的反查 (命令行 -> 枚举) */
-static bool parseBackbone(const std::string &s, SACAZAgent::Backbone &out)
-{
-    if (s == "mlp")          { out = SACAZAgent::Backbone::Mlp;          return true; }
-    if (s == "moe-mlp")      { out = SACAZAgent::Backbone::SparseMoeMlp; return true; }
-    if (s == "tb")           { out = SACAZAgent::Backbone::SparseMoeTb;  return true; }
-    if (s == "dense-tb")     { out = SACAZAgent::Backbone::DenseMoeTb;   return true; }
-    return false;
-}
+/*
+   [2026-09 独立类拆分] 这里原来有一个 `parseBackbone` (命令行 -> `SACAZAgent::Backbone`)。
+   现在命令行 -> 骨干的映射只有一处: `test/sacaz_variants.h` 的 `sacazx::parseVariant`,
+   四个取值 (mlp / moe-mlp / tb / dense-tb) 的拼写与拆分前**逐字相同**。
+*/
 
 /* ============================================================
  *  一局的统计
@@ -186,7 +199,8 @@ static void randomOpening(Chess &c, int &turn, int plies)
 /* ============================================================
  *  打一局 (逐手校验合法性 —— 这是这个基准唯一的"断言")
  * ============================================================ */
-static GameStat playGame(Chess &c, SACAZAgent &sac, ABAgent &ab,
+template <class A>
+static GameStat playGame(Chess &c, A &sac, ABAgent &ab,
                          bool sacIsRed, int simsForSac)
 {
     GameStat g;
@@ -272,7 +286,8 @@ static GameStat playGame(Chess &c, SACAZAgent &sac, ABAgent &ab,
 }
 
 /* SAC+AZ 的 ms/模拟 (等时间模式的标定) */
-static double calibrateMsPerSim(Chess &c, SACAZAgent &sac)
+template <class A>
+static double calibrateMsPerSim(Chess &c, A &sac)
 {
     const int probeSims = 4;
     double total = 0.0;
@@ -307,13 +322,14 @@ static double calibrateMsPerSim(Chess &c, SACAZAgent &sac)
  *     (实测踩到过)。初始局面永远有 44 个合法走法, 是稳定的参照点。
  *   * 棋盘被 reset 不影响 agent (它们只在调用期间持有 Chess&, 不缓存局面)。
  */
-static bool numericHealth(Chess &c, SACAZAgent &sac, double &qmax, double &piDev)
+template <class A>
+static bool numericHealth(Chess &c, A &sac, double &qmax, double &piDev)
 {
     c.reset();
-    RL::Tensor state(SACAZAgent::STATE_DIM, 1);
+    RL::Tensor state(A::STATE_DIM, 1);
     std::vector<Step*> legal;
     std::vector<int> idx;
-    RL::Tensor mask(SACAZAgent::ACTION_DIM, 1);
+    RL::Tensor mask(A::ACTION_DIM, 1);
     sac.getLegalActions(Stone::COLOR_RED, legal, idx, mask);
     Steps::instance().put(legal);
     sac.encodeStateFor(Stone::COLOR_RED, state);
@@ -325,16 +341,16 @@ static bool numericHealth(Chess &c, SACAZAgent &sac, double &qmax, double &piDev
         return true;
     }
 
-    RL::Tensor pi(SACAZAgent::ACTION_DIM, 1);
-    RL::Tensor q1(SACAZAgent::ACTION_DIM, 1);
-    RL::Tensor q2(SACAZAgent::ACTION_DIM, 1);
+    RL::Tensor pi(A::ACTION_DIM, 1);
+    RL::Tensor q1(A::ACTION_DIM, 1);
+    RL::Tensor q2(A::ACTION_DIM, 1);
     sac.policy(state, mask, pi);
     sac.qValues(state, q1, q2);
 
     bool finite = true;
     qmax = 0.0;
     double piSum = 0.0;
-    for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+    for (int a = 0; a < A::ACTION_DIM; a++) {
         if (!std::isfinite(pi[a]) || !std::isfinite(q1[a]) || !std::isfinite(q2[a])) {
             finite = false;
         }
@@ -367,6 +383,11 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--warmup-sims"))  { g_cfg.warmupSims = std::atoi(v); }
         else if (const char *v = val("--backbone")){ g_cfg.backbone = v; }
         else if (const char *v = val("--trunk"))   { g_cfg.trunk = v; }
+        else if (const char *v = val("--learn-from-search")){ g_cfg.learnFromSearch = (std::atoi(v) != 0); }
+        else if (const char *v = val("--reward-shape")){ g_cfg.rewardShape = std::atoi(v); }
+        else if (const char *v = val("--pos-score-mode")){ g_cfg.mateScoreMode = std::atoi(v); }
+        else if (const char *v = val("--pos-mat-boost")){ g_cfg.matRewardBoost = (float)std::atof(v); }
+        else if (const char *v = val("--pos-mate-boost")){ g_cfg.mateRewardBoost = (float)std::atof(v); }
         else if (const char *v = val("--tb-heads")){ g_cfg.tbHeads = v; }
         else if (const char *v = val("--load"))    { g_cfg.loadPrefix = v; }
         else if (const char *v = val("--save"))    { g_cfg.savePrefix = v; }
@@ -408,8 +429,14 @@ int main(int argc, char **argv)
     parseArgs(argc, argv);
     RL::Random::setSeed(g_cfg.seed);
 
-    SACAZAgent::Backbone backbone = SACAZAgent::Backbone::SparseMoeTb;
-    if (!parseBackbone(g_cfg.backbone, backbone)) {
+    /*
+       [2026-09 独立类拆分] `--backbone` 的四个取值现在对应**四个不同的类**
+       (见 test/sacaz_variants.h)。这里按变体构造, 再把"对局 + 逐手校验"整段交给
+       模板 `runSacVsAb<A>` —— 于是"四个骨干跑的是不是同一段代码"是编译期事实。
+       `--trunk` / `--tb-heads` 两个开关照旧透给构造函数。
+    */
+    sacazx::Variant variant;
+    if (!sacazx::parseVariant(g_cfg.backbone, variant)) {
         std::printf("[错误] 未知骨干: %s (可选: mlp / moe-mlp / tb / dense-tb)\n",
                     g_cfg.backbone.c_str());
         return 1;
@@ -419,34 +446,56 @@ int main(int argc, char **argv)
     Chess c;
     c.reset();
 
+    sacazx::Opts o;
+    o.shared = (g_cfg.trunk == "shared");
+    o.tbHonorHeads = (g_cfg.tbHeads == "honor");
+    return sacazx::withSacazAgent(c, variant, o, [&](auto &sac) {
+        /*
+           [2026-09 动态奖励分配] 奖励旋钮在**训练之前**写进实例 (warmup 就在 runSacVsAb 里)。
+           走 visit: lambda 里是真实类型, 与拆分前 `sac.rewardShape = ...` 同一件事。
+        */
+        sac.learnFromSearch = g_cfg.learnFromSearch;
+        sac.rewardShape = g_cfg.rewardShape;
+        sac.mateScoreMode = g_cfg.mateScoreMode;
+        sac.matRewardBoost = g_cfg.matRewardBoost;
+        sac.mateRewardBoost = g_cfg.mateRewardBoost;
+        return runSacVsAb(sac, c, variant);
+    }, 1);
+}
+
+/*
+ * [2026-09 独立类拆分] 主体从 main 抽成模板: 对四个类**写法完全同形** ——
+ * 公共 API + `A::STATE_DIM/ACTION_DIM` + 两个 trait
+ * (`sacazx::MoeInfo` / `sacazx::TbHeadInfo`, 把"只有某些骨干才有的读数"抹平)。
+ * 只属于某些骨干的读数 (专家数 / 注意力头) 在别的骨干上返回 0 / -1, 与拆分前一致。
+ */
+template <class A>
+int runSacVsAb(A &sac, Chess &c, sacazx::Variant variant)
+{
     const double tBuild0 = nowMs();
     /*
        参数与 GUI 的 SAC+AZ-MoE 完全一致 (SACAZ_HIDDEN/SACAZ_MOE_AUX + lr 0.001,
        c_puct 1.5, 模拟次数见 --sims 或 --budget)。
-       `--trunk` / `--tb-heads` 两个开关直接透给构造函数 (见文件头的说明)。
        内存: 独立口径下五个 TB 网约 1.6 GB; 共享口径下 2.50x 的参数降幅
        (test_sacaz [17B]: 143,903,940 -> 57,586,536)。
     */
-    const SACAZAgent::TrunkMode trunkMode =
-        (g_cfg.trunk == "shared") ? SACAZAgent::TrunkMode::Shared
-                                  : SACAZAgent::TrunkMode::Separate;
-    const bool honorHeads = (g_cfg.tbHeads == "honor");
-    SACAZAgent sac(c, 64, 0.99f, 0.001f, 1.5f, backbone, 64, 0.1f, trunkMode, honorHeads);
     ABAgent ab(c, g_cfg.depth);
     const double tBuild1 = nowMs();
 
     if (!g_cfg.quiet) {
         std::printf("=== SAC+AZ(骨干=%s) vs Alpha-Beta 静默对弈验证 ===\n",
-                    SACAZAgent::backboneName(backbone));
+                    sac.backboneName());
         std::printf("结构    : %s | TB 头口径 %s (请求 %d / 实际 %d / 分配 %d, d_k=%d,"
                     " 注意力元素 %lld)\n",
-                    SACAZAgent::trunkModeName(trunkMode),
-                    honorHeads ? "honor (按请求头数)" : "legacy (最大整除因子)",
-                    sac.tbHeadsRequested(), sac.tbHeadsUsed(), sac.tbHeadsAllocated(),
-                    sac.tbHeadDim(), sac.tbAttentionElements());
+                    A::trunkModeName(sac.trunkMode),
+                    g_cfg.tbHeads == "honor" ? "honor (按请求头数)" : "legacy (最大整除因子)",
+                    sacazx::TbHeadInfo<A>::requested(sac), sacazx::TbHeadInfo<A>::used(sac),
+                    sacazx::TbHeadInfo<A>::allocated(sac), sacazx::TbHeadInfo<A>::dim(sac),
+                    sacazx::TbHeadInfo<A>::elements(sac));
         std::printf("SAC+AZ  : state=%d action=%d  专家=%d topK=%d  唯一参数量=%lld\n",
-                    SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM,
-                    sac.moeExpertCount(), sac.moeTopK(), sac.uniqueParamCount());
+                    A::STATE_DIM, A::ACTION_DIM,
+                    sacazx::MoeInfo<A>::expertCount(sac), sacazx::MoeInfo<A>::topK(sac),
+                    sac.uniqueParamCount());
         std::printf("AB      : 深度 %d\n", g_cfg.depth);
         std::printf("规则    : %d 局 (交换先后手), 每局最多 %d 手, 随机开局 %d 步, seed=%u\n",
                     g_cfg.games, g_cfg.maxPlies, g_cfg.openingPlies, g_cfg.seed);
@@ -543,7 +592,7 @@ int main(int argc, char **argv)
 
     /* ---- MoE 路由诊断 (top-1 最容易坍缩) ---- */
     std::vector<long long> usage;
-    sac.moeUsage(usage);
+    sacazx::MoeInfo<A>::usage(sac, usage);
     long long usageTotal = 0;
     int unused = 0;
     long long usageMax = 0;
@@ -576,6 +625,23 @@ int main(int argc, char **argv)
         }
         std::printf("  max/均值=%.2f, 未用到=%d\n",
                     usageMean > 0.0 ? (double)usageMax / usageMean : 0.0, unused);
+        /*
+           [2026-09 奖励复核] 终局通道的样本量: 判"后期杀将加权"这类旋钮活/死的唯一读数
+           (只有 done 且分胜负的样本携带杀将奖励; 和棋的终局值恒 0)。
+        */
+        {
+            const auto &D = sacazx::diagOf(sac);
+            if (D.n > 0) {
+                std::printf("  训练诊断  : 样本=%lld 被夹=%lld(%.1f%%) |y|均=%.4f |Q|均=%.4f "
+                            "Q间距均=%.4f\n",
+                            D.n, D.clamped, 100.0 * (double)D.clamped / (double)D.n,
+                            D.yPreAbsSum / (double)D.n, D.qAbsMeanSum / (double)D.n,
+                            D.qSpreadSum / (double)D.n);
+                std::printf("  终局通道  : done 样本=%lld (%.4f%%) 其中分胜负=%lld (%.4f%%)\n",
+                            D.doneSamples, 100.0 * (double)D.doneSamples / (double)D.n,
+                            D.decisiveSamples, 100.0 * (double)D.decisiveSamples / (double)D.n);
+            }
+        }
         std::printf("  总耗时    : %.1f s\n", elapsed);
     }
 
@@ -597,7 +663,7 @@ int main(int argc, char **argv)
     std::printf("VERDICT: %s | 骨干=%s 局数=%d 比分=%d/%d/%d 违规=%d 数值有限=%d "
                 "Σπ偏差=%.1e 专家使用=%lld(未用到 %d)\n",
                 mechanismOk ? "PASS" : "FAIL",
-                SACAZAgent::backboneName(backbone), g_cfg.games,
+                sac.backboneName(), g_cfg.games,
                 sacWins, abWins, draws, broken, (int)allFinite, worstPiDev,
                 usageTotal, unused);
 

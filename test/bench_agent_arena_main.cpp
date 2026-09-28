@@ -50,7 +50,7 @@
 #include "chess.h"
 #include "abagent.h"
 #include "mcts.h"
-#include "sacazagent.h"
+#include "sacaz_variants.h"
 #include "ppomcts_agent.h"
 #include "rl/ppo.h"
 #include "rl/util.hpp"
@@ -168,12 +168,12 @@ static const char *kindName(Kind k)
     }
 }
 
-static bool parseSacBackbone(const std::string &s, SACAZAgent::Backbone &out)
+static bool parseSacBackbone(const std::string &s, sacazx::Variant &out)
 {
-    if (s == "mlp")      { out = SACAZAgent::Backbone::Mlp;          return true; }
-    if (s == "moe-mlp")  { out = SACAZAgent::Backbone::SparseMoeMlp; return true; }
-    if (s == "tb")       { out = SACAZAgent::Backbone::SparseMoeTb;  return true; }
-    if (s == "dense-tb") { out = SACAZAgent::Backbone::DenseMoeTb;   return true; }
+    if (s == "mlp")      { out = sacazx::Variant::Mlp;        return true; }
+    if (s == "moe-mlp")  { out = sacazx::Variant::MoeMlp;     return true; }
+    if (s == "tb")       { out = sacazx::Variant::MoeTb;      return true; }
+    if (s == "dense-tb") { out = sacazx::Variant::DenseMoeTb; return true; }
     return false;
 }
 
@@ -253,7 +253,7 @@ struct Agent {
     Kind kind = Kind::NONE;
     std::string label;
     std::string backboneName;
-    std::unique_ptr<SACAZAgent> sac;
+    std::unique_ptr<sacazx::AnySac> sac;   /* [2026-09 独立类] 任意骨干的 SAC+AZ */
     std::unique_ptr<PPOMCTSAgent> ppo;
     std::unique_ptr<MCTS> mcts;
     std::unique_ptr<ABAgent> ab;
@@ -280,8 +280,9 @@ struct Agent {
     void pollLoss(int &reported, float &first, float &last)
     {
         if (!trainable()) { return; }
-        const float v = (kind == Kind::SAC) ? sac->getLastTrainLoss()
-                                            : ppo->getLastTrainLoss();
+        const float v = (kind == Kind::SAC)
+                            ? sac->visit([](auto &s) { return s.getLastTrainLoss(); })
+                            : ppo->getLastTrainLoss();
         if (std::isnan(v)) { return; }
         if (std::isnan(lastLoss) || v != lastLoss) {
             reported++;
@@ -301,7 +302,9 @@ struct Agent {
 
     long long paramCount() const
     {
-        if (kind == Kind::SAC) { return sac->actor.paramCount(); }
+        if (kind == Kind::SAC) {
+            return sac->visit([](auto &s) { return s.actor.paramCount(); });
+        }
         if (kind == Kind::PPO) { return ppo->actorParamCount(); }
         return 0;
     }
@@ -490,9 +493,13 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
         std::vector<Step*> legal;
         std::vector<int> idx;
         if (ag.kind == Kind::SAC) {
-            ag.sac->getLegalActions(turn, legal, idx, mask);
-            ag.sac->encodeStateFor(turn, state);
-            ag.sac->policy(state, mask, pi);
+            /* [2026-09 独立类] 骨干相关的调用走 visit (lambda 里是**真实类型**,
+               三个类各实例化一份 —— 编译期派发, 不是 dynamic_cast) */
+            ag.sac->visit([&](auto &s) {
+                s.getLegalActions(turn, legal, idx, mask);
+                s.encodeStateFor(turn, state);
+                s.policy(state, mask, pi);
+            });
         } else {
             /* PPO 的策略走它自己的稀疏入口 (RL::PPO::actionMasked 是公开的, 见 ppo.h);
                掩码仍由 agent 的 getLegalActions 给出, 与搜索内部同一口径。 */
@@ -522,7 +529,7 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
         int qn = 0;
         if (ag.kind == Kind::SAC) {
             RL::Tensor q1(actionDim, 1), q2(actionDim, 1);
-            ag.sac->qValues(state, q1, q2);
+            ag.sac->visit([&](auto &s) { s.qValues(state, q1, q2); });
             for (int a = 0; a < actionDim; a++) {
                 if (mask[a] <= 0.5f) { continue; }
                 const double q = std::min((double)q1[a], (double)q2[a]);
@@ -569,8 +576,9 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
         out.qAbsMean /= n;
     }
     out.alpha = (ag.kind == Kind::SAC) ? (double)ag.sac->getAlpha() : 0.0;
-    out.loss = (double)((ag.kind == Kind::SAC) ? ag.sac->getLastTrainLoss()
-                                               : ag.ppo->getLastTrainLoss());
+    out.loss = (double)((ag.kind == Kind::SAC)
+                            ? ag.sac->visit([](auto &s) { return s.getLastTrainLoss(); })
+                            : ag.ppo->getLastTrainLoss());
 
     std::printf("  %-28s 样本=%3d  合法数=%.1f  策略熵=%.3f (归一 %.3f)  "
                 "top1=%.3f  |Q|=%.3f [%.3f, %.3f]  alpha=%.3f loss=%.5g  (%.1f s)\n",
@@ -586,25 +594,36 @@ static void buildAgent(Agent &ag, Kind kind, Chess &c)
     ag.kind = kind;
     switch (kind) {
     case Kind::SAC: {
-        SACAZAgent::Backbone bb = SACAZAgent::Backbone::Mlp;
+        sacazx::Variant bb = sacazx::Variant::Mlp;
         if (!parseSacBackbone(g_cfg.backboneSac, bb)) {
             std::printf("[错误] 未知 SAC 骨干: %s\n", g_cfg.backboneSac.c_str());
             std::exit(1);
         }
-        ag.sac.reset(new SACAZAgent(c, g_cfg.sacHidden, 0.99f, 0.001f,
-                                    g_cfg.sacCpuct, bb, 64, 0.1f));
-        ag.sac->valueScale = g_cfg.sacValueScale;
-        /* 消融旋钮 (默认值 = 当前实现, 所以不传参时行为不变) */
-        ag.sac->clampTarget = g_cfg.sacClampTarget;
-        ag.sac->huberDelta = g_cfg.sacHuber;
-        ag.sac->entropyRatio = g_cfg.sacEntropyRatio;
-        ag.sac->learningRateAlpha = g_cfg.sacAlphaLr;
-        ag.sac->rewardScale = g_cfg.sacRewardScale;
-        ag.sac->legacyHashAction = g_cfg.sacLegacyHash;
-        if (g_cfg.sacResetInterval > 0) {
-            ag.sac->replaceTargetIter = g_cfg.sacResetInterval;
-        }
-        ag.backboneName = SACAZAgent::backboneName(bb);
+        /*
+           [2026-09 独立类拆分] 这一支原来是 `SACAZAgent` + `Backbone` 枚举; 现在骨干 =
+           **类型**, 所以用 `sacazx::AnySac` (三个类里选一个, 存起来) + `visit` 设旋钮。
+           旋钮名与拆分前**逐字相同** (valueScale / clampTarget / …), 只是从 `ag.sac->x`
+           变成 `visit` 里的 `s.x`。
+        */
+        sacazx::Opts o;
+        o.hidden = g_cfg.sacHidden;
+        o.cpuct = g_cfg.sacCpuct;
+        o.aux = 0.1f;
+        ag.sac.reset(new sacazx::AnySac(c, bb, o));
+        ag.sac->visit([&](auto &s) {
+            s.valueScale = g_cfg.sacValueScale;
+            /* 消融旋钮 (默认值 = 当前实现, 所以不传参时行为不变) */
+            s.clampTarget = g_cfg.sacClampTarget;
+            s.huberDelta = g_cfg.sacHuber;
+            s.entropyRatio = g_cfg.sacEntropyRatio;
+            s.learningRateAlpha = g_cfg.sacAlphaLr;
+            s.rewardScale = g_cfg.sacRewardScale;
+            s.legacyHashAction = g_cfg.sacLegacyHash;
+            if (g_cfg.sacResetInterval > 0) {
+                s.replaceTargetIter = g_cfg.sacResetInterval;
+            }
+        });
+        ag.backboneName = sacazx::variantName(bb);
         ag.label = std::string("SAC+AZ/") + ag.backboneName;
         break;
     }

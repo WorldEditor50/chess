@@ -135,6 +135,8 @@ set(CHESS_CORE_SOURCES
     ${SRC_DIR}/dqnmcts_agent.cpp
     ${SRC_DIR}/evagent.cpp
     ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
     ${SRC_DIR}/sacazlegacyagent.cpp
     ${SRC_DIR}/dqnabagent.cpp
     ${SRC_DIR}/chessboard.cpp
@@ -618,7 +620,14 @@ if(CHESS_BUILD_TESTS)
     # ([2.12] EVAB + [2.13] SAC+AZ / SAC+AZ-MoE / DQN+AB), 而其中两个 agent 的一轮
     # 本身是分钟级 (稀疏 MoE 的前向 + ~276 MB 权重的临时文件往返)。实测本机 250 s,
     # 原来的 600 s 在慢一点的机器上会擦边。
-    set_tests_properties(test_match PROPERTIES TIMEOUT 900
+    #
+    # TIMEOUT 900 -> 2700 (2026-09 独立类拆分): 900 s **早就已经不够** —— 而且这**不是**
+    # 本轮改动造成的: 改动前的 ctest 记录里就是同一条失败
+    # (.r1build/ctest_after.log: `Test #6: test_match ***Timeout 900.32 sec`, 93% passed)。
+    # 单独跑实测 **314 项断言 0 失败、1608 s** (Release/AVX2, 本机)。
+    # 也就是说这是**预算过期**, 不是测试坏了 —— 按实测值放宽到 45 分钟 (留 ~1.7x 余量),
+    # 而不是让它继续以"Timeout = 失败"的样子挂在 ctest 汇总里。
+    set_tests_properties(test_match PROPERTIES TIMEOUT 2700
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir}")
 
@@ -642,6 +651,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/ppomcts_agent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/dqnabagent.cpp)
     target_include_directories(repro_concurrency PRIVATE ${SRC_DIR})
@@ -820,6 +831,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_moe PRIVATE ${SRC_DIR})
     target_link_libraries(bench_moe PRIVATE
@@ -933,6 +946,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/abagent.cpp)
     target_include_directories(bench_sacaz_vs_ab PRIVATE ${SRC_DIR})
@@ -988,6 +1003,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_sac_mcts_min PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sac_mcts_min PRIVATE
@@ -1018,7 +1035,9 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/abagent.cpp
-        ${SRC_DIR}/sacazagent.cpp)
+        ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp)
     target_include_directories(bench_sacmoetb_train PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sacmoetb_train PRIVATE
         RL_CORE
@@ -1044,6 +1063,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(bench_sac_learn PRIVATE ${SRC_DIR})
     target_link_libraries(bench_sac_learn PRIVATE
@@ -1069,6 +1090,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp)
     target_compile_definitions(bench_sac_mcts_min_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
     target_include_directories(bench_sac_mcts_min_aligned PRIVATE ${SRC_DIR})
@@ -1094,6 +1117,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(probe_sac_head_grad PRIVATE ${SRC_DIR})
@@ -1130,6 +1155,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/abagent.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(bench_agent_arena PRIVATE ${SRC_DIR})
@@ -1165,6 +1192,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/mcts.cpp
         ${SRC_DIR}/abagent.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_include_directories(bench_agent_arena_ab PRIVATE ${SRC_DIR})
@@ -1226,6 +1255,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/dqnagent.cpp
         ${SRC_DIR}/dqnmcts_agent.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/evagent.cpp)
     target_include_directories(test_reward_diag PRIVATE ${SRC_DIR})
@@ -1477,6 +1508,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
         ${SRC_DIR}/ppomcts_agent.cpp)
     target_compile_definitions(test_sacaz_aligned PRIVATE SACAZ_ALIGNED_REPR=1)
@@ -1499,6 +1532,8 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
         ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp)
     target_include_directories(test_sacaz PRIVATE ${SRC_DIR})
     target_link_libraries(test_sacaz PRIVATE

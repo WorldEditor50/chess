@@ -303,6 +303,12 @@ int main(int argc, char *argv[])
             { ChessBoard::AGENT_EVAB,      "EVAB",         true },
             { ChessBoard::AGENT_SACAZ,     "SAC+AZ",       true },
             { ChessBoard::AGENT_SACAZ_MOE, "SAC+AZ-MoE",   true },
+            /*
+               [2026-09 独立类] 稀疏 MoE + **MLP 专家**那一支 (独立类 SACAZMoEMlpAgent)。
+               它是**新增的界面 agent 类型** —— 这一条覆盖的是"下拉框里选得到它、
+               显示名与损失上报都接上了" (接口层面的证据, 不用开 GUI)。
+            */
+            { ChessBoard::AGENT_SACAZ_MOE_MLP, "SAC+AZ-MoE-MLP", true },
             /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent): 显示名与"上报损失"都要接上 */
             { ChessBoard::AGENT_SACAZ_OLD, "SAC+AZ-59e5233", true },
             { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP", true }
@@ -1804,6 +1810,9 @@ int main(int argc, char *argv[])
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
+            /* [2026-09 独立类] MoE+MLP 那一支 (新增的界面 agent 类型): 自检/权重状态
+               两条读数都要能拿到 —— 这是"下拉框里选得到它"的接口层证据 */
+            ChessBoard::AGENT_SACAZ_MOE_MLP,
             ChessBoard::AGENT_PPOMCTS_MLP,
             /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent), 2026-09 新增 */
             ChessBoard::AGENT_SACAZ_OLD

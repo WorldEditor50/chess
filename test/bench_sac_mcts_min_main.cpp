@@ -31,7 +31,7 @@
 
 #include "chess.h"
 #include "mcts.h"
-#include "sacazagent.h"
+#include "sacaz_variants.h"
 #include "rl/util.hpp"
 
 namespace {
@@ -43,6 +43,19 @@ struct Cfg {
     int openingPlies = 4;
     unsigned seed = 20240901;
     std::string backbone = "moe-mlp";
+    /*
+       [2026-09 独立类] 骨干共享口径: separate (五张网各背一套骨干) | shared (一份骨干+三头)。
+       默认 separate = 拆分前这一支的口径 (也是界面 AGENT_SACAZ 的口径);
+       界面 AGENT_SACAZ_MOE / AGENT_SACAZ_MOE_MLP 走的是 shared —— 要复现界面读数就得传它。
+    */
+    std::string trunk = "separate";
+    /*
+       [2026-09 强度对照] 评测期间是否继续"从自己的搜索学一次"。
+       默认 1 = 界面口径 (对局中继续学); 做棋力对照时传 0 —— 否则"对手也在改权重",
+       量到的不是"这一版权重有多强"。也让每次决策不再多付一次 learnBatch
+       (MoE-MLP 实测那一步约 47 ms, 是搜索本身的十几倍)。
+    */
+    bool learnFromSearch = true;
     /*
        TB 专家的头数口径 (见 main 里 --tb-heads 的说明)。默认 = `SACAZAgent` 的新默认
        (**honor**), 与界面一致; 要复现改动前的 TB 走法序列就传 `legacy`。
@@ -85,14 +98,10 @@ static double nowMs()
                clock::now().time_since_epoch()).count() / 1e6;
 }
 
-static bool parseBackbone(const std::string &s, SACAZAgent::Backbone &out)
-{
-    if (s == "mlp")      { out = SACAZAgent::Backbone::Mlp;          return true; }
-    if (s == "moe-mlp")  { out = SACAZAgent::Backbone::SparseMoeMlp; return true; }
-    if (s == "tb")       { out = SACAZAgent::Backbone::SparseMoeTb;  return true; }
-    if (s == "dense-tb") { out = SACAZAgent::Backbone::DenseMoeTb;   return true; }
-    return false;
-}
+/*
+   [2026-09 独立类拆分] `parseBackbone()` 删掉了 —— 命令行 -> 骨干的映射现在只有一处
+   (test/sacaz_variants.h 的 `sacazx::parseVariant`), 四个类各自的名字也在那边。
+*/
 
 static void randomOpening(Chess &c, int &turn, int plies)
 {
@@ -186,6 +195,8 @@ int main(int argc, char **argv)
            而报告里只差一个词)。
         */
         else if (const char *v = val("--tb-heads")) { g.tbHeads = v; }
+        else if (const char *v = val("--trunk")) { g.trunk = v; }
+        else if (const char *v = val("--learn-from-search")) { g.learnFromSearch = (std::atoi(v) != 0); }
         /*
            --legacy-net 已删除 (2026-09): 那个开关想用 `TanhNorm<Linear>` 且 r=1 复现
            59e5233 的隐层激活, 实测**不等价** (TanhNorm 的偏置加在 tanh 外面;
@@ -199,9 +210,16 @@ int main(int argc, char **argv)
     if (g.games % 2 != 0) { g.games++; }
     RL::Random::setSeed(g.seed);
 
-    SACAZAgent::Backbone bb = SACAZAgent::Backbone::SparseMoeMlp;
-    if (!parseBackbone(g.backbone, bb)) {
-        std::printf("[错误] 未知骨干 %s\n", g.backbone.c_str());
+    /*
+       [2026-09 独立类拆分] `--backbone` 的四个取值现在对应**四个不同的类**
+       (见 test/sacaz_variants.h), 不再是同一个类的四个枚举值 —— 所以这里按变体
+       构造, 再把"跑对局"那一整段交给模板 `runSacVsMcts<A>`。
+       命令行拼写、默认值 (`moe-mlp`) 与拆分前**逐字相同**。
+    */
+    sacazx::Variant variant;
+    if (!sacazx::parseVariant(g.backbone, variant)) {
+        std::printf("[错误] 未知骨干 %s (可选 mlp / moe-mlp / tb / dense-tb)\n",
+                    g.backbone.c_str());
         return 1;
     }
     if (g.tbHeads != "honor" && g.tbHeads != "legacy") {
@@ -211,9 +229,23 @@ int main(int argc, char **argv)
 
     Chess board;
     board.reset();
-    const SACAZAgent::TrunkMode trunkMode = SACAZAgent::TrunkMode::Separate;
-    const bool honorHeads = (g.tbHeads == "honor");
-    SACAZAgent sac(board, 64, 0.99f, 0.001f, 1.5f, bb, 64, 0.1f, trunkMode, honorHeads);
+    sacazx::Opts o;
+    o.shared = (g.trunk == "shared");
+    o.tbHonorHeads = (g.tbHeads == "honor");
+    return sacazx::withSacazAgent(board, variant, o, [&](auto &sac) {
+        sac.learnFromSearch = g.learnFromSearch;   /* [2026-09] 棋力对照要关掉对局中学习 */
+        return runSacVsMcts(sac, board, g);
+    }, 1);
+}
+
+/*
+ * [2026-09 独立类拆分] 主体从 main 抽成**模板**: `--backbone` 的四个取值是不同的类,
+ * 而这一段代码对四个类的写法**完全同形** (只用公共 API + `A::STATE_DIM/ACTION_DIM`)。
+ * 抽出来之后 "四个骨干跑的是不是同一段代码" 变成编译期事实, 而不是四份复制粘贴。
+ */
+template <class A>
+int runSacVsMcts(A &sac, Chess &board, const Cfg &g)
+{
     MCTS mcts(board, 1.414);
 
     /*
@@ -265,9 +297,10 @@ int main(int argc, char **argv)
     }
 
     std::printf("=== SAC(min) vs MCTS ===\n");
-    std::printf("SAC     : state=%d action=%d 骨干=%s 参数(actor)=%lld%s\n",
-                SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM,
-                SACAZAgent::backboneName(bb), sac.actor.paramCount(),
+    std::printf("SAC     : state=%d action=%d 骨干=%s trunk=%s 模拟=%d 参数(actor)=%lld%s\n",
+                A::STATE_DIM, A::ACTION_DIM,
+                sac.backboneName(), g.trunk.c_str(), g.sims,
+                sac.actor.paramCount(),
                 g.load.empty() ? " [随机权重]" : " [已载入权重]");
     std::printf("协议    : %d 局(交换先后手) 每步 %d 模拟 上限 %d 手 随机开局 %d 步 seed=%u\n\n",
                 g.games, g.sims, g.maxPlies, g.openingPlies, g.seed);
@@ -283,11 +316,11 @@ int main(int argc, char **argv)
         int turn0 = Stone::COLOR_RED;
         randomOpening(board, turn0, g.openingPlies);
         const int turn = board.sideToMove;
-        RL::Tensor st(SACAZAgent::STATE_DIM, 1);
-        RL::Tensor mk(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor pv(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor q1(SACAZAgent::ACTION_DIM, 1);
-        RL::Tensor q2(SACAZAgent::ACTION_DIM, 1);
+        RL::Tensor st(A::STATE_DIM, 1);
+        RL::Tensor mk(A::ACTION_DIM, 1);
+        RL::Tensor pv(A::ACTION_DIM, 1);
+        RL::Tensor q1(A::ACTION_DIM, 1);
+        RL::Tensor q2(A::ACTION_DIM, 1);
         std::vector<Step*> lg;
         std::vector<int> li;
         sac.getLegalActions(turn, lg, li, mk);
@@ -296,12 +329,12 @@ int main(int argc, char **argv)
         sac.policy(st, mk, pv);
         sac.qValues(st, q1, q2);
         std::printf("[dump-forward] 状态维=%d 动作维=%d 合法=%zu\n",
-                    SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM, li.size());
+                    A::STATE_DIM, A::ACTION_DIM, li.size());
         double ssum = 0.0, psum = 0.0, qsum = 0.0;
         for (std::size_t i = 0; i < st.size(); i++) {
             ssum += std::fabs((double)st[i]) * (double)((i % 89) + 1);
         }
-        for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+        for (int a = 0; a < A::ACTION_DIM; a++) {
             psum += (double)pv[a] * (double)(a + 1);
             qsum += (double)q1[a] * (double)(a + 1);
         }
@@ -338,21 +371,21 @@ int main(int argc, char **argv)
         }
         Steps::instance().put(before);
 
-        RL::Tensor piDump(SACAZAgent::ACTION_DIM, 1);
+        RL::Tensor piDump(A::ACTION_DIM, 1);
         const Step chosen = sac.selectMove(board.sideToMove, g.sims, 0.0f, &piDump);
         std::printf("[dump-root] 选点 (%d,%d)->(%d,%d)\n",
                     chosen.pos.x, chosen.pos.y, chosen.nextPos.x, chosen.nextPos.y);
         double sum = 0.0;
-        for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) { sum += (double)piDump[a]; }
+        for (int a = 0; a < A::ACTION_DIM; a++) { sum += (double)piDump[a]; }
         std::printf("[dump-root] 根分布: Σ=%f, 非零槽位=%d\n", sum, [&] {
             int c = 0;
-            for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) { if (piDump[a] > 0.0f) { c++; } }
+            for (int a = 0; a < A::ACTION_DIM; a++) { if (piDump[a] > 0.0f) { c++; } }
             return c;
         }());
         for (int rank = 0; rank < 8; rank++) {
             int best = -1;
             double bv = -1.0;
-            for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+            for (int a = 0; a < A::ACTION_DIM; a++) {
                 if ((double)piDump[a] > bv) { bv = (double)piDump[a]; best = a; }
             }
             if (best < 0 || bv <= 0.0) { break; }
@@ -375,7 +408,7 @@ int main(int argc, char **argv)
         if (mvDump != nullptr) {
             std::fprintf(mvDump, "# state=%d action=%d sims=%d plies=%d opening=%d "
                                  "seed=%u mctsSrand=%u\n",
-                         SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM, g.sims,
+                         A::STATE_DIM, A::ACTION_DIM, g.sims,
                          g.maxPlies, g.openingPlies, g.seed, g.mctsSrand);
         }
     }
@@ -487,7 +520,7 @@ int main(int argc, char **argv)
                             "wins,losses,draws,broken,score_rate,lo,hi,elo\n");
             std::fprintf(f, "min,%d,%d,%d,%d,%u,%s,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.2f\n",
                          st.n(), g.sims, g.maxPlies, g.openingPlies, g.seed,
-                         g.backbone.c_str(), SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM,
+                         g.backbone.c_str(), A::STATE_DIM, A::ACTION_DIM,
                          st.wins, st.losses, st.draws, st.broken,
                          st.rate(), lo, hi, st.eloDiff());
             std::fclose(f);

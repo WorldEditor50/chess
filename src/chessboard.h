@@ -40,6 +40,16 @@
 */
 class SACAZLegacyAgent;
 
+/*
+   AGENT_SACAZ_MOE 的实例类型。**[2026-09 独立类拆分]** 它原来也是 SACAZAgent
+   (只是构造时传 `Backbone::SparseMoeTb`), 现在 TB 专家那一支是**自己的类**
+   `SACAZMoETbAgent` (src/sacazmoetbagent.h/.cpp) —— 与 SACAZAgent / SACAZMoEMlpAgent
+   互不继承, 改一个文件碰不到另一个。这里同样只前置声明 (成员是指针)。
+*/
+class SACAZMoETbAgent;
+/* [2026-09 独立类] AGENT_SACAZ_MOE_MLP 的实例类型 (稀疏 MoE + MLP 专家) */
+class SACAZMoEMlpAgent;
+
 class ChessBoard : public QWidget
 {
     Q_OBJECT
@@ -168,7 +178,24 @@ public:
         */
         AGENT_AB_L1,
         AGENT_AB_L2,
-        AGENT_AB_L3
+        AGENT_AB_L3,
+        /*
+           SAC + MCTS + AlphaZero, 骨干换成**稀疏路由 MoE + MLP 专家** (E=8, top-2)。
+           [2026-09 独立类拆分] 它是**独立类** `SACAZMoEMlpAgent`
+           (src/sacazmoemlpagent.h/.cpp) —— 与另外两支 SAC 互不继承:
+             * AGENT_SACAZ          纯 MLP                        (SACAZAgent)
+             * AGENT_SACAZ_MOE      稀疏 MoE(E=4,top-1) + TB 专家  (SACAZMoETbAgent)
+             * AGENT_SACAZ_MOE_MLP  稀疏 MoE(E=8,top-2) + MLP 专家 (SACAZMoEMlpAgent)
+           为什么给它一个界面入口: 那一支以前**只能在 bench 里跑到** (它是
+           `Backbone::SparseMoeMlp` 的取值), 而拆分之后"一个骨干 = 一个类",
+           把它接进下拉框才谈得上"两支独立类都在产品路径上"。
+           代价实测**比 TB 那一支便宜得多**: 共享骨干口径下 2.90 M 参数、~2.9 ms/模拟
+           (TB 是 57.6 M / ~5.4 ms/模拟), 所以模拟次数按 SACAZ_MOE_MLP_SIMS 给。
+           **权重文件独立** (weights/sacaz_moe_mlp_agent*): 三支结构指纹不同,
+           交叉载入当场失败, 不会静默串权重。
+           **追加在枚举末尾** (同上面几条的理由): 值经 GUI 下拉框 userData 传出去。
+        */
+        AGENT_SACAZ_MOE_MLP
     };
 
 public:
@@ -715,7 +742,8 @@ private:
     static DQNMCTSAgent *m_sfDQNMCTS;
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
-    static SACAZAgent *m_sfSACAZMoe;   /* 稀疏 MoE + TB 专家骨干的那个变体 */
+    static SACAZMoETbAgent *m_sfSACAZMoe;   /* 独立类: 稀疏 MoE + TB 专家骨干 */
+    static SACAZMoEMlpAgent *m_sfSACAZMoeMlp; /* 独立类: 稀疏 MoE + MLP 专家骨干 */
     static SACAZLegacyAgent *m_sfSACAZOld;      /* 行为还原版: 独立类 (59e5233), MLP 骨干 */
     static SACAZLegacyAgent *m_sfSACAZOldMoe;   /* 同上, 但骨干换成稀疏 MoE + TB 专家 */
     static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
@@ -959,6 +987,12 @@ private:
 
     /* ---- P1: 对手参数 (语义见 public 段那一大段说明) ---- */
     bool m_opponentInRollout = false;      /* 默认关: 行为与改动前逐字相同 */
+    /*
+       奖励方法开关: **默认 false = 旧奖励**（用户口径: 保留旧的）。
+       见上面 setDynamicRewardEnabled 的说明 —— 它不是棋力旋钮, 而且"杀将"那一半
+       在当前训练协议下没有样本（done=0）。
+    */
+    bool m_dynamicReward = false;
     int m_opponentRolloutPlies = 1;        /* 打开时每次探索最多问对手几手 */
     std::atomic<int> m_opponentQueryCount{0};
     std::atomic<int> m_opponentQueryUnmatched{0};
@@ -1065,6 +1099,43 @@ public:
      */
     void setOpponentInRolloutEnabled(bool on) { m_opponentInRollout = on; }
     bool isOpponentInRolloutEnabled() const { return m_opponentInRollout; }
+
+    /*
+       ================================================================
+       [2026-09 奖励方法开关] setDynamicRewardEnabled —— 界面上的"动态奖励"
+       ================================================================
+       用户口径: **保留旧的奖励方法**（默认就是它），新的那一套只在显式打开时生效。
+
+         * `false`（默认）= **旧奖励**：`rewardShape = 0`
+           —— 即时 = 材质 × REWARD_MATERIAL_COEF(0.1) + 每步代价；终局 = 引擎真值 ±1。
+           这一支**一个字都没动**，历史读数与它对得上。
+         * `true` = **动态奖励**：`rewardShape = 3` + 出厂参数
+           （`mateScoreMode = 0` 三因子等权 / `matRewardBoost = mateRewardBoost = 0.5`）
+           —— 按局面评估 e 在"吃子 / 杀将"之间分配一个**固定预算**（两个倍数之和恒 2.5）。
+           见 `src/sacazagent.h` 的 `rewardShape = 3` 一节与
+           `docs/sacmoetb_pos_reward_2026_09.md`。
+
+       三条必须先说清的边界（否则这个开关会被读成"变强的旋钮"）:
+
+         1. **它不是棋力旋钮，本轮实测也没有量出棋力差别**
+            （`docs/sacmoetb_pos_reward_2026_09.md` §9 四条臂全部落在噪声里；
+            `docs/sacmoetb_independent_classes_2026_09.md` §8 是界面读数复核）。
+         2. **"杀将"那一半目前是死的**：实测自对弈训练里 `done` 样本 = 0
+            （一局走到手数上限被截断，截断那一步 `done` 仍为 false），而终局倍率只作用在
+            `terminalReward()` 上 ⇒ 打开这个开关**实际只改到"吃子那一半"**。
+            "后期重杀将"要真起作用得先让训练见到终局（那份文档 §10.3）。
+         3. **它改变训练出来的权重**：两套奖励训出的不是同一个东西。所以要它和
+            "从哪份权重起训"一起记录，否则会出现"棋力对不上训练量"。
+
+       实现: 四个旋钮都是**普通成员**（不是建网期参数），所以开关随时可改、对**已建好的
+       实例当场生效**；本函数遍历当前存在的 SAC 实例写一遍，新建实例时
+       （`createSACAZAgent` / `createSACAZMoETbAgent` / `createSACAZMoEMlpAgent`
+       以及后台训练的 clone）也会按当前值写一遍。
+       **59e5233 还原版 (SACAZLegacyAgent) 不受影响** —— 它连这几个成员都没有。
+       ================================================================
+    */
+    void setDynamicRewardEnabled(bool on);
+    bool isDynamicRewardEnabled() const { return m_dynamicReward; }
     /* 每次探索最多问对手几次 (夹到 >= 0; 0 = 不问, 即使开关是开的) */
     void setOpponentRolloutPlies(int n) { m_opponentRolloutPlies = (n > 0) ? n : 0; }
     int getOpponentRolloutPlies() const { return m_opponentRolloutPlies; }

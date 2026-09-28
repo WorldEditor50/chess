@@ -1,4 +1,4 @@
-#include "sacazagent.h"
+#include "sacazmoemlpagent.h"
 
 #include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "agentrollout.hpp"
@@ -65,13 +65,13 @@ RL::ISparseMoE *findSparseMoe(RL::Net &net)
 
 } // namespace
 
-/* 本类骨干的名字: 纯 MLP —— 只有这一种 (见头文件"骨干"那一节) */
-const char *SACAZAgent::backboneName() const
+/* 本类骨干的名字: 稀疏 MoE(MLP 专家) —— 只有这一种 (见头文件"骨干"那一节) */
+const char *SACAZMoEMlpAgent::backboneName() const
 {
-    return "MLP";
+    return "稀疏MoE(MLP专家)";
 }
 
-const char *SACAZAgent::trunkModeName(TrunkMode m)
+const char *SACAZMoEMlpAgent::trunkModeName(TrunkMode m)
 {
     switch (m) {
     case TrunkMode::Separate: return "独立骨干x5 (Separate)";
@@ -86,17 +86,14 @@ const char *SACAZAgent::trunkModeName(TrunkMode m)
  *  独立口径写 3 个 (actor/q1/q2), 目标网在载入时由在线网 copyTo 派生。
  *  两套文件的个数、名字、语义都不同 ⇒ 绝不能共用一个前缀。
  * ---------------------------------------------------------------- */
-const char *SACAZAgent::sharedWeightPrefix()
+const char *SACAZMoEMlpAgent::sharedWeightPrefix()
 {
     /*
-       [2026-09 独立类拆分] 这个前缀原来是 **TB 那一支在用** (两个骨干挤在一个类里,
-       所以只能有一个值)。拆分之后**每个类必须有自己的**: 三个类的骨干不同 ⇒ 权重
-       结构不同, 共用一个前缀 = 两个骨干互相覆盖 (结构指纹挡得住"明显不同",
-       挡不住"同名同构、训练口径不同"的那种错)。
-       本类 (纯 MLP) 用这一个; TB 那一支保留历史值 (界面 `AGENT_SACAZ_MOE` 的存量模型
-       就是那套文件), MoE-MLP 那一支见 `SACAZMoEMlpAgent::sharedWeightPrefix()`。
+       [2026-09 独立类拆分] **必须与另外两个类不同** —— 逐字副本继承了同一个
+       "weights/sacaz_shared_agent", 而那个值是 TB 那一支的历史前缀 (界面
+       `AGENT_SACAZ_MOE` 的存量模型用它)。继续共用就等于让 MoE-MLP 的权重覆盖 TB 的。
     */
-    return "weights/sacaz_mlp_shared_agent";
+    return "weights/sacaz_moe_mlp_shared_agent";
 }
 
 /*
@@ -131,7 +128,7 @@ RL::iLayer::sptr makeMoeLayer(int d, bool withGrad, int hidden)
  *  SparseMoE 内部专家的构造顺序不变 —— 独立口径因此与改动前**逐位相同**。
  * ================================================================
  */
-void SACAZAgent::makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const
+void SACAZMoEMlpAgent::makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const
 {
     const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
     out.clear();
@@ -140,20 +137,22 @@ void SACAZAgent::makeTrunkLayers(RL::Net::Layers &out, bool withGrad) const
        隐层激活 = `Layer<RL::Tanh>` (与 59e5233 **逐字相同**的代码)。
        **不要**改用 `TanhNorm<Linear>` 且 r=1 去"复现"它: 那个层的偏置是加在 tanh
        外面的 (`tanh(r·Wx)+b`), 与这里的 `tanh(Wx+b)` 不是同一个函数 —— 实测同权重同
-       局面下 max|ΔQ| = 8.9e-06 (test_sacaz [14])。完整来龙去脉见 sacazagent.h 里
+       局面下 max|ΔQ| = 8.9e-06 (test_sacaz [14])。完整来龙去脉见 sacazmoemlpagent.h 里
        `hiddenActivationName()` 上面那段注释。
     */
     /*
        [2026-09 独立类] 这里原来是按 `Backbone` 枚举分四支的 switch; 现在本类只有
-       一支骨干 (纯 MLP), 所以直接往下写。**层构造顺序是契约的一部分** (每层构造时从
-       RL::Random 抽初始化权重): 与拆分前 `case Backbone::Mlp` 那一支逐字相同, 所以
-       拆分前后同种子下的权重**逐位相同** (回归证据: 四个骨干的指纹与拆分前逐行相同)。
+       一支骨干 (稀疏 MoE(MLP 专家) + 一个 Tanh 隐层), 所以直接往下写。
+       **层构造顺序是契约的一部分** (每层构造时从 RL::Random 抽初始化权重):
+       MoE 层在前、Tanh 层在后, 与拆分前 `case Backbone::SparseMoeMlp` 那一支逐字相同,
+       所以拆分前后同种子下的权重**逐位相同** (回归证据见 docs/…)。
     */
+    out.push_back(makeMoeLayer<RL::MlpExpert, MOE_MLP_EXPERTS, MOE_MLP_TOPK>(
+        STATE_DIM, withGrad, expertHidden > 0 ? expertHidden : 64));
     out.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
-    out.push_back(RL::Layer<RL::Tanh>::_(h, h, true, withGrad));
 }
 
-void SACAZAgent::makeHeadLayer(RL::Net::Layers &out, bool withGrad) const
+void SACAZMoEMlpAgent::makeHeadLayer(RL::Net::Layers &out, bool withGrad) const
 {
     const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
     out.clear();
@@ -166,7 +165,7 @@ void SACAZAgent::makeHeadLayer(RL::Net::Layers &out, bool withGrad) const
     out.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, withGrad));
 }
 
-RL::Net SACAZAgent::buildNet(bool withGrad) const
+RL::Net SACAZMoEMlpAgent::buildNet(bool withGrad) const
 {
     RL::Net::Layers all;
     makeTrunkLayers(all, withGrad);
@@ -217,7 +216,7 @@ RL::Net SACAZAgent::buildNet(bool withGrad) const
  *      只是会把骨干跑三遍 (那就是独立口径的开销)。
  * ================================================================
  */
-void SACAZAgent::buildSharedNets()
+void SACAZMoEMlpAgent::buildSharedNets()
 {
     const std::size_t h = (std::size_t)(hiddenDim > 0 ? hiddenDim : 64);
     (void)h;
@@ -279,7 +278,7 @@ void SACAZAgent::buildSharedNets()
  * 在自检面板上直接可见。它同时是一条回归断言: 正常情况下必须报 `tanh (Layer<Tanh>)`,
  * 正常的两个骨干 (Mlp / 稀疏 MoE 的专家骨干) 都是这一层。
  */
-const char *SACAZAgent::hiddenActivationName() const
+const char *SACAZMoEMlpAgent::hiddenActivationName() const
 {
     RL::Net &self = const_cast<RL::Net &>(actor);   /* Net::operator[] 没有 const 重载 */
     if (self.size() < 2) {
@@ -293,38 +292,77 @@ const char *SACAZAgent::hiddenActivationName() const
     }
     if (dynamic_cast<RL::TanhNorm<RL::Linear> *>(self[1]) != nullptr) {
         return "TanhNorm<Linear> —— 与 Layer<Tanh> **不等价** (偏置加在 tanh 外,"
-               " 实测 max|dQ|=8.9e-06), 见 sacazagent.h";
+               " 实测 max|dQ|=8.9e-06), 见 sacazmoemlpagent.h";
     }
     return "其它 (既不是 Layer<Tanh> 也不是已知的 TanhNorm —— 检查 buildNet 第 2 层)";
 }
 
 /*
- * 界面上的哪一支。**[2026-09 独立类] 本类就是界面上的 `AGENT_SACAZ` (纯 MLP 骨干)**;
- * 拆分前它和 AGENT_SACAZ_MOE (TB 专家) 挤在同一个类里, 所以这一行必须按骨干分叉。
- * 59e5233 还原版与两个 MoE 支都是**独立的类** (互不继承), 各有自己的同名实现。
+ * 界面上的哪一支。**[2026-09 独立类] 本类对应界面上的 `AGENT_SACAZ_MOE_MLP`**
+ * (稀疏 MoE(MLP 专家)) —— 拆分前它是"SACAZAgent + backbone 枚举"的一种取值
+ * (`Backbone::SparseMoeMlp`), 那时这一行必须按骨干分叉, 否则同一个类背着的两支会在
+ * 面板上印同一个名字。59e5233 还原版是**另一个独立的类** SACAZLegacyAgent。
  */
-const char *SACAZAgent::guiAgentLabel() const
+const char *SACAZMoEMlpAgent::guiAgentLabel() const
 {
-    return "SAC+AZ (AGENT_SACAZ, 当前口径)";
-}
-
-/* 当前 SAC 的权重前缀。其余三支各有独立前缀 (见两个 MoE 独立类与自己那一支的说明):
- *   纯 MLP        : "weights/sacaz_agent"    (本类)
- *   稀疏MoE(TB)   : "weights/sacaz_moe_tb"
- *   稀疏MoE(MLP)  : "weights/sacaz_moe_mlp"
- *   59e5233 还原版: 在 SACAZLegacyAgent 里
- * 为什么不能共用: 四个类可训练的口径不同, 共用一个前缀 = 后训练的那一支静默覆盖另一支。
- */
-const char *SACAZAgent::defaultWeightPrefix()
-{
-    return "weights/sacaz_agent";
+    return "SAC+AZ-MoE-MLP (AGENT_SACAZ_MOE_MLP)";
 }
 
 /*
- * [2026-09 独立类] 从这一行往下, 原来还有四个 MoE 路由读数 (moeExpertCount / moeTopK /
- * moeUsage / resetMoeUsage) 与五个 TB 头数读数 (tbHeadsRequested/Used/Dim/Allocated /
- * tbAttentionElements) —— 它们**整段搬到了两个 MoE 独立类**里。本类是纯 MLP, 没有 MoE
- * 层也没有 TransformerBlock 专家, 这些读数在本类里恒为 0/-1。
+ * 本类的权重前缀。**必须与另外三支不同** (同一条纪律, 见头文件):
+ * 四个类可训练的口径不同 (骨干不同 → 权重结构不同 → 载入就会静默错配),
+ * 共用一个前缀等于让后训练的那一支覆盖另一支。
+ *   纯 MLP        : "weights/sacaz_agent"      (SACAZAgent)
+ *   稀疏MoE(TB)   : "weights/sacaz_moe_tb"     (SACAZMoETbAgent)
+ *   稀疏MoE(MLP)  : "weights/sacaz_moe_mlp"    (本类)
+ *   59e5233 还原版: 在 SACAZLegacyAgent 里
+ */
+const char *SACAZMoEMlpAgent::defaultWeightPrefix()
+{
+    return "weights/sacaz_moe_mlp";
+}
+
+int SACAZMoEMlpAgent::moeExpertCount() const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    return (m != nullptr) ? m->expertCount() : 0;
+}
+
+int SACAZMoEMlpAgent::moeTopK() const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    return (m != nullptr) ? m->topK() : 0;
+}
+
+void SACAZMoEMlpAgent::moeUsage(std::vector<long long> &out) const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    if (m == nullptr) {
+        out.clear();
+        return;
+    }
+    m->usageSnapshot(out);
+}
+
+void SACAZMoEMlpAgent::resetMoeUsage()
+{
+    for (std::size_t i = 0; i < actor.size(); i++) {
+        RL::ISparseMoE *m = dynamic_cast<RL::ISparseMoE*>(actor[i]);
+        if (m != nullptr) {
+            m->resetUsage();
+        }
+    }
+}
+
+/*
+ * [2026-09 独立类] TB 专家的头数读数 (`tbHeadsRequested/Used/Dim/Allocated` 与
+ * `tbAttentionElements`) 与它们的辅助函数 `findSparseMoeOf` **已经整段搬到
+ * `SACAZMoETbAgent`** —— 本类没有 TransformerBlock 专家, 那四个读数的正确取值
+ * 恒为 -1, 留着只会让"面板上永远显示 -1 的一节"继续存在。
+ * 头数被静默降级那个 bug 的来龙去脉见 src/sacazmoetbagent.h。
  */
 
 /*
@@ -333,7 +371,7 @@ const char *SACAZAgent::defaultWeightPrefix()
  * 视图**, 各自都会把整份骨干数进去 —— 三个数相加等于把骨干算了三遍, 那正是这次要
  * 消掉的东西。独立口径下三张网本来就不共享, actor+q1 (同构) 就是全部。
  */
-long long SACAZAgent::uniqueParamCount() const
+long long SACAZMoEMlpAgent::uniqueParamCount() const
 {
     if (trunkMode != TrunkMode::Shared) {
         /* 独立口径: actor/q1/q2 同构, 目标网无梯度但同样占内存 -> 5 份 */
@@ -344,14 +382,18 @@ long long SACAZAgent::uniqueParamCount() const
            + q1TargetHead.paramCount() + q2TargetHead.paramCount();
 }
 
-SACAZAgent::SACAZAgent(Chess &chess_,
+SACAZMoEMlpAgent::SACAZMoEMlpAgent(Chess &chess_,
                        int hiddenDim_,
                        float gamma_,
                        float lr,
                        float cpuct,
+                       int expertHidden_,
+                       float auxLossCoef_,
                        TrunkMode trunkMode_)
     : chess(chess_),
       trunkMode(trunkMode_),
+      expertHidden(expertHidden_ > 0 ? expertHidden_ : 64),
+      auxLossCoef(auxLossCoef_),
       hiddenDim(hiddenDim_ > 0 ? hiddenDim_ : 64),
       gamma(gamma_),
       learningRateActor(lr),
@@ -442,7 +484,7 @@ SACAZAgent::SACAZAgent(Chess &chess_,
     m_q2 = RL::Tensor(ACTION_DIM, 1);
 }
 
-std::string SACAZAgent::getName() const
+std::string SACAZMoEMlpAgent::getName() const
 {
     return "SAC+MCTS+AlphaZero (最大熵搜索)";
 }
@@ -453,7 +495,7 @@ std::string SACAZAgent::getName() const
  *  同一个 canonicalCell 镜像、同一个 STATE_DIM=1710。下面有一条
  *  static_assert 把"两边维度一致"钉成编译期事实。
  * ============================================================ */
-void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
+void SACAZMoEMlpAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
 {
     cells.clear();
     cells.reserve(32);
@@ -477,7 +519,7 @@ void SACAZAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) cons
    这边取同样的 5 个数进 Transition::ctx)。
    这一致性是"两边状态同构"的全部内容: 只要有一边换了公式, 对照就不再受控。
 */
-void SACAZAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
+void SACAZMoEMlpAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
 {
     /*
        两种表示下的**语义不同**, 这点很关键:
@@ -507,7 +549,7 @@ void SACAZAgent::contextOf(Chess &c, int color, float out[CTX_COUNT])
     }
 }
 
-void SACAZAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
+void SACAZMoEMlpAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
 {
     if (state.size() < (std::size_t)STATE_DIM) {
         return;
@@ -529,7 +571,7 @@ void SACAZAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT])
     }
 }
 
-void SACAZAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
+void SACAZMoEMlpAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
 {
     for (int i = 0; i < CTX_COUNT; i++) {
         out[i] = 0.0f;
@@ -544,7 +586,7 @@ void SACAZAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT])
     }
 }
 
-void SACAZAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state)
+void SACAZMoEMlpAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tensor &state)
 {
     state.zero();
     for (std::size_t i = 0; i < cells.size(); i++) {
@@ -555,7 +597,7 @@ void SACAZAgent::expandSparse(const std::vector<std::uint16_t> &cells, RL::Tenso
     }
 }
 
-void SACAZAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells)
+void SACAZMoEMlpAgent::denseToSparse(const RL::Tensor &state, std::vector<std::uint16_t> &cells)
 {
     cells.clear();
     cells.reserve(32);
@@ -586,21 +628,21 @@ static void expandSparseGrids(const std::vector<std::uint16_t> &cells, RL::Tenso
 /* 5 个上下文标量铺成整平面 (每条 90 个相同值) —— 只在对齐表示下用。
    为什么值走标量而不是"再塞 450 个非零格": 稀疏回放只存棋子格; 稠密展开时按平面铺开
    是**确定性的函数**, 不增加任何回放内存。 */
-static void fillContextPlanes(RL::Tensor &state, const float ctx[SACAZAgent::CTX_COUNT])
+static void fillContextPlanes(RL::Tensor &state, const float ctx[SACAZMoEMlpAgent::CTX_COUNT])
 {
-    for (int p = 0; p < SACAZAgent::CTX_COUNT; p++) {
+    for (int p = 0; p < SACAZMoEMlpAgent::CTX_COUNT; p++) {
         const float v = ctx[p];
         if (v == 0.0f) {
             continue;   /* 0 平面本来就是零, 跳过 (省 90 次写) */
         }
-        float *dst = &state[(std::size_t)(SACAZAgent::PIECE_PLANES + p) * SACAZAgent::CELLS];
-        for (int c = 0; c < SACAZAgent::CELLS; c++) {
+        float *dst = &state[(std::size_t)(SACAZMoEMlpAgent::PIECE_PLANES + p) * SACAZMoEMlpAgent::CELLS];
+        for (int c = 0; c < SACAZMoEMlpAgent::CELLS; c++) {
             dst[c] = v;
         }
     }
 }
 
-void SACAZAgent::encodeStateFor(int color, RL::Tensor &state)
+void SACAZMoEMlpAgent::encodeStateFor(int color, RL::Tensor &state)
 {
     if (state.size() != (std::size_t)STATE_DIM) {
         state = RL::Tensor(STATE_DIM, 1);
@@ -615,7 +657,7 @@ void SACAZAgent::encodeStateFor(int color, RL::Tensor &state)
     writeContext(state, ctx);
 }
 
-void SACAZAgent::encodeState(RL::Tensor &state)
+void SACAZMoEMlpAgent::encodeState(RL::Tensor &state)
 {
     /*
        视角由棋盘当前的 sideToMove 决定 —— MCTS 里走法是真正落在棋盘上的
@@ -641,7 +683,7 @@ void SACAZAgent::encodeState(RL::Tensor &state)
  *  它让 SAC 与 PPO 的动作空间不同构, "算法对照"就没法解释。见
  *  docs/agents_design.md §11 / §20.4 与 docs/arena_sac_vs_ppo_report.md §8.4。
  * ============================================================ */
-int SACAZAgent::stepToActionIdx(const Step &s, int color) const
+int SACAZMoEMlpAgent::stepToActionIdx(const Step &s, int color) const
 {
     /*
        两种表示的索引公式 (与头文件的开关一一对应):
@@ -662,7 +704,7 @@ int SACAZAgent::stepToActionIdx(const Step &s, int color) const
     return ChessState::actionIndexOf(from, to);
 }
 
-void SACAZAgent::getLegalActions(int color,
+void SACAZMoEMlpAgent::getLegalActions(int color,
                                  std::vector<Step*> &steps,
                                  std::vector<int> &actionIndices,
                                  RL::Tensor &actionMask)
@@ -681,7 +723,7 @@ void SACAZAgent::getLegalActions(int color,
 /* ============================================================
  *  动态奖励分配 (rewardShape = 3): 局面评估 e 与两个权重倍数
  *
- *  设计与全部理由见 sacazagent.h 的 `rewardShape = 3` 一节。这里只写实现约定:
+ *  设计与全部理由见 sacazmoemlpagent.h 的 `rewardShape = 3` 一节。这里只写实现约定:
  *
  *   1. **e 是局面的函数, 不是手数的函数**: 第一版按"剩余子力"做了一个单向的阶段钟,
  *      用户指出"局势是反复变化的" —— 单调坐标表示不了反复。这一版同时读
@@ -703,7 +745,7 @@ struct PosFactors {
 };
 }   /* namespace */
 
-double SACAZAgent::mateProximity(const Step *pendingCapture) const
+double SACAZMoEMlpAgent::mateProximity(const Step *pendingCapture) const
 {
     const int pendingVictim = (pendingCapture != nullptr) ? pendingCapture->nextId
                                                           : Stone::ID_NONE;
@@ -761,7 +803,7 @@ double SACAZAgent::mateProximity(const Step *pendingCapture) const
     return e;
 }
 
-float SACAZAgent::materialWeightMul(const Step *pendingCapture) const
+float SACAZMoEMlpAgent::materialWeightMul(const Step *pendingCapture) const
 {
     if (rewardShape != 3 || matRewardBoost <= 0.0f) {
         return 1.0f;
@@ -770,7 +812,7 @@ float SACAZAgent::materialWeightMul(const Step *pendingCapture) const
     return (float)(1.0 + (double)matRewardBoost * (1.0 - e));
 }
 
-float SACAZAgent::mateWeightMul() const
+float SACAZMoEMlpAgent::mateWeightMul() const
 {
     if (rewardShape != 3 || mateRewardBoost <= 0.0f) {
         return 1.0f;
@@ -780,7 +822,7 @@ float SACAZAgent::mateWeightMul() const
     return (float)(1.0 + (double)mateRewardBoost * e);
 }
 
-float SACAZAgent::computeReward(const Step &s, int color)
+float SACAZMoEMlpAgent::computeReward(const Step &s, int color)
 {
     (void)color;   /* 走子方视角, 与颜色无关 */
 
@@ -812,7 +854,7 @@ float SACAZAgent::computeReward(const Step &s, int color)
 
        rewardScale 是**消融旋钮** (默认 1.0 = 逐位不变): 只缩放即时奖励, 不动终局 ±1。
        终局是环境的真值, 缩放它等于换一个游戏; 即时项是"塑形", 缩它才是在问
-       "这个塑形值多少"。见 sacazagent.h 的说明。
+       "这个塑形值多少"。见 sacazmoemlpagent.h 的说明。
 
        **默认路径必须逐位等于改动前的代码** (2026-09 排查教训): `1.0f * x` 数学上是恒等,
        但在"与参考实现逐位对比"的场合不该留任何多余运算 —— 一旦出现偏差, 排查者会先
@@ -821,7 +863,7 @@ float SACAZAgent::computeReward(const Step &s, int color)
     const bool capturedJiang = (victim->type == Stone::TYPE_JIANG);
 
     /*
-       rewardShape = 1: **去掉材质塑形** (见 sacazagent.h 的说明)。
+       rewardShape = 1: **去掉材质塑形** (见 sacazmoemlpagent.h 的说明)。
        每步代价**保留**: 它是"别磨蹭"的那一项, 去掉只会让长局更多 —— 而这次实验要问的
        恰恰是不是长局(和棋)太多。
     */
@@ -853,7 +895,7 @@ float SACAZAgent::computeReward(const Step &s, int color)
        [2026-09 实验轮] 提议②: `rewardTanhGain > 0` 时把**即时**奖励换成
        `tanh(gain · r)`。gain<=0 (默认) 直接返回上面的原式 —— 默认路径一位不变。
 
-       两条先算好的预期 (见 sacazagent.h 的说明):
+       两条先算好的预期 (见 sacazmoemlpagent.h 的说明):
          * gain = 1 是**恒等**: 即时奖励只有 0.029, tanh(0.029)=0.02899;
          * 要起作用必须先放大, 而那等于 `rewardScale`, 已经实测过 5x/20x **无效果**
            (TD 目标的主项是 −γ·V(s') 而不是 r)。
@@ -868,12 +910,12 @@ float SACAZAgent::computeReward(const Step &s, int color)
 /*
  * 终局值 (走子方视角) —— 塑形方案的**唯一出口**。三个产生点 (搜索叶子 terminalValue /
  * 自对弈 resultValue / rollout 的 outcomeForMover) 全部走这里, 理由是"搜索估的"与
- * "训练学的"必须是同一个游戏 (见 sacazagent.h 的 rewardShape 说明)。
+ * "训练学的"必须是同一个游戏 (见 sacazmoemlpagent.h 的 rewardShape 说明)。
  *
  * 读的是 this->chess 的**当前**局面 —— 三个调用点都保证棋盘就在终局那个局面上
  * (搜索是沿着路径 moveForward 走过来的; rollout 与自对弈都刚 moveForward 完)。
  */
-float SACAZAgent::terminalReward(int chessResult, int perspective) const
+float SACAZMoEMlpAgent::terminalReward(int chessResult, int perspective) const
 {
     const float base = outcomeForMover(chessResult, perspective);
     if (base == 0.0f) {
@@ -922,7 +964,7 @@ float SACAZAgent::terminalReward(int chessResult, int perspective) const
 /* ============================================================
  *  掩码 softmax 及其反向
  * ============================================================ */
-void SACAZAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
+void SACAZMoEMlpAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
                                RL::Tensor &pi)
 {
     pi.zero();
@@ -957,7 +999,7 @@ void SACAZAgent::maskedSoftmax(const RL::Tensor &logits, const RL::Tensor &mask,
     }
 }
 
-void SACAZAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
+void SACAZMoEMlpAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
                                        RL::Tensor &dz)
 {
     /*
@@ -973,7 +1015,7 @@ void SACAZAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g
     }
 }
 
-void SACAZAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
+void SACAZMoEMlpAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
 {
     bits[0] = 0;
     bits[1] = 0;
@@ -984,7 +1026,7 @@ void SACAZAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
     }
 }
 
-void SACAZAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
+void SACAZMoEMlpAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
 {
     mask.zero();
     for (int i = 0; i < ACTION_DIM; i++) {
@@ -1001,7 +1043,7 @@ void SACAZAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
  *  同一批层对象), 但**走视图 = 骨干被跑三遍** —— 那正是独立口径的开销。
  *  所以热路径显式地"trunk.forward 一次 + 头各 forward 一次"。
  * ============================================================ */
-void SACAZAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
+void SACAZMoEMlpAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
                         RL::Tensor &pi)
 {
     /* actor 的输出缓冲会被下一次 forward 覆盖, 先拷出来再做掩码归一化 */
@@ -1013,7 +1055,7 @@ void SACAZAgent::policy(const RL::Tensor &state, const RL::Tensor &mask,
     maskedSoftmax(m_logits, mask, pi);
 }
 
-void SACAZAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor &q2Out)
+void SACAZMoEMlpAgent::qValues(const RL::Tensor &state, RL::Tensor &q1Out, RL::Tensor &q2Out)
 {
     if (trunkMode == TrunkMode::Shared) {
         RL::Tensor &h = trunk.forward(state);
@@ -1096,7 +1138,7 @@ bool softmaxOnSubset(const std::vector<float> &logits, std::vector<float> &piOut
  *  返回 false = 走不了稀疏路径, 调用方**必须**回退全量口径 (与改动前同一条契约)。
  * ================================================================
  */
-bool SACAZAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &legalIdx,
+bool SACAZMoEMlpAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &legalIdx,
                             std::vector<float> &pi, std::vector<float> &q1Out,
                             std::vector<float> &q2Out)
 {
@@ -1131,7 +1173,7 @@ bool SACAZAgent::sparseLeaf(const RL::Tensor &state, const std::vector<int> &leg
     return true;
 }
 
-bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+bool SACAZMoEMlpAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
                                std::vector<float> &q1Out, std::vector<float> &q2Out)
 {
     if (trunkMode == TrunkMode::Shared) {
@@ -1148,7 +1190,7 @@ bool SACAZAgent::qValuesSparse(const RL::Tensor &state, const std::vector<int> &
     return ok;
 }
 
-bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+bool SACAZMoEMlpAgent::policySparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
                               std::vector<float> &piOut)
 {
     std::vector<float> logits;
@@ -1163,7 +1205,7 @@ bool SACAZAgent::policySparse(const RL::Tensor &state, const std::vector<int> &l
     return softmaxOnSubset(logits, piOut);
 }
 
-bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
+bool SACAZMoEMlpAgent::softValueSparse(const RL::Tensor &state, const std::vector<int> &legalIdx,
                                  double &valueOut)
 {
     std::vector<float> pi, qa, qb;
@@ -1199,7 +1241,7 @@ bool SACAZAgent::softValueSparse(const RL::Tensor &state, const std::vector<int>
     return true;
 }
 
-void SACAZAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
+void SACAZMoEMlpAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
                                RL::Tensor &q2Out)
 {
     if (trunkMode == TrunkMode::Shared) {
@@ -1221,7 +1263,7 @@ void SACAZAgent::qTargetValues(const RL::Tensor &state, RL::Tensor &q1Out,
     squashQInPlace(q2Out);
 }
 
-float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
+float SACAZMoEMlpAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
                                 const RL::Tensor &q1In, const RL::Tensor &q2In) const
 {
     const float a = effectiveAlpha();
@@ -1271,7 +1313,7 @@ float SACAZAgent::softValueFrom(const RL::Tensor &pi, const RL::Tensor &mask,
 /* ============================================================
  *  MCTS
  * ============================================================ */
-double SACAZAgent::getPUCT(int childID, int parentVisits) const
+double SACAZMoEMlpAgent::getPUCT(int childID, int parentVisits) const
 {
     const AZNode &child = nodes[childID];
     if (child.visitCount == 0) {
@@ -1279,7 +1321,7 @@ double SACAZAgent::getPUCT(int childID, int parentVisits) const
         return std::numeric_limits<double>::max();
     }
     /*
-       符号 (2026-09 修正): `totalValue` 按**当前走棋方视角**累计 (见 sacazagent.h 的
+       符号 (2026-09 修正): `totalValue` 按**当前走棋方视角**累计 (见 sacazmoemlpagent.h 的
        字段注释与 backup 的逐层翻号), 而子节点的走棋方就是父节点的对手 ——
        所以父节点比较时必须取负号。漏掉它等于最大化对手的价值:
        搜索专挑对自己最差的着法, 且评估越准越糟 (症状是"loss 降、棋力不涨",
@@ -1293,7 +1335,7 @@ double SACAZAgent::getPUCT(int childID, int parentVisits) const
     return q + u;
 }
 
-bool SACAZAgent::terminalValue(int color, double &value) const
+bool SACAZMoEMlpAgent::terminalValue(int color, double &value) const
 {
     const int res = chess.getResult(color);
     if (res == Chess::RESULT_ONGOING) {
@@ -1307,7 +1349,7 @@ bool SACAZAgent::terminalValue(int color, double &value) const
     return true;
 }
 
-bool SACAZAgent::resultValue(int result, int color, float &out)
+bool SACAZMoEMlpAgent::resultValue(int result, int color, float &out)
 {
     if (result == Chess::RESULT_ONGOING) {
         return false;
@@ -1317,7 +1359,7 @@ bool SACAZAgent::resultValue(int result, int color, float &out)
     return true;
 }
 
-void SACAZAgent::visitDistribution(int rootID, RL::Tensor &pi)
+void SACAZMoEMlpAgent::visitDistribution(int rootID, RL::Tensor &pi)
 {
     pi.zero();
     int total = 0;
@@ -1346,7 +1388,7 @@ void SACAZAgent::visitDistribution(int rootID, RL::Tensor &pi)
  *    2. 终局节点用真实胜负, 不再自举 (PPOMCTS 在终局也用网络值);
  *    3. 展开时按**先验**挑动作, 而不是随机挑 (同样模拟次数下更有效)。
  * ============================================================ */
-bool SACAZAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
+bool SACAZMoEMlpAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
                                      const RL::Tensor &piVisit)
 {
     /*
@@ -1435,7 +1477,7 @@ bool SACAZAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
     return true;
 }
 
-Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
+Step SACAZMoEMlpAgent::selectMove(int color, int simulations_, float temp, RL::Tensor *piOut)
 {
     nodes.clear();
     if (simulations_ < 1) {
@@ -1560,7 +1602,7 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
                 /*
                    稀疏头路径 (只算合法列): 动作空间 8100 之后这是必须的 —— 否则每次叶子
                    估值要算 8100 个 Q 值, 而这一步只有 ~44 个合法着法 (实测 216 ms/步 ->
-                   见 sacazagent.h 的说明)。取不到 (头不支持/下标越界) 就回退全量口径。
+                   见 sacazmoemlpagent.h 的说明)。取不到 (头不支持/下标越界) 就回退全量口径。
 
                    [2026-09 dev-sacmoetb] 用 sparseLeaf 而不是 policySparse +
                    qValuesSparse: 后者在**共享骨干**口径下会把唯一的那次骨干前向白做
@@ -1687,7 +1729,7 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
 
     if (bestChildID >= 0) {
         /*
-           ---- [2026-09 新] 从**自己的搜索**学一次 (见 sacazagent.h 的 learnFromSearch) ----
+           ---- [2026-09 新] 从**自己的搜索**学一次 (见 sacazmoemlpagent.h 的 learnFromSearch) ----
            位置刻意放在这里: 棋盘已经恢复成根局面 (上面第 5 步把试走的都回退了),
            π 也已经在 nodes 里算好 —— 于是这一步不需要重新搜索, 代价只有"试走一手再退回"。
            `piOut` 为空时也要自己算一份访问分布 (调用方不一定要 π)。
@@ -1719,16 +1761,31 @@ Step SACAZAgent::selectMove(int color, int simulations_, float temp, RL::Tensor 
     return Step();
 }
 
-/*
- * [2026-09 独立类] 这里原来是 `resetMoeBatchStats()` —— 纯 MLP 骨干没有 MoE 层,
- * 没有"门控批统计"这回事, 所以整段删掉 (它只服务于 MoE 的负载均衡辅助损失,
- * 而那套东西现在与 `auxLossCoef` 一起留在两个 MoE 独立类里)。
- */
+void SACAZMoEMlpAgent::resetMoeBatchStats()
+{
+    if (auxLossCoef <= 0.0f) {
+        return;
+    }
+    /*
+       目标网 q1Target/q2Target 也要复位: 它们只前向、不训练, 门控统计永远用不到
+       (辅助损失只注入在线网), 但 xSum/probSumBatch 是 float 累加器 —— 不复位的话
+       会随一局的模拟次数一路涨上去, 精度慢慢烂掉。
+    */
+    RL::Net *nets[5] = {&actor, &q1, &q2, &q1Target, &q2Target};
+    for (int ni = 0; ni < 5; ni++) {
+        for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+            RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+            if (moe != nullptr) {
+                moe->resetBatchStats();
+            }
+        }
+    }
+}
 
 /* ============================================================
  *  learnBatch: 一次 mini-batch 的 SAC 更新 (critic / actor / α)
  * ============================================================ */
-float SACAZAgent::learnBatch(int batchSize_, int epochs)
+float SACAZMoEMlpAgent::learnBatch(int batchSize_, int epochs)
 {
     if (batchSize_ < 1 || (int)memories.size() < batchSize_) {
         return 0.0f;
@@ -1767,9 +1824,11 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     std::uniform_int_distribution<int> pick(0, (int)memories.size() - 1);
 
     /*
-       [2026-09 独立类] 这里原来还有一次 `resetMoeBatchStats()` (MoE 门控批统计的边界)。
-       纯 MLP 骨干没有 MoE 层, 因此没有"批统计"要复位。
+       [MoE] 批统计的**边界**: 只反映本批的训练前向。
+       搜索期间每次模拟都会跑一次策略/价值前向, 那些是"推理前向", 不该混进负载均衡
+       辅助损失的批均值里 (见 resetMoeBatchStats 的说明)。
     */
+    resetMoeBatchStats();
 
     /* 诊断读数按**本批**重置 (它们是"最近一次 learnBatch 的极值", 见头文件说明) */
     m_maxAbsTarget = 0.0;
@@ -1980,7 +2039,7 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
 
         /*
            ---- [2026-09 ①] 训练中的 critic/α 诊断 (只累加, 不进任何梯度/更新路径) ----
-           三个问题见 sacazagent.h 的 TrainDiag 说明。这里全部是**读**已经算好的量,
+           三个问题见 sacazmoemlpagent.h 的 TrainDiag 说明。这里全部是**读**已经算好的量,
            不改变任何前向/反向/随机流 ⇒ 默认口径下的数值与改动前逐位一致。
         */
         {
@@ -2059,12 +2118,41 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     m_lastBatchSamples = n;
 
     /*
-       ---- [2026-09 独立类] 这里原来是"稀疏 MoE 的负载均衡辅助损失" ----
-       纯 MLP 骨干没有 MoE 层, 没有路由会坍缩, 因此没有这一项。
-       整套 L_aux (addAuxGradient + 批统计 + `auxLossCoef`) 连同 `resetMoeBatchStats()`
-       一起**在两个 MoE 独立类里** (`SACAZMoEMlpAgent` / `SACAZMoETbAgent`) ——
-       细节与有限差分验证见 rl/sparse_moe.hpp 与 test/test_sparse_moe_main.cpp [6][7]。
+       ---- 稀疏 MoE 的负载均衡辅助损失 ----
+       放在优化器之前、主反向之后: 这个 mini-batch 里每个层的前向次数、被选中的
+       专家次数、门控概率之和都已经累计好了, addAuxGradient 用这些统计算出
+       "哪些专家被喂爆了", 把它们的 logit 压下去、把饿着的抬起来 (Switch
+       Transformer 的 L_aux = E·Σ f_i·P_i 对 logits 的梯度)。
+       没有这一项时, softmax 的反向会把没被选中的专家的概率继续压低, 路由会迅速
+       坍缩到少数专家、其余永远不训练。细节与有限差分验证见 rl/sparse_moe.hpp
+       和 test/test_sparse_moe_main.cpp [6][7]。
     */
+    if (auxLossCoef > 0.0f) {
+        /*
+           [2026-09 dev-sacmoetb] 共享口径下 actor/q1/q2 是**同一个 MoE 层对象**的
+           三张视图: 照旧遍历三个 Net 会让同一个层被 addAuxGradient 调三次。今天"碰巧"
+           是对的 (第一次调用末尾就把 batchForwardCount 清 0, 后两次直接返回), 但那
+           依赖 addAuxGradient 的实现细节 —— 显式只调一次, 不靠运气。
+        */
+        if (trunkMode == TrunkMode::Shared) {
+            for (std::size_t li = 0; li < trunk.size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
+                if (moe != nullptr) {
+                    moe->addAuxGradient(auxLossCoef);
+                }
+            }
+        } else {
+            RL::Net *nets[3] = {&actor, &q1, &q2};
+            for (int ni = 0; ni < 3; ni++) {
+                for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                    RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                    if (moe != nullptr) {
+                        moe->addAuxGradient(auxLossCoef);
+                    }
+                }
+            }
+        }
+    }
 
     /* ---- 应用梯度 ----
        共享口径: 骨干只更新**一次** (用 learningRateTrunk)。若照旧对 actor/q1/q2 各调
@@ -2123,7 +2211,7 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
 /* ============================================================
  *  trainSelfPlay: 自对弈 (MCTS 访问分布做策略目标) + 回放训练
  * ============================================================ */
-void SACAZAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
+void SACAZMoEMlpAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
                                bool verbose, float tempRoot, float tempFinal,
                                int learnEveryMoves)
 {
@@ -2218,7 +2306,7 @@ void SACAZAgent::trainSelfPlay(int episodes, int simulations_, int maxMoves,
     }
 }
 
-void SACAZAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
+void SACAZMoEMlpAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
 {
     /* 从当前局面继续 (不 reset) —— 调用方负责棋盘状态 */
     const int savedTurn = chess.sideToMove;
@@ -2234,7 +2322,7 @@ void SACAZAgent::warmupFromCurrent(int episodes, int simulations_, int maxMoves)
  *  这些样本的策略目标不是搜索出来的, 所以 hasSearch=false —— 只训练 critic 与
  *  SAC 的软 Q 项, 不用 AlphaZero 的监督项 (否则就是把策略往它自己身上拉)。
  * ============================================================ */
-bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
+bool SACAZMoEMlpAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPolicy &opponent)
 {
     if (rolloutSteps <= 0) {
         m_exploreInfo = "SAC+AZ: 探索步数为 0, 已跳过";
@@ -2326,7 +2414,7 @@ bool SACAZAgent::exploreAndTrain(int color, int rolloutSteps, const OpponentPoli
  *  语义完全不同 (一个是 Q1 头, 一个是"骨干+Q1"), 共用一个前缀就等于给"载错文件"
  *  留门 —— 而载错的后果不是报错, 是把一份 28.8 M 的骨干当成 64x128 的头去用。
  * ============================================================ */
-bool SACAZAgent::saveModel(const std::string &filepath)
+bool SACAZMoEMlpAgent::saveModel(const std::string &filepath)
 {
     if (trunkMode == TrunkMode::Shared) {
         trunk.save(filepath + "_trunk");
@@ -2346,7 +2434,7 @@ bool SACAZAgent::saveModel(const std::string &filepath)
            && weightFileWritten(filepath + "_q2");
 }
 
-bool SACAZAgent::loadModel(const std::string &filepath)
+bool SACAZMoEMlpAgent::loadModel(const std::string &filepath)
 {
     if (trunkMode == TrunkMode::Shared) {
         if (!weightFileReadable(filepath + "_trunk")
@@ -2360,7 +2448,7 @@ bool SACAZAgent::loadModel(const std::string &filepath)
         const int r1 = q1Head.load(filepath + "_q1head");
         const int r2 = q2Head.load(filepath + "_q2head");
         if (rt != 0 || ra != 0 || r1 != 0 || r2 != 0) {
-            std::cerr << "[weights] SACAZAgent(Shared)::loadModel 失败 (trunk=" << rt
+            std::cerr << "[weights] SACAZMoEMlpAgent(Shared)::loadModel 失败 (trunk=" << rt
                       << ", actorHead=" << ra << ", q1Head=" << r1 << ", q2Head=" << r2
                       << "), 未同步目标网" << std::endl;
             return false;
@@ -2388,7 +2476,7 @@ bool SACAZAgent::loadModel(const std::string &filepath)
     const int r1 = q1.load(filepath + "_q1");
     const int r2 = q2.load(filepath + "_q2");
     if (ra != 0 || r1 != 0 || r2 != 0) {
-        std::cerr << "[weights] SACAZAgent::loadModel 失败 (actor=" << ra
+        std::cerr << "[weights] SACAZMoEMlpAgent::loadModel 失败 (actor=" << ra
                   << ", q1=" << r1 << ", q2=" << r2 << "), 未同步目标网" << std::endl;
         return false;
     }
@@ -2400,7 +2488,7 @@ bool SACAZAgent::loadModel(const std::string &filepath)
 /* ============================================================
  *  AgentBase
  * ============================================================ */
-Step SACAZAgent::getBestMove(int color)
+Step SACAZMoEMlpAgent::getBestMove(int color)
 {
     return selectMove(color, simulations, 0.0f);
 }
@@ -2416,11 +2504,10 @@ Step SACAZAgent::getBestMove(int color)
  *
  *  具体到这个 agent, 有四条读数最值得看:
  *
- *   (1) **本实例是哪个骨干**。这一个类同时被两个界面 agent 类型构造 —
- *       AGENT_SACAZ (Mlp) 与 AGENT_SACAZ_MOE (SparseMoeTb) —— 两块面板的数字会差
- *       很多 (参数量、有没有路由、每次前向 3 ms 级的 TB 专家开销)。所以第一行先报
- *       backboneName(backbone) 与它对应的界面类型, 否则"同名的两个 agent 读数不同"
- *       会被记到错的账上。
+ *   (1) **本实例是哪一支**。[2026-09 独立类] 本类只有一种骨干 (稀疏 MoE(MLP 专家)),
+ *       界面类型也只有一个 (AGENT_SACAZ_MOE_MLP) —— 所以这一行是"自报家门"。它仍然
+ *       必须存在: 面板上还有别的 agent, 各支的参数量 / 路由 / 前向开销差别很大,
+ *       读数不能被记到错的账上。
  *
  *   (2) **规则上下文可观测 / 动作层有别名** —— 一好一坏, 都写在同一节里。
  *       好的一面: 14 个棋子平面之后跟着 3 个标量槽 (无吃子进度 / 重复
@@ -2475,7 +2562,7 @@ namespace {
  *  这正是本仓库的惯例 —— 把"本该成立的不变量"变成可见的断言, 而不是删掉读数。
  *
  *  为什么是**自由函数**: 它只做统计, 不碰棋盘、不碰网络, 唯一要用的是
- *  `stepToActionIdx` 那一份公式 —— 签名只要 `const SACAZAgent &` + color 就够。
+ *  `stepToActionIdx` 那一份公式 —— 签名只要 `const SACAZMoEMlpAgent &` + color 就够。
  *  这样一来**面板数的一定是训练用的同一个公式** (DQNMCTS 那边只能把哈希再抄一份
  *  并靠注释提醒"改一处必须改两处"; 这里换成编译期耦合: 谁把那个 const 去掉, 这里
  *  当场编不过)。
@@ -2485,7 +2572,7 @@ namespace {
  *
  *  只读: 只看传进来的走法列表 (调用方负责 `Steps::instance().put()` 归还)。
  */
-void aliasOfPosition(const SACAZAgent &ag, const std::vector<Step *> &legal, int color,
+void aliasOfPosition(const SACAZMoEMlpAgent &ag, const std::vector<Step *> &legal, int color,
                      int &legalCount, int &slotCount, int &worstSlot)
 {
     std::map<int, std::set<long long> > bucket;
@@ -2509,16 +2596,16 @@ void aliasOfPosition(const SACAZAgent &ag, const std::vector<Step *> &legal, int
 
 } // namespace
 
-std::string SACAZAgent::selfCheckReport() const
+std::string SACAZMoEMlpAgent::selfCheckReport() const
 {
     char buf[512];
     std::string out;
 
     /* ---- 0. 本实例是**哪一支** ----
-       [2026-09 独立类] 这一段原来要解释"一个类背着两个界面 agent 类型"的坑 —— 现在
-       坑被结构性地填掉了: 本类**只有一种骨干** (纯 MLP), 界面类型也只有一个
-       (AGENT_SACAZ)。这一行从"分辨身份"退化成"自报家门", 但仍然要在: 面板上还有
-       MoE-MLP / TB 专家 / 59e5233 还原版, 读数不能被记到错的账上。 */
+       [2026-09 独立类] 这一段原来要解释"一个类背着两个界面 agent 类型"的坑 ——
+       现在坑被结构性地填掉了: 本类**只有一种骨干**, 界面类型也只有一个
+       (`AGENT_SACAZ_MOE_MLP`)。这一行因此从"分辨身份"退化成"自报家门", 但仍然要在:
+       面板上还有别的 agent (纯 MLP / TB 专家 / 59e5233 还原版)。 */
     std::snprintf(buf, sizeof(buf),
                   "界面 agent 类型 %s | 骨干 %s\n", guiAgentLabel(), backboneName());
     out += buf;
@@ -2536,8 +2623,8 @@ std::string SACAZAgent::selfCheckReport() const
        Shared 与 Separate 的权重文件**互不通用**, 不写出来就没法解释"为什么这个 agent
        的权重载入失败了"。
        **[2026-09 独立类]** 原来这里还有一节"TB 专家的实际头数" —— 那一节**整段搬到了
-       `SACAZMoETbAgent`**: 纯 MLP 骨干里没有 TransformerBlock, 那一节在本类里恒为
-       "没有 TB 专家", 留着只是噪声。
+       `SACAZMoETbAgent`**: 本类没有 TransformerBlock 专家, 那几行在本类里恒为
+       "没有 TransformerBlock 专家", 留着只是噪声。
     */
     std::snprintf(buf, sizeof(buf),
                   "骨干口径 %s | 唯一参数量 %lld (actor.paramCount=%lld 在共享口径下会把"
@@ -2714,17 +2801,69 @@ std::string SACAZAgent::selfCheckReport() const
            "的自举项也被 (1-done) 截断 -> 一局最后几步回归的是真结果而不是网络自己的"
            "估计, 这是它局末价值目标可信的原因 (PPOMCTS 那边终局仍用网络值)\n";
 
-    /* ---- 4. 骨干 ----
-       [2026-09 独立类] 本类只有一种骨干 (纯 MLP): 两行就报完。
-       原来这里还有"专家隐层 / auxLossCoef"与一整节 MoE 路由读数 (专家数 / topK /
-       使用计数直方图 / 坍缩判读) —— 那些**整段搬到了两个 MoE 独立类**的自检报告里,
-       在本类里它们恒为"无稀疏层"。
-    */
+    /* ---- 4. 骨干 / MoE ---- */
     std::snprintf(buf, sizeof(buf),
-                  "骨干结构: 纯 MLP %d -> %d -> %d -> %d (两个 Tanh 隐层, 无 MoE 层)\n",
-                  STATE_DIM, hiddenDim, hiddenDim, ACTION_DIM);
+                  "骨干结构: hiddenDim=%d | 专家隐层 expertHidden=%d (只有 MLP 专家骨干用)"
+                  " | auxLossCoef=%.3f\n",
+                  hiddenDim, expertHidden, (double)auxLossCoef);
     out += buf;
-    out += "MoE: 无稀疏层 (本骨干是纯 MLP) -> 没有路由, 不存在专家坍缩\n";
+    const int experts = moeExpertCount();
+    if (experts <= 0) {
+        std::snprintf(buf, sizeof(buf),
+                      "MoE: 无稀疏层 (本骨干是纯 MLP) -> 没有路由, 不存在专家坍缩\n");
+        out += buf;
+    } else {
+        const int topK = moeTopK();
+        std::vector<long long> usage;
+        /* moeExpertCount / moeTopK / moeUsage 内部对 actor 做了 const_cast —— 只是因为
+           `Net::operator[]` 没有 const 重载, 用到的 `usageSnapshot()` 本身是 const 且
+           只读全生命周期计数, 所以这里没有写操作、也不复位 (复位是训练路径的事)。 */
+        moeUsage(usage);
+        std::snprintf(buf, sizeof(buf),
+                      "MoE: 专家 %d 个, topK=%d (topK=1 是 Switch 式硬路由; 稠密对照骨干"
+                      "取 topK=专家数, 同参数不同算力)\n",
+                      experts, topK);
+        out += buf;
+
+        std::string hist;
+        long long total = 0, mx = 0, mn = -1;
+        for (std::size_t i = 0; i < usage.size(); i++) {
+            hist += (i == 0) ? "" : "/";
+            hist += std::to_string(usage[i]);
+            total += usage[i];
+            if (usage[i] > mx) {
+                mx = usage[i];
+            }
+            if (mn < 0 || usage[i] < mn) {
+                mn = usage[i];
+            }
+        }
+        if (mn < 0) {
+            mn = 0;
+        }
+        /* 直方图是全生命周期累计 (本函数不复位它, 只读): 一次前向都没发生过时全 0 */
+        std::snprintf(buf, sizeof(buf),
+                      "MoE 使用计数 (actor 第一个稀疏层, 全生命周期): %s\n", hist.c_str());
+        out += buf;
+        if (total <= 0) {
+            out += "  全 0 = 还没有发生过前向 (没搜过也没训过), 现在读不出坍缩信息\n";
+        } else {
+            const double mean = (double)total / (double)experts;
+            const double ratio = (mean > 0.0) ? (double)mx / mean : 0.0;
+            std::snprintf(buf, sizeof(buf),
+                          "  最挤 %lld (%.0f%%), 均值 %.1f, 最挤/均值 = %.2f",
+                          mx, 100.0 * (double)mx / (double)total, mean, ratio);
+            out += buf;
+            if (mn == 0) {
+                out += " -> **有专家一次都没被选中 = 路由已坍缩** (它拿不到任何梯度,"
+                       " 负载均衡辅助损失没兜住)\n";
+            } else if (ratio >= 2.0) {
+                out += " -> 偏斜 (最挤是均值的 2 倍以上), 路由在收缩, 盯住下一轮\n";
+            } else {
+                out += " -> 均衡 (无专家为 0, 最挤/均值 < 2), 未观察到路由坍缩\n";
+            }
+        }
+    }
 
     /* 参数量: Net::paramCount() 各层求和 (MoE/TransformerBlock 也实现了它, 所以这里
        报的是真实总数, 不是"只算 Linear" 的旧口径)。目标网只前向, 单独列出来。 */

@@ -855,6 +855,29 @@ constexpr float REWARD_STEP_COST     = -0.001f; /* 每步代价 (效率); 见上
 constexpr int   REWARD_MAX_PLIES     = 120;     /* 一局最长手数 (60 回合规则) */
 
 /*
+ *  ---- 局面评估的三个"满盘"刻度 (2026-09 用户提议: 按棋子的数量与价值动态分配
+ *       "吃子 / 杀将"两个奖励权重) ----
+ *
+ *  把"这盘棋还剩多少、差多少"折算成一个 [0,1] 的局面评估 e (0 = 满盘均势,
+ *  1 = 残局/大势已定), 三个因子各有一个归一化分母:
+ *
+ *    * **价值** 一方非将子力合计 (车 2x0.5 + 马 2x0.3 + 炮 2x0.3 + 相 2x0.2
+ *      + 仕 2x0.2 + 兵 5x0.1) = **3.5**, 双方 = **7.0**;
+ *    * **数量** 一方 15 个非将棋子 -> 双方 **30** 个;
+ *    * **定局度** 用**相对**子力差 `|红−黑| / (红+黑) ∈ [0,1]` (尺度无关: 0 = 均势,
+ *      1 = 一边被吃光), 所以它不需要"满盘"刻度 —— `REWARD_FULL_MATERIAL_DIFF`
+ *      只是"一方全部非将子力"这个常用量的一份具名常量。
+ *
+ *  将一律不参与材质与计数: 它的价值就是"被吃"= 终局本身 (见 stepReward 的说明)。
+ *
+ *  实现与理由在 `SACAZAgent` 的 `rewardShape = 3` 一节 (src/sacazagent.h) 与
+ *  `docs/sacmoetb_pos_reward_2026_09.md`。
+ */
+constexpr double REWARD_FULL_MATERIAL      = 7.0;   /* 双方非将子力价值合计 */
+constexpr double REWARD_FULL_PIECE_COUNT   = 30.0;  /* 双方非将棋子个数 */
+constexpr double REWARD_FULL_MATERIAL_DIFF = 3.5;   /* 一方全部非将子力 (= 满盘时的一半) */
+
+/*
  *  一步的完整即时奖励 (**走子方视角**) —— 所有 agent 的 computeReward 都走这里,
  *  免得 5 份实现各漂各的 (诊断的 [1] 会断言它们一致)。
  *
