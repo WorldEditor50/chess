@@ -351,11 +351,24 @@ static constexpr float SACAZ_MOE_AUX = 0.1f;
  */
 static constexpr int DQNAB_NODES = 256;
 static constexpr int DQNAB_HIDDEN = 64;    /* DQN+AB 的头隐层宽度 */
-/* DQN+MCTS (稀疏MoE+TB专家) 每次决策的模拟次数: 一个 TB 专家前向 ~5-6 ms (d_model=1263,
-   见 src/dqnmctsmoetbagent.h 头注释的实测), 所以 40 次模拟约 175 ms/步 —— 与界面
-   SACAZ_MOE_SIMS 那一档同一个时间预算。旧类 DQNMCTS_ITERATIONS=200 是 d_model=90 的稠密
-   MoE 预算, 直接搬过来会让每步变成秒级。 */
-static constexpr int DQNMCTS_MOE_SIMS = 40;
+/*
+   DQN+MCTS (稀疏MoE+TB专家) 每次决策的模拟次数。
+
+   实测 (本机, Release): 一次叶子估值 (骨干 1 次前向) = 2.9~3.0 ms ⇒ 40 次模拟 = 123~135
+   ms/步、120 次 = 364~371 ms/步。
+
+   为什么取 120 而**不是** 40 (我最初填的就是 40): 40 次时搜索**退化了** —— 开局有 ~40 个
+   合法着法, 每个孩子恰好被访问 1 次、严格打平, 于是根选择退化成"按先验顺序取第一个孩子"
+   (先验 = 合法槽位上 Q 的 softmax) = 一层 Q 贪心, MCTS 那部分等于没干活。
+   证据 (`bench_dqnmcts_moe --mode=agree --positions=16 --sims=40 --sims2=120`): 两个预算
+   选出的着法一致率 **0/16 = 0%** —— 预算确实是这条路径上真的会改行为的旋钮。
+   同一份工具里也能看到: 稀疏路由 vs 等参数稠密 = 3.99x, 所以"省算力"这件事已经由骨干
+   拿到了, 这里把省下来的时间还给搜索。
+
+   旧类 DQNMCTS_ITERATIONS=200 不能照搬: 那是 d_model=90 的稠密 MoE 预算 (一次模拟便宜
+   两个数量级), 搬过来就是 1.3 s/步。
+*/
+static constexpr int DQNMCTS_MOE_SIMS = 120;
 static constexpr int DQNMCTS_MOE_HIDDEN = 64;
 /* 单局手数上限已集中到 ChessBoard::DEFAULT_MAX_PLIES (界面上可用 setMaxPliesPerGame 调) */
 
@@ -3472,8 +3485,9 @@ Step ChessBoard::aiThinkRaw(int color)
            ---- DQN+MCTS (稀疏MoE+TB专家), 独立类 DQNMCTSMOETbAgent ----
            与上面 AGENT_DQNAB 那一支同形 (懒构造 + 载权重 + 定预算 + 决策), 差别只在
            "预算"这个词的口径: DQNAB 是**节点数**, 本类是 MCTS 的**模拟次数**
-           (DQNMCTS_MOE_SIMS = 40, 见那个常数的注释: 一个 TB 专家前向 ~5-6 ms,
-           40 次约 175 ms/步, 与 SACAZ_MOE_SIMS 同一档, 不是旧类的 200)。
+           (DQNMCTS_MOE_SIMS = 120, 见那个常数的注释: 一次叶子估值 ~2.9 ms, 120 次约
+           364 ms/步; 40 次时搜索会退化成"每个孩子各访问一次 + 按先验取第一手",
+           实测两个预算的着法一致率 0%)。
            ⚠ `selectMove` 的第二个参数传 0 = "用成员 simulations", 所以上面那行赋值是
            **必需**的, 不是冗余: 不设它就跑构造函数的默认值 (与界面常数脱钩)。
            ⚠ 构造参数必须与 makeAgentInstance / loadAgentModel / 后台训练那几处**逐字一致**
@@ -3826,8 +3840,9 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
            两条决策路径各有一份 switch, 人机走 aiThinkRaw, 对弈 (含问对手一手) 走这里 ——
            以前 SAC 就漏改过其中一处 (见上面 AGENT_SACAZ 分支的注释: 表现是"评估模式下
            B 方仍然每手更新"), 那种漏洞在读数上极难归因。
-           `simulations` 用 DQNMCTS_MOE_SIMS (40): 一个 TB 专家前向 ~5-6 ms, 与
-           SACAZ_MOE_SIMS 同一时间预算档; `selectMove` 的第二参传 0 = 用该成员值。
+           `simulations` 用 DQNMCTS_MOE_SIMS (120): 一次叶子估值 ~2.9 ms ⇒ 约 364 ms/步,
+           而 40 次会让搜索退化成"每个孩子各访问一次 + 按先验取第一手"
+           (见那个常数的注释与 bench 的一致率证据); `selectMove` 的第二参传 0 = 用该成员值。
         */
         DQNMCTSMOETbAgent *ag = decisionInstance(m_sfDQNMCTSMOE, AGENT_DQNMCTS_MOE);
         if (ag == nullptr) {

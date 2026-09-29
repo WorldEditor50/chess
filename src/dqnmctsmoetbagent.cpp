@@ -221,7 +221,13 @@ DQNMCTSMOETbAgent::DQNMCTSMOETbAgent(Chess &chess_,
       learnFromSearch(true),
       auxLossCoef(0.1f),
       exploringRate(eps),
-      simulations(40),
+      /*
+         模拟次数默认 120 是**实测定的**: 40 次时开局 ~40 个合法着法 ⇒ 每个孩子恰好
+         1 次访问、严格打平, 根选择退化成"按先验顺序取第一个孩子" = 1 层 Q 贪心
+         (证据: --sims=40 --sims2=120 的着法一致率 0/16; 而 40 次 = 123~135 ms/步,
+         120 次 = 364~371 ms/步)。这是"边界值必须让搜索真的能回访孩子"那条纪律。
+      */
+      simulations(120),
       c_puct(c_puct_),
       priorTemp(1.0f),
       sparseLeafEval(true),
