@@ -139,6 +139,7 @@ set(CHESS_CORE_SOURCES
     ${SRC_DIR}/sacazmoemlpagent.cpp
     ${SRC_DIR}/sacazlegacyagent.cpp
     ${SRC_DIR}/dqnabagent.cpp
+    ${SRC_DIR}/dqnmctsmoetbagent.cpp
     ${SRC_DIR}/chessboard.cpp
 )
 add_library(CHESS_CORE STATIC ${CHESS_CORE_SOURCES})
@@ -795,6 +796,61 @@ if(CHESS_BUILD_TESTS)
     chess_add_header_deps(test_dqnab)
     add_test(NAME test_dqnab COMMAND test_dqnab)
     set_tests_properties(test_dqnab PROPERTIES TIMEOUT 900)
+
+    # ------------------------------------------- DQN+MCTS (稀疏MoE+TB专家)
+    # [2026-09 dev-dqnmcts-moetb] 新 agent: 独立类 DQNMCTSMOETbAgent —— 稀疏 MoE
+    # (E=4 top-1) + TransformerBlock 专家骨干, 规范视角 1263 维表示, PUCT(negamax 符号),
+    # Double DQN + clampTarget/Huber + 多 epoch 回放, 外部终局通道。
+    # 测试盯: 表示/动作编码与旧类那两处**具体**差别 (走子方通道、规范平面)、稀疏叶子估值
+    # 与全量口径逐元素等价、PUCT 的负号、终局口径统一 (getResult 而不是 isGameOver)、
+    # 权重往返 (_trunk + _q 两个文件)、自检面板的骨干指纹 (专家数/实际注意力头数)。
+    #
+    # 依赖与 test_dqnab **同一份**: 显式列出它需要的三个源文件 + agent 自己, 只链 RL_CORE
+    # (不碰 Qt, 也不链 CHESS_CORE —— 那是给要 QWidget/chessboard.cpp 的测试用的, 见 test_match)。
+    # 若这个 agent 以后用上 gamedb/Qt, 就照 test_sacaz 那一块补 gamedb.cpp + Qt Core/Sql。
+    # ctest: 与 test_dqnab 同一档 (它跑真实自对弈, 分钟级) —— TIMEOUT 900。
+    add_executable(test_dqnmcts_moe
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_dqnmcts_moe_main.cpp
+        ${SRC_DIR}/dqnmctsmoetbagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_include_directories(test_dqnmcts_moe PRIVATE ${SRC_DIR})
+    target_link_libraries(test_dqnmcts_moe PRIVATE RL_CORE)
+    target_compile_options(test_dqnmcts_moe PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_dqnmcts_moe PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_dqnmcts_moe)
+    add_test(NAME test_dqnmcts_moe COMMAND test_dqnmcts_moe)
+    set_tests_properties(test_dqnmcts_moe PROPERTIES TIMEOUT 900)
+
+    # ------------------------------------------- DQN+MCTS (MoE+TB 专家) 实测工具
+    # **不进 ctest** (与 bench_dqnab_vs_ab / bench_sacaz_vs_ab 同一理由): 它跑真实对局
+    # 与固定局面上的 A/B, 依赖随机开局, 一个 TB 骨干建网 ~0.8 s、一次决策 40 模拟
+    # ~135 ms。手动跑:
+    #   cmake --build <build> --target bench_dqnmcts_moe
+    #   <build>/bench_dqnmcts_moe --mode=agree --positions=32 --sims=40
+    #   <build>/bench_dqnmcts_moe --mode=arena --games=12 --opp=mcts --quiet
+    add_executable(bench_dqnmcts_moe
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_dqnmcts_moe_main.cpp
+        ${SRC_DIR}/dqnmctsmoetbagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp)
+    target_include_directories(bench_dqnmcts_moe PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_dqnmcts_moe PRIVATE RL_CORE)
+    target_compile_options(bench_dqnmcts_moe PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_dqnmcts_moe PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_dqnmcts_moe)
 
     # ------------------------------------------- DQN+AB vs AB 静默对弈验证
     # **不进 ctest** (与 bench_sacaz_vs_ab / bench_ppo_vs_ab 同一理由): 跑真实对局,

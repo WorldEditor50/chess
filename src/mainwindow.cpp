@@ -67,6 +67,19 @@ const AgentChoice kAgents[] = {
     */
     { "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)", ChessBoard::AGENT_PPOMCTS_MLP },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
+    /*
+       [2026-09 dev-dqnmcts-moetb] **同一个算法, 另一个骨干** —— 与上面那一项成对排列
+       (房子里的惯例: "同算法不同骨干"挨着放, 才能直接选中互相对弈比较)。
+       它**不是**上面那一支的运行时开关, 而是一个**独立的 C++ 类**
+       (DQNMCTSMOETbAgent, src/dqnmctsmoetbagent.h): 骨干换成稀疏 MoE (E=4 top-1) +
+       TransformerBlock 专家, 表示换成规范视角的 1263 维, 搜索用 PUCT + negamax 符号,
+       学习用 Double DQN + clampTarget/Huber。旧的那一支一位没动, 于是两条可以直接对弈。
+       代价: 一个 TB 专家前向 ~5-6 ms ⇒ 每次走子只给 DQNMCTS_MOE_SIMS = 40 次模拟
+       (约 175 ms/步, 与 SACAZ_MOE_SIMS 同一预算档; 旧类的 200 是 d_model=90 的预算)。
+       **权重文件独立** (weights/dqnmcts_moe_agent_trunk / _q, 旧类是单文件
+       weights/dqnmcts_agent.dat) —— 两者结构不同, 共用一个前缀只会静默互相覆盖。
+    */
+    { "DQN+MCTS (稀疏MoE+TB专家)",   ChessBoard::AGENT_DQNMCTS_MOE },
     { "EVAB (学会评估的 Alpha-Beta)", ChessBoard::AGENT_EVAB },
     { "SAC+MCTS+AlphaZero (最大熵搜索)", ChessBoard::AGENT_SACAZ },
     /*
@@ -152,6 +165,8 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
+    /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 有参数可存 (主干 + Q 头) */
+    case ChessBoard::AGENT_DQNMCTS_MOE:
     case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
     default:
@@ -1274,7 +1289,10 @@ void MainWindow::selfCheckWorkerLoop()
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
             ChessBoard::AGENT_PPOMCTS_MLP, ChessBoard::AGENT_SACAZ_OLD,
-            ChessBoard::AGENT_SACAZ_OLD_MOE
+            ChessBoard::AGENT_SACAZ_OLD_MOE,
+            /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 独立类, 自检面板
+               要能回答"骨干里真的有几个专家/几个注意力头在用"这类只能靠读数发现的事 */
+            ChessBoard::AGENT_DQNMCTS_MOE
         };
         if (all) {
             text = QStringLiteral(

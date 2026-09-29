@@ -54,6 +54,12 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD: return QStringLiteral("SAC+AZ-59e5233");
     case ChessBoard::AGENT_SACAZ_OLD_MOE: return QStringLiteral("SAC+AZ-59e5233-MoE");
     case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
+    /*
+       [2026-09 dev-dqnmcts-moetb] DQN+MCTS 的**MoE+TB 专家骨干**那一支 (独立类
+       DQNMCTSMOETbAgent)。名字里必须带上骨干口径 —— 与 AGENT_DQNMCTS 在同一个
+       下拉框里, 两者在日志/奖励曲线/比分表上不能同名 (同名 = 读数没法归因)。
+    */
+    case ChessBoard::AGENT_DQNMCTS_MOE: return QStringLiteral("DQN+MCTS (稀疏MoE+TB专家)");
     case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
     }
     return QStringLiteral("agent");
@@ -74,6 +80,8 @@ bool agentCanExplore(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
+    /* 本类实现了 exploreAndTrain (AgentBase 口径), 所以状态条上是"① 探索" */
+    case ChessBoard::AGENT_DQNMCTS_MOE:
     case ChessBoard::AGENT_PPOMCTS_MLP:
         return true;
     default:
@@ -106,6 +114,8 @@ bool agentHasLearningRewardTable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD:
     case ChessBoard::AGENT_SACAZ_OLD_MOE:
     case ChessBoard::AGENT_DQNAB:
+    /* DQN+MCTS (MoE+TB 专家) 有 computeReward 口径 (走子方视角的材质 + 每步代价) */
+    case ChessBoard::AGENT_DQNMCTS_MOE:
         return true;
     default:   /* AGENT_ALPHABETA / AGENT_MCTS / AGENT_EVAB */
         return false;
@@ -341,6 +351,12 @@ static constexpr float SACAZ_MOE_AUX = 0.1f;
  */
 static constexpr int DQNAB_NODES = 256;
 static constexpr int DQNAB_HIDDEN = 64;    /* DQN+AB 的头隐层宽度 */
+/* DQN+MCTS (稀疏MoE+TB专家) 每次决策的模拟次数: 一个 TB 专家前向 ~5-6 ms (d_model=1263,
+   见 src/dqnmctsmoetbagent.h 头注释的实测), 所以 40 次模拟约 175 ms/步 —— 与界面
+   SACAZ_MOE_SIMS 那一档同一个时间预算。旧类 DQNMCTS_ITERATIONS=200 是 d_model=90 的稠密
+   MoE 预算, 直接搬过来会让每步变成秒级。 */
+static constexpr int DQNMCTS_MOE_SIMS = 40;
+static constexpr int DQNMCTS_MOE_HIDDEN = 64;
 /* 单局手数上限已集中到 ChessBoard::DEFAULT_MAX_PLIES (界面上可用 setMaxPliesPerGame 调) */
 
 /*
@@ -441,6 +457,14 @@ static const char *TMP_WEIGHTS_SACAZ_OLD = "weights/_temp_train_sacaz_old";
 */
 static const char *TMP_WEIGHTS_SACAZ_OLD_MOE = "weights/_temp_train_sacaz_old_moe";
 static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab";
+/*
+   [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 那一支的临时前缀。
+   **必须独立**: 它写出的文件名是 `<prefix>_trunk` / `<prefix>_q`, 而 DQN+AB 写的是
+   `<prefix>_trunk` / `_v` / `_a` —— `_trunk` **同名**。共用前缀就是"两支持续互相
+   覆盖主干" (同一时刻只有一支在跑, 但上一轮的残留会让本轮 loadModel 读到别的结构),
+   与上面 PPO/SAC 那几段是同一条理由。
+*/
+static const char *TMP_WEIGHTS_DQNMCTS_MOE = "weights/_temp_train_dqnmcts_moe";
 
 /* 这个 agent 的后台训练临时前缀 (见上面那段注释) */
 static const char *tmpWeightsOf(ChessBoard::AgentType type)
@@ -454,6 +478,8 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD: return TMP_WEIGHTS_SACAZ_OLD;
     case ChessBoard::AGENT_SACAZ_OLD_MOE: return TMP_WEIGHTS_SACAZ_OLD_MOE;
     case ChessBoard::AGENT_DQNAB:     return TMP_WEIGHTS_DQNAB;
+    /* 独立前缀 (见上面那条注释: 它与 DQN+AB 的 _trunk 同名) */
+    case ChessBoard::AGENT_DQNMCTS_MOE: return TMP_WEIGHTS_DQNMCTS_MOE;
     default:                          return TMP_WEIGHTS;
     }
 }
@@ -730,7 +756,12 @@ static const ChessBoard::AgentType kWeightAgents[] = {
        它的 TB 专家骨干那一支紧跟其后 (同一口径、另一个骨干, 也是 3 x 146 MB 量级)。
     */
     ChessBoard::AGENT_SACAZ_OLD,
-    ChessBoard::AGENT_SACAZ_OLD_MOE
+    ChessBoard::AGENT_SACAZ_OLD_MOE,
+    /*
+       [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 排在最后: 它也是
+       "3 x 146 MB 量级"的那一组 (主干 + 头), 放在大的那一组之后读启动日志最清楚。
+    */
+    ChessBoard::AGENT_DQNMCTS_MOE
 };
 
 /*
@@ -764,6 +795,16 @@ static std::vector<std::string> weightFilesOf(ChessBoard::AgentType type)
     /* 一个模型三个文件: 主干 + V 头 + A 头 */
     case ChessBoard::AGENT_DQNAB:
         return { p + "_trunk", p + "_v", p + "_a" };
+    /*
+       一个模型三个文件: 主干 + Q 头 + 第二个 Q 头 (twinCritic 用)。
+       ⚠ 第二个头**无条件写**: 文件个数与名字不许依赖运行时开关 —— 否则载入方
+       就得猜"这一次有没有 _q2", 而猜错的表现是"载入失败"或者更坏: 半载入。
+       (类里 `twinCritic` 默认关, 但头照样存在, 打开时立刻生效。)
+       ⚠ 两个家族的 `_trunk` 同名 —— 所以前缀必须不同 (见 TMP_WEIGHTS_DQNMCTS_MOE
+       与 defaultWeightPath() 的说明)。
+    */
+    case ChessBoard::AGENT_DQNMCTS_MOE:
+        return { p + "_trunk", p + "_q", p + "_q2" };
     /* 单文件 */
     default:
         return { p };
@@ -783,6 +824,8 @@ SACAZMoEMlpAgent *ChessBoard::m_sfSACAZMoeMlp = nullptr; /* 独立类: 稀疏 Mo
 SACAZLegacyAgent *ChessBoard::m_sfSACAZOld = nullptr;      /* 独立类, 不是 SACAZAgent 的派生类 */
 SACAZLegacyAgent *ChessBoard::m_sfSACAZOldMoe = nullptr;   /* 同一口径 + TB 专家骨干 */
 DQNABAgent *ChessBoard::m_sfDQNAB = nullptr;
+/* DQN+MCTS (MoE+TB 专家) 那一支: 独立类 (src/dqnmctsmoetbagent.h/.cpp) */
+DQNMCTSMOETbAgent *ChessBoard::m_sfDQNMCTSMOE = nullptr;
 std::map<ChessBoard::AgentType, std::string> ChessBoard::s_weightPaths;
 
 /*
@@ -1019,6 +1062,31 @@ void ChessBoard::startupLoad()
         }
         m_sfDQNAB->loadModel(prefix);
         logLoad("DQN+AB 读权重(主干 + V 头 + A 头)");
+    }
+    if (s_weightPaths.count(AGENT_DQNMCTS_MOE)) {
+        /*
+           [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 的预加载: 与 DQN+AB 那块对称。
+           ⚠ 这里"建网"本身就不便宜 (稀疏 MoE + 4 个 TB 专家 = ~29 M 参数的
+           "分配 + 随机初始化"), 与 TB 那一组 SAC 一样: 单独记一条耗时日志,
+           启动慢的话能一眼看出是这一步, 而不是"读文件慢"。DQN+AB 也是同样地
+           在启动时**急切**建网 (用户口径: 启动时加载所有模型), 所以这里照做。
+           `denseMoe` 走默认值 false (就是稀疏路由那一支; 等参数对照组只在 bench 里开)。
+        */
+        emit busyMessage(QStringLiteral("正在载入 DQN+MCTS (稀疏MoE+TB专家) 权重…"));
+        if (m_sfDQNMCTSMOE == nullptr) {
+            m_sfDQNMCTSMOE = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                                  1.0f, 1.5f);
+        }
+        logLoad("DQN+MCTS-MoE 建网(稀疏 MoE + 4 个 TB 专家)");
+        /* 探测串是 `<prefix>_trunk`, 去掉后缀得到 loadModel 要的前缀 */
+        std::string prefix = s_weightPaths[AGENT_DQNMCTS_MOE];
+        const std::string suffix = "_trunk";
+        if (prefix.size() > suffix.size()
+            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            prefix.erase(prefix.size() - suffix.size());
+        }
+        m_sfDQNMCTSMOE->loadModel(prefix);
+        logLoad("DQN+MCTS-MoE 读权重(主干 + Q 头)");
     }
 
     /* ---- 4. 启动时给每个**已加载的模型**跑一遍自检 (2026-09) ---- */
@@ -2242,6 +2310,8 @@ AgentBase *ChessBoard::agentInstance(AgentType type) const
     case AGENT_SACAZ_OLD:   return m_sfSACAZOld;
     case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe;
     case AGENT_DQNAB:       return m_sfDQNAB;
+    /* DQN+MCTS (MoE+TB 专家): 独立类 (src/dqnmctsmoetbagent.h) */
+    case AGENT_DQNMCTS_MOE: return m_sfDQNMCTSMOE;
     default:                return nullptr;   /* Alpha-Beta / MCTS: 没有常驻对象 */
     }
 }
@@ -2331,6 +2401,18 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
         a->nodeBudget = DQNAB_NODES;      /* 与 aiThinkRaw 同一预算, 否则搜索行为不一致 */
         return a;
     }
+    case AGENT_DQNMCTS_MOE: {
+        /*
+           [2026-09 dev-dqnmcts-moetb] 独立类 DQNMCTSMOETbAgent。构造参数必须与
+           aiThinkRaw / loadAgentModel / 后台训练那几处**逐字一致** (见本函数头注释) ——
+           它不含骨干开关 (denseMoe 走默认 false), 所以两处 ctor 的差别只可能在
+           隐层宽度与那几个超参上。
+        */
+        DQNMCTSMOETbAgent *a = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                                     1.0f, 1.5f);
+        a->simulations = DQNMCTS_MOE_SIMS;   /* 与 aiThinkRaw 同一预算 */
+        return a;
+    }
     default:
         return nullptr;   /* 纯搜索 agent (AB 各档 / MCTS): 没有实例可建 */
     }
@@ -2363,6 +2445,9 @@ bool ChessBoard::saveWeightsOf(AgentBase *inst, AgentType type, const std::strin
     case AGENT_SACAZ_OLD_MOE:
         return static_cast<SACAZLegacyAgent *>(inst)->saveModel(filepath);
     case AGENT_DQNAB:       return static_cast<DQNABAgent *>(inst)->saveModel(filepath);
+    /* DQN+MCTS (MoE+TB 专家): 独立类, 写 <prefix>_trunk + <prefix>_q (见 weightFilesOf) */
+    case AGENT_DQNMCTS_MOE:
+        return static_cast<DQNMCTSMOETbAgent *>(inst)->saveModel(filepath);
     default:                return false;      /* 纯搜索 agent: 没有权重 */
     }
 }
@@ -2387,6 +2472,9 @@ bool ChessBoard::loadWeightsInto(AgentBase *inst, AgentType type, const std::str
     case AGENT_SACAZ_OLD_MOE:
         return static_cast<SACAZLegacyAgent *>(inst)->loadModel(filepath);
     case AGENT_DQNAB:       return static_cast<DQNABAgent *>(inst)->loadModel(filepath);
+    /* DQN+MCTS (MoE+TB 专家): 独立类, 读同样的 <prefix>_trunk + <prefix>_q */
+    case AGENT_DQNMCTS_MOE:
+        return static_cast<DQNMCTSMOETbAgent *>(inst)->loadModel(filepath);
     default:                return false;      /* 纯搜索 agent: 没有权重 */
     }
 }
@@ -2730,6 +2818,18 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
             return m_sfDQNAB->selfCheckReport();
         }
         break;
+    /*
+       [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 的只读自检: 它报的是骨干指纹
+       (专家数/topK/注意力头请求数 vs 实用数)、表示口径、搜索的 PUCT 符号、学习读数
+       与终局通道 —— 全是**只能靠读数发现**的静默失效, 所以面板上必须有它一格。
+       没有实例时返回空串 (与上面各支一致: "没有实例"与"报告为空"在界面上由
+       getAgentWeightStatus 那一行区分)。
+    */
+    case AGENT_DQNMCTS_MOE:
+        if (m_sfDQNMCTSMOE != nullptr) {
+            return m_sfDQNMCTSMOE->selfCheckReport();
+        }
+        break;
     case AGENT_PPOMCTS_MLP:
         if (m_sfPPOMCTSMLP != nullptr) {
             return m_sfPPOMCTSMLP->selfCheckReport();
@@ -2873,8 +2973,9 @@ Step ChessBoard::humanTurnAiMoveForTest(int color)
  *  2. **锁**: 要改 agent 的回放池 (还可能做一次 learnBatch), 与"决策 / 权重保存 /
  *     后台训练同步回主 agent"共用 `m_agentMutex`。调用方不持有棋盘 mutex, 锁序与别处
  *     一致。对局线程 / GUI 线程都会调它 (三个终局点分别在 process() 与人落子的那条路)。
- *  3. **agent 决定接不接**: 三支 SAC+AZ 会接 (把终局挂到最后一条真实决策样本上, 幂等);
- *     纯搜索与 rollout 系 agent 默认 no-op 返回 false。**返回 false 必须打日志** ——
+ *  3. **agent 决定接不接**: 三支 SAC+AZ 与 DQN+MCTS (MoE+TB 专家) 会接 (把终局挂到最后
+ *     一条真实决策样本上, 幂等); 纯搜索与 rollout 系 agent 默认 no-op 返回 false。
+ *     **返回 false 必须打日志** ——
  *     否则这条通道会静默地什么都不做, 而"没生效"与"没输过"在读数上长得一样。
  */
 bool ChessBoard::notifyHumanGameEnd(int result)
@@ -2905,7 +3006,17 @@ bool ChessBoard::notifyHumanGameEnd(int result)
     */
     const bool channelClass = (m_agentType == AGENT_SACAZ
                                || m_agentType == AGENT_SACAZ_MOE
-                               || m_agentType == AGENT_SACAZ_MOE_MLP);
+                               || m_agentType == AGENT_SACAZ_MOE_MLP
+                               /*
+                                  [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 也实现
+                                  了 AgentBase::notifyGameResult, 而且它也保留**真实决策样本**
+                                  (Sample::decision) —— 人机里"结束这一局的那一手"是**人**走的,
+                                  学习器看不到终局, 不在这里列举的话 AI 输掉的那一局最后一条
+                                  样本的 done 永远是 false (终局 −1 拿不到)。
+                                  别的 DQN 系 agent (AGENT_DQN / AGENT_DQNAB) 不在名单里:
+                                  它们的终局值随 rollout 一起进池, 这是它们自己的口径。
+                               */
+                               || m_agentType == AGENT_DQNMCTS_MOE);
     bool instanceExists = false;
 
     bool taken = false;
@@ -2914,14 +3025,16 @@ bool ChessBoard::notifyHumanGameEnd(int result)
         AgentBase *agent = nullptr;
         switch (m_agentType) {
         /*
-           只有这三支有"真实决策样本"这条通道 (learnFromSearch 写进去的
-           hasSearch=true 样本)。别的 agent 不在这里列举: 它们要么没有可训练参数
-           (AB / MCTS), 要么终局值本来就随 rollout 一起进了池 (PPO / DQN / EVAB),
-           对它们调用没有意义 —— 默认实现返回 false 已经表达了这件事。
+           只有这四支有"真实决策样本"这条通道 (learnFromSearch / 决策路径写进去的
+           decision 样本)。别的 agent 不在这里列举: 它们要么没有可训练参数
+           (AB / MCTS), 要么终局值本来就随 rollout 一起进了池 (PPO / DQN / DQN+AB /
+           EVAB), 对它们调用没有意义 —— 默认实现返回 false 已经表达了这件事。
         */
         case AGENT_SACAZ:         agent = m_sfSACAZ;         break;
         case AGENT_SACAZ_MOE:     agent = m_sfSACAZMoe;      break;
         case AGENT_SACAZ_MOE_MLP: agent = m_sfSACAZMoeMlp;   break;
+        /* DQN+MCTS (MoE+TB 专家): 独立类, 池里的 decision 样本由终局回填 (幂等) */
+        case AGENT_DQNMCTS_MOE:   agent = m_sfDQNMCTSMOE;    break;
         default:                                             break;
         }
         instanceExists = (agent != nullptr);
@@ -3354,6 +3467,53 @@ Step ChessBoard::aiThinkRaw(int color)
         /* temp = 0: 取搜索值最大的那一手 (确定性) */
         return m_sfDQNAB->selectMove(color, 0.0f);
     }
+    case AGENT_DQNMCTS_MOE: {
+        /*
+           ---- DQN+MCTS (稀疏MoE+TB专家), 独立类 DQNMCTSMOETbAgent ----
+           与上面 AGENT_DQNAB 那一支同形 (懒构造 + 载权重 + 定预算 + 决策), 差别只在
+           "预算"这个词的口径: DQNAB 是**节点数**, 本类是 MCTS 的**模拟次数**
+           (DQNMCTS_MOE_SIMS = 40, 见那个常数的注释: 一个 TB 专家前向 ~5-6 ms,
+           40 次约 175 ms/步, 与 SACAZ_MOE_SIMS 同一档, 不是旧类的 200)。
+           ⚠ `selectMove` 的第二个参数传 0 = "用成员 simulations", 所以上面那行赋值是
+           **必需**的, 不是冗余: 不设它就跑构造函数的默认值 (与界面常数脱钩)。
+           ⚠ 构造参数必须与 makeAgentInstance / loadAgentModel / 后台训练那几处**逐字一致**
+           (隐层 64 / gamma 0.99 / lr 0.001 / eps 1.0 / c_puct 1.5, denseMoe 走默认 false),
+           否则 save/load 的结构指纹对不上 (每一轮都载入失败)。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfDQNMCTSMOE == nullptr) {
+            /* 正常路径下 startupLoad() 已经预加载过它; 这里只是兜底 */
+            m_sfDQNMCTSMOE = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                                   1.0f, 1.5f);
+            auto it = s_weightPaths.find(AGENT_DQNMCTS_MOE);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 DQN+MCTS (稀疏MoE+TB专家): "
+                                                "读取主干 + Q 头的权重…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_trunk";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                m_sfDQNMCTSMOE->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        m_sfDQNMCTSMOE->simulations = DQNMCTS_MOE_SIMS;
+        preTrainThenDecide(m_sfDQNMCTSMOE, color);
+        /*
+           走 finishDecisionSearch (与 SAC 两支同一个收尾钩子), 而不是直接 return:
+             1. **对弈模式掩码**: 评估 / 只对弈模式下必须把"从自己的搜索学一次"
+                (learnFromSearch) 在一手之内关掉 —— 那两条模式承诺"权重也不变",
+                而每次真实决策都会存一条 decision 样本并按节拍更新一次;
+             2. **损失上报**: 这一手真的学过就要上曲线 (按 getLearnSteps 有没有前进判断)。
+           temp = 0: 取访问数最多的走法 (确定性), 与旧类 AGENT_DQNMCTS 同一收尾口径。
+        */
+        return finishDecisionSearch(m_sfDQNMCTSMOE, [&] {
+            return m_sfDQNMCTSMOE->selectMove(color, 0, 0.0f);
+        });
+    }
     default: {
         /*
            兜底: 走到这里说明**这个 agent 类型没有自己的决策 case** (新增类型忘了接线),
@@ -3658,6 +3818,44 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         ag->nodeBudget = DQNAB_NODES;
         preTrainThenDecide(ag, color);
         return ag->selectMove(color, 0.0f);
+    }
+    case AGENT_DQNMCTS_MOE: {
+        /*
+           ---- DQN+MCTS (稀疏MoE+TB专家), 独立类 DQNMCTSMOETbAgent ----
+           与上面 AGENT_DQNAB 那一支同形。**这一支必须与 aiThinkRaw 里那一支同时存在**:
+           两条决策路径各有一份 switch, 人机走 aiThinkRaw, 对弈 (含问对手一手) 走这里 ——
+           以前 SAC 就漏改过其中一处 (见上面 AGENT_SACAZ 分支的注释: 表现是"评估模式下
+           B 方仍然每手更新"), 那种漏洞在读数上极难归因。
+           `simulations` 用 DQNMCTS_MOE_SIMS (40): 一个 TB 专家前向 ~5-6 ms, 与
+           SACAZ_MOE_SIMS 同一时间预算档; `selectMove` 的第二参传 0 = 用该成员值。
+        */
+        DQNMCTSMOETbAgent *ag = decisionInstance(m_sfDQNMCTSMOE, AGENT_DQNMCTS_MOE);
+        if (ag == nullptr) {
+            m_sfDQNMCTSMOE = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                                   1.0f, 1.5f);
+            ag = m_sfDQNMCTSMOE;
+            /* 与上面 SACAZ_MOE / DQNAB 同一条约定: 建了对象就把权重载上, 两条兜底路径不许分叉 */
+            auto it = s_weightPaths.find(AGENT_DQNMCTS_MOE);
+            if (it != s_weightPaths.end()) {
+                emit busyStarted(QStringLiteral("正在载入"),
+                                 QStringLiteral("首次使用 DQN+MCTS (稀疏MoE+TB专家): "
+                                                "读取主干 + Q 头的权重…"));
+                std::string prefix = it->second;
+                const std::string suffix = "_trunk";
+                if (prefix.size() > suffix.size()
+                    && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    prefix.erase(prefix.size() - suffix.size());
+                }
+                ag->loadModel(prefix);
+                emit busyFinished();
+            }
+        }
+        ag->simulations = DQNMCTS_MOE_SIMS;   /* 与 aiThinkRaw 同一预算 */
+        preTrainThenDecide(ag, color);
+        /* 走 finishDecisionSearch (对弈模式掩码 + 损失上报), 与 aiThinkRaw 那一支一致 */
+        return finishDecisionSearch(ag, [&] {
+            return ag->selectMove(color, 0, 0.0f);
+        });
     }
     case AGENT_PPOMCTS_MLP: {
         /*
@@ -4425,6 +4623,16 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
         return SACAZLegacyAgent::defaultWeightPrefix(SACAZLegacyAgent::Backbone::SparseMoeTb);
     /* DQN+AB: 前缀 -> <prefix>_trunk / _v / _a */
     case AGENT_DQNAB:  return "weights/dqnab_agent";
+    /*
+       [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): **前缀** ->
+       <prefix>_trunk / <prefix>_q (不是文件名)。
+       与旧类 AGENT_DQNMCTS 的 `weights/dqnmcts_agent.dat` 刻意分开: 两者参数量与结构
+       都不同, 共用前缀 = 后训练的那一支静默覆盖另一支 (理由见类的头注释"权重文件"段)。
+       字符串取自类自己的 `defaultWeightPrefix()` (与三支 SAC 同一手法): 前缀一旦手抄成
+       两份, weightFilesOf() 探测的名字就会与 saveModel 写出的名字漂移 —— 那正是
+       PPO+MCTS 当年 279 MB 权重从来没被载入过的形状 (见上面那段说明)。
+    */
+    case AGENT_DQNMCTS_MOE: return DQNMCTSMOETbAgent::defaultWeightPrefix();
     default:              return std::string();
     }
 }
@@ -4443,6 +4651,8 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     case AGENT_SACAZ_OLD: return m_sfSACAZOld != nullptr;
     case AGENT_SACAZ_OLD_MOE: return m_sfSACAZOldMoe != nullptr;
     case AGENT_DQNAB:  return m_sfDQNAB != nullptr;
+    /* DQN+MCTS (MoE+TB 专家): 独立类, 有自己的常驻实例 */
+    case AGENT_DQNMCTS_MOE: return m_sfDQNMCTSMOE != nullptr;
     case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP != nullptr;
     default:              return false;
     }
@@ -4611,6 +4821,20 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
             m_sfDQNAB->nodeBudget = DQNAB_NODES;
         }
         return m_sfDQNAB->loadModel(filepath);
+    }
+    case AGENT_DQNMCTS_MOE: {
+        /*
+           [2026-09 dev-dqnmcts-moetb] 独立类 DQNMCTSMOETbAgent。
+           构造参数与 aiThinkRaw / decideOnEnvRawLocked / makeAgentInstance / 后台训练
+           那几处**逐字一致** (见本函数头注释), 预算也一起定下来 (selectMove 传 0 时用成员值)。
+        */
+        if (m_sfDQNMCTSMOE == nullptr) {
+            m_sfDQNMCTSMOE = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                                   1.0f, 1.5f);
+            m_sfDQNMCTSMOE->simulations = DQNMCTS_MOE_SIMS;
+        }
+        /* filepath 是前缀 -> _trunk / _q */
+        return m_sfDQNMCTSMOE->loadModel(filepath);
     }
     default:
         return false;
@@ -4794,6 +5018,10 @@ void ChessBoard::backgroundTrainLoop()
         case AGENT_SACAZ_OLD:
         case AGENT_SACAZ_OLD_MOE:
         case AGENT_DQNAB:
+        /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 有可训练权重, 已接入
+           (它下面四个 switch 里都有 case —— 漏一个的表现是"该 agent 的后台训练尚未
+           接入"或"种子权重写入失败", 见 4981 行那段说明) */
+        case AGENT_DQNMCTS_MOE:
         case AGENT_PPOMCTS_MLP:
             trainable = true;
             break;
@@ -4899,6 +5127,20 @@ void ChessBoard::backgroundTrainLoop()
                     m_sfDQNAB->nodeBudget = DQNAB_NODES;   /* 与 aiThinkRaw 同一预算 */
                 }
                 break;
+            /*
+               [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 构造参数与
+               aiThinkRaw / decideOnEnvRawLocked / makeAgentInstance / loadAgentModel
+               **逐字一致** (含 denseMoe 走默认 false), 预算同样在这里定下来 ——
+               主 agent 与下面那个训练 clone 的网络结构必须一模一样, 否则结构指纹
+               让整轮 load 失败 (表现是"每轮都在报载入失败": 不静默, 但白跑)。
+            */
+            case AGENT_DQNMCTS_MOE:
+                if (m_sfDQNMCTSMOE == nullptr) {
+                    m_sfDQNMCTSMOE = new DQNMCTSMOETbAgent(env, DQNMCTS_MOE_HIDDEN, 0.99f,
+                                                           0.001f, 1.0f, 1.5f);
+                    m_sfDQNMCTSMOE->simulations = DQNMCTS_MOE_SIMS;  /* 与 aiThinkRaw 同一预算 */
+                }
+                break;
             default: break;
             }
         }
@@ -4946,6 +5188,10 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_DQNAB:
                 if (m_sfDQNAB) seeded = m_sfDQNAB->saveModel(tmpWeights);
+                break;
+            /* [2026-09 dev-dqnmcts-moetb] 同上: 前缀 -> <prefix>_trunk / _q */
+            case AGENT_DQNMCTS_MOE:
+                if (m_sfDQNMCTSMOE) seeded = m_sfDQNMCTSMOE->saveModel(tmpWeights);
                 break;
             default: break;
             }
@@ -5199,6 +5445,36 @@ void ChessBoard::backgroundTrainLoop()
                 roundApplied = true;
                 break;
             }
+            /*
+               ---- DQN+MCTS (稀疏MoE+TB专家), 2026-09 dev-dqnmcts-moetb ----
+               与上面 DQN+AB 那一支同一条往返 (clone -> 独立棋盘 -> 载种子 -> 自对弈 ->
+               写回), 差别在训练接口与预算口径:
+                 * `trainSelfPlay(episodes, simulations, maxMoves, verbose)` 的第三个参数是
+                   **模拟次数** (不是节点数), 给 DQNMCTS_MOE_SIMS;
+                 * 训练用多少次模拟与界面决策**同一个常数** —— 它是"这次训练花多少时间"
+                   的唯一旋钮 (一个 TB 专家前向 ~5-6 ms, 40 次 ≈ 175 ms/步)。
+               ⚠ clone 的构造参数必须与主 agent **逐字一致** (denseMoe 走默认 false),
+                 否则结构指纹让 loadModel 每轮失败 (不静默, 但白跑)。
+            */
+            case AGENT_DQNMCTS_MOE: {
+                DQNMCTSMOETbAgent clone(trainChess, DQNMCTS_MOE_HIDDEN, 0.99f, 0.001f,
+                                        1.0f, 1.5f);
+                clone.simulations = DQNMCTS_MOE_SIMS;   /* 与主 agent / 界面同一预算 */
+                if (!clone.loadModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+MCTS (稀疏MoE+TB专家) clone 载入种子权重失败, "
+                                  "本轮丢弃 (临时文件与当前网络结构不匹配? 路径"
+                               << tmpWeights << ")";
+                    break;
+                }
+                clone.trainSelfPlay(roundEpisodes, DQNMCTS_MOE_SIMS, roundMaxMoves, false);
+                roundLoss = clone.getLastTrainLoss();
+                if (!clone.saveModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+MCTS (稀疏MoE+TB专家) 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
+                break;
+            }
             default: break;
             }
 
@@ -5310,6 +5586,12 @@ void ChessBoard::backgroundTrainLoop()
                     qWarning() << "[train] DQN+AB 权重同步回主 agent 失败";
                 }
                 break;
+            /* [2026-09 dev-dqnmcts-moetb] 从**自己的**临时前缀同步回**自己的**实例 */
+            case AGENT_DQNMCTS_MOE:
+                if (m_sfDQNMCTSMOE && !m_sfDQNMCTSMOE->loadModel(tmpWeights)) {
+                    qWarning() << "[train] DQN+MCTS (稀疏MoE+TB专家) 权重同步回主 agent 失败";
+                }
+                break;
             default: break;
             }
         }
@@ -5358,7 +5640,10 @@ int ChessBoard::saveAllInstantiatedAgentsOnExit()
 
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
                               AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB,
-                              AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD, AGENT_SACAZ_OLD_MOE };
+                              AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD, AGENT_SACAZ_OLD_MOE,
+                              /* [2026-09 dev-dqnmcts-moetb] 独立类, 正式前缀
+                                 weights/dqnmcts_moe_agent_* (与旧类的单文件不同) */
+                              AGENT_DQNMCTS_MOE };
     int saved = 0;
     for (AgentType t : all) {
         if (!hasAgentInstance(t)) {

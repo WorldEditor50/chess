@@ -311,7 +311,17 @@ int main(int argc, char *argv[])
             { ChessBoard::AGENT_SACAZ_MOE_MLP, "SAC+AZ-MoE-MLP", true },
             /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent): 显示名与"上报损失"都要接上 */
             { ChessBoard::AGENT_SACAZ_OLD, "SAC+AZ-59e5233", true },
-            { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP", true }
+            { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP", true },
+            /*
+               [2026-09 dev-dqnmcts-moetb] DQN+MCTS 的 **MoE+TB 专家骨干**那一支
+               (独立类 DQNMCTSMOETbAgent)。它与上面 DQN+MCTS 那一支**不是同一个类**,
+               而这里钉的是接口层面两件事: 下拉框里选得到它 (名字就是 agentDisplayName
+               的那个串)、以及**对弈时会真的上报训练损失** —— 曲线按 agent 名分线,
+               名字接不上(或不上报)就等于"选了它在界面上没有任何读数"。
+               注意它比旧类慢得多 (一个 TB 专家前向 ~5-6 ms ⇒ 每手 40 次模拟约 175 ms),
+               所以这里同样只跑 10 手一小局 (与 AGENT_SACAZ_MOE 那一档同一种代价)。
+            */
+            { ChessBoard::AGENT_DQNMCTS_MOE, "DQN+MCTS (稀疏MoE+TB专家)", true }
         };
         /*
            10 手 + 预训 32 步: 有几个 agent 的在线训练是**按回放池大小门控**的
@@ -1815,7 +1825,15 @@ int main(int argc, char *argv[])
             ChessBoard::AGENT_SACAZ_MOE_MLP,
             ChessBoard::AGENT_PPOMCTS_MLP,
             /* 59e5233 行为还原版 (**独立类** SACAZLegacyAgent), 2026-09 新增 */
-            ChessBoard::AGENT_SACAZ_OLD
+            ChessBoard::AGENT_SACAZ_OLD,
+            /*
+               [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家), **独立类**
+               DQNMCTSMOETbAgent。这里走的是**轻量**接口 (getAgentSelfCheck /
+               getAgentWeightStatus 都不建 agent: 没有实例就返回空串、权重状态只是
+               列文件名), 所以加它不会为这一节引入 TB 骨干的构造开销。
+               有实例时报告必须满足下面那三条通判据 (非空 / 可重复 / 写明"不是棋力")。
+            */
+            ChessBoard::AGENT_DQNMCTS_MOE
         };
         int reported = 0;
         for (ChessBoard::AgentType t : all) {
@@ -2005,7 +2023,18 @@ int main(int argc, char *argv[])
                PPO+MCTS-MLP 也在这一组: 它的 learnFromReplay 同样有"池 ≥ replayBatchSize(64)
                才学"的门控, 而镜像是 2 倍增广 ⇒ 40 手的轮次给 80 条样本, 刚好过门槛。
             */
-            { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP" }
+            { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP" },
+            /*
+               [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家)。
+               这一支**必须**在这张表里: 它是新类型, 而"一条没人走过的分支等于没有接线"
+               (EVAB 那次就是空转了很多轮才被发现)。判据与上面几条完全一样 —— 只有
+               `roundApplied` 为真才 emit trainLossSample (写种子 -> clone 载入 -> 训练 ->
+               写回 -> 同步, 整条链都成功), 所以等到一条损失就说明后台训练真的接上了。
+               名字用**显示名**: 那一行的信号带的是 agentDisplayName(type)。
+               ⚠ 它在三个 switch (trainable / 建主 agent / 建 clone) 里都必须有 case,
+                 少一个的表现分别是"尚未接入"、"种子权重写入失败"、"载入种子失败"。
+            */
+            { ChessBoard::AGENT_DQNMCTS_MOE, "DQN+MCTS (稀疏MoE+TB专家)" }
         };
         const int savedEpisodes = board.getBackgroundTrainEpisodes();
         const int savedMaxMoves = board.getBackgroundTrainMaxMoves();

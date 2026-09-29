@@ -31,6 +31,7 @@
 #include "evagent.h"
 #include "sacazagent.h"
 #include "dqnabagent.h"
+#include "dqnmctsmoetbagent.h"
 
 /*
    AGENT_SACAZ_OLD 的实例类型。这里只**前置声明**就够了 (成员是指针, 上报损失是个模板),
@@ -195,7 +196,44 @@ public:
            交叉载入当场失败, 不会静默串权重。
            **追加在枚举末尾** (同上面几条的理由): 值经 GUI 下拉框 userData 传出去。
         */
-        AGENT_SACAZ_MOE_MLP
+        AGENT_SACAZ_MOE_MLP,
+        /*
+           ================================================================
+           DQN+MCTS, 但骨干换成**稀疏路由 MoE + TransformerBlock 专家** ——
+           也就是"SAC 那条线上已经被实测过的优化"搬进 DQN+MCTS 的这一支。
+           ================================================================
+           它是一个**独立类** `DQNMCTSMOETbAgent`
+           (src/dqnmctsmoetbagent.h/.cpp), 与 `DQNMCTSAgent` (AGENT_DQNMCTS)
+           **互不继承、互不包含** —— 旧的那一支、以及它的权重文件
+           `weights/dqnmcts_agent.dat`, 一位不动。
+           **不要**把它当成 `AGENT_DQNMCTS` 的"另一个开关": "改这一支不许碰那一支"
+           这件事在枚举这一层就要能读出来 (两个类型 = 两个类 = 两个文件)。
+
+           搬过来的东西 (逐条出处见 dqnmctsmoetbagent.h 的头注释):
+             * 骨干: 稀疏 MoE E=4 / top-1, 专家 = TransformerBlock<15, 315, HonorHeads=true>
+               (同一个专家前向的实测口径与 SACAZMoETbAgent 的 TB 那一支逐字相同);
+             * 表示: 规范视角 14 子力平面 + 3 个规则上下文标量 ⇒ STATE_DIM = 1263
+               (旧类是 90 维, 而且没有走子方通道);
+             * 搜索: PUCT + 先验, 且 Q 的符号按 **negamax** 取负 (旧类的 getUCB1 漏了
+               这个负号 —— "评估越准错得越狠", 见 docs/session_2026_09_sac.md);
+             * 学习: Double DQN / clampTarget + Huber / 多 epoch 回放 / 梯度累积;
+             * 终局: 搜索叶子与训练目标同走一个 `terminalReward` 出口 (旧类的
+               evaluateLeaf 用 `isGameOver()`, 将杀/困毙/重复/限着一概不算终局);
+             * 外部终局通道 (`AgentBase::notifyGameResult`), 所以它要在人机对弈的
+               终局广播名单里 (见 chessboard.cpp 的 notifyHumanGameEnd);
+             * 只读自检面板 (骨干指纹 / 表示 / 搜索 / 学习 / 终局通道的读数)。
+
+           **权重文件独立**: 前缀 `weights/dqnmcts_moe_agent`, 两个文件
+           (`_trunk` + `_q`) —— 与旧类的**单文件** `weights/dqnmcts_agent.dat`
+           刻意不同。两者参数量与结构都不同 (交叉载入会当场失败), 但命名上必须能回答
+           "这是哪一支的权重": 共用前缀 = 后训练的那一支静默覆盖另一支。
+
+           **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
+           (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
+           同理, **不要**把它插到 AGENT_DQNMCTS 旁边去"排得好看" ——
+           下拉框里的位置由 mainwindow.cpp 的 kAgents 决定, 与枚举值无关。
+        */
+        AGENT_DQNMCTS_MOE
     };
 
 public:
@@ -780,6 +818,8 @@ private:
     static SACAZLegacyAgent *m_sfSACAZOld;      /* 行为还原版: 独立类 (59e5233), MLP 骨干 */
     static SACAZLegacyAgent *m_sfSACAZOldMoe;   /* 同上, 但骨干换成稀疏 MoE + TB 专家 */
     static DQNABAgent *m_sfDQNAB; /* AB 当 DQN 的 planning head (见 dqnabagent.h) */
+    /* DQN+MCTS 的 MoE+TB 专家骨干那一支 (AGENT_DQNMCTS_MOE): 独立类, 见下面枚举里的说明 */
+    static DQNMCTSMOETbAgent *m_sfDQNMCTSMOE;
 
     /* "走子前先探索环境 + 预训练"开关 (仿 snakeAI) */
     std::atomic<bool> m_preTrainEnabled{true};    std::atomic<int> m_preTrainSteps{64};
