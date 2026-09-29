@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <chrono>  /* pretrainQFromHand 的耗时读数 */
 #include <map>    /* selfCheckReport 的动作别名统计: 槽位 -> 互不相同的走法 */
 #include <set>
 #include <random>
@@ -40,6 +41,14 @@
  * ================================================================ */
 
 namespace {
+
+/* 本文件内部的毫秒时钟 (只用给预训练/诊断打耗时, 不参与任何判断) */
+double nowMs()
+{
+    using clock = std::chrono::steady_clock;
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               clock::now().time_since_epoch()).count() / 1e6;
+}
 
 /* 上下文个数必须与 chessstate.h 的那三项一一对应 (顺序见 contextOf) */
 static_assert(DQNMCTSMOETbAgent::CTX_COUNT == 3,
@@ -1709,6 +1718,245 @@ int DQNMCTSMOETbAgent::pickActionEpsilon(const RL::Tensor &state,
         }
     }
     return best;
+}
+
+/* ================================================================
+ *  手工评估锚预训练 (见头文件那一节)
+ * ================================================================ */
+double DQNMCTSMOETbAgent::handAnchor(int color)
+{
+    /*
+       `Chess::evaluate()` 是**黑方视角** (正 = 黑方有利), 而本 agent 的价值一律是
+       "走子方视角" ⇒ 红方取负。除以 3 再 tanh 是 EVAB / DQNAB 的 EVAL_SCALE 口径
+       (保持三个 agent 的手工锚可以互换对照)。
+    */
+    const double e = chess.evaluate();
+    return std::tanh((color == Stone::COLOR_RED ? -e : e) / 3.0);
+}
+
+void DQNMCTSMOETbAgent::buildHandProbes(int count, int maxPlies,
+                                        std::vector<std::vector<Step> > &out)
+{
+    out.clear();
+    if (count <= 0) {
+        return;
+    }
+    Chess walk;
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    for (int i = 0; i < count; i++) {
+        walk.reset();
+        int turn = Stone::COLOR_RED;
+        const int span = std::max(1, maxPlies - 4);
+        const int len = 4 + (int)(u01(RL::Random::engine) * (float)span);
+        std::vector<Step> seq;
+        for (int k = 0; k < len; k++) {
+            if (walk.getResult(turn) != Chess::RESULT_ONGOING) {
+                break;
+            }
+            std::vector<Step*> legal;
+            walk.sample(turn, legal);
+            if (legal.empty()) {
+                Steps::instance().put(legal);
+                break;
+            }
+            /*
+               吃子偏置 0.5: 纯随机走出来的局面子力几乎不动, 手工锚的方差太小
+               (DQNAB 那边实测过: 纯随机探针的 anchorStd 只有 0.0074 ⇒ 监督信号是常数)。
+               有偏置地优先取吃子着法, 能让"正在交换子力"的局面进探针集。
+            */
+            std::vector<Step*> captures;
+            for (std::size_t j = 0; j < legal.size(); j++) {
+                if (legal[j]->nextId != Stone::ID_NONE) {
+                    captures.push_back(legal[j]);
+                }
+            }
+            int k2 = 0;
+            if (!captures.empty() && u01(RL::Random::engine) < 0.5f) {
+                k2 = std::min((int)(u01(RL::Random::engine) * (float)captures.size()),
+                              (int)captures.size() - 1);
+                k2 = std::max(0, k2);
+                seq.push_back(*captures[(std::size_t)k2]);
+            } else {
+                k2 = std::min((int)(u01(RL::Random::engine) * (float)legal.size()),
+                              (int)legal.size() - 1);
+                k2 = std::max(0, k2);
+                seq.push_back(*legal[(std::size_t)k2]);
+            }
+            Steps::instance().put(legal);
+            double dummy = 0.0;
+            Step mv = seq.back();
+            walk.moveForward(&mv, dummy);
+            turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+        }
+        if (seq.size() >= 2) {
+            out.push_back(seq);
+        }
+    }
+}
+
+/*
+ *  量一次"当前 Q 与手工锚的差距" —— 实现写在 pretrainQFromHand 里的两个 lambda
+ *  (它们要用到那张函数里的缓冲区), 这里不再单独抽一个模板。
+ */
+
+DQNMCTSMOETbAgent::HandPretrainStats
+DQNMCTSMOETbAgent::pretrainQFromHand(int positions, int epochs, bool trainTrunk,
+                                     int maxPlies, int batchSize)
+{
+    HandPretrainStats st;
+    if (positions <= 0 || epochs <= 0) {
+        return st;
+    }
+    if (batchSize < 1) {
+        batchSize = 8;
+    }
+    const double t0 = nowMs();
+
+    std::vector<std::vector<Step> > probes;
+    buildHandProbes(positions, maxPlies, probes);
+    if (probes.empty()) {
+        return st;
+    }
+    st.probes = (int)probes.size();
+
+    RL::Tensor state(STATE_DIM, 1);
+    RL::Tensor qCur(ACTION_DIM, 1);
+    RL::Tensor target(ACTION_DIM, 1);
+    RL::Tensor dq(ACTION_DIM, 1);
+    std::vector<Step*> legal;
+    std::vector<int> legalIdx;
+    std::vector<float> tgt;
+
+    /* 把棋摆到探针局面 (重放那一串着法) */
+    auto setupProbe = [&](const std::vector<Step> &seq, int &color) {
+        double dummy = 0.0;
+        chess.reset();
+        for (std::size_t k = 0; k < seq.size(); k++) {
+            Step mv = seq[k];
+            chess.moveForward(&mv, dummy);
+        }
+        color = chess.sideToMove;
+    };
+    /* 一个局面上的目标: target_a = −anchor(s'), 终局则取真实终局值 */
+    auto buildTargets = [&](int color, int &legalCount) {
+        legal.clear();
+        chess.sample(color, legal);
+        legalIdx.clear();
+        tgt.clear();
+        legalIdx.reserve(legal.size());
+        tgt.reserve(legal.size());
+        double dummy = 0.0;
+        for (std::size_t j = 0; j < legal.size(); j++) {
+            legalIdx.push_back(stepToActionIdx(*legal[j], color));
+            Step copy = *legal[j];
+            chess.moveForward(&copy, dummy);
+            const int res = chess.getResult(chess.sideToMove);
+            if (res != Chess::RESULT_ONGOING) {
+                tgt.push_back(terminalReward(res, color));   /* 唯一的真值 */
+            } else {
+                tgt.push_back((float)(-handAnchor(chess.sideToMove)));
+            }
+            chess.moveBack(&copy, dummy);
+        }
+        legalCount = (int)legalIdx.size();
+        Steps::instance().put(legal);
+    };
+    auto gapOf = [&](double &gapOut, double &agreeOut) {
+        double gap = 0.0, agree = 0.0;
+        long long n = 0;
+        int used = 0;
+        for (std::size_t pi = 0; pi < probes.size(); pi++) {
+            int color = Stone::COLOR_RED;
+            setupProbe(probes[pi], color);
+            int lc = 0;
+            buildTargets(color, lc);
+            if (lc <= 0) {
+                continue;
+            }
+            encodeStateFor(color, state);
+            qValuesFull(state, qCur, nullptr);
+            int bestQ = 0, bestT = 0;
+            for (int j = 0; j < lc; j++) {
+                const int a = legalIdx[(std::size_t)j];
+                gap += std::fabs((double)qCur[a] - (double)tgt[(std::size_t)j]);
+                if (qCur[a] > qCur[legalIdx[(std::size_t)bestQ]]) { bestQ = j; }
+                if (tgt[(std::size_t)j] > tgt[(std::size_t)bestT]) { bestT = j; }
+                n++;
+            }
+            agree += (bestQ == bestT) ? 1.0 : 0.0;
+            used++;
+        }
+        gapOut = (n > 0) ? gap / (double)n : 0.0;
+        agreeOut = (used > 0) ? agree / (double)used : 0.0;
+    };
+
+    /* ---- 改之前 ---- */
+    gapOf(st.gapBefore, st.agreeBefore);
+
+    /* ---- 监督回归: 梯度累积, 每批一次优化器 (P3) ---- */
+    int inBatch = 0;
+    std::uniform_int_distribution<int> pick(0, (int)probes.size() - 1);
+    const long long total = (long long)probes.size() * (long long)epochs;
+    for (long long it = 0; it < total; it++) {
+        int color = Stone::COLOR_RED;
+        setupProbe(probes[(std::size_t)pick(RL::Random::engine)], color);
+        int lc = 0;
+        buildTargets(color, lc);
+        if (lc <= 0) {
+            continue;
+        }
+        encodeStateFor(color, state);
+
+        /* 前向: 骨干一次 + 头一次 (这一次就是反向要用的那次) */
+        RL::Tensor &h = trunk.forward(state);
+        RL::Tensor q1o = qHead.forward(h);
+
+        /*
+           梯度只对**合法列**: `RL::Loss::MSE::df(out, target)` = 2(out − target),
+           所以把 target 的非法列设成 out 的当前值 ⇒ 那些列的误差恰好为 0
+           (与 learnBatch 里"只回归实际走过的那一列"是同一条纪律)。
+        */
+        target = q1o;
+        for (int j = 0; j < lc; j++) {
+            target[legalIdx[(std::size_t)j]] = tgt[(std::size_t)j];
+        }
+        st.samples += lc;
+        dq = RL::Loss::MSE::df(q1o, target);
+        qHead.backward(h, dq);
+        if (trainTrunk) {
+            RL::Tensor gh = qHead.inputGrad;
+            trunk.backward(state, gh);
+        }
+        inBatch++;
+        if (inBatch < batchSize && it + 1 < total) {
+            continue;
+        }
+        if (auxLossCoef > 0.0f) {
+            for (std::size_t i2 = 0; i2 < trunk.size(); i2++) {
+                RL::ISparseMoE *m = dynamic_cast<RL::ISparseMoE*>(trunk[i2]);
+                if (m != nullptr) {
+                    m->addAuxGradient(auxLossCoef);
+                }
+            }
+        }
+        qHead.RMSProp(learningRate, 0.9f, 0.0f);
+        if (trainTrunk) {
+            trunk.RMSProp(learningRate, 0.9f, 0.0f);
+        }
+        inBatch = 0;
+    }
+
+    /* 目标网跟着走: 它现在应该反映"手工锚那一版"的 Q */
+    trunk.copyTo(trunkTarget);
+    qHead.copyTo(qHeadTarget);
+    q2Head.copyTo(q2HeadTarget);
+
+    /* ---- 改之后 ---- */
+    gapOf(st.gapAfter, st.agreeAfter);
+
+    st.ms = nowMs() - t0;
+    chess.reset();
+    return st;
 }
 
 void DQNMCTSMOETbAgent::recordExperience(const Step &chosenStep, int color)

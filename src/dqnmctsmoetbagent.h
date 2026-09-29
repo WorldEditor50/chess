@@ -593,6 +593,47 @@ public:
      */
     int getLearnSteps() const { return m_learnSteps; }
 
+    /* ================================================================
+     *  手工评估锚预训练 (从 DQNABAgent 的"引导阶梯第一级"搬过来的)
+     * ================================================================
+     *  为什么需要它 (本轮实测的诊断): 随机初始化时, **搜索的叶子估值与先验都来自一张
+     *  随机网** —— 叶子 = max_a Q(s,a), 先验 = softmax(Q/T)。也就是说 MCTS 拿到的
+     *  价值排序是噪声, 那时只有"模拟次数"在起作用。实测 24 局自对弈之后 Q spread
+     *  从 0.209 收到 0.078 (收缩到奖励本身的尺度), 而终局样本只有 17/1789 = 0.95%
+     *  —— 靠自对弈把"子力值多少"学出来需要的数据量远大于本轮的预算。
+     *
+     *  这个函数用一个**现成的、不需要学的手工评估** (`Chess::evaluate()`: 材质 +
+     *  子力位置表) 去监督 Q 头: 对采到的局面 s, 把每个合法着法 a 的目标设成
+     *      target_a = −anchor(s')     (s' = 走完 a 之后的局面; anchor 取 s' 的走子方视角)
+     *  anchor(c) = tanh(±evaluate()/3) —— 与 EVAB / DQNAB 同一口径 (红方取负, 因为
+     *  `evaluate()` 是黑方视角)。负号来自 negamax: s' 轮到对手走, 对手的价值取负
+     *  才是"我走这一手之后的价值"。
+     *
+     *  三个必须写清楚的地方:
+     *   1. **它不改搜索/学习口径**, 只是给 Q 一个非随机的起点; `trainTrunk=false`
+     *      (默认) 只训输出头 ⇒ 那是一次**线性**拟合 (骨干冻结), 便宜到可以当"开箱
+     *      即用"的一步;
+     *   2. 它**整批监督合法列**, 而不是 DQN 那种"一条样本只回归一列": 这里的目标是
+     *      现成的 (不用自举), 一次前向就能监督 ~40 列;
+     *   3. 它报**两个读数**: 合法列上 |Q − target| 的均值 (gap), 与"argmax_a Q 与
+     *      argmax_a target 一致的比例" (move agreement)。后者才是搜索真正吃的东西
+     *      (叶子取 max, 先验按 Q 排序) —— 只看 gap 会看不出"排序对不对"。
+     */
+    struct HandPretrainStats {
+        int probes = 0;          /* 真正用上的局面数 */
+        long long samples = 0;   /* 监督过的 (局面, 合法列) 对数 */
+        double gapBefore = 0.0, gapAfter = 0.0;
+        double agreeBefore = 0.0, agreeAfter = 0.0;
+        double ms = 0.0;
+    };
+    HandPretrainStats pretrainQFromHand(int positions, int epochs, bool trainTrunk,
+                                        int maxPlies = 40, int batchSize = 8);
+    /* 手工锚: tanh(±evaluate()/3), 走子方视角 (红方取负) */
+    double handAnchor(int color);
+    /* 采一批随机局面 (每条是一串从开局走出来的着法, 供重放) */
+    void buildHandProbes(int count, int maxPlies,
+                         std::vector<std::vector<Step> > &out);
+
     /* ---- 在线训练助手 (界面/测试) ---- */
     void recordExperience(const Step &chosenStep, int color);
     void endOnlineEpisode(int gameResult);

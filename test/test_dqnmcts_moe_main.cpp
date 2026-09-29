@@ -524,6 +524,29 @@ int main()
     }
 
     /* ============================================================
+     *  [12] 手工评估锚预训练 (从 DQNAB 搬过来的第一级引导)
+     * ============================================================
+     *  为什么需要它: 随机初始化时搜索的叶子 (max Q) 与先验 (softmax Q) 都来自一张随机网,
+     *  而自对弈把子力值学出来需要的数据量很大 (24 局之后终局样本只占 0.95%)。
+     *  这一节断言的是"监督真的把排序灌进去了": gap 必须下降, 而 argmax 一致率
+     *  (搜索真正吃的东西) 必须不下降。
+     */
+    std::printf("\n[12] 手工锚预训练 (evaluate() 监督 Q 的合法列)\n");
+    {
+        const DQNMCTSMOETbAgent::HandPretrainStats st =
+            ag.pretrainQFromHand(12, 4, false, 30, 8);
+        CHECK(st.probes >= 8, "采到了足够的探针局面");
+        CHECK(st.samples > 0, "监督过合法列 (samples > 0)");
+        CHECK(st.gapAfter < st.gapBefore, "gap 必须下降 (监督回归的目标就是这个)");
+        CHECK(st.agreeAfter + 1e-9 >= st.agreeBefore,
+              "argmax 一致率不下降 (搜索真正吃的是排序)");
+        std::printf("  探针 %d | 监督 %lld 列 | gap %.4f -> %.4f | 一致率 %.1f%% -> %.1f%%"
+                    " | %.1f s\n",
+                    st.probes, st.samples, st.gapBefore, st.gapAfter,
+                    100.0 * st.agreeBefore, 100.0 * st.agreeAfter, st.ms / 1000.0);
+    }
+
+    /* ============================================================
      *  [11] 耗时读数 (不是断言)
      * ============================================================ */
     std::printf("\n[11] 耗时读数 (本机, 仅供界面常数参考)\n");
