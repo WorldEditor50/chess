@@ -1,5 +1,11 @@
 #include "chessboard.h"
 #include "rl/cpuinfo.hpp"
+/*
+   [2026-10] 实时路由探针的**完整定义** (界面呼吸灯)。
+   chessboard.h 只有它的前向声明 (那个头要保持轻), 而 `liveMoeRoute` 要读它的原子
+   快照, 所以完整定义在这里要进来 —— 与下面几个 agent 的 .cpp 同一个做法。
+*/
+#include "rl/sparse_moe.hpp"
 /* AGENT_SACAZ_OLD 用的是这个**独立类** (不是 SACAZAgent + 开关, 也不是它的派生类), 见头注释 */
 #include "sacazlegacyagent.h"
 #include "sacazmoetbagent.h"   /* AGENT_SACAZ_MOE = 稀疏 MoE + TB 专家 (独立类) */
@@ -255,7 +261,21 @@ static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
  * BG_TRAIN_SIMS 的长注释: 少于分支数时搜索一次深挖都没有, 出招与策略目标都退化成
  * "先验前 N 名的均匀分布"。80 次时实测仍有约 48% 的访问落在"每个孩子一次"的
  * 地板里 (bench_ppo_sims 的根节点诊断), 400 次降到约 10%。
- * 代价: 当前骨干约 8 ms/模拟 ⇒ 一步决策从 ~0.65 s 变成 ~3.2 s。
+ *
+ * ---- [2026-10] E/top-k 从 4/1 提到 8/2 之后, 这个预算的**代价变了** (实测) ----
+ * 同一台机器 (bench_ppo_backbone_tb + tools/measure_peak_working_set.ps1):
+ *   E=4/top-1: 单网络前向 3.59 ms, 400 模拟 ≈ 3.2 s/步   (旧读数)
+ *   E=8/top-2: **20.1 ms/模拟 -> 400 模拟 = 8.0 s/步**; 参数量 76 M -> 207.8 M;
+ *              峰值工作集 3,301 MB (actor+critic 各背一套完整 TB 专家, 四份缓冲)
+ * 也就是"每步等到 8 秒"。这不是 bug, 是 top-k 直接乘算力的必然结果 —— 所以:
+ *   * 想保持"每步 3 秒"的感觉, 就把这个数降到 **~160**; 但要记住 160 已经接近
+ *     "分支数 38.7 的 4 倍", 深挖余量比 400 时薄得多 (那正是搜索值钱的地方);
+ *   * 想保持搜索深度, 就接受 8 s/步 (界面有沙漏 + 状态条, 不至于像死机);
+ *   * 想"又快又深", 换 `PPO+MCTS (MLP专家)` 那一支: 同一份搜索代码、0.22 ms/模拟,
+ *     1600 模拟 ≈ 0.35 s/步 —— 它的骨干便宜 ~90 倍 (见 rl/ppo.h 顶部那张表)。
+ * 一句话: **top-k 那一半是拿"模拟次数"换"容量"**, 而模拟次数是本工程唯一测出过
+ * 棋力的杠杆 (40/64/120 -> 42.2%/50.0%/62.5%), 所以这个数字要不要跟着改, 是个
+ * 需要用户决定的取舍, 不该由代码偷偷改掉。
  */
 static constexpr int PPO_SIMS = 400;          /* PPO+MCTS 每次决策的模拟次数 */
 /*
@@ -342,6 +362,58 @@ static constexpr int SACAZ_MOE_MLP_SIMS = 256;
  * Switch Transformer 论文里的 0.01 要大得多才起作用。
  */
 static constexpr float SACAZ_MOE_AUX = 0.1f;
+/*
+ * ================================================================
+ *  [2026-10 门控实验] 两个 MoE 骨干的**无辅助损失偏置均衡** (界面口径)
+ * ================================================================
+ *  依据: docs/moe_gate_experiment_2026_10.md 的"建议 1"。
+ *  机制 (Loss-Free Balancing, arXiv:2408.15664 Algorithm 1): 给每个专家一个
+ *  **只影响 top-k 选择、不进输出加权** 的偏置 b_i, 每批 b_i += rate*sign(mean-load_i)。
+ *  因为它走 argmax 而不是损失, **不产生任何干扰梯度** —— 与"把 SACAZ_MOE_AUX 调大"
+ *  有本质区别 (后者的可用窗口只有 [0.1, 0.5), 再大就盖过主目标)。
+ *
+ *  实测 (端到端, 训练侧专家负载的 MaxVio; 0 = 完美均衡):
+ *    TB 支   : 基线 0.963  ->  开偏置 0.009   (最小份额 0.129 -> 0.247)
+ *    MLP 支  : 基线 0.318  ->  开偏置 0.006   (最小份额 0.102 -> 0.124; 8 个专家)
+ *  为什么这条路必须走: [3b] 实测在真实棋局状态分布上, softmax + 辅助损失
+ *  **即使 coef=10 也拉不动负载** (MaxVio 恒为理论最大 3.000) —— 它的梯度正比于
+ *  饿死专家自己的门控概率(≈0), 放大系数乘的仍是 0。
+ *
+ *  rate 取 0.01: 这是本工程实测用的值 (20 局热身 ≈2494 个学习步内到位)。
+ *  论文推荐 0.001, 但在界面这种"学习步稀疏"的节奏下太慢, 未在本工程扫过。
+ *  关掉 = 回到改动前的行为 (setLossFreeBias(false, ...) 等价于这一支不存在)。
+ */
+static constexpr bool  SACAZ_MOE_LOSSFREE = true;
+static constexpr float SACAZ_MOE_LOSSFREE_RATE = 0.01f;
+
+/*
+ * ================================================================
+ *  [2026-10] PPO 两支 (AGENT_PPOMCTS / AGENT_PPOMCTS_MLP) 的 MoE 均衡口径
+ * ================================================================
+ *  为什么 PPO 这条也要有: 它同样是**稀疏 MoE 骨干** (TB 专家 E=4 top-1 与 MLP 专家
+ *  E=8 top-2), 而此前只有辅助损失 `moeAuxCoef` —— 受控实验 ([3b]) 与端到端实测都表明
+ *  **只靠辅助损失拉不平负载** (coef 开到 10, 训练侧 MaxVio 仍贴在上界; 根因是它的梯度
+ *  正比于饿死专家自己的门控概率 ≈0)。SAC 那两支已经拿到这条修法 (训练侧 MaxVio
+ *  0.963 -> 0.009 / 0.318 -> 0.006), PPO 这里此前是**空缺**, 这次补齐。
+ *
+ *  ---- 偏置均衡 (非参数缓冲, 默认开是安全的) ----
+ *  它不进权重文件、不进参数量、不产生梯度 ⇒ 打开它**不会**让存量权重作废。
+ *  刻度: rate=0.01 (本工程实测值)。论文推荐 0.001, 但那是在"学习步密集"的设定下,
+ *  而本工程一局才一步 RMSProp —— 0.001 在会话尺度上几乎不动。
+ *
+ *  ---- MLP 门控 (默认关, 打开会让存量权重作废) ----
+ *  三层 `d_model -> hidden (tanh) -> E`, 与 SAC 那两支同一个接口 (`enableMlpGate`)。
+ *  为什么默认仍然是关 (三条, 都是实测):
+ *    1. 形状变了 ⇒ `Net::load` 的参数量守卫会**拒绝**存量权重 (只能重训);
+ *    2. 棋力没有结论 (SAC 支: 20 局 + 8 局对照, 区间跨 50%);
+ *    3. 它**不是**均衡手段, 方向甚至相反: SAC 支实测训练侧更均衡 (0.049->0.009)
+ *       而评测侧更偏 (0.264->0.598)。正确用法是**与偏置均衡配对**。
+ *  要与不要, 都靠这个常量一处决定 (它是 >0 才装, 且必须在任何前向之前装)。
+ * ================================================================
+ */
+static constexpr bool  PPO_MOE_LOSSFREE = true;
+static constexpr float PPO_MOE_LOSSFREE_RATE = 0.01f;
+static constexpr int   PPO_MOE_MLP_GATE_HIDDEN = 0;
 /*
  * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
  * 单位是**搜索节点数** (= 网络前向次数), 不是模拟次数: TB 骨干实测 ~3 ms/节点,
@@ -524,6 +596,102 @@ static void applyRewardMethod(A &a, bool dynamic)
 
 /*
  * ================================================================
+ *  applyLossFreeBias —— "两个 MoE 支要不要开偏置均衡"的唯一一处写法
+ * ================================================================
+ *  与 applyRewardMethod 同一个理由: **四个点**(两个构造工厂 + 两个后台训练的 clone)
+ *  各手抄一遍的话, 迟早有一支漏掉, 而"漏掉"的表现只是"这一支还在用旧路由",
+ *  面板上完全看不出来 —— 更糟的是 clone 漏掉会让**训练用的那一支**与决策用的实例
+ *  不是同一个东西 (权重往返看不出来, 因为偏置不进权重文件、不进参数量)。
+ *
+ *  只对两个 MoE 独立类成立 (它们有同名同义的这两个成员); 纯 MLP / legacy 支没有
+ *  稀疏 MoE 层 —— 所以**不要**把这个模板用到它们上面 (调用点只有那四个)。
+ * ================================================================
+ */
+template <class A>
+static void applyLossFreeBias(A &a)
+{
+    /*
+       走 setter 而不是直接写两个成员 (2026-10): 单一真源在 `RL::PPO` / agent 内部的
+       MoE 层上, "只改了 agent 的成员"是**静默不生效**的 —— 那正是本工程反复栽的
+       "旋钮没接线"那一类。`SACAZMoETbAgent` / `SACAZMoEMlpAgent` / `PPOMCTSAgent`
+       三者都有这个同名同签名的 setter, 所以这一个模板对三支都成立。
+    */
+    a.setLossFreeBias(SACAZ_MOE_LOSSFREE, SACAZ_MOE_LOSSFREE_RATE);
+}
+
+/*
+ * ================================================================
+ *  [2026-10] PPO 两支的同一套"均衡 + 门控"接线 (唯一一处写法)
+ * ================================================================
+ *  为什么必须写成函数而不是每个构造点手抄: PPO 两支在 chessboard.cpp 里有**七个**
+ *  构造点 (预加载 ×2、三个按需决策实例、后台兜底建网、后台训练 clone ×2)。手抄七遍
+ *  迟早漏一处, 而"漏掉"的表现只是"这一支还在用旧路由" —— 面板上完全看不出来;
+ *  clone 漏掉更糟: 训练用的那一支与决策用的实例就不是同一个东西 (权重往返看不出来,
+ *  因为 `biasGate` 是控制回路状态, 不进权重文件、不进参数量)。
+ *  ⚠ `enableMlpGate` 必须在**任何前向之前**调用 (它会重建并重新初始化门控权重),
+ *  所以只能在构造点之后立刻调 —— 这里就是。
+ * ================================================================
+ */
+template <class A>
+static void applyPpoBalance(A &a)
+{
+    a.setLossFreeBias(PPO_MOE_LOSSFREE, PPO_MOE_LOSSFREE_RATE);
+    if (PPO_MOE_MLP_GATE_HIDDEN > 0) {
+        a.enableMlpGate(PPO_MOE_MLP_GATE_HIDDEN);
+    }
+}
+
+/*
+ * ================================================================
+ *  [2026-10 门控实验] MLP 门控 (三层: d_model -> hidden -> E)
+ * ================================================================
+ *  把骨干的**线性门控**（`wg·x + bg`，即 4 个超平面切状态空间）换成
+ *  `d_model -> hidden (tanh) -> E -> softmax` 的 MLP 门控。
+ *
+ *  ---- 为什么默认是 0（关）而不是像偏置均衡那样默认开 ----
+ *  三条，都是实测而不是偏好:
+ *   1. **它会让现有权重文件作废。** 线性门控的 `wg` 是 (E, d_model)，MLP 门控是
+ *      `wg1 (hidden,d_model) + wg2 (E,hidden)` —— 形状不同，`Net::load` 的参数量守卫
+ *      会**明确拒绝**。也就是说：打开它的那一刻，界面上这两支 agent 的存量模型
+ *      （weights/sacaz_moe_tb* 与 sacaz_moe_mlp*）全部载不进来，只能从随机初始化重练。
+ *      偏置均衡没有这个问题（它是非参数缓冲），所以它可以默认开。
+ *   2. **棋力没有结论。** 20 局自对弈 + 8 局对 MCTS-800 的对照里，得分率
+ *      50.0% -> 43.8%，95% 区间 [31.5, 56.0] **跨过 50%**；而且同一次运行里
+ *      "材料差"的方向与得分率**相反**（−0.24 -> +0.40）。n=8 不足以谈差别。
+ *   3. **推理侧的负载均衡反而更差**（这是反直觉但可解释的一条）：
+ *      训练侧 MaxVio 0.049 -> **0.009**（更均衡），而评测（MCTS-800 对局）侧的
+ *      MaxVio 0.264 -> **0.598**（更不均衡），最弱专家份额 19.65% -> 12.35%。
+ *      原因：偏置只在 `learnBatch` 的批边界更新，它均衡的是**训练分布**；MLP 门控
+ *      表达力更强 ⇒ 能把训练分布拟合得更平，但换到对局分布上更偏。
+ *      **"偏置均衡"不等于"到处都均衡"。**
+ *
+ *  ---- 要启用就把它改成 >0（例如 64）----
+ *  `static constexpr int SACAZ_MOE_MLP_GATE_HIDDEN = 64;`
+ *  然后**必须重训**这两支（旧权重会被拒），并用锚点 Elo 判定
+ *  （`bench_anchor`，~80 Elo 分辨力；8 局分辨不出来）。
+ *
+ *  成本（实测，20 局自对弈）: 参数量 +162,312（+0.28%），训练耗时 +0.8%
+ *  —— 门控本身几乎免费，代价全在"旧权重作废"与"训练难度"上。
+ * ================================================================
+ */
+static constexpr int SACAZ_MOE_MLP_GATE_HIDDEN = 0;
+
+/*
+ *  与 applyLossFreeBias 同一个理由写成一处: **四个点**(两个构造工厂 + 两个后台训练
+ *  clone) 各手抄一遍的话迟早漏一支, 而"漏掉"的表现只是"这一支还在用线性门控",
+ *  面板上完全看不出来 —— 更糟的是 clone 漏掉会让训练用的那一支与决策实例不是同一个东西。
+ *  ⚠ `enableMlpGate` 必须在**任何前向之前**调用, 所以只能在构造点后立刻调 (这里就是)。
+ */
+template <class A>
+static void applyMlpGate(A &a)
+{
+    if (SACAZ_MOE_MLP_GATE_HIDDEN > 0) {
+        a.enableMlpGate(SACAZ_MOE_MLP_GATE_HIDDEN);
+    }
+}
+
+/*
+ * ================================================================
  *  createSACAZAgent / createSACAZLegacyAgent —— SAC 三支的**唯一**构造点
  * ================================================================
  * 为什么必须只有一处: 三支的**参数结构完全相同** (都是 iFcLayer 的 w/b),
@@ -592,12 +760,28 @@ static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
 
        (2) **共享骨干**: 原来五张网各自背一整套骨干 (TB 专家下 28.8 M 参数/张,
            合计 144 M)。现在骨干只留在线/目标各一份, actor/q1/q2 退化成三个只有
-           输出层的头。实测 (test_sacaz [17B], 同权重同局面):
+           输出层的头。实测 (test_sacaz [17B], 同权重同局面, **当时是 E=4/top-1**):
                参数量      143,903,940 -> 57,586,536   (2.50x 少)
                learnBatch  649.9 ms/批 -> 225.6 ms/批  (2.88x 快)
                selectMove  9.3 ms/模拟 -> 4.1 ms/模拟   (2.24x 快)
            而且 π / Q / V **逐位相同** (把独立口径的三个骨干也设成同一份之后)。
            于是"同一套算法、同样的预算"下能跑的模拟次数从 ~19 变成 ~42。
+
+       ⚠ **[2026-10 E=8/top-2] 上面那三行数字是 E=4 时代量的, 现在是两倍量级。**
+           专家数 4 -> 8 之后: 每个 TB 专家 ≈ 7.17 M 参数 => 一张网的专家部分
+           28.8 M -> 57.4 M, 共享口径的唯一参数量 57,586,536 -> **114,969,680**
+           (2.00x, 实测); 峰值工作集 577 MB -> **1,138 MB** (1.97x, 实测, 见下);
+           learnBatch 也随 top-2 翻倍 (那 225.6 ms/批 现在约 **450 ms/批**,
+           32 条 ≈ 3.6 s/手)。
+           结论没变 (共享仍然比独立省一半、快一倍以上), 但**绝对值要按新的看** ——
+           照旧引用 57,586,536 / 225.6 ms 会把这一支的代价低估一半。
+           改这两个常量时**这里也要改**, 见 `sacazmoetbagent.h` 的 MOE_TB_EXPERTS。
+           工作集的量法 (E=8 那个数): 20 局不必跑满, 网络张量才是大头 ——
+               bench_sacmoetb_train --train-games=2 --train-sims=8 --train-plies=24
+                 --learn-every=4 --openings=1 --opening=4 --eval-plies=20 --eval-sims=8
+                 --opponent=ab --aux=0.1 --lossfree-bias=1 --lossfree-bias-rate=0.01
+           跑的时候每 0.4 s 采一次 WorkingSet64/PeakWorkingSet64 取最大 =
+           **1,138 MB** (日志 build/gate_moe_out/E8k2_workingset.txt)。
 
        **权重文件必须换前缀** (weights/sacaz_moe_shared_agent): 共享口径写 4 个文件
        (trunk + 三个头), 独立口径写 3 个 (_actor/_q1/_q2), 两者的 `_q1` 语义完全
@@ -622,8 +806,23 @@ static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
        `bench_sacaz_vs_ab --trunk=shared --budget=175` 复核一步的真实耗时。
     */
     a->learnFromSearch = false;
+    /*
+       [2026-10] 但**终局通道必须留着**: learnFromSearch 关掉之后, 池里就再也没有
+       hasSearch=true 的样本, 而 `notifyGameResult`(人机对弈终局) 正是要把结果挂到
+       那样一条样本上 —— 关着 learnFromSearch 且不记录的话, 人把 AI 将死的那一局
+       输赢被直接丢掉 (用户实测日志: "没有可挂的真实决策样本 ... 这一局的输赢没有进
+       学习回路")。这正是文档里"解决终局样本稀疏"的四个出口之一 (§11 人机对弈通道)。
+       记录本身几乎免费 (一次稀疏编码 + π 拷贝); 那批样本会在下一次 learnBatch
+       (界面上是"走子前先探索+预训练"那条路径) 被一起训练。
+    */
+    a->recordDecisionSamples = true;
     /* [2026-09 奖励方法开关] 同上 (默认 = 旧奖励) */
     applyRewardMethod(*a, dynamicReward);
+    /* [2026-10 门控实验] 无辅助损失偏置均衡 (见 SACAZ_MOE_LOSSFREE 的说明) */
+    applyLossFreeBias(*a);
+    /* [2026-10 门控实验] MLP 门控 (默认关; 见 SACAZ_MOE_MLP_GATE_HIDDEN 的说明)。
+       必须在任何前向之前装上, 所以就在构造点后立刻调。 */
+    applyMlpGate(*a);
     return a;
 }
 
@@ -655,6 +854,10 @@ static SACAZMoEMlpAgent *createSACAZMoEMlpAgent(Chess &board, bool shared,
     a->learnFromSearch = true;
     /* [2026-09 奖励方法开关] 同上 (默认 = 旧奖励) */
     applyRewardMethod(*a, dynamicReward);
+    /* [2026-10 门控实验] 无辅助损失偏置均衡 (与 TB 支同一口径) */
+    applyLossFreeBias(*a);
+    /* [2026-10 门控实验] MLP 门控 (与 TB 支同一口径; 默认关) */
+    applyMlpGate(*a);
     return a;
 }
 
@@ -747,10 +950,20 @@ static bool trainSACRound(AgentT &clone,
  * ---- 有权重文件的 agent 名单 (单一来源) ----
  * 顺序 = "启动加载顺序" = "自检面板的列举顺序": 大的/慢的放后面, 这样启动日志里
  * 一眼能看出是哪一组在耗时 (稀疏 MoE 那一组是 3 x 146 MB)。
+ *
+ * [2026-10 用户口径] **PG / DQN / SAC 行为还原版(两支) 移出这张表** ——
+ * 用户要求"界面下拉框移除 PG, DQN, SAC legacy agent, 减少加载时间"。界面上不再可选,
+ * 启动时也就不该再为它们读盘 + 建网 (实测这两件事在它们身上要 ~11.2 s)。
+ * 类、权重前缀、bench/测试全都留着; 自检面板的横向列举也随之不再列它们
+ * (见 mainwindow.cpp 的 kAll 与 kAgents 两处注释里的同一段说明):
+ *   * PG                 —— 实测 146 ms (权重只 8.6 MB)
+ *   * DQN                —— 实测 171 ms (权重只 8.6 MB)
+ *   * AGENT_SACAZ_OLD    —— 实测 43 ms (MLP 还原版, 权重 0.5 MB x3)
+ *   * AGENT_SACAZ_OLD_MOE —— **实测 建网 4499 ms + 读权重 6300 ms** (5 个 TB 专家网络
+ *                             + 3 x 146 MB), 这一支就是省下来的大头
+ * 要恢复某一条: 这里加回枚举 + 下面那段加载代码加回对应分支 (两处都要)。
  */
 static const ChessBoard::AgentType kWeightAgents[] = {
-    ChessBoard::AGENT_PG,
-    ChessBoard::AGENT_DQN,
     ChessBoard::AGENT_EVAB,
     ChessBoard::AGENT_PPOMCTS_MLP,
     ChessBoard::AGENT_DQNMCTS,
@@ -759,17 +972,10 @@ static const ChessBoard::AgentType kWeightAgents[] = {
     ChessBoard::AGENT_DQNAB,
     ChessBoard::AGENT_SACAZ_MOE,
   /*
-     [2026-09 独立类] MoE + MLP 专家那一支: 排在 TB 那一组之后、还原版之前。
+     [2026-09 独立类] MoE + MLP 专家那一支: 排在 TB 那一组之后。
      它比 TB 小得多 (2.9 M 参数), 但也属于"稀疏 MoE 那一组", 所以紧跟其后读起来最清楚。
   */
   ChessBoard::AGENT_SACAZ_MOE_MLP,
-    /*
-       行为还原版 SAC 排在最后: 它与 AGENT_SACAZ 是"两份独立实现 + 另一套口径",
-       启动日志里紧跟大的 MoE 那一组之后读起来最清楚。
-       它的 TB 专家骨干那一支紧跟其后 (同一口径、另一个骨干, 也是 3 x 146 MB 量级)。
-    */
-    ChessBoard::AGENT_SACAZ_OLD,
-    ChessBoard::AGENT_SACAZ_OLD_MOE,
     /*
        [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 排在最后: 它也是
        "3 x 146 MB 量级"的那一组 (主干 + 头), 放在大的那一组之后读启动日志最清楚。
@@ -907,24 +1113,20 @@ void ChessBoard::startupLoad()
                                  .arg(QString::fromUtf8(what)).arg(ms);
         loadClock = now;
     };
-    if (s_weightPaths.count(AGENT_PG)) {
-        emit busyMessage(QStringLiteral("正在载入 Policy Gradient 权重…"));
-        if (m_sfPG == nullptr)
-            m_sfPG = new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
-        m_sfPG->loadPolicy(s_weightPaths[AGENT_PG]);
-        logLoad("PG");
-    }
-    if (s_weightPaths.count(AGENT_DQN)) {
-        emit busyMessage(QStringLiteral("正在载入 DQN 权重…"));
-        if (m_sfDQN == nullptr)
-            m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
-        m_sfDQN->loadModel(s_weightPaths[AGENT_DQN]);
-        logLoad("DQN");
-    }
+    /*
+       [2026-10 用户口径] 这里原来还有 PG / DQN 两段预加载 (各 ~0.15 s), 与后面
+       SAC 59e5233 还原版那两段。用户要求"下拉框移除 PG, DQN, SAC legacy agent,
+       减少加载时间" ⇒ 这四支既不预热也不在界面上出现 (名单见 kWeightAgents 的注释)。
+       它们的类与权重文件都还在: 真要用 (`decideOnEnvRawLocked` 的对应 case 仍在,
+       会按需构造), 或者靠 bench/测试自己 new —— 只是不再为它们付启动时间。
+    */
     if (s_weightPaths.count(AGENT_PPOMCTS)) {
         emit busyMessage(QStringLiteral("正在载入 PPO+MCTS 权重…"));
-        if (m_sfPPOMCTS == nullptr)
+        if (m_sfPPOMCTS == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            /* MoE 均衡 + 门控接线 (必须在任何前向之前; 见 applyPpoBalance) */
+            applyPpoBalance(*m_sfPPOMCTS);
+        }
         m_sfPPOMCTS->loadModel(s_weightPaths[AGENT_PPOMCTS]);
         logLoad("PPO+MCTS");
     }
@@ -996,48 +1198,13 @@ void ChessBoard::startupLoad()
         m_sfSACAZMoeMlp->loadModel(prefix);
         logLoad("SAC+AZ-MoE-MLP 读权重(4 个文件)");
     }
-    if (s_weightPaths.count(AGENT_SACAZ_OLD)) {
-        /*
-           59e5233 行为还原版 (独立类 SACAZLegacyAgent)。权重是**独立前缀**
-           (weights/sacaz_old_agent_*), 与 AGENT_SACAZ 不共用 —— 见 sacazlegacyagent.h
-           的头注释 (两者参数结构相同, 结构指纹挡不住串权重, 而训练口径不同)。
-        */
-        emit busyMessage(QStringLiteral("正在载入 SAC+AZ (59e5233 行为还原版) 权重…"));
-        if (m_sfSACAZOld == nullptr) {
-            m_sfSACAZOld = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD);
-        }
-        std::string prefix = s_weightPaths[AGENT_SACAZ_OLD];
-        const std::string suffix = "_actor";
-        if (prefix.size() > suffix.size()
-            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            prefix.erase(prefix.size() - suffix.size());
-        }
-        m_sfSACAZOld->loadModel(prefix);
-        logLoad("SAC+AZ-59e5233");
-    }
-    if (s_weightPaths.count(AGENT_SACAZ_OLD_MOE)) {
-        /*
-           59e5233 行为还原版的 **TB 专家骨干**那一支: 同一个类 (SACAZLegacyAgent)、
-           同一套还原口径, 只是 Backbone 不同 —— 所以权重前缀也再分一个
-           (weights/sacaz_old_moe_agent_*), 与 AGENT_SACAZ_OLD 的
-           weights/sacaz_old_agent_* 不共用。两组的前缀只差一个 _moe, 抄错一个字符
-           就是"载进来看着能用、其实是另一支"的静默错误, 所以这行注释写清了两边。
-        */
-        emit busyMessage(QStringLiteral("正在载入 SAC+AZ-59e5233 (稀疏MoE+TB专家) 权重… "
-                                        "(3 个 146 MB 文件)"));
-        if (m_sfSACAZOldMoe == nullptr) {
-            m_sfSACAZOldMoe = createSACAZLegacyAgent(env, AGENT_SACAZ_OLD_MOE);
-        }
-        logLoad("SAC+AZ-59e5233-MoE 建网(5 个 TB 专家网络)");
-        std::string prefix = s_weightPaths[AGENT_SACAZ_OLD_MOE];
-        const std::string suffix = "_actor";
-        if (prefix.size() > suffix.size()
-            && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            prefix.erase(prefix.size() - suffix.size());
-        }
-        m_sfSACAZOldMoe->loadModel(prefix);
-        logLoad("SAC+AZ-59e5233-MoE 读权重(3 x 146 MB)");
-    }
+    /*
+       [2026-10 用户口径] 这里原来是 SAC 的 59e5233 **行为还原版**两支的预加载
+       (MLP 骨干 43 ms + MoE/TB 骨干 "建网 4499 ms + 读权重 6300 ms")。
+       与 PG/DQN 一起从启动路径上摘掉了 —— 省下来的 ~11.2 s 里, **这一支占 10.8 s**。
+       还原版的能力没有被删: `SACAZLegacyAgent` 两个 Backbone 都在,
+       `test_sacaz` [14] 节与 `bench_sacaz_vs_ab --legacy` 仍在跑它们; 界面上只是选不到。
+    */
     if (s_weightPaths.count(AGENT_PPOMCTS_MLP)) {
         /*
            PPO+MCTS 的 MLP 专家变体 (2026-09)。它排在 TB 那一支**前面**: MLP 专家
@@ -1055,6 +1222,7 @@ void ChessBoard::startupLoad()
             */
             m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                               true, RL::PPO::Backbone::MlpExperts);
+            applyPpoBalance(*m_sfPPOMCTSMLP);
         }
         m_sfPPOMCTSMLP->loadModel(s_weightPaths[AGENT_PPOMCTS_MLP]);
         logLoad("PPO+MCTS (MLP专家)");
@@ -1228,8 +1396,6 @@ ChessBoard::ChessBoard(QWidget *parent) :
     m_currentGameId(-1),
     m_moveCount(0),
     m_dbEnabled(false),
-    m_replayGameId(-1),
-    m_replayIndex(0),
     m_agentType(AGENT_ALPHABETA)
 {
     connect(this, &ChessBoard::sendResult,
@@ -1669,10 +1835,8 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
                    .arg((int)state.load()));
         return;
     }
-    if (isReplayMode()) {
-        dbgLog(QStringLiteral("点击被丢弃: 回放模式"));
-        return;
-    }
+    /* [2026-10 移除] 这里原有 `if (isReplayMode()) { 点击被丢弃: 回放模式 }` ——
+       回放功能整体删除后这个守卫不可能成立 (见 mainwindow.h 的说明) */
 
     if (selectID == -1) {
         /* 选择己方棋子 */
@@ -1916,16 +2080,12 @@ void ChessBoard::process()
 void ChessBoard::reset()
 {
     /*
-       reset() 必须同时退出回放模式。原来的实现只重置棋盘, 不清 m_replayGameId,
-       而 mousePressEvent 开头是 `if (isReplayMode()) return;` —— 只要在"历史对局"
-       下拉框里选过一次, 之后按"开局"也只重置棋盘、点击继续被吞掉, 只能重启程序
-       (replayModeExited 信号声明了、也连接了, 但从来没有被 emit 过)。
+       [2026-10 移除] 这里原来是"reset() 必须同时退出回放模式"的修复 —— 原实现只重置
+       棋盘、不清 m_replayGameId, 而 mousePressEvent 开头有 `if (isReplayMode()) return;`,
+       于是选过一次历史对局之后按"开局"也点不动 (replayModeExited 声明了、连接了、
+       却从来没被 emit 过)。回放功能整体删除后这个失效模式连同修复一起消失:
+       现在没有回放模式, 也就不存在"退出"这件事。
     */
-    bool wasReplay = isReplayMode();
-    m_replayGameId = -1;
-    m_replayIndex = 0;
-    m_replaySteps.clear();
-
     {
         QMutexLocker locker(&mutex);
         /*
@@ -1949,9 +2109,6 @@ void ChessBoard::reset()
     }
     m_busyClickSeen = false;
     m_thinkStage.clear();
-    if (wasReplay) {
-        emit replayModeExited();
-    }
     update();
 }
 
@@ -2389,11 +2546,24 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
     switch (type) {
     case AGENT_PG:        return new PGEagent(env, 64, 0.9f, 0.01f, 1.0f);
     case AGENT_DQN:       return new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
-    case AGENT_PPOMCTS:   return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
-    case AGENT_PPOMCTS_MLP:
+    case AGENT_PPOMCTS: {
+        /*
+           `applyPpoBalance` 必须在**任何前向之前**调用 —— 它给 MoE 门控接线
+           (偏置均衡默认开; MLP 门控按常量决定)。见 applyPpoBalance 的说明。
+           `enableMlpGate` 是幂等的, 所以"工厂建网"与"决策路径兜底建网"两处都接
+           也不会互相破坏。
+        */
+        PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+        applyPpoBalance(*ag);
+        return ag;
+    }
+    case AGENT_PPOMCTS_MLP: {
         /* 骨干参数 (64, 0.1f, true, MlpExperts) 必须与决策路径一致, 否则结构指纹对不上 */
-        return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
-                                true, RL::PPO::Backbone::MlpExperts);
+        PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                            true, RL::PPO::Backbone::MlpExperts);
+        applyPpoBalance(*ag);
+        return ag;
+    }
     case AGENT_DQNMCTS:   return new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
     case AGENT_EVAB:      return new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
     case AGENT_SACAZ:     return createSACAZAgent(env, AGENT_SACAZ, m_dynamicReward);
@@ -2856,6 +3026,187 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
 }
 
 /*
+ * ================================================================
+ *  getMoeLoad —— 稀疏 MoE 的专家负载快照 (界面 MoeLoadView 的数据源)
+ * ================================================================
+ *  与 `getAgentSelfCheck` **同一把锁、同一条约束**: 常驻实例的内部计数器要在
+ *  `m_agentMutex` 上读, 所以 GUI 线程不能直接调它 —— 界面侧复用自检那个 worker。
+ *
+ *  哪些 agent 有稀疏 MoE 层 (本工程目前三个):
+ *    * AGENT_SACAZ_MOE      -> SACAZMoETbAgent    (TB 专家,  E=4 top-1)
+ *    * AGENT_SACAZ_MOE_MLP  -> SACAZMoEMlpAgent   (MLP 专家, E=8 top-2)
+ *    * AGENT_DQNMCTS_MOE    -> DQNMCTSMOETbAgent  (TB 专家,  E=4 top-1)
+ *  前两个的**训练侧/推理侧拆分**已经接线 (`moeUsageSplit`: 训练侧由 learnBatch 在批
+ *  边界累计); 第三个目前只有生命周期合计 (`moeUsage`), 所以 `splitReady=false` ——
+ *  界面会明说这一点, 而不是拿合计冒充训练侧。
+ *
+ *  注意 `AGENT_SACAZ_OLD_MOE` (59e5233 还原版) **故意不报**: 那一支的存在意义就是
+ *  复现旧行为, 它的路由读数属于"历史口径", 混进这张均衡视图只会误导。
+ */
+bool ChessBoard::getMoeLoad(MoeLoadSnapshot &out) const
+{
+    return getMoeLoad(m_agentType, out);
+}
+
+bool ChessBoard::getMoeLoad(AgentType type, MoeLoadSnapshot &out) const
+{
+    out = MoeLoadSnapshot();
+    /* 显示名一律先填上 (见 MoeLoadSnapshot::agentName 的说明): 控件的"不适用"文案
+       要靠它说清"你选的是哪一个 agent", 否则用户分不清"选错了"和"功能坏了" */
+    out.agentName = agentDisplayName(type).toStdString();
+
+    /*
+       [2026-10] 实时探针的登记也在这条路径上 (见 m_liveMoeProbe 的说明)。
+       **先无条件清空**: 下面每个 case 只在真拿到探针时才登记 —— 于是"换成没有 MoE 的
+       agent 之后呼吸灯还留着上一个 agent 的读数"这件事不可能发生 (那种残留正是本工程
+       反复栽的"静默错读数")。
+    */
+    m_liveMoeProbe.store(nullptr, std::memory_order_release);
+
+    /* 与 getAgentSelfCheck 一样: 先处理掉不碰常驻 agent 的类型, 让临界区里只有一把锁 */
+    if (abDepthOf(type) > 0 || type == AGENT_MCTS) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> agentLock(m_agentMutex);
+    switch (type) {
+    case AGENT_SACAZ_MOE:
+        /* 先记下"这个类型有已接线的读数" —— 实例可能是懒建的 (还没走过一步), 那时
+           applicable 仍为 false, 但 capable 为 true, 界面据此报"实例还没建出来" */
+        out.capable = true;
+        if (m_sfSACAZMoe != nullptr) {
+            out.experts = m_sfSACAZMoe->moeExpertCount();
+            out.topK = m_sfSACAZMoe->moeTopK();
+            m_sfSACAZMoe->moeUsageSplit(out.train, out.infer);
+            m_sfSACAZMoe->moeUsage(out.total);
+            out.splitReady = true;
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfSACAZMoe->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    case AGENT_SACAZ_MOE_MLP:
+        out.capable = true;
+        if (m_sfSACAZMoeMlp != nullptr) {
+            out.experts = m_sfSACAZMoeMlp->moeExpertCount();
+            out.topK = m_sfSACAZMoeMlp->moeTopK();
+            m_sfSACAZMoeMlp->moeUsageSplit(out.train, out.infer);
+            m_sfSACAZMoeMlp->moeUsage(out.total);
+            out.splitReady = true;
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfSACAZMoeMlp->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    case AGENT_DQNMCTS_MOE:
+        out.capable = true;
+        if (m_sfDQNMCTSMOE != nullptr) {
+            out.experts = m_sfDQNMCTSMOE->moeExpertCount();
+            out.topK = m_sfDQNMCTSMOE->moeTopK();
+            m_sfDQNMCTSMOE->moeUsage(out.total);
+            /* 这一支还没接训练/推理拆分 -> 明说, 不拿合计冒充训练侧 */
+            out.splitReady = false;
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfDQNMCTSMOE->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    case AGENT_PPOMCTS:
+        /*
+           [2026-10] PPO+MCTS 两类骨干也**有**稀疏 MoE, 而且 `PPOMCTSAgent::moeUsage`
+           一直是接好的 (它把 actor 与 critic 两个网络的逐专家计数相加)。第一版只覆盖
+           了三个 agent, 结果是"选到 PPO 那一支就什么都不显示" —— 用户当场报了
+           "负载均衡状态控件并没有显示"。这里补上。
+           **[2026-10 第二轮]** 训练侧/推理侧的拆分也补齐了: `RL::PPO::finalizeMoeBatch()`
+           在批边界累计训练侧 (`moeUsageSplit`), 于是界面上这一支与 SAC 那两支**同口径**
+           —— 而这一列正是判断"均衡机制有没有生效"的唯一依据 (合计里混着数量上压倒性的
+           搜索前向, 见 rl/ppo.h 的说明)。
+        */
+        out.capable = true;
+        if (m_sfPPOMCTS != nullptr) {
+            out.experts = m_sfPPOMCTS->moeExpertCount();
+            out.topK = m_sfPPOMCTS->moeTopK();
+            m_sfPPOMCTS->moeUsage(out.total);
+            m_sfPPOMCTS->moeUsageSplit(out.train, out.infer);
+            out.splitReady = !out.train.empty();
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfPPOMCTS->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    case AGENT_PPOMCTS_MLP:
+        out.capable = true;
+        if (m_sfPPOMCTSMLP != nullptr) {
+            out.experts = m_sfPPOMCTSMLP->moeExpertCount();
+            out.topK = m_sfPPOMCTSMLP->moeTopK();
+            m_sfPPOMCTSMLP->moeUsage(out.total);
+            m_sfPPOMCTSMLP->moeUsageSplit(out.train, out.infer);
+            out.splitReady = !out.train.empty();
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfPPOMCTSMLP->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    default:
+        break;
+    }
+    return out.applicable;
+}
+
+/*
+ * ================================================================
+ *  liveMoeRoute —— "此刻哪个专家在工作" (**不加锁**)
+ * ================================================================
+ *  读的是 MoE 层里的无锁探针, 不是 agent 的内部状态 —— 所以本函数可以在 AI 思考中
+ *  每几十毫秒调一次 (那时 `m_agentMutex` 被整段决策占着, 加锁的路径会一直阻塞)。
+ *  详细理由见 chessboard.h 的 MoeLiveRoute 与 rl/sparse_moe.hpp 的 MoERouteProbe。
+ *
+ *  返回 false 的三种情形 (界面据此不画呼吸灯, 而不是画一排 0):
+ *    * 当前 agent 不是带稀疏 MoE 的那几个 (探针没登记);
+ *    * 登记过但这一帧读到"正在写"(seqlock 奇数) —— 宁可少画一帧;
+ *    * 从来没有前向过 (还没走过子 / 还没训练过)。
+ */
+bool ChessBoard::liveMoeRoute(MoeLiveRoute &out) const
+{
+    /*
+       两个上限必须与探针的一致 (理由见 chessboard.h 的 MoeLiveRoute): 头文件不包含
+       sparse_moe.hpp, 所以只能各写一份 —— 这一行就是"两份不许漂移"的钉子。
+       漂移的后果是**静默截断** (呼吸灯认不出某个专家), 所以宁可编译不过。
+    */
+    static_assert(MoeLiveRoute::kMaxExperts == RL::MoERouteProbe::kMaxExperts,
+                  "MoeLiveRoute::kMaxExperts 与 RL::MoERouteProbe::kMaxExperts 不一致");
+    static_assert(MoeLiveRoute::kMaxPicked == RL::MoERouteProbe::kMaxPicked,
+                  "MoeLiveRoute::kMaxPicked 与 RL::MoERouteProbe::kMaxPicked 不一致");
+
+    out = MoeLiveRoute();
+    const RL::MoERouteProbe *probe = m_liveMoeProbe.load(std::memory_order_acquire);
+    if (probe == nullptr) {
+        return false;
+    }
+
+    RL::MoERouteProbe::Snapshot snap;
+    if (!probe->read(snap)) {
+        return false;
+    }
+    out.serial = snap.serial;
+    out.experts = snap.experts;
+    out.pickedCount = snap.picked;
+    out.dense = snap.dense;
+    for (int k = 0; k < MoeLiveRoute::kMaxPicked; k++) {
+        out.picked[k] = snap.idx[k];
+        out.pickedW[k] = snap.w[k];
+    }
+
+    RL::MoERouteProbe::Heat heat;
+    probe->readHeat(heat);
+    out.heatTotal = heat.total;
+    out.ageSec = heat.ageSec;
+    for (int i = 0; i < MoeLiveRoute::kMaxExperts; i++) {
+        out.heat[i] = heat.v[i];
+    }
+    /* active 的判据用**热度的总量**而不是"读到了快照": 快照只是"有过前向", 而灯要表达的是
+       "**现在**在干活" —— 停止计算 ~3τ 之后热度衰减到 5% 以下, 灯自己灭。 */
+    out.active = (heat.total > 0.0f);
+    out.available = true;
+    return true;
+}
+
+/*
  * 权重文件在磁盘上的状态 (自检面板顶端那两行)。
  *
  * 判据只有一个: weightFilesOf() 给出的那些文件**在不在**、多大。文件名单一来源的
@@ -2991,6 +3342,48 @@ Step ChessBoard::humanTurnAiMoveForTest(int color)
  *     **返回 false 必须打日志** ——
  *     否则这条通道会静默地什么都不做, 而"没生效"与"没输过"在读数上长得一样。
  */
+/*
+ * ================================================================
+ *  humanEndChannel - 人机终局反馈: 这个 agent 归哪一类 (2026-10, 见头文件)
+ * ================================================================
+ * 写成**显式名单**而不是"默认归某一类": 新增一个 agent 类型时, 默认归类会让它静默地
+ * 落到"无需反馈"那一档 —— 而"这一支到底学不学、有没有可挂的样本"是必须逐支想清楚的事
+ * (这正是 2026-10 那次"PPO 被说成纯搜索"的根因: 它落在了一个**凑合**的默认分支上)。
+ * 名单里每一支的机制依据:
+ *   PureSearch        : AgentBase 没有可训练参数 (AB 各档按深度, MCTS 无权重);
+ *   RealSample        : 实现了 notifyGameResult 且保留 decision 样本 (SAC 三支 + DQN+MCTS MoE);
+ *   Rollout           : 在学, 但样本是"从某局面滚出去的一串" —— PPO 两支 / DQN / DQN+AB /
+ *                       EVAB / SAC 还原版两支 (后两支同样没有 decision 样本这条通道)。
+ */
+ChessBoard::HumanEndChannel ChessBoard::humanEndChannel(AgentType type)
+{
+    switch (type) {
+    case AGENT_ALPHABETA:
+    case AGENT_AB_L1:
+    case AGENT_AB_L2:
+    case AGENT_AB_L3:
+    case AGENT_MCTS:
+        return HUMAN_END_PURE_SEARCH;
+    case AGENT_SACAZ:
+    case AGENT_SACAZ_MOE:
+    case AGENT_SACAZ_MOE_MLP:
+    case AGENT_DQNMCTS_MOE:
+        return HUMAN_END_REAL_SAMPLE;
+    /* 显式列出而不是 default: 见上面的理由 (新增一支时编译器会提醒这里要想一次) */
+    case AGENT_PG:
+    case AGENT_DQN:
+    case AGENT_PPOMCTS:
+    case AGENT_PPOMCTS_MLP:
+    case AGENT_DQNMCTS:
+    case AGENT_EVAB:
+    case AGENT_DQNAB:
+    case AGENT_SACAZ_OLD:
+    case AGENT_SACAZ_OLD_MOE:
+        return HUMAN_END_ROLLOUT;
+    }
+    return HUMAN_END_ROLLOUT;
+}
+
 bool ChessBoard::notifyHumanGameEnd(int result)
 {
     if (result == Chess::RESULT_ONGOING) {
@@ -3012,24 +3405,32 @@ bool ChessBoard::notifyHumanGameEnd(int result)
     /* AI 执黑是 process() 的既有约定; 终局反馈挂在**它**那一方最后那次决策上 */
     const int aiColor = Stone::COLOR_BLACK;
     /*
-       "这个类型有没有终局通道" 与 "这个类型的实例建出来了没有" 是两件事, 必须分开报:
-         * AGENT_SACAZ 系但实例还没建 (这一局一步没走过) -> "没有实例";
-         * AB / MCTS / PPO 系 -> "这个 agent 没有这条通道"。
-       混成一句话会在排查时把人带错方向 (而这条通道的失效本来就是**静默**的)。
+       ---- [2026-10] "没有这条通道" 必须**分成三类**说清楚, 不能一句话盖过去 ----
+       原来的代码把纯搜索 (AB / MCTS) 与 rollout 系 (PPO / DQN / EVAB) 合成一类, 日志
+       于是打出 "PPO+MCTS 没有终局通道 (纯搜索 / 终局值随 rollout 进池的那几支), 无需反馈"。
+       用户当场指出来: **PPO+MCTS 不是纯搜索, 它在学**。那句话有三个问题:
+
+         1. **事实错**: PPO 有可训练参数, 而且每手都在学 (走子前 `exploreAndTrain` ->
+            `learnSelfPlay`; 自对弈那条路还会 `commitEpisode` 进池)。把它与 AB/MCTS
+            并列会让人以为人机对弈这一局白下了;
+         2. **机制说反了一半**: rollout 的终局值确实进得去 —— 但只在**它自己的 rollout
+            走到终局**时 (agentrollout 在 `done` 时把 r 换成走子方视角的 ±1,
+            `ppomcts_agent.cpp` 的 `terminalReward`)。而**结束这一局的那一手是"人"走的**,
+            AI 最后那次决策样本的终局值只是 `-V(s')` 自举 (同文件
+            `exploreAndTrain` 里"自举: V(s_end+1) …"那一段), 真实胜负**不会**回填到它身上;
+         3. 于是"无需反馈"是**结论性措辞**, 而正确的说法是"这条通道对它们**不适用**,
+            因为池里没有可挂的"真实决策样本" —— 它们的学习发生在自对弈/rollout 里。
+
+       所以判据换成"**这个 agent 到底学不学**" —— 现在由 `humanEndChannel(AgentType)`
+       (纯函数, 见本文件上面的实现与 chessboard.h 的声明) 一次给出三档之一:
+         * 不学 (AB 各档 / MCTS) -> 保持原话;
+         * 在学但样本来自 rollout -> 单独一条日志, 并如实说明"这一局的胜负只经由
+           `-V(s')` 间接进去".
+       ⚠ 与"DQMCTS_MOE 也有这条通道"同一类教训: 把不同机制压成一句话, 只会让排查走错方向。
     */
-    const bool channelClass = (m_agentType == AGENT_SACAZ
-                               || m_agentType == AGENT_SACAZ_MOE
-                               || m_agentType == AGENT_SACAZ_MOE_MLP
-                               /*
-                                  [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 也实现
-                                  了 AgentBase::notifyGameResult, 而且它也保留**真实决策样本**
-                                  (Sample::decision) —— 人机里"结束这一局的那一手"是**人**走的,
-                                  学习器看不到终局, 不在这里列举的话 AI 输掉的那一局最后一条
-                                  样本的 done 永远是 false (终局 −1 拿不到)。
-                                  别的 DQN 系 agent (AGENT_DQN / AGENT_DQNAB) 不在名单里:
-                                  它们的终局值随 rollout 一起进池, 这是它们自己的口径。
-                               */
-                               || m_agentType == AGENT_DQNMCTS_MOE);
+    const bool channelClass = (humanEndChannel(m_agentType) == HUMAN_END_REAL_SAMPLE);
+    /* 纯搜索那一档 (没有可训练参数) 由**类型**决定 —— 与实例建没建出来无关 */
+    const bool pureSearchClass = (humanEndChannel(m_agentType) == HUMAN_END_PURE_SEARCH);
     bool instanceExists = false;
 
     bool taken = false;
@@ -3038,10 +3439,9 @@ bool ChessBoard::notifyHumanGameEnd(int result)
         AgentBase *agent = nullptr;
         switch (m_agentType) {
         /*
-           只有这四支有"真实决策样本"这条通道 (learnFromSearch / 决策路径写进去的
-           decision 样本)。别的 agent 不在这里列举: 它们要么没有可训练参数
-           (AB / MCTS), 要么终局值本来就随 rollout 一起进了池 (PPO / DQN / DQN+AB /
-           EVAB), 对它们调用没有意义 —— 默认实现返回 false 已经表达了这件事。
+           只有"有真实决策样本"这一类的四支会接 (见 humanEndChannel): 它们实现了
+           `notifyGameResult`, 池里也真的存了那种样本。其余类型的默认实现返回 false
+           已经表达了"接不住" —— 那一句日志由 humanEndChannel 分类决定怎么写。
         */
         case AGENT_SACAZ:         agent = m_sfSACAZ;         break;
         case AGENT_SACAZ_MOE:     agent = m_sfSACAZMoe;      break;
@@ -3062,11 +3462,27 @@ bool ChessBoard::notifyHumanGameEnd(int result)
             << QStringLiteral("[human] 终局 %1: 已交给 %2 —— 它最后那一步的决策样本"
                               "按此改写 (done + 终局奖励), 并已更新一次")
                    .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
-    } else if (!channelClass) {
+    } else if (pureSearchClass) {
         m_humanEndMissed.fetch_add(1);
         qInfo().noquote()
-            << QStringLiteral("[human] 终局 %1: %2 没有终局通道 (纯搜索 / 终局值随 rollout "
-                              "进池的那几支), 无需反馈")
+            << QStringLiteral("[human] 终局 %1: %2 是纯搜索 agent (没有可训练参数), "
+                              "这一局的胜负对它没有意义 —— 无需反馈")
+                   .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
+    } else if (!channelClass) {
+        /*
+           ---- [2026-10] rollout 系 (PPO / DQN / DQN+AB / EVAB) 单独一条 ----
+           它们**在学**, 只是"学习"发生在自对弈/rollout 里: 池里的样本是它自己从某个
+           局面滚出去的那一串, 而**结束这一局的那一手是"人"走的** ⇒ 它最后那次真实决策
+           的终局值只能由 `-V(s')` 自举 (见 ppomcts_agent.cpp 的自举那一段), 真实胜负
+           不会回填。
+           这与 SAC 那三支的差别是**有没有存"真实决策样本"可挂**, 不是"学不学"。
+        */
+        m_humanEndMissed.fetch_add(1);
+        qInfo().noquote()
+            << QStringLiteral("[human] 终局 %1: %2 **在学** (每一手都在学), 但它池里没有"
+                              "\"真实决策样本\"可挂 —— 这一局的胜负不会回填到它最后那一步, "
+                              "只经自举 -V(s') 与后续 rollout/自对弈间接进入学习回路 "
+                              "(SAC 那几支存了决策样本, 所以它们能回填; 这是两支口径的差别)")
                    .arg(QString::fromUtf8(resText), agentDisplayName(m_agentType));
     } else if (!instanceExists) {
         m_humanEndMissed.fetch_add(1);
@@ -3227,6 +3643,7 @@ Step ChessBoard::aiThinkRaw(int color)
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPPOMCTS == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            applyPpoBalance(*m_sfPPOMCTS);
             auto it = s_weightPaths.find(AGENT_PPOMCTS);
             if (it != s_weightPaths.end())
                 m_sfPPOMCTS->loadModel(it->second);
@@ -3240,6 +3657,7 @@ Step ChessBoard::aiThinkRaw(int color)
         if (m_sfPPOMCTSMLP == nullptr) {
             m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                               true, RL::PPO::Backbone::MlpExperts);
+            applyPpoBalance(*m_sfPPOMCTSMLP);
             auto it = s_weightPaths.find(AGENT_PPOMCTS_MLP);
             if (it != s_weightPaths.end())
                 m_sfPPOMCTSMLP->loadModel(it->second);
@@ -3639,6 +4057,7 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTS, AGENT_PPOMCTS);
         if (ag == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            applyPpoBalance(*m_sfPPOMCTS);
             ag = m_sfPPOMCTS;
         }
         preTrainThenDecide(ag, color);
@@ -3882,6 +4301,7 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         if (ag == nullptr) {
             m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                               true, RL::PPO::Backbone::MlpExperts);
+            applyPpoBalance(*m_sfPPOMCTSMLP);
             ag = m_sfPPOMCTSMLP;
             /* 与上面 DQNAB / SACAZ_MOE 同一条约定: 建了对象就把权重载上 */
             auto it = s_weightPaths.find(AGENT_PPOMCTS_MLP);
@@ -4773,6 +5193,7 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
     case AGENT_PPOMCTS: {
         if (m_sfPPOMCTS == nullptr) {
             m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            applyPpoBalance(*m_sfPPOMCTS);
         }
         return m_sfPPOMCTS->loadModel(filepath);
     }
@@ -4781,6 +5202,7 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
         if (m_sfPPOMCTSMLP == nullptr) {
             m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                               true, RL::PPO::Backbone::MlpExperts);
+            applyPpoBalance(*m_sfPPOMCTSMLP);
         }
         return m_sfPPOMCTSMLP->loadModel(filepath);
     }
@@ -5077,16 +5499,20 @@ void ChessBoard::backgroundTrainLoop()
                     m_sfDQN = new DQNAgent(env, 64, 0.99f, 0.001f, 1.0f);
                 break;
             case AGENT_PPOMCTS:
-                if (m_sfPPOMCTS == nullptr)
+                if (m_sfPPOMCTS == nullptr) {
                     m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+                    applyPpoBalance(*m_sfPPOMCTS);
+                }
                 break;
             case AGENT_PPOMCTS_MLP:
                 /* 构造参数必须与 aiThinkRaw / aiThinkForAgentRaw 那一支逐字一致
                    (含骨干), 否则训练 clone 与主 agent 的结构指纹对不上, 每轮都载入失败 */
-                if (m_sfPPOMCTSMLP == nullptr)
+                if (m_sfPPOMCTSMLP == nullptr) {
                     m_sfPPOMCTSMLP = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64,
                                                       0.1f, true,
                                                       RL::PPO::Backbone::MlpExperts);
+                    applyPpoBalance(*m_sfPPOMCTSMLP);
+                }
                 break;
             case AGENT_DQNMCTS:
                 if (m_sfDQNMCTS == nullptr)
@@ -5283,6 +5709,12 @@ void ChessBoard::backgroundTrainLoop()
             }
             case AGENT_PPOMCTS: {
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f);
+                /*
+                   训练 clone 必须与主 agent 用**同一套** MoE 均衡/门控接线 —— 否则
+                   "训练用的那一支"与"决策用的那一支"不是同一个东西, 而且这件事情
+                   在权重往返上**看不出来** (偏置是非参数缓冲, 不进权重文件)。
+                */
+                applyPpoBalance(clone);
                 if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
@@ -5308,6 +5740,10 @@ void ChessBoard::backgroundTrainLoop()
                 */
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                    true, RL::PPO::Backbone::MlpExperts);
+                /* 与 AGENT_PPOMCTS 那一支同一条纪律: 均衡/门控接线必须与主 agent 一致
+                   (`enableMlpGate` 还必须在 loadModel **之前** —— 门控形状不同的话
+                   权重文件读侧会明确拒绝, 而不是静默错位)。 */
+                applyPpoBalance(clone);
                 if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS-MLP clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
@@ -5393,6 +5829,10 @@ void ChessBoard::backgroundTrainLoop()
                 */
                 SACAZMoETbAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
                                       64, SACAZ_MOE_AUX);
+                /* [2026-10 门控实验] clone 必须与主 agent 同一套路由口径,
+                   否则"训练用的克隆"与"决策用的实例"不是同一个东西 */
+                applyLossFreeBias(clone);
+                applyMlpGate(clone);
                 roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
                                              roundEpisodes, sacazTrainSims(type),
                                              roundMaxMoves, roundLoss);
@@ -5408,6 +5848,9 @@ void ChessBoard::backgroundTrainLoop()
                 SACAZMoEMlpAgent clone(trainChess, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
                                        64, SACAZ_MOE_AUX,
                                        SACAZMoEMlpAgent::TrunkMode::Separate);
+                /* [2026-10 门控实验] clone 必须与主 agent 同一套路由口径 */
+                applyLossFreeBias(clone);
+                applyMlpGate(clone);
                 roundApplied = trainSACRound(clone, tmpWeights, agentDisplayName(type),
                                              roundEpisodes, sacazTrainSims(type),
                                              roundMaxMoves, roundLoss);
@@ -5659,6 +6102,14 @@ int ChessBoard::saveAllInstantiatedAgentsOnExit()
                               /* [2026-09 dev-dqnmcts-moetb] 独立类, 正式前缀
                                  weights/dqnmcts_moe_agent_* (与旧类的单文件不同) */
                               AGENT_DQNMCTS_MOE };
+    /*
+       ⚠ [2026-10] 表里这四个 (PG / DQN / AGENT_SACAZ_OLD / AGENT_SACAZ_OLD_MOE)
+       现在是**不可达**的: 它们已从下拉框与启动预加载里移除 (见 kWeightAgents 注释),
+       所以 `hasAgentInstance()` 恒为假 ⇒ 下面直接 continue。留着它们是为了"哪天真要
+       恢复"时只需要改两处 (kAgents + kWeightAgents), 而不用再回来补这里 ——
+       但**列表本身仍然必须与"能实例化的 agent"一致**: 这里漏一个, 表现是
+       "界面上能选、能训练, 退出后权重从来没写过" (EVAB 当年就是这么漏的, 见上面那段)。
+    */
     int saved = 0;
     for (AgentType t : all) {
         if (!hasAgentInstance(t)) {
@@ -5676,88 +6127,17 @@ int ChessBoard::saveAllInstantiatedAgentsOnExit()
 }
 
 /* ================================================================
- *  回放功能
- * ================================================================ */
-
-/*
- * applyDbStep: 把一条数据库走法记录落到棋盘上。
+ *  [2026-10 移除] 回放功能 (applyDbStep / loadReplayGame / replayPrev /
+ *  replayNext / applyReplayStep)
+ * ================================================================
+ *  这五个函数连同 MainWindow 侧的回放 UI 一起删除。删的理由是这条链路
+ *  **结构性不可达**, 不是"没用": 写入端从未接线 (`GameDatabase::startGame /
+ *  recordMove / endGame` 全仓零调用, 见 docs/analysis.md 第 357 行与
+ *  docs/issues_review.md 第 1000 / 2739 行), 所以"选历史对局 -> 逐步回放"
+ *  永远走不到。`GameDatabase` 与 chess_games.db 保留 (构造函数里那句 open 不动)。
  *
- * 三处回放代码原来都写成 `step->nextId = dbStep.toX;` —— 把终点**列坐标**
- * (0..8) 当成了棋子 id。moveForward/moveBack 会用 nextId 去索引 m_children
- * 并结算收益, 语义完全是错的; 而且 step->valid 一直是 false。
+ *  顺带记一条被删掉的修正, 免得将来重写时再踩: 原来的三处回放代码都写成
+ *  `step->nextId = dbStep.toX;` —— 把终点**列坐标**(0..8) 当成了棋子 id;
+ *  moveForward/moveBack 会用 nextId 去索引 m_children 并结算收益, 语义完全错,
+ *  而且 step->valid 一直是 false。
  */
-bool ChessBoard::applyDbStep(const DBStep &dbStep)
-{
-    const Pos from(dbStep.fromX, dbStep.fromY);
-    const Pos to(dbStep.toX, dbStep.toY);
-    if (chess.m_map.isInner(from) == false || chess.m_map.isInner(to) == false) {
-        return false;
-    }
-    Stone *stone = chess.m_map[from];
-    if (stone == nullptr || stone->alive == false) {
-        return false;
-    }
-    Stone *victim = chess.m_map[to];
-    if (victim != nullptr && victim->color == stone->color) {
-        return false;   /* 记录与当前局面不一致 */
-    }
-
-    Step step;
-    step.id = stone->id;
-    step.pos = from;
-    step.nextId = (victim != nullptr) ? victim->id : Stone::ID_NONE;
-    step.nextPos = to;
-    step.reward = 0;
-    step.valid = true;
-
-    double totalReward = 0;
-    chess.moveForward(&step, totalReward);
-    return true;
-}
-
-void ChessBoard::loadReplayGame(int gameId, const QVector<DBStep> &steps)
-{
-    m_replayGameId = gameId;
-    m_replaySteps = steps;
-    chess.reset();
-    /* 应用到所有步 */
-    for (int i = 0; i < steps.size(); i++) {
-        applyDbStep(steps[i]);
-    }
-    m_replayIndex = steps.size();
-    update();
-    emit replayIndexChanged(m_replayIndex, m_replaySteps.size());
-}
-
-bool ChessBoard::replayPrev()
-{
-    if (m_replayGameId < 0) return false;
-    if (m_replayIndex <= 0) return false;
-    m_replayIndex--;
-    applyReplayStep(m_replayIndex);
-    update();
-    emit replayIndexChanged(m_replayIndex, m_replaySteps.size());
-    return true;
-}
-
-bool ChessBoard::replayNext()
-{
-    if (m_replayGameId < 0) return false;
-    if (m_replayIndex >= m_replaySteps.size()) return false;
-    if (applyDbStep(m_replaySteps[m_replayIndex]) == false) {
-        m_replayIndex++;
-        return false;
-    }
-    m_replayIndex++;
-    update();
-    emit replayIndexChanged(m_replayIndex, m_replaySteps.size());
-    return true;
-}
-
-void ChessBoard::applyReplayStep(int targetIndex)
-{
-    chess.reset();
-    for (int i = 0; i < targetIndex; i++) {
-        applyDbStep(m_replaySteps[i]);
-    }
-}

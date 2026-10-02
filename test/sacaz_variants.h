@@ -10,7 +10,7 @@
  *
  *      SACAZAgent          纯 MLP (两个 Tanh 隐层)              AGENT_SACAZ
  *      SACAZMoEMlpAgent    稀疏 MoE(E=8, top-2) + MLP 专家      AGENT_SACAZ_MOE_MLP
- *      SACAZMoETbAgent     稀疏 MoE(E=4, top-1) + TB 专家       AGENT_SACAZ_MOE
+ *      SACAZMoETbAgent     稀疏 MoE(E=8, top-2) + TB 专家       AGENT_SACAZ_MOE
  *      SACAZLegacyAgent    59e5233 行为还原版 (自带两支骨干)     AGENT_SACAZ_OLD*
  *
  *  拆分前它们是**一个类 + `Backbone` 枚举**: 工具里 `--backbone=tb` 只是给同一个
@@ -85,6 +85,43 @@ inline const char *variantName(Variant v)
     case Variant::DenseMoeTb: return "稠密MoE(TB专家,对照)";
     }
     return "?";
+}
+
+/* ----------------------------------------------------------------
+ *  1b. 变体的**结构常量** —— 必须取自"这个变体真正建出来的那个类"
+ *
+ *  [2026-10 E=8/top-2 回归当场抓到的一个真实错误] 工具/测试里要断言"专家数 = ?"时,
+ *  原来是写 `SACAZAgent::MOE_TB_EXPERTS` —— 但 `test_sacaz` 的骨干扫描建的是
+ *  **独立类** `SACAZMoETbAgent`, 它有自己的同名常量 (4/1 -> 8/2 时只改了它自己那份)。
+ *  于是: **测试的红灯看着像"代码错了", 其实是测试盯错了类** —— 这是四个类互不继承
+ *  在工具侧的直接代价, 也是最容易犯的一类错 (同名常量在四个类里各有一份)。
+ *
+ *  所以这里给"按变体问结构"留**唯一一处**入口: 值来自那个变体实际建出来的类,
+ *  改 E/top-k 时工具侧一个字都不用动。`Mlp` 没有 MoE 层 -> 0/0 (与 `MoeInfo` 把
+ *  "只有某些骨干才有的读数"抹平是同一个口径)。
+ *
+ *  注意这**不是**自证: `moeExpertCount()` 读的是网里那个 `ISparseMoE` 层**建出来之后**
+ *  的 `expertCount()` (见 sacazmoetbagent.cpp), 所以"类常量 == 层读数"这条断言查的是
+ *  `buildNet` 有没有真的用这个常量建层 (写死成别的数字就会红)。
+ * ---------------------------------------------------------------- */
+struct VariantShape {
+    int experts;   /* 稀疏 MoE 层建了几个专家 (0 = 这个变体没有 MoE 层) */
+    int topK;      /* 每次前向激活几个 (dense 对照 = experts) */
+};
+
+inline VariantShape variantShape(Variant v)
+{
+    switch (v) {
+    case Variant::Mlp:        return { 0, 0 };
+    case Variant::MoeMlp:     return { SACAZMoEMlpAgent::MOE_MLP_EXPERTS,
+                                       SACAZMoEMlpAgent::MOE_MLP_TOPK };
+    case Variant::MoeTb:      return { SACAZMoETbAgent::MOE_TB_EXPERTS,
+                                       SACAZMoETbAgent::MOE_TB_TOPK };
+    /* "等参数不等算力"的对照: 专家数同上, 但**全算** —— topK = experts */
+    case Variant::DenseMoeTb: return { SACAZMoETbAgent::MOE_TB_EXPERTS,
+                                       SACAZMoETbAgent::MOE_TB_EXPERTS };
+    }
+    return { 0, 0 };
 }
 
 /* ----------------------------------------------------------------
@@ -186,6 +223,11 @@ template <class A> struct MoeInfo {
     static int topK(const A &) { return 0; }
     static void usage(const A &, std::vector<long long> &out) { out.clear(); }
     static void resetUsage(A &) {}
+    static void usageSplit(const A &, std::vector<long long> &tr, std::vector<long long> &inf)
+    {
+        tr.clear();
+        inf.clear();
+    }
 };
 
 template <> struct MoeInfo<SACAZMoEMlpAgent> {
@@ -193,6 +235,8 @@ template <> struct MoeInfo<SACAZMoEMlpAgent> {
     static int topK(const SACAZMoEMlpAgent &a) { return a.moeTopK(); }
     static void usage(const SACAZMoEMlpAgent &a, std::vector<long long> &out) { a.moeUsage(out); }
     static void resetUsage(SACAZMoEMlpAgent &a) { a.resetMoeUsage(); }
+    static void usageSplit(const SACAZMoEMlpAgent &a, std::vector<long long> &tr,
+                           std::vector<long long> &inf) { a.moeUsageSplit(tr, inf); }
 };
 
 template <> struct MoeInfo<SACAZMoETbAgent> {
@@ -200,6 +244,44 @@ template <> struct MoeInfo<SACAZMoETbAgent> {
     static int topK(const SACAZMoETbAgent &a) { return a.moeTopK(); }
     static void usage(const SACAZMoETbAgent &a, std::vector<long long> &out) { a.moeUsage(out); }
     static void resetUsage(SACAZMoETbAgent &a) { a.resetMoeUsage(); }
+    static void usageSplit(const SACAZMoETbAgent &a, std::vector<long long> &tr,
+                           std::vector<long long> &inf) { a.moeUsageSplit(tr, inf); }
+};
+
+/*
+   ----------------------------------------------------------------
+   [2026-10 门控实验] 无辅助损失的偏置均衡 —— 只有两个 MoE 骨干有它。
+   纯 MLP / legacy 支没有稀疏 MoE 层 (或没有该开关), 这里是**空操作**,
+   与 MoeInfo 把"只有某些骨干才有的读数"抹平是同一个做法。
+   ----------------------------------------------------------------
+*/
+template <class A> struct MoeBias {
+    static bool available() { return false; }
+    static void set(A &, bool, float) {}
+    static bool enabled(const A &) { return false; }
+    static float rate(const A &) { return 0.0f; }
+};
+
+template <> struct MoeBias<SACAZMoEMlpAgent> {
+    static bool available() { return true; }
+    static void set(SACAZMoEMlpAgent &a, bool on, float r)
+    {
+        a.lossFreeBias = on;
+        a.lossFreeBiasRate = r;
+    }
+    static bool enabled(const SACAZMoEMlpAgent &a) { return a.lossFreeBias; }
+    static float rate(const SACAZMoEMlpAgent &a) { return a.lossFreeBiasRate; }
+};
+
+template <> struct MoeBias<SACAZMoETbAgent> {
+    static bool available() { return true; }
+    static void set(SACAZMoETbAgent &a, bool on, float r)
+    {
+        a.lossFreeBias = on;
+        a.lossFreeBiasRate = r;
+    }
+    static bool enabled(const SACAZMoETbAgent &a) { return a.lossFreeBias; }
+    static float rate(const SACAZMoETbAgent &a) { return a.lossFreeBiasRate; }
 };
 
 /* TB 专家的注意力头口径: 只有 TB 那一支有 -> 其余返回 -1 (与拆分前的返回值一致) */

@@ -97,6 +97,14 @@ struct Cfg {
     std::string loadPrefix;
     std::string savePrefix;
     /*
+       [2026-10 门控实验] 无辅助损失的偏置均衡 (报告"建议 1")。
+       加在这里的理由同上: 这是唯一同时支持四个骨干变体的工具, 所以"MoE-MLP 那一支
+       要不要开偏置均衡"的 A/B 必须走它 (TB 的对应实验由 bench_sacmoetb_train 做,
+       那边已加同名同义的开关)。默认关 = 改动前的行为。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = 0.001f;
+    /*
        [2026-09 动态奖励分配] 四个奖励旋钮 (默认 = 出厂口径)。为什么加在这里:
        这是唯一同时支持**四个骨干变体** + 赛前自对弈 (`--warmup-games`) + 存盘的工具,
        所以"奖励 A/B"要覆盖 MoE-MLP 那一支就得走它 (TB 的对应实验由
@@ -381,6 +389,8 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--max-sims")){ g_cfg.maxSims = std::atoi(v); }
         else if (const char *v = val("--warmup-games")) { g_cfg.warmupGames = std::atoi(v); }
         else if (const char *v = val("--warmup-sims"))  { g_cfg.warmupSims = std::atoi(v); }
+        else if (const char *v = val("--lossfree-bias")) { g_cfg.lossFreeBias = (std::atoi(v) != 0); }
+        else if (const char *v = val("--lossfree-bias-rate")) { g_cfg.lossFreeBiasRate = (float)std::atof(v); }
         else if (const char *v = val("--backbone")){ g_cfg.backbone = v; }
         else if (const char *v = val("--trunk"))   { g_cfg.trunk = v; }
         else if (const char *v = val("--learn-from-search")){ g_cfg.learnFromSearch = (std::atoi(v) != 0); }
@@ -455,6 +465,12 @@ int main(int argc, char **argv)
            走 visit: lambda 里是真实类型, 与拆分前 `sac.rewardShape = ...` 同一件事。
         */
         sac.learnFromSearch = g_cfg.learnFromSearch;
+        /*
+           [2026-10] 无辅助损失的偏置均衡。必须在 warmup (trainSelfPlay) **之前**写入。
+           走 trait: 纯 MLP / legacy 支没有稀疏 MoE 层, 那里是空操作 (不编译不过)。
+        */
+        sacazx::MoeBias<std::decay_t<decltype(sac)> >::set(sac, g_cfg.lossFreeBias,
+                                                          g_cfg.lossFreeBiasRate);
         sac.rewardShape = g_cfg.rewardShape;
         sac.mateScoreMode = g_cfg.mateScoreMode;
         sac.matRewardBoost = g_cfg.matRewardBoost;
@@ -527,6 +543,40 @@ int runSacVsAb(A &sac, Chess &c, sacazx::Variant variant)
             std::printf("热身    : 自对弈 %d 局 (%d 模拟/步), %.1f s; learnSteps=%d\n",
                         g_cfg.warmupGames, g_cfg.warmupSims, (nowMs() - t0) / 1000.0,
                         sac.getLearnSteps());
+        }
+        /*
+           [2026-10] 专家负载必须**按前向来源拆开**读 (与 bench_sacmoetb_train 同一口径):
+           生命周期累计混着 MCTS 推理前向, 而推理前向在数量上通常压倒训练前向 ——
+           判断"偏置均衡在训练批上生效没有"只能看训练侧那一行。
+        */
+        if (!g_cfg.quiet) {
+            std::vector<long long> tr, inf;
+            sacazx::MoeInfo<A>::usageSplit(sac, tr, inf);
+            auto loadLine = [&](const char *name, const std::vector<long long> &v) {
+                if (v.empty()) {
+                    return;
+                }
+                long long tot = 0;
+                for (long long x : v) { tot += x; }
+                if (tot <= 0) {
+                    std::printf("负载(%s) : 无前向\n", name);
+                    return;
+                }
+                double mx = 0.0, mn = 1.0;
+                int eff = 0;
+                std::printf("负载(%s) : {", name);
+                for (std::size_t i = 0; i < v.size(); i++) {
+                    const double sh = (double)v[i] / (double)tot;
+                    mx = std::fmax(mx, sh);
+                    mn = std::fmin(mn, sh);
+                    if (sh > 0.05) { eff++; }
+                    std::printf("%lld%s", v[i], (i + 1 < v.size()) ? "," : "}");
+                }
+                std::printf(" 总=%lld MaxVio=%.3f 最小份额=%.3f 有效专家=%d\n",
+                            tot, mx * (double)v.size() - 1.0, mn, eff);
+            };
+            loadLine("训练侧", tr);
+            loadLine("推理侧", inf);
         }
     }
 

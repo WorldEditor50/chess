@@ -21,6 +21,8 @@
 /* 稀疏 MoE 只需要指针/引用 (定义在 rl/sparse_moe.hpp, 由 .cpp 包含) */
 namespace RL {
 class ISparseMoE;
+/* [2026-10] 实时路由探针 —— 只返回指针, 所以前向声明就够 */
+class MoERouteProbe;
 }
 
 /*
@@ -662,6 +664,12 @@ public:
     int moeTopK() const;
     bool moeDenseNow() const;      /* 骨干内部真实的 TopK == E (不是开关回显) */
     void moeUsage(std::vector<long long> &out) const;
+    /*
+       [2026-10] "此刻哪个专家在工作"的**无锁**探针 (trunk 里那个稀疏 MoE 层)。
+       界面拿它做呼吸灯 —— 取一次指针之后可以在**不持 agent 锁**的情况下反复读
+       (整段决策都持着 `m_agentMutex`, 见 rl/sparse_moe.hpp 的 MoERouteProbe)。
+    */
+    const RL::MoERouteProbe *moeRouteProbe() const;
     void resetMoeUsage();
     int tbHeadsRequested() const;
     int tbHeadsUsed() const;

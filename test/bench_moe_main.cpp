@@ -79,13 +79,18 @@ static const Case kCases[4] = {
     { sacazx::Variant::DenseMoeTb,   "D  稠密MoE(TB专家) " }
 };
 
-/* 分析式参数量 (只用来在报告里说明"等参数"这件事) */
+/* 分析式参数量 (只用来在报告里说明"等参数"这件事)
+   ⚠ 专家数必须走 `sacazx::variantShape()` —— 这里算的是**这个变体真正建出来的类**
+   (如 `MoeTb` 建的是独立类 `SACAZMoETbAgent`), 它的 E/top-k 与 `SACAZAgent` 里那份
+   同名常量**是两份**(四个类互不继承)。2026-10 改 E=4->8 时这里漏改过: 报告里会把
+   E=8 的选手印成 E=4 的参数, 而它只用于打印, 没有任何断言会红 —— 静默错报告。 */
 static double paramCount(sacazx::Variant b, int hidden)
 {
     const double D = (double)SACAZAgent::STATE_DIM;
     const double A = (double)SACAZAgent::ACTION_DIM;
     const double h = (double)hidden;
     const double mlp = D * h + h + h * h + h + h * A + A;   /* 1260->h->h->A */
+    const int experts = sacazx::variantShape(b).experts;
     switch (b) {
     case sacazx::Variant::Mlp:
         return mlp;
@@ -93,19 +98,17 @@ static double paramCount(sacazx::Variant b, int hidden)
         const double eh = 64.0;
         /* 每个专家: D->eh->eh->D */
         const double expert = D * eh + eh + eh * eh + eh + eh * D + D;
-        const double gate = (double)SACAZAgent::MOE_MLP_EXPERTS * D
-                            + (double)SACAZAgent::MOE_MLP_EXPERTS;
+        const double gate = (double)experts * D + (double)experts;
         /* MoE 层 + Tanh(D->h) + Linear(h->A) */
-        return (double)SACAZAgent::MOE_MLP_EXPERTS * expert + gate + D * h + h + h * A + A;
+        return (double)experts * expert + gate + D * h + h + h * A + A;
     }
     case sacazx::Variant::MoeTb:
     case sacazx::Variant::DenseMoeTb: {
-        const double dff = (double)SACAZAgent::MOE_TB_DFF;
+        const double dff = (double)SACAZMoETbAgent::MOE_TB_DFF;
         /* 一个 TB 专家: 4 个 d x d 的投影 + LN(2*2*d) + FFN(d->dff->d) */
         const double expert = 4.0 * D * D + 4.0 * D + (D * dff + dff) + (dff * D + D);
-        const double gate = (double)SACAZAgent::MOE_TB_EXPERTS * D
-                            + (double)SACAZAgent::MOE_TB_EXPERTS;
-        return (double)SACAZAgent::MOE_TB_EXPERTS * expert + gate + D * h + h + h * A + A;
+        const double gate = (double)experts * D + (double)experts;
+        return (double)experts * expert + gate + D * h + h + h * A + A;
     }
     default:
         return mlp;

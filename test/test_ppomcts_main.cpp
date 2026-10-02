@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <algorithm>
 #include <cstdlib>
 #include <ctime>
@@ -2265,6 +2265,176 @@ static bool testMaskedTrainHead()
 }
 
 /* ================================================================
+ *  测试14: PPO 骨干的 MoE 负载均衡接线 (2026-10)
+ *
+ *  为什么必须进 ctest (而不是只靠 bench_ppo_moe_balance 的读数): 这一节的三个断言
+ *  全都是"**不会自己报错**"的那一类 ——
+ *    [a] `setLossFreeBias` 写了 agent 的成员但没转发到 `ppo.moeLossFreeBias`
+ *        ⇒ 运行完全正常、loss 照降, 只是均衡**从未生效**;
+ *    [b] `enableMlpGate` 被调用两次 (构造工厂与兜底建网各一处)
+ *        ⇒ 门控被重建并重抽随机数, **把已经训练过的路由器抹掉**;
+ *    [c] 训练跑完之后 `biasGate` 一格都没动
+ *        ⇒ 回路没接上 (批统计被别处清零 / updateLossFreeBias 没被调用)。
+ *  三者都不会有异常、不会有日志, 只会让"负载均衡"这件事静默地不存在。
+ *
+ *  [d] 是**方向性**的读数 (不是断言): 同一份自对弈数据、同一个种子下, 开偏置的
+ *  最大份额应当不高于关偏置。它只能当读数看 —— 4~6 个专家的有限样本上, 单次比较
+ *  的噪声与受控实验里的效应量同量级, 拿它当断言会变成"偶发失败"。
+ * ================================================================ */
+static bool testPpoMoeLoadBalance()
+{
+    bool ok = true;
+    printf("\n--- \xe6\xb5\x8b\xe8\xaf\x95""14: PPO \xe9\xaa\xa8\xe5\xb9\xb2 MoE \xe8\xb4\x9f\xe8\xbd\xbd\xe5\x9d\x87\xe8\xa1\xa1\xe6\x8e\xa5\xe7\xba\xbf ---\n");
+
+    using A = PPOMCTSAgent;
+    const int hidden = 16;
+    const int expertHidden = 8;
+
+    /* ---- [a] setLossFreeBias 必须落到 ppo 的真源上 ---- */
+    {
+        Chess env;
+        A ag(env, hidden, 0.99f, 0.003f, 1.414f, expertHidden, 0.1f, true,
+             RL::PPO::Backbone::MlpExperts);
+        const bool offByDefault = (!ag.lossFreeBias) && (!ag.ppo.moeLossFreeBias);
+        ag.setLossFreeBias(true, 0.02f);
+        const bool onAfterSet = ag.lossFreeBias && ag.ppo.moeLossFreeBias
+                                && (std::fabs((double)ag.ppo.moeLossFreeBiasRate - 0.02) < 1e-9);
+        ag.setLossFreeBias(false, -1.0f);   /* 负 rate 必须被夹成 0, 不能变成"反向均衡" */
+        const bool rateClamped = (ag.ppo.moeLossFreeBiasRate == 0.0f) && (!ag.ppo.moeLossFreeBias);
+        printf("  [a] \u9ed8\u8ba4\u5173=%d, setter \u8f6c\u53d1\u5230 ppo=%d, rate \u975e\u8d1f=%d\n",
+               (int)offByDefault, (int)onAfterSet, (int)rateClamped);
+        ok = ok && offByDefault && onAfterSet && rateClamped;
+    }
+
+    /* ---- [b] enableMlpGate 幂等: 重复调用不能重建/重抽随机数 ---- */
+    {
+        Chess env;
+        A ag(env, hidden, 0.99f, 0.003f, 1.414f, expertHidden, 0.1f, true,
+             RL::PPO::Backbone::MlpExperts);
+        const bool linearFirst = (ag.mlpGateHidden() == 0);
+        ag.enableMlpGate(8);
+        const bool mlpOn = (ag.mlpGateHidden() == 8);
+
+        /* 把门控和骨干全量拍下来, 再调一次, 逐位比较 */
+        std::vector<float> before;
+        for (std::size_t i = 0; i < ag.ppo.actorP.size(); i++) {
+            RL::iFcLayer *fc = dynamic_cast<RL::iFcLayer *>(ag.ppo.actorP[i]);
+            if (fc == nullptr) { continue; }
+            for (std::size_t k = 0; k < fc->w.size(); k++) { before.push_back(fc->w[k]); }
+            for (std::size_t k = 0; k < fc->b.size(); k++) { before.push_back(fc->b[k]); }
+        }
+        ag.enableMlpGate(8);   /* 同一个 hidden: 必须是空操作 */
+        std::size_t p = 0;
+        double diff = 0.0;
+        for (std::size_t i = 0; i < ag.ppo.actorP.size(); i++) {
+            RL::iFcLayer *fc = dynamic_cast<RL::iFcLayer *>(ag.ppo.actorP[i]);
+            if (fc == nullptr) { continue; }
+            for (std::size_t k = 0; k < fc->w.size() && p < before.size(); k++) {
+                diff = std::fmax(diff, std::fabs((double)fc->w[k] - (double)before[p++]));
+            }
+            for (std::size_t k = 0; k < fc->b.size() && p < before.size(); k++) {
+                diff = std::fmax(diff, std::fabs((double)fc->b[k] - (double)before[p++]));
+            }
+        }
+        const bool idempotent = (diff == 0.0) && (p == before.size());
+        printf("  [b] \u9ed8\u8ba4\u7ebf\u6027=%d, \u5f00 MLP \u540e\u9690\u5c42\u8bfb\u6570=%d, "
+               "\u91cd\u590d\u8c03\u7528\u6700\u5927\u6539\u53d8=%.3g (\u5fc5\u987b\u4e3a 0)\n",
+               (int)linearFirst, ag.mlpGateHidden(), diff);
+        ok = ok && linearFirst && mlpOn && idempotent;
+
+        /* MLP 门控必须真的能前向 (batch 三次 MlpExpert: d_model->h->h->d) —— 只建张量
+           不接线是查不出来的, 所以这里直接跑一次搜索。 */
+        env.reset();
+        env.sideToMove = Stone::COLOR_RED;
+        const Step s = ag.selectMove(Stone::COLOR_RED, 8, 0.0f);
+        const bool mlpRuns = s.valid;
+        printf("      MLP \u95e8\u63a7\u4e0b\u4e00\u6b21\u641c\u7d22\u8d70\u6cd5\u6709\u6548=%d\n", (int)mlpRuns);
+        ok = ok && mlpRuns;
+    }
+
+    /* ---- [c]+[d] 真训练: 偏置必须动, 且"开偏置"的最大份额不高于"关偏置" ---- */
+    {
+        /* 三轮: 关偏置 / 开偏置 / 再关一次 —— 同一 seed 下第 1 与第 3 轮必须逐位相同,
+           这才证明"读数差异来自开关本身"而不是随机流漂移。 */
+        struct Run {
+            bool on;
+            double maxShare;
+            double biasSpread;
+            long long trainForwards;
+        };
+        auto one = [&](bool on) {
+            Run r;
+            r.on = on;
+            RL::Random::setSeed(20240901u);
+            Chess env;
+            A ag(env, hidden, 0.99f, 0.003f, 1.414f, expertHidden, 0.1f, true,
+                 RL::PPO::Backbone::MlpExperts);
+            ag.replayBatchSize = 0;          /* 采集与学习分开, 学习节拍由这里控制 */
+            ag.learnStepsPerEpisode = 0;
+            ag.openingPlies = 4;
+            ag.openingSeed = 20240901u;
+            ag.setLossFreeBias(on, 0.01f);
+            ag.resetMoeUsage();
+            ag.trainSelfPlay(2, 12, 12, false, 1.0f, 0.25f);   /* 采数据 */
+            for (int b = 0; b < 6; b++) {
+                ag.ppo.learnFromReplay(32, 1, 0.003f);
+            }
+            std::vector<long long> tr, inf;
+            ag.moeUsageSplit(tr, inf);
+            long long tot = 0, mx = 0;
+            for (std::size_t i = 0; i < tr.size(); i++) {
+                tot += tr[i];
+                if (tr[i] > mx) { mx = tr[i]; }
+            }
+            r.trainForwards = tot;
+            r.maxShare = (tot > 0) ? (double)mx / (double)tot : 0.0;
+
+            std::vector<float> bias;
+            ag.moeBiasSnapshot(bias);
+            if (!bias.empty()) {
+                float lo = bias[0], hi = bias[0];
+                for (std::size_t i = 1; i < bias.size(); i++) {
+                    if (bias[i] < lo) { lo = bias[i]; }
+                    if (bias[i] > hi) { hi = bias[i]; }
+                }
+                r.biasSpread = (double)(hi - lo);
+            } else {
+                r.biasSpread = -1.0;   /* -1 = 这个配置没有偏置快照 */
+            }
+            return r;
+        };
+
+        const Run off1 = one(false);
+        const Run onR = one(true);
+        const Run off2 = one(false);
+
+        const bool biasMoved = (onR.biasSpread > 0.0);
+        const bool biasIdleWhenOff = (off1.biasSpread <= 0.0) && (off2.biasSpread <= 0.0);
+        const bool trainHappened = (onR.trainForwards > 0) && (off1.trainForwards > 0);
+        const bool deterministic = (std::fabs(off1.maxShare - off2.maxShare) < 1e-12)
+                                   && (off1.trainForwards == off2.trainForwards);
+        printf("  [c] \u504f\u7f6e\u6781\u5dee: \u5173=%.3f / \u5f00=%.3f (\u5f00\u65f6\u5fc5\u987b>0, \u5173\u65f6<=0)\n",
+               off1.biasSpread, onR.biasSpread);
+        printf("      \u8bad\u7ec3\u4fa7\u524d\u5411=%lld (\u5f00\u504f\u7f6e) / %lld (\u5173\u504f\u7f6e)\n",
+               onR.trainForwards, off1.trainForwards);
+        printf("  [d] \u6700\u5927\u4efd\u989d: \u5173\u504f\u7f6e=%.4f, \u5f00\u504f\u7f6e=%.4f "
+               "(\u65b9\u5411\u6027\u8bfb\u6570, \u4e0d\u4f5c\u65ad\u8a00)\n",
+               off1.maxShare, onR.maxShare);
+        printf("      \u540c\u4e00\u79cd\u5b50\u4e0b\u4e24\u6b21'\u5173' \u8dd1\u5f97\u4e00\u81f4=%d "
+               "(%.4f vs %.4f)\n", (int)deterministic, off1.maxShare, off2.maxShare);
+        if (!biasMoved)            { printf("      **EXPECTED \u5f00\u504f\u7f6e\u540e biasGate \u5fc5\u987b\u88ab\u63a8\u52a8**\n"); }
+        if (!biasIdleWhenOff)      { printf("      **EXPECTED \u5173\u504f\u7f6e\u65f6\u4e0d\u5e94\u6709\u504f\u7f6e\u5feb\u7167/\u63a8\u52a8**\n"); }
+        if (!trainHappened)        { printf("      **EXPECTED \u8bad\u7ec3\u4fa7\u524d\u5411\u5e94\u8be5\u975e\u96f6 (\u5426\u5219\u4e0a\u9762\u4e24\u4e2a\u8bfb\u6570\u90fd\u6ca1\u610f\u4e49)**\n"); }
+        if (!deterministic)        { printf("      **EXPECTED \u540c\u4e00\u79cd\u5b50\u4e0b\u91cd\u8dd1\u5e94\u8be5\u9010\u4f4d\u4e00\u81f4**\n"); }
+        ok = ok && biasMoved && biasIdleWhenOff && trainHappened && deterministic;
+    }
+
+    printf("  -> %s\n", ok ? "PPO MoE load-balance wiring verified"
+                           : "**MoE LOAD-BALANCE WIRING BUG**");
+    return ok;
+}
+
+/* ================================================================
  *  主函数
  * ================================================================ */
 int main()
@@ -2297,11 +2467,13 @@ int main()
     const bool sparseOk = testSparsePolicyHead();
     const bool reuseOk = testTreeReuse();
     const bool maskedOk = testMaskedTrainHead();
+    const bool moeBalanceOk = testPpoMoeLoadBalance();
 
     printf("\n========================================\n");
     printf("  PPO+MCTS Agent \xe6\xb5\x8b\xe8\xaf\x95\xe5\xae\x8c\xe6\x88\x90!\n");
     printf("========================================\n");
 
     /* 符号约定/目标分布这类"不会自己报错"的问题要能反映到退出码上 */
-    return (signOk && targetOk && puctOk && loadOk && noiseOk && replayOk && mirrorOk && sparseOk && reuseOk && maskedOk) ? 0 : 1;
+    return (signOk && targetOk && puctOk && loadOk && noiseOk && replayOk && mirrorOk
+            && sparseOk && reuseOk && maskedOk && moeBalanceOk) ? 0 : 1;
 }

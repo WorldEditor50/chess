@@ -2,6 +2,7 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QPointer>
 #include <QVector>
 #include <QHash>
 #include <QTimer>
@@ -11,11 +12,16 @@
 #include "gamedb.h"
 #include "chessboard.h"
 #include "metricsview.h"
+#include "moeloadview.h"
 
 #include "busydialog.h"
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
+
+/* [2026-10] "呼吸高亮"勾选框在 .cpp 里程序化创建 (与"动态奖励"那几个同一做法),
+   头文件只需要前置声明 (成员是指针) */
+class QCheckBox;
 
 class MainWindow : public QMainWindow
 {
@@ -27,11 +33,18 @@ public:
 
 private slots:
     void onAgentSelected(int index);
-    void onGameSelected(int index);
-    void onReplayPrev();
-    void onReplayNext();
-    void onReplayIndexChanged(int index, int total);
-    void onReplayModeExited();
+    /*
+       [2026-10 移除] 这里原来有"棋谱回放"的四个槽 —— onGameSelected / onReplayPrev /
+       onReplayNext / onReplayIndexChanged / onReplayModeExited, 由 recordcomboBox 与
+       Previous/Next Step 两个按键驱动。
+       移除的理由不是"没用", 而是**这条链路结构性不可达**: 写入端从未接线
+       (`GameDatabase::startGame/recordMove/endGame` 全仓零调用, 见 docs/issues_review.md
+       第 1000 行与 2739 行), 所以"选历史对局"列表里永远只有占位项, 两个步进键
+       开局就被禁用、永远不会启用 —— 它们看起来像"功能坏了", 实际是"功能没做"。
+       全仓无测试/验证脚本覆盖它们。`GameDatabase` 与 chess_games.db **保留**:
+       那一层是独立的东西, 将来要接线"每步落库 -> 可回放"时不用重写。
+       ChessBoard 侧的 replay API 一并移除 (只被这几个槽用过)。
+    */
     /* 开始 / 停止 Agent 对 Agent 对弈 (按钮兼作"停止") */
     void onStartMatch();
     /* 对弈模式下拉框 (P0-a): 把"训练 / 评估 / 只对弈不学习"写进 ChessBoard */
@@ -54,7 +67,6 @@ private slots:
     void onBgTrainEpisodesChanged(int n);
 
 private:
-    void refreshGameList();
     void populateAgentComboBox();
     /*
      * 权重**静默**存到标准路径 (不弹任何窗口): 放在**常驻后台线程**里做。
@@ -113,8 +125,6 @@ private:
     void openLargeChart(CurveChart *source, const QString &title);
 
     Ui::MainWindow *ui;
-    /* 缓存当前加载的走法列表 */
-    QVector<DBStep> m_currentReplaySteps;
 
     /* agent 名 -> 损失曲线下标 (同名复用, 见 lossSeriesFor) */
     QHash<QString, int> m_lossSeries;
@@ -171,6 +181,41 @@ private:
     QString m_selfCheckText;
     bool m_selfCheckReady = false;
     void selfCheckWorkerLoop();
+
+    /*
+       [2026-10 门控实验] 稀疏 MoE 专家负载小控件。
+       取数**复用上面那个自检 worker**: 那几个计数器要在 agent 锁上读 (后台训练线程
+       可能正在 loadModel 把整份权重写进同一个网络), 所以不能在 GUI 线程直接调 ——
+       与 self-check 完全同一条约束。worker 算完把快照放进 m_moeLoadSnapshot,
+       再用同一个队列信号贴回 GUI 线程。
+    */
+    MoeLoadView *m_moeLoadView = nullptr;
+    /*
+       [2026-10] 双击 MoeLoadView 弹出的放大窗口 (非模态, 与 CurveChartDialog 同一约定)。
+       用 QPointer: 那个窗口是 WA_DeleteOnClose, 关掉之后指针必须自动变空,
+       否则下一次双击会碰到已析构的对象。
+    */
+    QPointer<MoeLoadDialog> m_moeLoadDialog;
+    ChessBoard::MoeLoadSnapshot m_moeLoadSnapshot;
+    bool m_moeLoadReady = false;
+    /*
+       [2026-10] 实时路由 (呼吸灯)。与上面那份快照是**两条不同的路**:
+         * m_moeLoadSnapshot: 走 worker + `m_agentMutex`, 每手棋/切 agent 一次 (累计份额);
+         * m_moeLiveRoute   : 走 `ChessBoard::liveMoeRoute()` (**不加锁**), 15 Hz (此刻谁在干活)。
+       分两条是必须的 —— 思考中 `m_agentMutex` 被整段决策占着, 加锁的那条会一直阻塞。
+       `m_moeLiveRoute` 存一份是为了双击弹窗时能立刻用上 (不必等下一次定时器)。
+    */
+    QTimer *m_moeLiveTimer = nullptr;
+    ChessBoard::MoeLiveRoute m_moeLiveRoute;
+    /*
+       [2026-10 用户口径] "呼吸高亮"开关 (中间那一列, **默认关**)。
+       它是"MoE 负载面板的实时显示"的唯一入口: 勾上才 start 取数定时器, 取消就 stop。
+       与它成对的是 `MainWindow::applyMoeHighlight()` (唯一一个启停点) 与
+       `MoeLoadView::setHighlightEnabled()` (控件侧)。
+    */
+    QCheckBox *m_moeHighlightCheck = nullptr;
+    /* 唯一一个启停点: 定时器 + 主面板 + 放大窗口 三处一起切 (见 .cpp 的说明) */
+    void applyMoeHighlight(bool on);
 
     /* Agent 对弈状态 (只在 GUI 线程读写) */
     bool m_matchRunning = false;

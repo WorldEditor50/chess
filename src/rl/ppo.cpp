@@ -247,6 +247,74 @@ void RL::PPO::resetMoeBatchStats()
     }
 }
 
+void RL::PPO::enableMlpGate(int hidden)
+{
+    if (hidden < 1) {
+        return;
+    }
+    /*
+       幂等守卫 (意图层面): "已经是 MLP 门控"就直接返回。
+       ⚠ 单靠它**不够** —— 它挡不住"hidden 从 32 改成 64"这种重建 (那种重建会在
+       已训练的门控上重抽初始化), 所以各 agent 的 `enableMlpGate` 还各自记着
+       `gateMlpHidden` 做粗粒度去重 (那一层能挡住"同一 hidden 调两次")。
+       真正的保护是调用纪律: 只在构造点之后、任何前向之前调用一次。
+    */
+    std::vector<ISparseMoE*> actorMoes = sparseMoeLayers(actorP);
+    if (!actorMoes.empty() &&
+        actorMoes[0]->gateStructure() == RL::GateStructure::Mlp) {
+        return;
+    }
+    for (std::size_t i = 0; i < actorMoes.size(); i++) {
+        actorMoes[i]->enableMlpGate(hidden);
+    }
+    std::vector<ISparseMoE*> criticMoes = sparseMoeLayers(critic);
+    for (std::size_t i = 0; i < criticMoes.size(); i++) {
+        criticMoes[i]->enableMlpGate(hidden);
+    }
+}
+
+void RL::PPO::applyMoeBiasUpdate()
+{
+    if (!moeLossFreeBias) {
+        return;
+    }
+    std::vector<ISparseMoE*> actorMoes = sparseMoeLayers(actorP);
+    for (std::size_t i = 0; i < actorMoes.size(); i++) {
+        actorMoes[i]->setLossFreeBias(true, moeLossFreeBiasRate);
+        actorMoes[i]->updateLossFreeBias();
+    }
+    std::vector<ISparseMoE*> criticMoes = sparseMoeLayers(critic);
+    for (std::size_t i = 0; i < criticMoes.size(); i++) {
+        criticMoes[i]->setLossFreeBias(true, moeLossFreeBiasRate);
+        criticMoes[i]->updateLossFreeBias();
+    }
+}
+
+void RL::PPO::finalizeMoeBatch()
+{
+    /*
+       [2026-10] **无条件**累计"训练侧"计数 —— 这一句与均衡开不开无关, 所以默认路径
+       (moeLossFreeBias=false) 的**数值**逐位不变: `accumulateTrainBatch()` 只写
+       `usageTrain`, 而那个数组只被诊断读数 `moeUsageSplit` 读, 不进任何前向/反向/梯度。
+       为什么必须无条件: 它是"训练侧 vs 推理侧"这个拆分的唯一来源。放进
+       `if (moeLossFreeBias)` 里会让所有没开偏置的臂读到一个空的训练侧,
+       于是"辅助损失到底拉不拉得动负载"这个问题**根本没法量** —— 而那正是本轮要回答的。
+    */
+    std::vector<ISparseMoE*> actorMoes = sparseMoeLayers(actorP);
+    std::vector<ISparseMoE*> criticMoes = sparseMoeLayers(critic);
+    for (std::size_t i = 0; i < actorMoes.size(); i++) {
+        actorMoes[i]->accumulateTrainBatch();
+    }
+    for (std::size_t i = 0; i < criticMoes.size(); i++) {
+        criticMoes[i]->accumulateTrainBatch();
+    }
+    /*
+       偏置回路: 读的正是"本批各专家被选中多少次", 所以必须在 addAuxGradient
+       (它末尾会清批统计) 与 RMSProp 之前。默认关时整段是空操作。
+    */
+    applyMoeBiasUpdate();
+}
+
 void RL::PPO::accumulateGrad(const Tensor &state,
                              const Tensor &actionTarget,
                              float valueTarget)
@@ -362,6 +430,7 @@ void RL::PPO::trainStep(const Tensor &state,
     /* 单样本路径 = "清批统计 -> 累积 1 条 -> 应用"。批路径见 learnFromReplay()。 */
     resetMoeBatchStats();
     accumulateGrad(state, actionTarget, valueTarget);
+    finalizeMoeBatch();
     applyGradients(lr);
 }
 
@@ -677,6 +746,7 @@ bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)
             accumulateGrad(state, target, s.valueTarget);
         }
     }
+    finalizeMoeBatch();
     applyGradients(lr);
     return true;
 }
@@ -727,6 +797,7 @@ void RL::PPO::learnSelfPlay(std::vector<Step>& trajectory,
                        trajectory[(std::size_t)t].action,
                        returns[(std::size_t)t]);
     }
+    finalizeMoeBatch();
     applyGradients(learningRate);
 
     exploringRate *= 0.99999f;
@@ -825,6 +896,19 @@ int RL::PPO::moeTopK() const
     return layers.empty() ? 0 : layers[0]->topK();
 }
 
+/*
+ * [2026-10] 实时路由探针 —— **取 actor (策略网) 的**, 不是 critic 的。
+ * 理由: 界面要回答的是"现在这个决策走了哪个专家", 那是策略网的事; critic 每次估值
+ * 也前向, 但它算的是价值。`moeUsage` 把两个网**相加**是"容量/流量"口径, 与这里的
+ * "谁在做决策"不是同一个问题 —— 混在一起会显示成一个既不是 actor 也不是 critic 的
+ * 东西 (两个层的序号还被覆盖)。
+ */
+const RL::MoERouteProbe *RL::PPO::moeRouteProbe() const
+{
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    return layers.empty() ? nullptr : layers[0]->routeProbe();
+}
+
 void RL::PPO::moeUsage(std::vector<long long> &out) const
 {
     out.clear();
@@ -845,6 +929,45 @@ void RL::PPO::moeUsage(std::vector<long long> &out) const
             out[e] += one[e];
         }
     }
+}
+
+void RL::PPO::moeUsageSplit(std::vector<long long> &trainOut,
+                            std::vector<long long> &inferOut) const
+{
+    trainOut.clear();
+    inferOut.clear();
+    const int experts = moeExpertCount();
+    if (experts <= 0) {
+        return;
+    }
+    trainOut.assign((std::size_t)experts, 0);
+    inferOut.assign((std::size_t)experts, 0);
+
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    std::vector<ISparseMoE*> criticLayers = moeLayersOf(critic);
+    layers.insert(layers.end(), criticLayers.begin(), criticLayers.end());
+
+    /* 与 moeUsage 同一口径: actor + critic 逐专家相加 (一个"容量/流量"读数) */
+    std::vector<long long> t, inf;
+    for (std::size_t i = 0; i < layers.size(); i++) {
+        layers[i]->usageSnapshotSplit(t, inf);
+        for (std::size_t e = 0; e < t.size() && e < trainOut.size(); e++) {
+            trainOut[e] += t[e];
+        }
+        for (std::size_t e = 0; e < inf.size() && e < inferOut.size(); e++) {
+            inferOut[e] += inf[e];
+        }
+    }
+}
+
+void RL::PPO::moeBiasSnapshot(std::vector<float> &out) const
+{
+    out.clear();
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) {
+        return;
+    }
+    layers[0]->lossFreeBiasSnapshot(out);
 }
 
 void RL::PPO::resetMoeUsage()

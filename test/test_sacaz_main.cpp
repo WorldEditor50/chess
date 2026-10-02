@@ -757,8 +757,11 @@ static void testSparseMoECost()
  *  MCTS + 回放训练) 的实际表现。四种骨干:
  *    MLP          基线
  *    稀疏MoE(MLP专家) E=8 top-2  —— 容量 x8, 算力 ~2 个专家
- *    稀疏MoE(TB专家)  E=4 top-1  —— 容量最大, 但一个专家就要 3 ms 级
- *    稠密MoE(TB专家)  E=4 全算    —— 与上一个**参数量完全相同**的等参数对照
+ *    稀疏MoE(TB专家)  E=8 top-2  —— 容量最大, 但一个专家就要 3 ms 级 ⇒ top-2 约 7 ms/模拟
+ *    稠密MoE(TB专家)  E=8 全算    —— 与上一个**参数量完全相同**的等参数对照
+ *
+ *  (上面的 E / top-k 只是**当前口径的说明**, 断言读的是 `sacazx::variantShape()` ——
+ *   改那两个常量时这段注释要跟着改, 但测试代码不用动。)
  *
  *  这里断言的是"结构自检 + 能走合法棋 + 训练链路不炸", 不是棋力 (权重是随机的)。
  * ============================================================ */
@@ -775,7 +778,13 @@ static void testBackboneSweep()
         */
         sacazx::Variant v;
         int sims;             /* 决策用的模拟次数 (TB 专家只能给很少) */
-        int expectExperts;    /* 期望的专家数 (0 = 不是 MoE) */
+        /*
+           期望的专家数 / topK (0 = 这个骨干没有 MoE 层)。
+           值走 `sacazx::variantShape()` —— **必须按"这个变体真正建出来的类"取常量**:
+           四个类是独立实现, 同名常量各有一份, 从另一个类上抄就会在改 E/top-k 时
+           报一个看着像代码错、其实是测试盯错类的红灯 (2026-10 当场抓到过一次)。
+        */
+        int expectExperts;
         int expectTopK;
         /*
            是否在这里做"存了再读"的往返检查。TB 专家骨干参数量 28.7 M, 而权重是
@@ -787,12 +796,12 @@ static void testBackboneSweep()
     };
     const Case cases[4] = {
         { sacazx::Variant::Mlp,        64, 0, 0, true },
-        { sacazx::Variant::MoeMlp,     32, SACAZAgent::MOE_MLP_EXPERTS,
-          SACAZAgent::MOE_MLP_TOPK, true },
-        { sacazx::Variant::MoeTb,       4, SACAZAgent::MOE_TB_EXPERTS,
-          SACAZAgent::MOE_TB_TOPK, false },
-        { sacazx::Variant::DenseMoeTb,  4, SACAZAgent::MOE_TB_EXPERTS,
-          SACAZAgent::MOE_TB_EXPERTS, false }
+        { sacazx::Variant::MoeMlp,     32, sacazx::variantShape(sacazx::Variant::MoeMlp).experts,
+          sacazx::variantShape(sacazx::Variant::MoeMlp).topK, true },
+        { sacazx::Variant::MoeTb,       4, sacazx::variantShape(sacazx::Variant::MoeTb).experts,
+          sacazx::variantShape(sacazx::Variant::MoeTb).topK, false },
+        { sacazx::Variant::DenseMoeTb,  4, sacazx::variantShape(sacazx::Variant::DenseMoeTb).experts,
+          sacazx::variantShape(sacazx::Variant::DenseMoeTb).topK, false }
     };
 
     for (int ci = 0; ci < 4; ci++) {
@@ -1232,7 +1241,8 @@ static void testPpoPort()
  *    (b) **策略改得动吗**: 同一批经验带 AlphaZero 监督项 (π_MCTS = one-hot),
  *        策略在目标动作上的质量必须上升 —— 这条走的是"掩码 softmax 的雅可比 + TB 骨干"。
  *    (c) **自对弈跑得动吗、路由健康吗**: 短局自对弈跑通、池子长、loss 有限、Q/π 无 NaN,
- *        以及 **4 个专家到底有没有都被用到** —— top-1 路由最容易在这里坍缩。
+ *        以及 **全部专家到底有没有都被用到** —— 激活数少 (top-1) 时最容易在这里坍缩;
+ *        当前口径是 top-2/E=8 (见 sacazmoetbagent.h 里那两个常量)。
  *    (d) **代价**: ms/模拟 与 ms/learnBatch。TB 专家单价高, 这个数字直接决定
  *        "同一个时间预算下能跑几次模拟", 所以它和一条 MLP 骨干的对照在同一个进程里量
  *        (两块互不重叠: 一个 TB agent 的五个网络约 1.6 GB, 同时活着会顶到内存上限)。
@@ -1264,9 +1274,12 @@ static void testTbExpertAgent()
                 agent.moeExpertCount(), agent.moeTopK());
     std::printf("  参数: actor=%lld  q1=%lld  (target 网同构但无梯度)\n",
                 agent.actor.paramCount(), agent.q1.paramCount());
-    CHECK(agent.moeExpertCount() == SACAZAgent::MOE_TB_EXPERTS,
-          "骨干确实是 TB 专家那条 (专家数 = MOE_TB_EXPERTS)");
-    CHECK(agent.moeTopK() == SACAZAgent::MOE_TB_TOPK, "topK = MOE_TB_TOPK");
+    /* 期望值取自"这个变体建出来的那个类"自己的常量, 见 sacazx::variantShape 的说明 */
+    const sacazx::VariantShape shape = sacazx::variantShape(sacazx::Variant::MoeTb);
+    CHECK(agent.moeExpertCount() == shape.experts,
+          "骨干确实是 TB 专家那条 (专家数 = SACAZMoETbAgent::MOE_TB_EXPERTS)");
+    CHECK(agent.moeTopK() == shape.topK,
+          "topK = SACAZMoETbAgent::MOE_TB_TOPK");
     CHECK(agent.actor.paramCount() > 0, "参数量数得出来 (TransformerBlock 的 paramCount 有实现)");
 
     /* ---- 局面: 真实开局, 红方走 ---- */
@@ -1757,6 +1770,44 @@ static void testTbExpertAgent()
     std::printf("      换算: GUI 里 175 ms/步的预算只能跑约 %.1f 次模拟\n",
                 175.0 / msPerSim);
     CHECK(msPerSim > 0.0, "ms/模拟 量得出来");
+
+    /*
+       ---- [2026-10] 实时路由探针的**接线** (界面呼吸灯) ----
+       控件那一层 (`MoeLoadView`) 画的是"此刻哪个专家在工作", 数据来自
+       agent -> MoE 层里的那个**无锁**探针。这里只钉"接线通不通" —— 满量程的正确性
+       (逐次核对 + 多线程读一致性 + 热度衰减) 在 `test_sparse_moe` 的 [11] 里。
+       为什么要在 agent 这一层再钉一次: 这条链路上**一个 dynamic_cast 写错就静默返回
+       nullptr**, 界面表现只是"灯不亮", 而别的读数全都正常 —— 极难归因。
+       放在本节**最后**: 探针的读取本身是只读的, 但下面那次 selectMove 会前向, 所以
+       放在所有既有断言之后就不可能与它们相互影响。
+    */
+    const RL::MoERouteProbe *liveProbe = agent.moeRouteProbe();
+    CHECK(liveProbe != nullptr, "agent 能拿到 MoE 层的实时探针 (呼吸灯的接线)");
+    if (liveProbe != nullptr) {
+        RL::MoERouteProbe::Snapshot before;
+        const bool hadBefore = liveProbe->read(before);
+        agent.selectMove(Stone::COLOR_BLACK, sims, 0.0f);
+        RL::MoERouteProbe::Snapshot after;
+        const bool nowOk = liveProbe->read(after);
+        CHECK(nowOk, "走过子之后探针里有路由 (界面据此点灯)");
+        CHECK(!hadBefore || after.serial > before.serial,
+              "前向序号在往前走 (界面据此判断读数是不是新的)");
+        CHECK(after.experts == shape.experts && after.picked == shape.topK,
+              "探针报的 (专家数, top-k) 与骨干一致");
+        bool sane = nowOk;
+        for (int k = 0; k < after.picked && k < RL::MoERouteProbe::kMaxPicked; k++) {
+            if (after.idx[k] < 0 || after.idx[k] >= after.experts) {
+                sane = false;
+            }
+            if (!(after.w[k] > 0.0f) || after.w[k] > 1.0f) {
+                sane = false;
+            }
+        }
+        RL::MoERouteProbe::Heat heat;
+        liveProbe->readHeat(heat);
+        CHECK(sane, "探针里的下标在界内、门控概率在 (0,1] (界面照它点灯不会越界)");
+        CHECK(heat.ok && heat.total > 0.0f, "热度非零 -> 呼吸灯会亮 (刚才那几次前向)");
+    }
 }
 
 /* ============================================================
@@ -2703,11 +2754,11 @@ static void testSharedTrunkAndTbHeads()
         for (int i = 0; i < SACAZAgent::STATE_DIM; i++) {
             x[i] = 0.1f * std::sin((float)i);
         }
-        RL::Net tbLegacy(RL::TransformerBlock<SACAZAgent::MOE_TB_HEADS,
-                                              SACAZAgent::MOE_TB_DFF, false>::_(
+        RL::Net tbLegacy(RL::TransformerBlock<SACAZMoETbAgent::MOE_TB_HEADS,
+                                              SACAZMoETbAgent::MOE_TB_DFF, false>::_(
                              SACAZAgent::STATE_DIM, true));
-        RL::Net tbHonor(RL::TransformerBlock<SACAZAgent::MOE_TB_HEADS,
-                                             SACAZAgent::MOE_TB_DFF, true>::_(
+        RL::Net tbHonor(RL::TransformerBlock<SACAZMoETbAgent::MOE_TB_HEADS,
+                                             SACAZMoETbAgent::MOE_TB_DFF, true>::_(
                             SACAZAgent::STATE_DIM, true));
         const double msLegacy = timeForwardMs(tbLegacy, x, 30);
         const double msHonor = timeForwardMs(tbHonor, x, 30);
@@ -2728,7 +2779,8 @@ static void testSharedTrunkAndTbHeads()
                     msLegacy / msHonor, 100.0 * (1.0 - (double)elemH / (double)elemL));
 
         /* 头数真的落地了 */
-        CHECK(reqH == SACAZAgent::MOE_TB_HEADS, "新口径下请求的头数就是 MOE_TB_HEADS");
+        CHECK(reqH == SACAZMoETbAgent::MOE_TB_HEADS,
+              "新口径下请求的头数就是 MOE_TB_HEADS");
         CHECK(useH == reqH, "新口径: 实际参与前向的头数 == 请求值 (不再被 d_model 的因子数卡住)");
         CHECK(hA->attnHeadsAllocated() == reqH,
               "新口径: 分配出来的 head 对象数 == 实际用到的 (没有死内存)");
@@ -2750,7 +2802,7 @@ static void testSharedTrunkAndTbHeads()
             CHECK(useL == useH, "对齐表示下 d_model 能被 15 整除, 两种口径的头数一致");
             CHECK(elemL == elemH, "对齐表示下注意力元素数也一致");
             std::printf("      (对齐表示: STATE_DIM 能被 %d 整除, 这条降级路径不存在)\n",
-                        SACAZAgent::MOE_TB_HEADS);
+                        SACAZMoETbAgent::MOE_TB_HEADS);
         }
         /* 两种口径的参数形状只差 d_k 带来的 qkv 宽度 -> 参数量应当几乎一样 */
         const long long pL = tbLegacy.paramCount(), pH = tbHonor.paramCount();
@@ -3060,7 +3112,7 @@ static void testSharedTrunkAndTbHeads()
         std::printf("      唯一参数量:    独立 %lld vs 共享 %lld  -> %.2fx\n",
                     sepParams, shParams, (double)sepParams / (double)shParams);
         std::printf("      TB 专家头数(独立口径 agent): 请求 %d / 用 %d / 分配 %d\n",
-                    SACAZAgent::MOE_TB_HEADS, sepHeadsUsed, sepHeadsAlloc);
+                    SACAZMoETbAgent::MOE_TB_HEADS, sepHeadsUsed, sepHeadsAlloc);
         std::printf("      换算: GUI 里 175 ms/步的预算 -> 独立 %.1f 次模拟, 共享 %.1f 次模拟\n",
                     175.0 / sepPerSimMs, 175.0 / shPerSimMs);
 
@@ -3139,6 +3191,11 @@ static void testSharedTrunkAndTbHeads()
  *       (人机里三个终局点都会通知, 而"AI 自己将死对方"那一手本来就带终局);
  *   (3) 接不接得住: 池里没有真实决策样本时返回 false, 而不是"静默地挂个 0";
  *       对照组 = 还原版 SACAZLegacyAgent (59e5233 口径), 它没有这条通道 -> 一律 false。
+ *   (4) [2026-10 补] **界面那一支的口径** (`learnFromSearch=false` +
+ *       `recordDecisionSamples=true`, 共享骨干): 关掉 learnFromSearch 之后这条通道
+ *       整条是死的 (用户实测日志), 只有 `recordDecisionSamples` 能把它救回来 ——
+ *       而它必须"只记录不学" (learnSteps 不动)。这一段专门钉这个配置, 因为前三条
+ *       用的是类默认 (learnFromSearch=true), 对那个洞一路绿灯。
  */
 static void testHumanGameTerminalChannel()
 {
@@ -3207,6 +3264,66 @@ static void testHumanGameTerminalChannel()
             sac.lastDecisionSample(r, done);
             CHECK(done && r == 0.0f, "和棋的终局值是 0, 但 done 必须是 true");
         });
+    }
+
+    /*
+       ---- (4) [2026-10] **界面那一支的真实口径**: learnFromSearch 关 + 只记录样本 ----
+
+       用户实测日志 (人机对弈终局):
+           "[human] 终局 红胜 (人赢了): SAC+AZ-MoE 没有可挂的真实决策样本
+            (learnFromSearch 关着 / 这局还没走过一手) —— 这一局的输赢没有进学习回路"
+
+       根因与修法见 sacazmoetbagent.h 的 `recordDecisionSamples` 长注释。必须单独钉
+       一节的理由: 上面那段循环用的是**类默认** (learnFromSearch=true), 而界面那一支
+       是 `chessboard.cpp` 的 `createSACAZMoETbAgent` (共享骨干 + learnFromSearch=false
+       + recordDecisionSamples=true)。**那个洞只在这种配置下存在** —— 拿默认配置去测
+       这条通道, 它会一路绿灯 (这正是它以前没被任何断言挡住的原因)。
+    */
+    {
+        Chess c;
+        c.reset();
+        /* 界面那一支是共享骨干 (chessboard.cpp:2505 传 shared=true) */
+        SACAZMoETbAgent gui(c, 32, 0.99f, 0.001f, 1.5f, 32, 0.1f,
+                            SACAZMoETbAgent::TrunkMode::Shared);
+        gui.batchSize = 4;
+        gui.learnFromSearch = false;      /* 界面的口径: 每手一次 learnBatch 付不起 */
+
+        float r = 0.0f;
+        bool done = false;
+        const int steps0 = gui.getLearnSteps();
+
+        /* ---- 先复现"洞": 连记录也关着 -> 池里永远没有可挂的样本 ---- */
+        gui.recordDecisionSamples = false;
+        const Step sA = gui.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+        CHECK(sA.valid, "关着记录开关也能走出合法走法");
+        CHECK(!gui.lastDecisionSample(r, done),
+              "learnFromSearch 与 recordDecisionSamples 都关 -> 池里没有真实决策样本");
+        CHECK(!gui.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+              "这就是那条日志: 终局接不住 (输赢被丢掉)");
+        CHECK(gui.getTrainDiag().externalTerminals == 0, "...并且不计数");
+
+        /* ---- 修好之后: 打开记录 = 界面现在的口径 ---- */
+        gui.recordDecisionSamples = true;
+        const Step sB = gui.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+        CHECK(sB.valid, "记录开关打开后仍然给出合法走法");
+        CHECK(gui.lastDecisionSample(r, done),
+              "有可挂的真实决策样本了 (hasSearch=true)");
+        CHECK(!done, "...它还不是终局 (人还没走那一手)");
+        CHECK(gui.getLearnSteps() == steps0,
+              "**只记录不学**: learnSteps 没动 (解耦的全部意义 —— 界面付不起每手一次 learnBatch)");
+        CHECK(gui.notifyGameResult(Chess::RESULT_RED_WIN, Stone::COLOR_BLACK),
+              "终局接住了: 人把 AI 将死这一局的输赢进了学习回路");
+        CHECK(gui.lastDecisionSample(r, done) && done, "...那条样本的 done 被写成 true");
+        CHECK(std::fabs((double)r + 1.0) < 1e-6, "...奖励是 −1 (输)");
+        CHECK(gui.getTrainDiag().externalTerminals == 1, "外部补入计数 +1");
+
+        /* ---- 池里那条样本不是死重: 下一次 learnBatch 会真的拿它更新 ---- */
+        const Step sC = gui.selectMove(Stone::COLOR_BLACK, 8, 0.0f);
+        CHECK(sC.valid, "再记录一条真实决策样本");
+        CHECK(gui.getMemorySize() >= 2, "两次带记录的决策 -> 池里至少 2 条");
+        gui.learnBatch(2);
+        CHECK(gui.getLearnSteps() > steps0,
+              "下一次 learnBatch 把记录的样本训练掉了 (界面上的触发点 = 走子前先探索+预训练)");
     }
 
     /* ---- 对照组: 还原版没有这条通道 (默认实现, 行为一位没变) ---- */

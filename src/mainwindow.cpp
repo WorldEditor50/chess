@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include <chrono>
+#include <cstdlib>             /* std::getenv —— MoE 负载读数的按需诊断 (见 CHESS_MOE_TRACE) */
 #include "ui_mainwindow.h"
 #include "chessboard.h"
 #include "thinkingindicator.h"
@@ -46,8 +47,34 @@ const AgentChoice kAgents[] = {
     { "Alpha-Beta L2 (深度=2)",       ChessBoard::AGENT_AB_L2 },
     { "Alpha-Beta L3 (深度=3)",       ChessBoard::AGENT_AB_L3 },
     { "MCTS (800次模拟)",            ChessBoard::AGENT_MCTS },
-    { "Policy Gradient (PGEagent)",  ChessBoard::AGENT_PG },
-    { "Deep Q-Network (DQN)",        ChessBoard::AGENT_DQN },
+    /*
+       ================================================================
+       [2026-10 用户口径] 下拉框移除 PG / DQN / SAC 行为还原版(两支)
+       ================================================================
+       用户要求: "界面下拉框移除 PG, DQN, SAC legacy agent, 减少加载时间"。
+
+       **这四个 agent 的类、权重文件、bench/测试全都留着**, 只是不再出现在界面上、
+       也不再在启动时预加载。省下的时间是**实测**的 (本机, 每次都是完整冷启动):
+
+           [weights] PG:                        146 ms
+           [weights] DQN:                        171 ms
+           [weights] SAC+AZ-59e5233:              43 ms     (MLP 还原版, 权重只 0.5 MB x3)
+           [weights] SAC+AZ-59e5233-MoE 建网:   4499 ms     (5 个 TB 专家网络)
+           [weights] SAC+AZ-59e5233-MoE 读权重: 6300 ms     (3 x 146 MB)
+                                         合计 ≈ 11.2 s / 40.8 s 启动
+
+       也就是说: 真正贵的是**还原版的 MoE+TB 那一支**(建网 + 读 440 MB), 而 PG/DQN
+       各只有 ~0.15 s。要省时间就必须把这四个一起摘掉。
+
+       ⚠ 被摘掉的**能力** (诚实记一笔, 因为这些正是它们存在的理由):
+         1. 界面上再也**选不到** "当前口径 vs 59e5233 口径" 的直接对弈 —— 那条对比
+            现在只能走 bench (test_sacaz 的 [14] 节与 bench_sacaz_vs_ab --legacy 仍在);
+         2. PG / DQN 是这套列表里最"教科书"的两个基线, 界面上没有了 (代码与
+            test_grad / test_dqnab 不受影响);
+         3. "全部模型自检"那份横向对照里也不再列它们 (见 chessboard.cpp 的 kAll 说明)。
+       想恢复某一条: 把对应项加回这张表 **并且** 加回 chessboard.cpp 的 kWeightAgents
+       (两处都要 —— 只加前者会"能选中但没预热", 只加后者会"预热了但选不到")。
+    */
     /*
        ---- "同一算法, 两种骨干" 的两组, 刻意**成对排列** ----
        界面上把它们挨着放, 就是为了能直接选中互相对弈比较:
@@ -96,24 +123,11 @@ const AgentChoice kAgents[] = {
     */
     { "SAC+MCTS+AlphaZero (稀疏MoE+MLP专家)", ChessBoard::AGENT_SACAZ_MOE_MLP },
     /*
-       SAC+MCTS+AlphaZero 的**行为还原版** (提交 59e5233)。它是一个**独立的 C++ 类**
-       (SACAZLegacyAgent, src/sacazlegacyagent.h), 不是同一个类里的运行时开关 ——
-       与上面两项放在一起是为了能直接对弈比较"当前口径 vs 59e5233 口径"。
-       差别只有四项 (目标熵 0.98 / alpha lr 1e-3 / critic 不钳位+纯 MSE / 叶子全量估值)
-       加一处等价的激活写法, 完整表见那个头文件; **权重文件独立**
-       (weights/sacaz_old_agent_*), 与上面的 weights/sacaz_agent 不共用 ——
-       两者参数结构相同, 结构指纹挡不住串权重, 而训练口径不同会让共用变成静默覆盖。
+       (原来这里还有两支 SAC 的 59e5233 **行为还原版**: MLP 骨干与 MoE+TB 骨干。
+        2026-10 按用户口径从下拉框移除 —— 理由与实测省下的时间见本表顶部那段注释。
+        两个类 (SACAZLegacyAgent 的两个 Backbone) 与它们的权重前缀都还在,
+        `test_sacaz` [14] 节与 `bench_sacaz_vs_ab --legacy` 仍在用它们。)
     */
-    { "SAC+MCTS+AlphaZero (59e5233 行为还原版)", ChessBoard::AGENT_SACAZ_OLD },
-    /*
-       同一支还原版的**另一个骨干**: 同一个类 (SACAZLegacyAgent)、同一套 59e5233 口径,
-       只把骨干换成"稀疏路由 MoE + TransformerBlock 专家" —— 与上面 SAC 那一对
-       (当前口径 / MoE+TB) 是同一种做法, 所以"骨干"与"口径"可以在界面上分开对比。
-       算力贵得多, 所以每次走子只给 16 次模拟 (SACAZ_MOE_SIMS, 约 175 ms);
-       **权重文件也独立** (weights/sacaz_old_moe_agent_*)。
-    */
-    { "SAC+MCTS+AlphaZero (59e5233 还原版, 稀疏MoE+TB专家)",
-      ChessBoard::AGENT_SACAZ_OLD_MOE },
     /*
        DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
        网络 (稀疏 MoE + TB 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
@@ -127,12 +141,13 @@ const AgentChoice kAgents[] = {
 /*
    ---- 下拉框: 整份列表都要**看得见** (2026-09) ----
    Qt 的 QComboBox 默认 maxVisibleItems = **10**, 而列表比这多 (加
-   "PPO+MCTS (...MLP专家)" 那次是 11 项, 加 Alpha-Beta 三档弱等级之后是 **16 项**) ——
-   第 11 项及以后会被折叠在滚动区里, 打开下拉框只看到 10 行。
+   "PPO+MCTS (...MLP专家)" 那次是 11 项, 加 Alpha-Beta 三档弱等级之后一度到 18 项,
+   2026-10 移除 PG/DQN/SAC 还原版两支之后是 **14 项**) —— 第 11 项及以后会被折叠在
+   滚动区里, 打开下拉框只看到 10 行。
    表现就是"明明加进列表了, 界面上却找不到" (UIA 实测: 展开后只有 10 行可见).
    所以这里按条数放宽: 全部条目一次性可见, 不需要滚动。
    (这一行**不要**写死数字: 它读的是表的真实条数, 以后再加 agent 也不会忘 ——
-    上面那个"16 项"只是当时的读数, 会过期, 而这一行代码不会。)
+    上面那个"14 项"只是当时的读数, 会过期, 而这一行代码不会。)
 */
 void fillAgentCombo(QComboBox *combo, ChessBoard::AgentType defaultType)
 {
@@ -227,6 +242,104 @@ MainWindow::MainWindow(QWidget *parent)
     populateAgentComboBox();
 
     /*
+       ================================================================
+       [2026-10 门控实验] 稀疏 MoE 专家负载的可视化小控件
+       ================================================================
+       为什么必须有它: 稀疏 MoE 的失败模式**全是静默的** —— 路由坍缩之后前向照跑、
+       loss 照降、权重照存, 界面上一点异常都没有。本工程实测过两个极端:
+         * 只靠辅助损失: 训练侧 MaxVio 0.318~0.963 (最弱专家只有 1.1% 流量);
+         * 开了无辅助损失偏置均衡: MaxVio 0.006~0.009 (几乎完美)。
+       这两者在**其它任何读数上都分不出来**, 只有把每个专家的流量画出来才看得见。
+
+       [2026-10 用户口径] **放在最右列 (metricsPanel)**, 紧跟"当前比分"那一行之下。
+       它原来跟着 selfCheckView 走 (插在自检文本框前面) —— 但自检面板已经被用户口径
+       搬到**中间列**了, 而 MoE 负载要留在右侧, 所以这里**解耦**: 不再按 selfCheckView
+       定位, 而是直接插进 metricsPanel 的竖向布局。
+       仍然用代码插入而不是写进 mainwindow.ui: .ui 是 Qt Designer 的 XML, 为一个只读
+       小控件去动它有回归风险, 而 `insertWidget` 的落点是稳定的。
+    */
+    m_moeLoadView = new MoeLoadView(this);
+    {
+        QBoxLayout *lay = (ui->metricsPanel != nullptr)
+                              ? qobject_cast<QBoxLayout *>(ui->metricsPanel->layout())
+                              : nullptr;
+        if (lay != nullptr) {
+            /* 插在"当前比分"之后 (它占着 0 号位): 比分 -> MoE 负载 -> 曲线 */
+            const int at = (lay->count() > 0) ? 1 : 0;
+            lay->insertWidget(at, m_moeLoadView);
+        } else {
+            /* 布局结构变了也不静默丢掉这个读数: 退化成独立窗口 (仍然可用) */
+            m_moeLoadView->setWindowTitle(QStringLiteral("稀疏 MoE 专家负载"));
+            m_moeLoadView->resize(340, 108);
+            m_moeLoadView->show();
+        }
+    }
+    /*
+       双击 -> 弹一个放大的独立窗口 (与 CurveChart 的双击放大同一约定)。
+       窗口是**非模态 + WA_DeleteOnClose**: 可以一边跑对弈一边看; 已经开着就抬到前面,
+       不重复开。数据不在这里取 —— 它由下面那个每手刷新的自检 worker 一起喂
+       (见 applySelfCheckPanel), 因为读 agent 计数器要在锁上等。
+    */
+    connect(m_moeLoadView, &MoeLoadView::doubleClicked, this, [this]() {
+        if (m_moeLoadDialog == nullptr) {
+            m_moeLoadDialog = new MoeLoadDialog(this);
+        }
+        m_moeLoadDialog->setSnapshot(m_moeLoadSnapshot);
+        /*
+           新窗口的开关默认是关的, 所以这里必须把**当前**状态推过去 —— 否则"主面板
+           开着呼吸高亮、双击放大之后新的那一份不呼吸", 一处开一处关 (而放大窗口本来
+           就是用来"看得更清楚"的)。
+        */
+        m_moeLoadDialog->setHighlightEnabled(m_moeHighlightCheck != nullptr
+                                             && m_moeHighlightCheck->isChecked());
+        m_moeLoadDialog->setLiveRoute(m_moeLiveRoute);
+        m_moeLoadDialog->show();
+        m_moeLoadDialog->raise();
+        m_moeLoadDialog->activateWindow();
+    });
+
+    /*
+       ================================================================
+       [2026-10] 呼吸高亮的取数定时器 —— **默认不启动** (用户口径: 开关默认关)
+       ================================================================
+       为什么必须单独一条不取锁的路径: 上面那份快照走 worker + `m_agentMutex`, 而
+       **AI 的整段决策都持着那把锁** (chessboard.cpp 的 aiThinkForAgentRaw) —— 所以
+       "在锁上读"的路径在思考中会一直阻塞, 而思考中恰好是唯一想看实时路由的时刻。
+       `liveMoeRoute()` 读的是 MoE 层里的**无锁**探针 (RL::MoERouteProbe), 所以这里可以
+       按自己的节奏调, 既不阻塞界面也不影响搜索。
+
+       节奏取 15 Hz (66 ms): 人眼对"呼吸"这种慢变化够用, 而每次只是几个原子读;
+       控件自己还有 25 fps 的呼吸动画 (只在可见且有实时数据时跑, 见 MoeLoadView)。
+
+       ⚠ **开关关着的时候这个定时器是停的** (见 applyMoeHighlight): 关掉一个功能就该
+       连它的取数一起停, 而不是"取了不画" —— 后者会让"关了"这件事在 CPU 上仍然是真的,
+       而且一旦哪天有人把画的那一段改回去, 它就**静默地又开始动了**。
+    */
+    m_moeLiveTimer = new QTimer(this);
+    m_moeLiveTimer->setInterval(66);
+    connect(m_moeLiveTimer, &QTimer::timeout, this, [this]() {
+        ChessBoard::MoeLiveRoute live;
+        ui->gameWidget->liveMoeRoute(live);
+        m_moeLiveRoute = live;
+        if (m_moeLoadView != nullptr) {
+            m_moeLoadView->setLiveRoute(live);
+        }
+        if (m_moeLoadDialog != nullptr) {
+            m_moeLoadDialog->setLiveRoute(live);
+        }
+    });
+    /* 不在这里 start(): 默认关, 勾选框那边统一管 (唯一一个启停点) */
+
+    /*
+       开局就先取一份读数。否则这块控件要等到"第一手棋下完"或"切一次 agent"才有内容
+       (自检的刷新点只有那几个), 而它显示的正是"这个 agent 的路由健康度" ——
+       开局就空着会被读成"没有 MoE"(其实只是还没请求)。
+       用 singleShot(0) 而不是直接调: 刷新走后台 worker, 让它晚于构造函数、
+       在事件循环起来之后再启动, 免得在构造期就碰正在初始化的成员。
+    */
+    QTimer::singleShot(0, this, [this]() { requestSelfCheckPanelUpdate(false); });
+
+    /*
        对弈参数: 局数与每手探索(预训练)步数。把这两个数字放到界面上是为了让
        "对弈结果"可解释 —— 局数太少结论会被单局偶然性翻转, 探索步数直接决定
        每一步的思考成本。
@@ -298,13 +411,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->selfPlayBtn, &QPushButton::clicked,
             this, &MainWindow::onStartMatch);
 
-    /* 回放控制 */
-    connect(ui->recordcomboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &MainWindow::onGameSelected);
-    connect(ui->prevBtn, &QPushButton::clicked,
-            this, &MainWindow::onReplayPrev);
-    connect(ui->nextBtn, &QPushButton::clicked,
-            this, &MainWindow::onReplayNext);
+    /* [2026-10 移除] 棋谱回放的三个连接 (recordcomboBox / prevBtn / nextBtn) 已删,
+       理由见 mainwindow.h 里 private slots 顶部那段说明 */
 
     /* AI思考时间信号 */
     connect(ui->gameWidget, &ChessBoard::aiThinkFinished, this,
@@ -454,11 +562,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->gameWidget, &ChessBoard::aiExploreInfo, this,
         [this](const QString &) { requestSelfCheckPanelUpdate(false); });
 
-    /* 棋盘回放状态信号 */
-    connect(ui->gameWidget, &ChessBoard::replayIndexChanged,
-            this, &MainWindow::onReplayIndexChanged);
-    connect(ui->gameWidget, &ChessBoard::replayModeExited,
-            this, &MainWindow::onReplayModeExited);
+    /* [2026-10 移除] replayIndexChanged / replayModeExited 两个连接已删
+       (ChessBoard 侧的同名信号一并移除), 理由见 mainwindow.h 的 private slots 说明 */
 
     /*
        ---- 人机对战终局**不再保存权重** (2026-09 用户口径) ----
@@ -480,7 +585,6 @@ MainWindow::MainWindow(QWidget *parent)
             ui->matchBComboBox->setEnabled(true);
             ui->gamesSpin->setEnabled(true);
             ui->preTrainStepsSpin->setEnabled(true);
-            ui->recordcomboBox->setEnabled(true);
             ui->timeLabel->setText("AI思考时间: -");
             ui->exploreLabel->setText("探索+预训练: -");
             ui->matchResultLabel->setText("对弈结果: -");
@@ -488,7 +592,6 @@ MainWindow::MainWindow(QWidget *parent)
             ui->gameWidget->setEnabled(true);
             /* 启动加载完成: 现在才有 agent 可以自检 (之前都是 nullptr) */
             requestSelfCheckPanelUpdate(false);
-            refreshGameList();
             /*
                ---- 把"有没有载入模型"顶到对局列表最上面 (2026-09, 用户报障) ----
                报障是"点击开局模型未载入": 查下来代码没错 (weights/ 是 gitignore 的运行期
@@ -513,10 +616,6 @@ MainWindow::MainWindow(QWidget *parent)
     ui->matchBComboBox->setEnabled(false);
     ui->gamesSpin->setEnabled(false);
     ui->preTrainStepsSpin->setEnabled(false);
-    ui->recordcomboBox->setEnabled(false);
-    ui->prevBtn->setEnabled(false);
-    ui->nextBtn->setEnabled(false);
-    ui->stepLabel->setText("步数: -/-");
     ui->timeLabel->setText("正在加载...");
     ui->exploreLabel->setText("探索+预训练: -");
     ui->matchResultLabel->setText("对弈结果: -");
@@ -566,6 +665,18 @@ MainWindow::MainWindow(QWidget *parent)
         m_busyDelay->stop();
         m_busy->stopBusy();
     });
+
+    /*
+       ---- "呼吸高亮"的最后对齐: **唯一**一次把勾选框的状态应用到定时器与控件上 ----
+       必须是构造函数末尾: 勾选框在 populateAgentComboBox() 里建 (第 227 行, 很早),
+       而取数定时器要到上面 MoE 面板那一段才存在。中间任何一次调用都会被那个空指针
+       守卫吃掉 —— 于是"接线看起来好了、其实没接", 正是本工程反复栽的那种静默失效。
+       默认**关**: 定时器不 start, 控件侧的开关也是默认 false, 这一句只是把三处
+       口径钉成同一个 (勾选框 / 控件 / 定时器)。
+    */
+    if (m_moeHighlightCheck != nullptr) {
+        applyMoeHighlight(m_moeHighlightCheck->isChecked());
+    }
 
     /* 在后台线程启动异步加载 (数据库 + AI模型权重) */
     ui->gameWidget->setEnabled(false);
@@ -639,92 +750,28 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::refreshGameList()
-{
-    ui->recordcomboBox->blockSignals(true);
-    ui->recordcomboBox->clear();
+/*
+   ================================================================
+   [2026-10 移除] 棋谱回放的 UI 与槽函数
+   ================================================================
+   这里原有 refreshGameList / onGameSelected / onReplayPrev / onReplayNext /
+   onReplayIndexChanged / onReplayModeExited 六个函数, 连同 .ui 里的
+   recordcomboBox（选择历史对局）、stepLabel、prevBtn/nextBtn（Previous/Next Step）。
 
-    /* 添加提示项 */
-    ui->recordcomboBox->addItem("--- 选择历史对局 ---", -1);
+   为什么删: 这条链路**结构性不可达**, 不是"没用"。
+     * 写入端从未接线 —— `GameDatabase::startGame/recordMove/endGame` **全仓零调用点**
+       (本工程自己的文档就记着: docs/analysis.md 第 357 行、docs/issues_review.md
+        第 1000 行与第 2739 行"每步落库 -> 可回放 实际未接线, 需要设计决定");
+     * 于是 `chess_games.db` 只有表结构、没有新增行; 列表里永远只有占位项;
+       两个步进键开局 `setEnabled(false)`、只有选中一局之后才会启用 => **永远点不动**。
+     * 全仓没有测试或验证脚本覆盖它们 (只出现在 mainwindow.{h,cpp,ui} 里)。
 
-    GameDatabase &db = GameDatabase::instance();
-    if (db.isOpen()) {
-        QStringList games = db.getRecentGames(50);
-        for (const QString &line : games) {
-            /* 从行头解析对局ID */
-            int id = -1;
-            if (line.startsWith("对局#")) {
-                int endPos = line.indexOf(" |");
-                if (endPos > 3) {
-                    id = line.mid(3, endPos - 3).toInt();
-                }
-            }
-            ui->recordcomboBox->addItem(line, id);
-        }
-    }
-
-    ui->recordcomboBox->blockSignals(false);
-}
-
-void MainWindow::onGameSelected(int index)
-{
-    if (index < 0) return;
-
-    int gameId = ui->recordcomboBox->itemData(index).toInt();
-    if (gameId < 0) return;
-
-    GameDatabase &db = GameDatabase::instance();
-    if (!db.isOpen()) return;
-
-    /* 加载该对局的走法记录 */
-    m_currentReplaySteps = db.getGameMoves(gameId);
-
-    if (m_currentReplaySteps.isEmpty()) {
-        qDebug() << "No moves for game" << gameId;
-        return;
-    }
-
-    /* 传入棋盘开始回放 */
-    ChessBoard *board = ui->gameWidget;
-    board->loadReplayGame(gameId, m_currentReplaySteps);
-
-    /* 启用回放按钮 */
-    ui->prevBtn->setEnabled(true);
-    ui->nextBtn->setEnabled(true);
-}
-
-void MainWindow::onReplayPrev()
-{
-    ChessBoard *board = ui->gameWidget;
-    board->replayPrev();
-}
-
-void MainWindow::onReplayNext()
-{
-    ChessBoard *board = ui->gameWidget;
-    board->replayNext();
-}
-
-void MainWindow::onReplayIndexChanged(int index, int total)
-{
-    if (total <= 0) {
-        ui->stepLabel->setText("步数: -/-");
-        return;
-    }
-    ui->stepLabel->setText(QString("步数: %1/%2").arg(index + 1).arg(total));
-
-    /* 边界按钮禁用 */
-    ui->prevBtn->setEnabled(index >= 0);
-    ui->nextBtn->setEnabled(index < total - 1);
-}
-
-void MainWindow::onReplayModeExited()
-{
-    /* 退出回放模式 (例如点了"开局") */
-    ui->stepLabel->setText("步数: -/-");
-    ui->prevBtn->setEnabled(false);
-    ui->nextBtn->setEnabled(false);
-}
+   **保留**: `GameDatabase`、`chess_games.db`、以及 ChessBoard 里那句
+   `GameDatabase::instance().open(...)` —— 那一层是独立的东西, 将来真要接线
+   "每步落库 -> 可回放"时不用重写。接线前需要先解决两个已记录的缺陷:
+   跨线程用 SQLite（连接在加载线程建、查询在 GUI 线程用）、以及 `recordMove`
+   每步一次自动提交（一局约 200 次 fsync, 无事务）。
+*/
 
 void MainWindow::populateAgentComboBox()
 {
@@ -779,6 +826,53 @@ void MainWindow::populateAgentComboBox()
        默认**关着**: 打开它会让价值/策略目标条件化于**当前这个对手** (同一份权重里混进
        对不同对手的数据时 V(s) 学的是平均值), 所以它适合"专门练一个对手", 不适合常开。
     */
+    /*
+       ================================================================
+       [2026-10 布局修] 把追加到 matchModeRow 的那几组控件分到独立行
+       ================================================================
+       原来下面三段一共对 `ui->matchModeRow->addWidget(...)` 调了 6 次, 于是那一行里
+       挤了**七个控件**: 模式标签 + 模式下拉框 + 对手入训 + 它的步数框 + 动态奖励 +
+       每轮训练局数标签 + 它的框。
+
+       实测代价 (UIA 读 BoundingRectangle): 模式下拉框被压到 **54 px** 宽, 而同一列的
+       另外三个下拉框是 340 / 356 / 356 —— 中文模式名 ("只对弈不学习" 之类) 根本显示
+       不全。用户报的"模式那一行非常拥挤、看不清文字"就是这一条。
+
+       现在每一组各自成行, 插在 matchModeRow **之后**, 顺序与原来完全一致。
+       仍然留在代码里建 (而不是搬回 .ui) 的理由见下面每一段自己的注释: 那几个控件的
+       语义必须贴着控件走, 工具提示又长 —— 写进 .ui 的 XML 里反而更难读。
+    */
+    QHBoxLayout *rowOpp = nullptr;      /* 对手入训 + 它的步数 */
+    QHBoxLayout *rowReward = nullptr;   /* 动态奖励 */
+    QHBoxLayout *rowBg = nullptr;       /* 每轮训练局数 + 它的框 */
+    QHBoxLayout *rowMoe = nullptr;      /* 呼吸高亮 (MoE 负载面板的实时显示开关) */
+    {
+        QWidget *host = ui->matchModeRow->parentWidget();
+        QBoxLayout *vb = (host != nullptr) ? qobject_cast<QBoxLayout *>(host->layout())
+                                           : nullptr;
+        int at = (vb != nullptr) ? vb->indexOf(ui->matchModeRow) : -1;
+        auto newRow = [&]() -> QHBoxLayout * {
+            if (vb == nullptr || at < 0) {
+                return nullptr;   /* 布局结构变了: 调用方退回 matchModeRow, 不静默丢控件 */
+            }
+            QHBoxLayout *r = new QHBoxLayout();
+            vb->insertLayout(++at, r);
+            return r;
+        };
+        rowOpp = newRow();
+        rowReward = newRow();
+        rowBg = newRow();
+        rowMoe = newRow();
+    }
+    /* 控件落位: 有独立行就进独立行, 否则退回原来那一行 (不会丢) */
+    auto place = [this](QHBoxLayout *row, QWidget *w) {
+        if (row != nullptr) {
+            row->addWidget(w);
+        } else {
+            ui->matchModeRow->addWidget(w);
+        }
+    };
+
     {
         QCheckBox *cb = new QCheckBox(QStringLiteral("对手入训"), this);
         cb->setObjectName(QStringLiteral("opponentRolloutCheck"));
@@ -797,7 +891,7 @@ void MainWindow::populateAgentComboBox()
             "⚠ 问一次对手 = 一次完整决策 (SAC+AZ 实测 2.3 s/手), 所以要给手数上限。\n"
             "⚠ 口径: 打开后价值/策略目标**条件化于这个对手**; 混着不同对手训练时 V(s)"
             " 学的是平均值 (对手特征没有进状态)。"));
-        ui->matchModeRow->addWidget(cb);
+        place(rowOpp, cb);
 
         QSpinBox *sp = new QSpinBox(this);
         sp->setObjectName(QStringLiteral("opponentRolloutSpin"));
@@ -807,7 +901,10 @@ void MainWindow::populateAgentComboBox()
             "P1: 每次探索最多问对手几手 (0 = 不问)\n\n"
             "默认 1 = 只问\"对手对学习方第一步的应手\" (能负担又有意义的那个点)。\n"
             "调大 = 探索的更多手由真对手产生, 代价是每多一手就多一次完整决策。"));
-        ui->matchModeRow->addWidget(sp);
+        place(rowOpp, sp);
+        if (rowOpp != nullptr) {
+            rowOpp->addStretch(1);   /* 左对齐 (与 .ui 里 freeMoveRow 同一个做法) */
+        }
 
         QObject::connect(cb, &QCheckBox::toggled, this,
                          &MainWindow::onOpponentRolloutToggled);
@@ -848,7 +945,10 @@ void MainWindow::populateAgentComboBox()
             "要做对照实验请用 bench 工具 (固定开局集 + 配对 + 区间):\n"
             "  bench_sacaz_vs_ab --backbone=moe-mlp --reward-shape=3 --warmup-games=60 ...\n"
             "  bench_sacmoetb_train --reward-shape=3 ..."));
-        ui->matchModeRow->addWidget(rcb);
+        place(rowReward, rcb);
+        if (rowReward != nullptr) {
+            rowReward->addStretch(1);
+        }
         QObject::connect(rcb, &QCheckBox::toggled, this,
                          &MainWindow::onDynamicRewardToggled);
     }
@@ -864,7 +964,7 @@ void MainWindow::populateAgentComboBox()
     */
     {
         QLabel *lb = new QLabel(QStringLiteral("每轮训练局数"), this);
-        ui->matchModeRow->addWidget(lb);
+        place(rowBg, lb);
         QSpinBox *tb = new QSpinBox(this);
         tb->setObjectName(QStringLiteral("bgTrainEpisodesSpin"));
         tb->setRange(1, 200);
@@ -879,9 +979,99 @@ void MainWindow::populateAgentComboBox()
             "  \"输多输少\"之间动 —— 那个锚点量不出胜率; 换成 MCTS 锚点才有胜/负\n"
             "  (8 胜 / 2 负 / 30 和)。所以**练棋与量棋都优先拿 MCTS 当对手**。\n"
             "  做法: 这一栏选 MCTS 当对手 + 下拉框选\"训练对局\"模式 (+ 需要时勾\"对手入训\")。"));
-        ui->matchModeRow->addWidget(tb);
+        place(rowBg, tb);
+        if (rowBg != nullptr) {
+            rowBg->addStretch(1);
+        }
         QObject::connect(tb, QOverload<int>::of(&QSpinBox::valueChanged), this,
                          &MainWindow::onBgTrainEpisodesChanged);
+    }
+
+    /*
+       ================================================================
+       [2026-10 用户口径] "呼吸高亮"开关 —— **默认关**
+       ================================================================
+       控制的是一整块**实时**显示 (MoE 负载面板上"此刻哪个专家在工作"):
+       打开后, 正在干活的那几根柱子会被暖色呼吸高亮, 标题多一个前向序号 `#N`,
+       末行多一句"此刻 3:34%,7:20%"。
+       关着 = **与加这个功能之前完全一样**, 而且连取数都停 (定时器不跑, 不读探针)。
+
+       为什么默认关 (三条, 都是"这一版的选择"而不是定论):
+         1. 这是一个 25 fps 的动画面板。旁边三块静态读数 (loss / reward / 比分) 里
+            突然多一块一直在呼吸的东西, 默认打开会让"看盘"变成"看动画";
+         2. 它有真实的代价: 每次 forward 多约 25 ns 的原子发布 + 每 66 ms 一次无锁读。
+            前者可以忽略, 但"默认路径逐位不变 / 默认不额外做功"是本工程的硬约束;
+         3. 关着的时候它是**可以断言**的 (`hl=off`), 于是"默认关"这条约定本身也进了
+            回归 (见 tools/verify_moe_load_view.ps1 -Live 的第一段断言)。
+
+       放在**中间这一列**(而不是贴着 MoE 面板): 右边那一列 (metricsPanel) 已经被
+       "比分 / 负载面板 / loss / reward / 按钮行 / 逐局明细"填满到只剩 ~9 px (UIA 实测),
+       再塞一行会把曲线或对局列表压矮 —— 中间这一列有 verticalSpacer, 加一行不挤任何东西。
+    */
+    {
+        QCheckBox *hcb = new QCheckBox(QStringLiteral("呼吸高亮"), this);
+        hcb->setObjectName(QStringLiteral("moeHighlightCheck"));
+        hcb->setChecked(false);          /* 默认关 */
+        hcb->setToolTip(QStringLiteral(
+            "MoE 负载面板上的**实时**显示：此刻哪个专家在工作（默认**不勾**）\n\n"
+            "勾上之后，面板上正在干活的那几根柱子会被暖色**呼吸高亮**（强度 = 最近约 1 秒的\n"
+            "前向活跃度 × 呼吸相位，越忙越亮），柱顶的亮块 = 最近**一次**前向选中的那 top-k 个，\n"
+            "标题里多一个前向序号 #N（一直在跳就说明读数在走）。\n\n"
+            "柱子的**高度与底色仍然只表示累计份额**（蓝=正常、橙红=超额），高亮是叠在上面的一层，\n"
+            "两个口径不混。\n\n"
+            "为什么它是**无锁**读数：AI 的整段决策都持着 agent 锁，走锁的读数在思考中会一直阻塞，\n"
+            "而思考中恰好是唯一想看它的时刻 —— 所以它读的是 MoE 层里的原子快照。\n"
+            "同理，累计份额只在选中 agent / 每手棋的探索+预训练之后刷新一次：没走预训练时柱子会停在\n"
+            "旧读数（此时面板画的是整列光柱，并写明\"累计计数还没刷新\"）。\n\n"
+            "⚠ 关着 = 连取数都停（不读探针、不跑动画）；开/关都只影响**显示**，\n"
+            "不参与任何训练或决策。"));
+        place(rowMoe, hcb);
+        if (rowMoe != nullptr) {
+            rowMoe->addStretch(1);
+        }
+        QObject::connect(hcb, &QCheckBox::toggled, this, [this](bool on) {
+            applyMoeHighlight(on);
+            qInfo().noquote() << QStringLiteral("[MoE] 呼吸高亮 = %1")
+                                     .arg(on ? QStringLiteral("开") : QStringLiteral("关"));
+        });
+        m_moeHighlightCheck = hcb;
+        /*
+           这里**不调** applyMoeHighlight: 本函数可能跑在 `m_moeLiveTimer` 创建之前
+           (构造顺序), 那样调用会被那个空指针守卫吃掉, 看起来"接线好了"其实没接。
+           对齐放在 MainWindow 构造函数**末尾**那一次统一调用 (见那里的说明)。
+        */
+    }
+}
+
+/*
+ * applyMoeHighlight - "呼吸高亮"的**唯一**一个启停点
+ *
+ * 三件事一起做, 缺一件就会留下"关了但还在动"或"开着但没数据"的半状态:
+ *   1. 取数定时器 (开 -> start, 关 -> stop);
+ *   2. 控件侧的开关 (它会顺手清掉最后一帧的实时数据, 免得高亮"冻"在面板上);
+ *   3. 放大窗口 (如果开着) 同步 —— 两处显示必须同一个口径。
+ *
+ * 调用点只有两个: 勾选框的 toggled, 以及构造函数末尾那一次对齐
+ * (见那里的说明: 勾选框建得比定时器早, 所以不能在建它的地方调用)。
+ */
+void MainWindow::applyMoeHighlight(bool on)
+{
+    if (m_moeLoadView != nullptr) {
+        m_moeLoadView->setHighlightEnabled(on);
+    }
+    if (m_moeLoadDialog != nullptr) {
+        m_moeLoadDialog->setHighlightEnabled(on);
+    }
+    if (m_moeLiveTimer == nullptr) {
+        return;              /* 构造期早于定时器创建: 由后面那次调用收尾 */
+    }
+    if (on) {
+        if (!m_moeLiveTimer->isActive()) {
+            m_moeLiveTimer->start();
+        }
+    } else {
+        m_moeLiveTimer->stop();
+        m_moeLiveRoute = ChessBoard::MoeLiveRoute();   /* 关掉就别留旧读数 */
     }
 }
 
@@ -1087,7 +1277,6 @@ void MainWindow::onStartMatch()
             ui->gameListWidget->addItem(
                 QStringLiteral("—— 本场结束 (权重将在**退出程序时**统一保存) ——"));
 
-            refreshGameList();
         }, Qt::QueuedConnection);
     });
 }
@@ -1278,18 +1467,29 @@ void MainWindow::selfCheckWorkerLoop()
 
         /* ---- 这里可能等 m_agentMutex 几秒: 这是 worker 线程, 界面不受影响 ---- */
         QString text;
+        /*
+           "全部模型自检"的列举名单。
+           [2026-10 用户口径] 这里原来还列着 PG / DQN / SAC 59e5233 还原版两支 ——
+           那四支已经从下拉框与**启动预加载**里移除 (见 kAgents 顶部那段注释: 省下
+           ~11.2 s 启动时间), 于是它们在这一份快照里只会印出
+           "(没有实例/没有自检项: 该 agent 尚未被创建)" —— 四行噪声, 读起来像"坏了"。
+           名单跟着"这个程序实际提供什么"走, 所以一并删掉。
+           (四个类本身还在, 它们的自检文本仍被 test_sacaz 断言 —— 只是不再从这里列举。)
+        */
         static const ChessBoard::AgentType kAll[] = {
             ChessBoard::AGENT_ALPHABETA,
             /* Alpha-Beta 三档弱等级: 与上面那一档并列列出, 自检报告里会各自印出
                **实际搜索深度**, 一眼能核"L1/L2/L3 到底是不是 1/2/3 层" */
             ChessBoard::AGENT_AB_L1, ChessBoard::AGENT_AB_L2, ChessBoard::AGENT_AB_L3,
             ChessBoard::AGENT_MCTS,
-            ChessBoard::AGENT_PG,        ChessBoard::AGENT_DQN,
+            /* [2026-10] PG / DQN 已从这里删除: 它们不再被启动预加载 (见上面那段),
+               没有实例 ⇒ 只会印 "(没有实例/没有自检项: 该 agent 尚未被创建)"。 */
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
-            ChessBoard::AGENT_PPOMCTS_MLP, ChessBoard::AGENT_SACAZ_OLD,
-            ChessBoard::AGENT_SACAZ_OLD_MOE,
+            ChessBoard::AGENT_PPOMCTS_MLP,
+            /* [2026-10] SAC 59e5233 还原版两支同样删除 (同上: 不再预加载, 列出来只是噪声)。
+               两个类与它们的自检文本都还在, `test_sacaz` [14] 节仍在断言。 */
             /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 独立类, 自检面板
                要能回答"骨干里真的有几个专家/几个注意力头在用"这类只能靠读数发现的事 */
             ChessBoard::AGENT_DQNMCTS_MOE
@@ -1349,6 +1549,33 @@ void MainWindow::selfCheckWorkerLoop()
             m_selfCheckText = text;
             m_selfCheckReady = true;
         }
+        /*
+           [2026-10 门控实验] 顺手取一份稀疏 MoE 的负载快照 —— **在同一个 worker 里**,
+           因为它要在 agent 锁上读 (与自检同一条约束), 而这条 worker 线程就是为那件事
+           存在的。只对"当前 agent"取 (all=true 是横向快照, 那一眼看的是口径不是负载)。
+        */
+        if (!all) {
+            ChessBoard::MoeLoadSnapshot snap;
+            const bool okLoad = ui->gameWidget->getMoeLoad(type, snap);
+            /*
+               [2026-10 诊断] 这一行是"控件为什么停在 state=na"唯一能定位的地方:
+               它把三件事分开报 —— 类型对不对 (type)、实例建出来没有 (experts)、
+               以及 getMoeLoad 自己的返回值 (ok)。没有它, "na" 既可能是"选错 agent"、
+               也可能是"实例还没建 (懒建, 还没走过一步)"、也可能是"这一支没接线",
+               三种原因的修法完全不同 —— 而界面上它们显示成同一个 "不适用"。
+               与 `ppoTrainTrace` 同一做法: 默认关, 用环境变量打开
+               (`set CHESS_MOE_TRACE=1`), 免得每手一条日志把启动日志淹掉。
+            */
+            static const bool kMoeTrace = (std::getenv("CHESS_MOE_TRACE") != nullptr);
+            if (kMoeTrace) {
+                qInfo("[moe-load] type=%d experts=%d topK=%d applicable=%d split=%d ok=%d",
+                      (int)type, snap.experts, snap.topK,
+                      (int)snap.applicable, (int)snap.splitReady, (int)okLoad);
+            }
+            std::lock_guard<std::mutex> lk(m_selfCheckMutex);
+            m_moeLoadSnapshot = snap;
+            m_moeLoadReady = true;
+        }
         /* 上屏必须在 GUI 线程: 队列投递 (worker 不碰控件) */
         QMetaObject::invokeMethod(this, [this]() { applySelfCheckPanel(); },
                                   Qt::QueuedConnection);
@@ -1358,6 +1585,8 @@ void MainWindow::selfCheckWorkerLoop()
 void MainWindow::applySelfCheckPanel()
 {
     QString text;
+    bool loadReady = false;
+    ChessBoard::MoeLoadSnapshot snap;
     {
         std::lock_guard<std::mutex> lk(m_selfCheckMutex);
         if (!m_selfCheckReady) {
@@ -1365,8 +1594,20 @@ void MainWindow::applySelfCheckPanel()
         }
         m_selfCheckReady = false;
         text = m_selfCheckText;
+        if (m_moeLoadReady) {
+            m_moeLoadReady = false;
+            snap = m_moeLoadSnapshot;
+            loadReady = true;
+        }
     }
     ui->selfCheckView->setPlainText(text);
+    if (loadReady && m_moeLoadView != nullptr) {
+        m_moeLoadView->setSnapshot(snap);
+        /* 放大窗口开着的话一起更新 (两边永远显示同一份快照, 不会一个新一个旧) */
+        if (m_moeLoadDialog != nullptr) {
+            m_moeLoadDialog->setSnapshot(snap);
+        }
+    }
 }
 
 /*

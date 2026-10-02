@@ -21,6 +21,8 @@
 /* 稀疏 MoE 层只需要指针/引用 (定义在 rl/sparse_moe.hpp, 由 .cpp 包含) */
 namespace RL {
 class ISparseMoE;
+/* [2026-10] 实时路由探针 —— 只返回指针, 所以前向声明就够 */
+class MoERouteProbe;
 }
 
 /*
@@ -405,6 +407,49 @@ public:
     */
     int expertHidden;         /* MLP 专家的隐层宽度 (本类**用得上**: 专家就是 MlpExpert) */
     float auxLossCoef;        /* 稀疏 MoE 负载均衡辅助损失的系数 (0 = 关掉) */    int hiddenDim;
+    /*
+       ================================================================
+       [2026-10 门控实验] 无辅助损失的偏置均衡 (Loss-Free Balancing)
+       ================================================================
+       与 `SACAZMoETbAgent` 同一套实现与同一套依据 (arXiv:2408.15664 Algorithm 1):
+       给每个专家一个只影响 **top-k 选择** 的偏置 b_i (不进输出加权), 每批按负载更新
+       b_i += rate * sign(mean_load - load_i)。它走 argmax 而不是损失, 所以**不产生
+       任何干扰梯度** —— 与"把 auxLossCoef 调大"有本质区别 (后者会往主目标注入梯度)。
+
+       实测依据 (报告 `docs/moe_gate_experiment_2026_10.md` [3b]): 在真实棋局状态分布上,
+       靠辅助损失的 softmax 门控即使 coef=10 也拉不动负载 (MaxVio 恒为理论最大 3.000、
+       有效专家 1.00), 因为它的梯度正比于饿死专家自己的门控概率(≈0); 而本开关能做到
+       MaxVio 0.29~0.32、有效专家 4.00。
+
+       **构造后设置也生效** (与 `moeDense` 不同): 它只翻层里的一个标志, 不需要重建网络。
+       默认 false -> 行为与改动前**逐位相同**。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = 0.001f;
+    /* [2026-10] 与 `SACAZMoETbAgent::setLossFreeBias` / `PPOMCTSAgent::setLossFreeBias`
+       同形同名同语义 (见那边的说明): 把"该开哪两个成员"收进一处, 免得界面上的
+       六个接线点各写一遍、漏一处还完全看不出来。`rate <= 0` 夹成 0 (关回路)。 */
+    void setLossFreeBias(bool on, float rate = 0.001f)
+    {
+        lossFreeBias = on;
+        lossFreeBiasRate = (rate > 0.0f) ? rate : 0.0f;
+    }
+
+    /*
+       ================================================================
+       [2026-10 门控实验] 把骨干的**线性门控**换成带隐层的 MLP 门控
+       ================================================================
+       与 `SACAZMoETbAgent::enableMlpGate` **同形同一套理由** (两个类互不继承, 所以
+       必须各写一份 —— 这是 [2026-09 独立类] 拆分的既定代价)。
+       结构: d_model -> hidden (tanh) -> NumExperts -> softmax (三层: 输入/隐层/输出)。
+
+       ⚠ 必须在**任何** forward / trainSelfPlay / selectMove 之前调用。
+       ⚠ 装了它之后**现有权重文件作废**: wg 的形状与 wg1/wg2 不同, `Net::load` 的
+         参数量守卫会明确拒绝 (不静默错读)。
+    */
+    void enableMlpGate(int hidden);
+    /* 门控隐层宽度 (0 = 线性门控, 即出厂口径) */
+    int gateMlpHidden = 0;
     float gamma;
     float learningRateActor;
     float learningRateCritic;
@@ -1157,9 +1202,22 @@ public:
     long long uniqueParamCount() const;
     /* 稀疏 MoE 的坍缩诊断: actor 的第一个稀疏 MoE 层的使用计数 */
     void moeUsage(std::vector<long long> &out) const;
+    /*
+       [2026-10] 按前向来源拆开的专家使用计数: `trainOut` = 训练批的前向,
+       `inferOut` = MCTS 展开/叶子估值的前向。`moeUsage` 读的是生命周期累计,
+       而搜索前向在数量上通常压倒训练前向 —— 判断"均衡机制在训练批上生效没有"
+       只能看 trainOut。
+    */
+    void moeUsageSplit(std::vector<long long> &trainOut, std::vector<long long> &inferOut) const;
     void resetMoeUsage();
     int moeExpertCount() const;
     int moeTopK() const;
+    /*
+       [2026-10] "此刻哪个专家在工作"的**无锁**探针 (actor 骨干里那个稀疏 MoE 层)。
+       界面拿它做呼吸灯 —— 取一次指针之后可以在**不持 agent 锁**的情况下反复读
+       (整段决策都持着 `m_agentMutex`, 见 rl/sparse_moe.hpp 的 MoERouteProbe)。
+    */
+    const RL::MoERouteProbe *moeRouteProbe() const;
     /* 掩码策略 π(·|s) */
     void policy(const RL::Tensor &state, const RL::Tensor &mask, RL::Tensor &pi);
     /* 在线双 Q (搜索与策略损失用) */

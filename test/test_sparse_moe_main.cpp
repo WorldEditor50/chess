@@ -29,12 +29,16 @@
  *   [7] 辅助损失真的把坍缩的路由拉回来 (符号 + 多步)
  *   [8] 使用计数 (坍缩诊断) 与权重存取往返
  *   [9] 代价: 稀疏 vs 稠密, MLP 专家 vs TransformerBlock 专家
+ *   [10] 上游 MOE / 专家类型 / copyTo 等既有路径不受影响
+ *   [11] 实时路由探针 MoERouteProbe (界面呼吸灯): 逐次核对 + MLP 门控 + 多线程读一致性
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include "rl/tensor.hpp"
@@ -1104,6 +1108,232 @@ static void part10()
     }
 }
 
+/* ============================================================
+ *  [11] 实时路由探针 MoERouteProbe (界面"哪个专家在工作"的呼吸灯)
+ * ============================================================
+ *  这个读数的**唯一**用途是显示, 所以它坏了不会有任何功能症状 —— 只会让界面安静地
+ *  骗人 ("专家 3 在干活" 而其实是专家 1)。因此这里要钉三件事:
+ *
+ *   (a) **逐次核对**: 每次 forward 之后探针报的 (下标, 门控概率) 必须与层自己
+ *       `selected[]` / `gate[]` 里那一份**逐位相同** —— 拿层的内部状态当真值, 而不是
+ *       拿"探针自己说它对"当真值;
+ *   (b) **两条门控路径都发**: 线性门控与 MLP 门控 (三个指标都来自同一段代码, 但
+ *       MLP 那一支的 `gate` 是另一条写入路径, 漏发的话只有它会静默不亮);
+ *   (c) **多线程读不许读到半条路由**: 界面在**搜索线程还在前向**的时候读 (这正是
+ *       这个探针存在的理由), 所以另起一个线程猛转发, 主线程猛读 —— 每一条快照都必须
+ *       自洽 (picked == topK、下标在 [0,E)、权重在 (0,1]、序号单调不减)。
+ *       这一条测的是 seqlock: 少了它, 界面偶尔会把两个专家的下标与权重配错。
+ *
+ *  另外还要测"热度"的两条语义: 只给被选中的专家加热、以及**按时间衰减**
+ *  (后者是"停止思考之后灯自己灭"的全部依据, 用真的 sleep 来测)。
+ * ============================================================ */
+static void part11()
+{
+    std::printf("\n[11] 实时路由探针 (界面呼吸灯的数据源)\n");
+    const int D = 32;
+    const int E = 4;
+    const int TOP = 2;
+
+    /* ---- 路由正确性: 线性门控 ---- */
+    {
+        Net net(std::make_shared<SparseMoE<MlpExpert, E, TOP> >(D, true, 8));
+        SparseMoE<MlpExpert, E, TOP> *lay = dynamic_cast<SparseMoE<MlpExpert, E, TOP>*>(net[0]);
+        ISparseMoE *iface = lay;
+        const MoERouteProbe *probe = iface->routeProbe();
+        CHECK(probe != nullptr, "稀疏 MoE 提供实时探针 (routeProbe() 非空)");
+        if (probe == nullptr) {
+            return;
+        }
+
+        MoERouteProbe::Snapshot s;
+        CHECK(!probe->read(s), "还没前向 -> 读不到快照 (界面据此不画灯, 而不是画一排 0)");
+        MoERouteProbe::Heat h0;
+        probe->readHeat(h0);
+        CHECK(!h0.ok && h0.experts == E, "没前向时热度为空, 但专家数是已知的");
+
+        Tensor x = randTensor(D, 1, 11, 1.0f);
+        const int N = 12;
+        int mismatches = 0;
+        int serialBad = 0;
+        unsigned prev = 0;
+        for (int i = 0; i < N; i++) {
+            net.forward(x, true);
+            if (!probe->read(s)) {
+                ++mismatches;
+                continue;
+            }
+            if (s.serial != prev + 1u) {
+                ++serialBad;
+            }
+            prev = s.serial;
+            if (s.experts != E || s.picked != TOP || s.dense) {
+                ++mismatches;
+                continue;
+            }
+            for (int k = 0; k < TOP; k++) {
+                const int idx = s.idx[k];
+                if (idx != lay->selected[k]) {
+                    ++mismatches;
+                    continue;
+                }
+                /* 门控概率逐位比: 探针必须发**输出加权用的那个** gate[i] */
+                if (s.w[k] != (float)lay->gate[(std::size_t)idx]) {
+                    ++mismatches;
+                }
+            }
+        }
+        std::printf("    %d 次前向: 路由不一致 %d 次, 序号不连续 %d 次 (序号=%u)\n",
+                    N, mismatches, serialBad, s.serial);
+        CHECK(mismatches == 0, "探针报的路由与层实际选中的逐位一致 (逐次核对 12 次)");
+        CHECK(serialBad == 0, "前向序号每次 +1 (界面据此判断读数是不是新的)");
+        CHECK(s.serial == (unsigned)N, "前向 N 次 -> 序号 == N");
+
+        /* ---- 热度: 只给被选中的专家加热 ---- */
+        std::vector<long long> usage;
+        iface->usageSnapshot(usage);
+        MoERouteProbe::Heat h;
+        probe->readHeat(h);
+        int heatMismatch = 0;
+        for (int i = 0; i < E; i++) {
+            const bool used = usage[(std::size_t)i] > 0;
+            const bool hot = h.v[i] > 0.0f;
+            if (used != hot) {
+                ++heatMismatch;
+            }
+        }
+        CHECK(h.ok && h.total > 0.0f, "有前向 -> 热度非零 (灯会亮)");
+        CHECK(heatMismatch == 0, "热度的非零集合 == 被选中过的专家集合 (12 次前向, 衰减可忽略)");
+        {
+            /* 最热的那个必须就是被选中最多的那个 (同份额按下标取小, 与实现同一约定) */
+            int hotMax = 0;
+            long long useMax = -1;
+            for (int i = 0; i < E; i++) {
+                if (h.v[i] > h.v[hotMax]) {
+                    hotMax = i;
+                }
+                if (usage[(std::size_t)i] > useMax) {
+                    useMax = usage[(std::size_t)i];
+                }
+            }
+            CHECK(usage[(std::size_t)hotMax] == useMax,
+                  "最热的专家 == 被选中次数最多的专家 (呼吸灯的排序口径)");
+        }
+
+        /* ---- 按时间衰减: 这是"停止思考之后灯自己灭"的依据 ---- */
+        const float before = h.total;
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        MoERouteProbe::Heat h2;
+        probe->readHeat(h2);
+        std::printf("    静置 400 ms: 热度 %.1f -> %.1f (τ=1s, 理论 ×0.67)\n",
+                    (double)before, (double)h2.total);
+        CHECK(h2.total > 0.0f && h2.total < before * 0.85f,
+              "静置 400 ms 后热度按时间衰减 (τ=1 s; 不衰减的话灯会永远停在最后一次)");
+        CHECK(h2.ageSec > 0.3 && h2.ageSec < 5.0, "ageSec 报出了'距上一次前向多久'");
+
+        /* ---- clear() 是真复位。探针本身是只读的, 复位要拿层里那个非 const 对象
+           (界面上的"清零"走的也是层这一侧, 见 resetMoeUsage 的说明) ---- */
+        lay->liveProbe.clear();
+        MoERouteProbe::Heat h3;
+        probe->readHeat(h3);
+        CHECK(!probe->read(s) && !h3.ok, "clear() 之后快照与热度都回到'没有前向'");
+    }
+
+    /* ---- MLP 门控那一支也要发 (另一条 gate 写入路径) ---- */
+    {
+        Net net(std::make_shared<SparseMoE<MlpExpert, E, TOP> >(D, true, 8));
+        SparseMoE<MlpExpert, E, TOP> *lay = dynamic_cast<SparseMoE<MlpExpert, E, TOP>*>(net[0]);
+        lay->enableMlpGate(8);
+        ISparseMoE *iface = lay;
+        const MoERouteProbe *probe = iface->routeProbe();
+        Tensor x = randTensor(D, 1, 13, 1.0f);
+        int bad = 0;
+        for (int i = 0; i < 6; i++) {
+            net.forward(x, true);
+            MoERouteProbe::Snapshot s;
+            if (!probe->read(s)) {
+                ++bad;
+                continue;
+            }
+            for (int k = 0; k < TOP; k++) {
+                if (s.idx[k] != lay->selected[k]
+                    || s.w[k] != (float)lay->gate[(std::size_t)s.idx[k]]) {
+                    ++bad;
+                }
+            }
+        }
+        CHECK(bad == 0, "MLP 门控那一支同样发布实时路由 (6 次前向逐位一致)");
+    }
+
+    /* ---- 稠密对照 (TopK == E): dense 标志必须报出来 ---- */
+    {
+        Net net(std::make_shared<SparseMoE<MlpExpert, 3, 3> >(D, true, 8));
+        ISparseMoE *iface = dynamic_cast<ISparseMoE*>(net[0]);
+        const MoERouteProbe *probe = (iface != nullptr) ? iface->routeProbe() : nullptr;
+        Tensor x = randTensor(D, 1, 17, 1.0f);
+        net.forward(x, true);
+        MoERouteProbe::Snapshot s;
+        const bool ok = (probe != nullptr) && probe->read(s);
+        CHECK(ok && s.picked == 3 && s.dense,
+              "稠密对照 (TopK==E) 报 picked==E 且 dense=true (界面要能区分'全算')");
+    }
+
+    /* ---- 多线程: 搜索线程一直在前向, 界面线程一直在读 ---- */
+    {
+        Net net(std::make_shared<SparseMoE<MlpExpert, E, TOP> >(D, true, 8));
+        ISparseMoE *iface = dynamic_cast<ISparseMoE*>(net[0]);
+        const MoERouteProbe *probe = (iface != nullptr) ? iface->routeProbe() : nullptr;
+        if (probe == nullptr) {
+            CHECK(false, "多线程那一节拿不到探针");
+        } else {
+            std::atomic<bool> stop{false};
+            std::atomic<long long> forwards{0};
+            std::thread writer([&]() {
+                Tensor x = randTensor(D, 1, 19, 1.0f);
+                while (!stop.load(std::memory_order_relaxed)) {
+                    net.forward(x, true);
+                    forwards.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+
+            long long reads = 0;
+            long long torn = 0;
+            long long badSerial = 0;
+            unsigned last = 0;
+            for (int i = 0; i < 200000; i++) {
+                MoERouteProbe::Snapshot s;
+                if (!probe->read(s)) {
+                    continue;               /* 正在写: 允许这一帧读不到 (界面会跳过) */
+                }
+                ++reads;
+                if (s.experts != E || s.picked != TOP || s.dense) {
+                    ++torn;
+                } else {
+                    for (int k = 0; k < TOP; k++) {
+                        if (s.idx[k] < 0 || s.idx[k] >= E) {
+                            ++torn;
+                        }
+                        if (!(s.w[k] > 0.0f) || s.w[k] > 1.0f) {
+                            ++torn;
+                        }
+                    }
+                }
+                if (s.serial < last) {
+                    ++badSerial;
+                }
+                last = s.serial;
+            }
+            stop.store(true, std::memory_order_relaxed);
+            writer.join();
+            std::printf("    并发: 前向 %lld 次, 读到 %lld 条快照, 撕裂 %lld 条, 序号回退 %lld 次\n",
+                        forwards.load(), reads, torn, badSerial);
+            CHECK(reads > 1000, "并发下真的读到了快照 (不是全程都在'正在写')");
+            CHECK(torn == 0, "并发读到的每一条快照都自洽 (下标在界内、权重在(0,1]、picked==topK)");
+            CHECK(badSerial == 0, "并发下前向序号单调不减 (seqlock 没有让读侧看到旧序号)");
+            CHECK(forwards.load() > 100, "写侧确实一直在前向 (这一条不是拿'没并发'当通过)");
+        }
+    }
+}
+
 int main()
 {
     /* 关掉 stdout 缓冲: 这个测试里有若干耗时较长的数值检查, 万一卡住或崩掉,
@@ -1113,16 +1343,17 @@ int main()
     std::printf("=== 稀疏路由 MoE (rl/sparse_moe.hpp) 测试 ===\n");
     Random::setSeed(20240501);
 
-    std::printf("[1/10] 前向/反向基础\n"); part1();
-    std::printf("[2/10]\n"); part2();
-    std::printf("[3/10]\n"); part3();
-    std::printf("[4/10]\n"); part4();
-    std::printf("[5/10]\n"); part5();
-    std::printf("[6/10]\n"); part6();
-    std::printf("[7/10]\n"); part7();
-    std::printf("[8/10]\n"); part8();
-    std::printf("[9/10]\n"); part9();
-    std::printf("[10/10]\n"); part10();
+    std::printf("[1/11] 前向/反向基础\n"); part1();
+    std::printf("[2/11]\n"); part2();
+    std::printf("[3/11]\n"); part3();
+    std::printf("[4/11]\n"); part4();
+    std::printf("[5/11]\n"); part5();
+    std::printf("[6/11]\n"); part6();
+    std::printf("[7/11]\n"); part7();
+    std::printf("[8/11]\n"); part8();
+    std::printf("[9/11]\n"); part9();
+    std::printf("[10/11]\n"); part10();
+    std::printf("[11/11]\n"); part11();
 
     std::printf("\n=== %d 项断言, %d 项失败 ===\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

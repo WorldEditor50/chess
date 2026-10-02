@@ -348,6 +348,13 @@ int SACAZMoETbAgent::moeTopK() const
     return (m != nullptr) ? m->topK() : 0;
 }
 
+const RL::MoERouteProbe *SACAZMoETbAgent::moeRouteProbe() const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    return (m != nullptr) ? m->routeProbe() : nullptr;
+}
+
 void SACAZMoETbAgent::moeUsage(std::vector<long long> &out) const
 {
     RL::Net &self = const_cast<RL::Net&>(actor);
@@ -357,6 +364,19 @@ void SACAZMoETbAgent::moeUsage(std::vector<long long> &out) const
         return;
     }
     m->usageSnapshot(out);
+}
+
+void SACAZMoETbAgent::moeUsageSplit(std::vector<long long> &trainOut,
+                                    std::vector<long long> &inferOut) const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    if (m == nullptr) {
+        trainOut.clear();
+        inferOut.clear();
+        return;
+    }
+    m->usageSnapshotSplit(trainOut, inferOut);
 }
 
 void SACAZMoETbAgent::resetMoeUsage()
@@ -1436,7 +1456,7 @@ void SACAZMoETbAgent::visitDistribution(int rootID, RL::Tensor &pi)
  *    3. 展开时按**先验**挑动作, 而不是随机挑 (同样模拟次数下更有效)。
  * ============================================================ */
 bool SACAZMoETbAgent::learnFromSearchStep(int color, int actionIdx, const Step &step,
-                                     const RL::Tensor &piVisit)
+                                     const RL::Tensor &piVisit, bool learn)
 {
     /*
        ============================================================
@@ -1515,7 +1535,15 @@ bool SACAZMoETbAgent::learnFromSearchStep(int color, int actionIdx, const Step &
        更新一次。批大小按池内实际条数夹一下 (与 exploreAndTrain 同一条理由:
        learnBatch 在"池 < batchSize"时**故意**直接返回、不拿半个批去更新, 于是开局
        前两手会白跑)。
+
+       [2026-10] `learn == false` = 只记录这一步的真实决策样本, 不立刻更新 ——
+       给界面那一支用的 (learnFromSearch 关着时, 终局仍然要有一条 hasSearch 样本可挂,
+       见 recordDecisionSamples 的说明)。这条分支下**样本已经入池**, 所以
+       notifyGameResult 找得到它; 它会等到下一次 learnBatch 才被训练。
     */
+    if (!learn) {
+        return true;      /* 样本已入池 (上面的 push_back), 只差没更新 */
+    }
     const int onlineBatch = std::min(batchSize, (int)memories.size());
     if (onlineBatch < 1) {
         return false;
@@ -1835,7 +1863,19 @@ Step SACAZMoETbAgent::selectMove(int color, int simulations_, float temp, RL::Te
             RL::Tensor piVisit(ACTION_DIM, 1);
             visitDistribution(rootID, piVisit);
             learnFromSearchStep(color, nodes[bestChildID].parentAction,
-                                nodes[bestChildID].step, piVisit);
+                                nodes[bestChildID].step, piVisit, /*learn=*/true);
+        } else if (recordDecisionSamples) {
+            /*
+               [2026-10] 只记录、不学。界面那一支 (AGENT_SACAZ_MOE) 的 learnFromSearch
+               是关的 (TB 骨干上 learnBatch(32) ~1.8 s/手, E=8/top-2 后 ~3.6 s/手),
+               但**终局通道必须有这条样本可挂** —— 否则人机对弈那一局的输赢直接丢掉
+               (用户实测日志: "没有可挂的真实决策样本 ... 这一局的输赢没有进学习回路")。
+               记录本身的代价 (一次稀疏编码 + π 拷贝) 相比这一步的搜索可忽略。
+            */
+            RL::Tensor piVisit(ACTION_DIM, 1);
+            visitDistribution(rootID, piVisit);
+            learnFromSearchStep(color, nodes[bestChildID].parentAction,
+                                nodes[bestChildID].step, piVisit, /*learn=*/false);
         }
         return nodes[bestChildID].step;
     }
@@ -1856,6 +1896,55 @@ Step SACAZMoETbAgent::selectMove(int color, int simulations_, float temp, RL::Te
         piOut->zero();
     }
     return Step();
+}
+
+void SACAZMoETbAgent::enableMlpGate(int hidden)
+{
+    if (hidden < 1) {
+        return;
+    }
+    /*
+       共享口径下 actor/q1/q2(+目标网) 是**同一个骨干层对象**的多张视图 —— 必须按指针
+       去重: 否则会对同一个 MoE 层调多次 enableMlpGate, 每次都重建张量并重抽一遍随机数,
+       最后留在层上的是最后一次的结果 (功能上"碰巧"还行, 但白花内存与随机数,
+       而且"共享模式下三张视图一致"这条前提会被悄悄破坏)。
+    */
+    std::vector<RL::ISparseMoE *> seen;
+    auto install = [&seen, hidden](RL::Net &net) {
+        for (std::size_t li = 0; li < net.size(); li++) {
+            RL::ISparseMoE *m = dynamic_cast<RL::ISparseMoE *>(net[li]);
+            if (m == nullptr) {
+                continue;
+            }
+            bool dup = false;
+            for (std::size_t k = 0; k < seen.size(); k++) {
+                if (seen[k] == m) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            seen.push_back(m);
+            m->enableMlpGate(hidden);
+        }
+    };
+    install(actor);
+    install(q1);
+    install(q2);
+    install(q1Target);
+    install(q2Target);
+    if (trunkMode == TrunkMode::Shared) {
+        install(trunk);
+        install(trunkTarget);
+    }
+    gateMlpHidden = hidden;
+    /*
+       两条配套: MLP 门控改变的是"路由判据", 而路由坍缩的门槛会随表达力上升而降不下来
+       —— 所以这一支**应当**与无辅助损失偏置均衡配对使用 (见 enableMlpGate 的说明)。
+       这里不强制打开, 由调用方决定 (实验要能分开量这两件事)。
+    */
 }
 
 void SACAZMoETbAgent::resetMoeBatchStats()
@@ -2224,6 +2313,63 @@ float SACAZMoETbAgent::learnBatch(int batchSize_, int epochs)
        坍缩到少数专家、其余永远不训练。细节与有限差分验证见 rl/sparse_moe.hpp
        和 test/test_sparse_moe_main.cpp [6][7]。
     */
+    /*
+       ---- 训练侧前向计数 (批边界) ----
+       必须在这里: 本批的训练前向已经跑完 (usageBatch 记着它们), 而 addAuxGradient
+       末尾会把批统计清零。`usageSnapshotSplit` 的推理侧 = total − 训练侧。
+    */
+    if (trunkMode == TrunkMode::Shared) {
+        for (std::size_t li = 0; li < trunk.size(); li++) {
+            RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
+            if (moe != nullptr) {
+                moe->accumulateTrainBatch();
+            }
+        }
+    } else {
+        RL::Net *nets[3] = {&actor, &q1, &q2};
+        for (int ni = 0; ni < 3; ni++) {
+            for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                if (moe != nullptr) {
+                    moe->accumulateTrainBatch();
+                }
+            }
+        }
+    }
+
+    /*
+       ---- 无辅助损失的偏置均衡 (Loss-Free Balancing) ----
+       必须在 addAuxGradient **之前**: 后者末尾会把批统计清零, 偏置更新要读的正是
+       "本批各专家被选中多少次"。默认 lossFreeBias=false 时整段是空操作。
+    */
+    if (lossFreeBias) {
+        if (trunkMode == TrunkMode::Shared) {
+            for (std::size_t li = 0; li < trunk.size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
+                if (moe != nullptr) {
+                    moe->setLossFreeBias(true, lossFreeBiasRate);
+                    moe->updateLossFreeBias();
+                }
+            }
+        } else {
+            RL::Net *nets[3] = {&actor, &q1, &q2};
+            for (int ni = 0; ni < 3; ni++) {
+                for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                    RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                    if (moe != nullptr) {
+                        moe->setLossFreeBias(true, lossFreeBiasRate);
+                        moe->updateLossFreeBias();
+                    }
+                }
+            }
+        }
+    } else if (auxLossCoef <= 0.0f) {
+        /*
+           两条路都关: 什么都不做 —— 批统计由 learnBatch 开头的 resetMoeBatchStats()
+           划边界, 与改动前完全一致 (这里**故意不**多做一次复位, 以保证默认路径逐位不变)。
+        */
+    }
+
     if (auxLossCoef > 0.0f) {
         /*
            [2026-09 dev-sacmoetb] 共享口径下 actor/q1/q2 是**同一个 MoE 层对象**的
@@ -2729,6 +2875,62 @@ std::string SACAZMoETbAgent::selfCheckReport() const
                   "骨干重复计入三张视图)\n",
                   trunkModeName(trunkMode), uniqueParamCount(), actor.paramCount());
     out += buf;
+    /*
+       [2026-10 门控实验] 路由均衡口径必须**自报**: 偏置不进权重文件、不进 paramCount、
+       不进指纹, 所以"这一支到底开没开"从别处一个读数都看不出来 ——
+       而它直接决定专家负载是 MaxVio≈0 还是 0.3~0.96 (见
+       docs/moe_gate_experiment_2026_10.md §8)。
+    */
+    {
+        std::snprintf(buf, sizeof(buf),
+                      "MoE 均衡: %s (偏置均衡 rate=%.4g, 辅助损失 auxLossCoef=%.4g)"
+                      " | 门控 %s (隐层 %d) | 偏置不进权重/不进参数量\n",
+                      lossFreeBias ? "无辅助损失偏置 (Loss-Free Balancing)"
+                                   : "**仅辅助损失 (改动前的行为)**",
+                      (double)lossFreeBiasRate, (double)auxLossCoef,
+                      (gateMlpHidden > 0) ? "MLP 三层 (d->h->E)"
+                                          : "线性 单层仿射 (出厂口径)",
+                      gateMlpHidden);
+        out += buf;
+        /*
+           训练侧/推理侧**分开**报: 生命周期累计混着 MCTS 推理前向, 而推理前向在数量上
+           压倒训练前向 —— 只看合计会把"搜索访问到的局面分布"当成"训练批的路由分布"。
+        */
+        std::vector<long long> tr, inf;
+        moeUsageSplit(tr, inf);
+        if (!tr.empty()) {
+            auto loadLine = [&](const char *name, const std::vector<long long> &v) -> std::string {
+                long long tot = 0;
+                for (long long x : v) { tot += x; }
+                if (tot <= 0) {
+                    return std::string(name) + ": 无前向";
+                }
+                double mx = 0.0, mn = 1.0;
+                int eff = 0;
+                std::string s = std::string(name) + " {";
+                for (std::size_t i = 0; i < v.size(); i++) {
+                    const double sh = (double)v[i] / (double)tot;
+                    mx = std::fmax(mx, sh);
+                    mn = std::fmin(mn, sh);
+                    if (sh > 0.05) { eff++; }
+                    s += std::to_string(v[i]);
+                    if (i + 1 < v.size()) { s += ","; }
+                }
+                s += "}";
+                std::string tail;
+                {
+                    char b2[128];
+                    std::snprintf(b2, sizeof(b2),
+                                  " MaxVio=%.3f 最小份额=%.3f 有效专家=%d",
+                                  mx * (double)v.size() - 1.0, mn, eff);
+                    tail = b2;
+                }
+                return s + tail;
+            };
+            out += "  " + loadLine("专家负载(训练侧)", tr) + "\n";
+            out += "  " + loadLine("专家负载(推理侧)", inf) + "\n";
+        }
+    }
     {
         const int hReq = tbHeadsRequested();
         if (hReq < 0) {

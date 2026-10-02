@@ -97,6 +97,22 @@ struct Cfg {
     float clampValue = -1.0f;
     float clipEps = -1.0f;
     float entropyCoef = -1.0f;
+    /*
+       ---- [2026-10] MoE 负载均衡: 无辅助损失偏置 (Loss-Free Balancing) ----
+       背景 (为什么 PPO 这条骨干需要它): 本工程实测过**只靠辅助损失 `moeAuxCoef` 拉不平
+       负载** —— 在同一批真实棋局状态上 `coef` 开到 10, MaxVio 仍恒为理论最大值 3.000、
+       有效专家 1.00 (根因: 辅助损失的梯度正比于饿死专家自己的门控概率 ≈0, 放大系数乘的
+       仍是 0)。把均衡的作用点从"梯度"换到"top-k 的 argmax 比较项"之后, 同一实验里
+       MaxVio 0.29~0.32、有效专家 4.00。见 docs/moe_gate_experiment_2026_10.md 的 [3b]。
+
+       `lossFreeBiasRate` 的刻度坑: 论文推荐 0.001, 但那是在"学习步密集"的前提下。
+       本工程的节拍很稀疏 (默认一局一步 RMSProp), 所以默认给 0.01 (与上面那份实验一致)。
+       `0` = 不改 (用 agent 的类默认)。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = -1.0f;
+    bool  auxCoefGiven = false;
+    float auxCoef = -1.0f;
 };
 
 Cfg g_cfg;
@@ -137,6 +153,11 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--clamp") { g_cfg.clampValue = (float)std::atof(v.c_str()); }
         else if (k == "--clip-eps") { g_cfg.clipEps = (float)std::atof(v.c_str()); }
         else if (k == "--entropy") { g_cfg.entropyCoef = (float)std::atof(v.c_str()); }
+        else if (k == "--lossfree-bias") { g_cfg.lossFreeBias = (std::atoi(v.c_str()) != 0); }
+        else if (k == "--lossfree-bias-rate") {
+            g_cfg.lossFreeBiasRate = (float)std::atof(v.c_str());
+        }
+        else if (k == "--aux-coef") { g_cfg.auxCoef = (float)std::atof(v.c_str()); g_cfg.auxCoefGiven = true; }
         else if (k == "--quiet") { g_cfg.verbose = false; }
         else if (k == "--help" || k == "-h") {
             std::printf(
@@ -147,7 +168,10 @@ bool parseArgs(int argc, char **argv)
                 "                 [--no-shaping] [--shaping-alpha=F] [--no-material-reward]\n"
                 "                 [--no-bootstrap] [--no-root-noise] [--quiet]\n"
                 "                 [--learn-per-episode=K] 每局几次批学习 (默认 1; 见头文件)\n"
-                "                 [--clamp=F] [--clip-eps=F] [--entropy=F]\n");
+                "                 [--clamp=F] [--clip-eps=F] [--entropy=F]\n"
+                "                 [--aux-coef=F]          MoE 辅助损失系数 (默认 0.1)\n"
+                "                 [--lossfree-bias=0|1]   无辅助损失偏置均衡 (默认 0 = 关)\n"
+                "                 [--lossfree-bias-rate=F] 它的步长 (默认 0.01; 见 Cfg 的刻度坑)\n");
             return false;
         } else {
             std::printf("[警告] 未知参数: %s (--help 看用法)\n", argv[i]);
@@ -211,6 +235,15 @@ int main(int argc, char **argv)
     if (g_cfg.clampValue >= 0.0f)  { ag.ppo.clampValue = g_cfg.clampValue; }
     if (g_cfg.clipEps >= 0.0f)     { ag.ppo.clipEps = g_cfg.clipEps; }
     if (g_cfg.entropyCoef >= 0.0f) { ag.ppo.entropyCoef = g_cfg.entropyCoef; }
+    /*
+       ---- [2026-10] MoE 负载均衡的两条路 (可以同时开, 也可以只开一条) ----
+       `setLossFreeBias` 而不是直接写成员: 单一真源在 `ppo` 里, 只改 agent 上的成员
+       会静默不生效 (见 ppomcts_agent.h 的 setter 说明)。
+    */
+    if (g_cfg.auxCoefGiven) { ag.ppo.moeAuxCoef = g_cfg.auxCoef; ag.moeAuxCoef = g_cfg.auxCoef; }
+    ag.setLossFreeBias(g_cfg.lossFreeBias,
+                       (g_cfg.lossFreeBiasRate >= 0.0f) ? g_cfg.lossFreeBiasRate
+                                                        : ag.lossFreeBiasRate);
     ag.ppo.resetCriticDiag();
     const int stepsBefore = ag.ppo.learningSteps;
     std::printf("[配置] 每局批学习 %d 次 (批 %d x %d epoch) | clampValue=%.2f clipEps=%.2f "
@@ -218,6 +251,9 @@ int main(int argc, char **argv)
                 ag.learnStepsPerEpisode, ag.replayBatchSize, ag.replayEpochs,
                 (double)ag.ppo.clampValue, (double)ag.ppo.clipEps,
                 (double)ag.ppo.entropyCoef);
+    std::printf("       MoE 均衡: 辅助损失 auxCoef=%.3f | 无辅助损失偏置 %s (rate=%.4g)\n",
+                (double)ag.ppo.moeAuxCoef,
+                ag.lossFreeBias ? "开" : "关", (double)ag.lossFreeBiasRate);
 
     /*
        P0.1 的核心: 一个常驻 agent + 一个按局日志指针。
@@ -367,17 +403,88 @@ int main(int argc, char **argv)
         std::vector<long long> usage;
         ag.moeUsage(usage);
         if (!usage.empty()) {
-            long long sum = 0, mx = 0;
-            int unused = 0;
-            for (std::size_t e = 0; e < usage.size(); e++) {
-                sum += usage[e];
-                mx = std::max(mx, usage[e]);
-                if (usage[e] == 0) { unused++; }
+            /*
+               ---- 负载读数的口径 (与 bench_gate_moe / 界面 MoE 负载条同一套) ----
+               MaxVio = max_i share_i/(1/E) − 1 (0 = 完美均衡; 与 Loss-Free Balancing
+                        论文同口径);
+               有效专家 = 份额 > 5% 的专家个数;
+               **不用 max/min** —— 它对"最弱专家是 1.1% 还是 2.7%"过敏, 容易把噪声当趋势。
+               必须**按前向来源拆开**: 搜索每次决策就几十~几百次前向, 数量上压倒训练批,
+               只看合计会把"搜索访问到的局面分布"当成"训练批的路由分布", 于是判不出
+               均衡机制有没有生效 (见 RL::PPO::moeUsageSplit)。
+            */
+            struct LoadStat {
+                double maxVio = 0.0, minShare = 0.0;
+                int effective = 0;
+                long long total = 0;
+            };
+            auto loadOf = [](const std::vector<long long> &counts) {
+                LoadStat s;
+                const int e = (int)counts.size();
+                for (std::size_t i = 0; i < counts.size(); i++) { s.total += counts[i]; }
+                if (e <= 0 || s.total <= 0) {
+                    return s;
+                }
+                double mx = 0.0;
+                s.minShare = 1.0;
+                for (int i = 0; i < e; i++) {
+                    const double sh = (double)counts[(std::size_t)i] / (double)s.total;
+                    if (sh > mx) { mx = sh; }
+                    if (sh < s.minShare) { s.minShare = sh; }
+                    if (sh > 0.05) { s.effective++; }
+                }
+                s.maxVio = mx * (double)e - 1.0;
+                return s;
+            };
+
+            const LoadStat all = loadOf(usage);
+            std::printf("  MoE 专家使用 (合计): E=%d top-%d | MaxVio %.3f | 最小份额 %.1f%% | "
+                        "有效专家 %d/%d | 未使用 %d 个\n",
+                        ag.moeExpertCount(), ag.moeTopK(), all.maxVio,
+                        100.0 * all.minShare, all.effective, (int)usage.size(),
+                        [&usage] {
+                            int z = 0;
+                            for (std::size_t e = 0; e < usage.size(); e++) {
+                                if (usage[e] == 0) { z++; }
+                            }
+                            return z;
+                        }());
+
+            std::vector<long long> trainUse, inferUse;
+            ag.moeUsageSplit(trainUse, inferUse);
+            if (!trainUse.empty()) {
+                const LoadStat tr = loadOf(trainUse);
+                const LoadStat inf = loadOf(inferUse);
+                std::printf("              训练侧前向 %lld 次: MaxVio %.3f | 最小份额 %.1f%% | "
+                            "有效专家 %d/%d   <== 判均衡机制看这一列\n",
+                            tr.total, tr.maxVio, 100.0 * tr.minShare,
+                            tr.effective, (int)trainUse.size());
+                std::printf("              推理侧前向 %lld 次: MaxVio %.3f | 最小份额 %.1f%% | "
+                            "有效专家 %d/%d   (搜索访问分布, 不是训练批的路由分布)\n",
+                            inf.total, inf.maxVio, 100.0 * inf.minShare,
+                            inf.effective, (int)inferUse.size());
+                if (tr.total == 0 && ag.lossFreeBias) {
+                    std::printf("              [警告] 训练侧为 0 —— 偏置回路读的是批统计, 没有训练\n"
+                                "                     前向它一步都不会动 (检查 replayBatch=0?)\n");
+                }
             }
-            const double mean = (double)sum / (double)usage.size();
-            std::printf("  MoE 专家使用: E=%d top-%d | 最大/均值 %.2f | 未使用 %d 个\n",
-                        ag.moeExpertCount(), ag.moeTopK(),
-                        (mean > 0.0) ? (double)mx / mean : 0.0, unused);
+            std::vector<float> bias;
+            ag.moeBiasSnapshot(bias);
+            if (!bias.empty()) {
+                std::printf("              偏置 b_i:");
+                for (std::size_t i = 0; i < bias.size(); i++) {
+                    std::printf(" %+.3f", (double)bias[i]);
+                }
+                std::printf("   (只进 top-k 比较, 不进输出加权; 极差 %.3f)\n",
+                            [&bias] {
+                                float lo = bias[0], hi = bias[0];
+                                for (std::size_t i = 1; i < bias.size(); i++) {
+                                    if (bias[i] < lo) { lo = bias[i]; }
+                                    if (bias[i] > hi) { hi = bias[i]; }
+                                }
+                                return (double)(hi - lo);
+                            }());
+            }
         }
     }
 

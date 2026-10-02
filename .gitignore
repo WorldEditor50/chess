@@ -18,3 +18,8 @@ build-*/
 # 训练权重 (运行期产物, 每个文件约 15 MB; GUI 与基准都从运行目录的 weights/ 读写)
 # 验证用的权重可用 bench_ppo_mt --save=<prefix> 重新生成, 见 docs/training_optimization.md §7
 weights/
+
+# 棋局库 (2026-10): GUI 启动时 `GameDatabase::instance().open("chess_games.db")` 在**运行目录**
+# 建出来的本地 SQLite 文件。同样是运行期产物 —— 仓库里从来没有提交过 .db (git log --all -- '*.db'
+# 为空), 需要时跑一局就有了。
+chess_games.db

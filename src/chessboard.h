@@ -34,6 +34,17 @@
 #include "dqnmctsmoetbagent.h"
 
 /*
+   [2026-10] 实时路由探针 (界面呼吸灯) 的**前向声明**。
+   为什么不在本头文件包含 `rl/sparse_moe.hpp`: 那个头很重 (transformer / expert / net
+   都在里面), 而这里只需要一个**指针**成员 (`m_liveMoeProbe`) —— 与下面几个 agent 类的
+   "只前置声明"是同一个做法 (它们也把 sparse_moe.hpp 留给自己的 .cpp)。
+   探针的完整定义只在 chessboard.cpp 里需要 (那边读它的原子快照)。
+*/
+namespace RL {
+class MoERouteProbe;
+}
+
+/*
    AGENT_SACAZ_OLD 的实例类型。这里只**前置声明**就够了 (成员是指针, 上报损失是个模板),
    真正的定义在 src/sacazlegacyagent.cpp 里 —— 头文件不必把那份实现拖进来。
    [2026-09] 它不再是 SACAZAgent 的派生类, 所以不能拿 SACAZAgent* 存它 (那是编译错误,
@@ -240,14 +251,14 @@ public:
     explicit ChessBoard(QWidget *parent = nullptr);
     ~ChessBoard();
 
-    /* 回放功能 */
-    bool isReplayMode() const { return m_replayGameId >= 0; }
-    void loadReplayGame(int gameId, const QVector<DBStep> &steps);
-    bool replayPrev();
-    bool replayNext();
-    int replayIndex() const { return m_replayIndex; }
-    int replayTotal() const { return m_replaySteps.size(); }
-    int replayGameId() const { return m_replayGameId; }
+    /*
+       [2026-10 移除] 这里原有 isReplayMode / loadReplayGame / replayPrev / replayNext /
+       replayIndex / replayTotal / replayGameId —— 棋谱回放的功能面。
+       删的理由见 mainwindow.h 里 private slots 顶部那段: 写入端从未接线
+       (`GameDatabase::startGame/recordMove/endGame` 全仓零调用), 所以"选历史对局 ->
+       逐步回放"这条链路**结构性不可达**; MainWindow 侧对应的 UI 与槽也一并删了。
+       `GameDatabase` 与 chess_games.db 保留 (下面构造函数里那句 open 不动)。
+    */
 
     /* Agent 选择 */
     void setAgentType(AgentType type);
@@ -561,6 +572,93 @@ public:
     std::string getAgentSelfCheck(AgentType type) const;
 
     /*
+     * ================================================================
+     *  [2026-10 门控实验] 稀疏 MoE 的**专家负载快照** (界面 MoeLoadView 的数据源)
+     * ================================================================
+     *  为什么单独做一个接口、而不是让界面去读 agent:
+     *    * 那几个计数器要在 `m_agentMutex` 上读 (后台训练线程可能正在 loadModel
+     *      把整份权重写进同一个网络), 所以**不能在 GUI 线程直接调** ——
+     *      与 `getAgentSelfCheck` 完全同一条约束、同一把锁, 界面侧也复用同一个 worker;
+     *    * 它是**纯数据** (没有 QString / 没有格式化), 所以 MoeLoadView 可以只依赖
+     *      这个结构, 不必反向依赖 GUI 的字符串口径。
+     *
+     *  `train` / `infer` 分开是本接口的重点: 生命周期累计混着 MCTS 推理前向, 而推理
+     *  前向在数量上通常压倒训练前向 —— 只看合计会把"搜索访问到的局面分布"当成
+     *  "训练批的路由分布", 判不出均衡机制有没有生效。
+     *
+     *  返回 false = 这个 agent 没有稀疏 MoE 层 (纯 MLP / AB / MCTS ...), 或者它的
+     *  常驻实例还没建出来。两种情况下 `out.applicable` 都为 false, 由界面显示
+     *  "不适用"而不是画一排 0 (后者会被误读成"负载是 0")。
+     */
+    struct MoeLoadSnapshot {
+        /*
+           `capable` 与 `applicable` 的区别是实测逼出来的: SAC+AZ-MoE 的常驻实例是
+           **懒建**的 (第一次决策/预热时才建网), 所以"选中了这个 agent"与"它有计数器"
+           之间有一段时间差。只用一个标志的话, 那段时间会显示成"该 agent 没有稀疏 MoE"
+           —— 而它其实有, 只是**实例还没建出来**。界面必须把这两件事分开说,
+           否则用户会以为选错了 agent。
+        */
+        bool capable = false;       /* 这个 agent **类型**有已接线的 MoE 读数吗 */
+        bool applicable = false;    /* 实例在、而且真的读到了专家数 */
+        bool splitReady = false;    /* 训练侧/推理侧分开的计数可用吗 */
+        /*
+           agent 的显示名 (如 "SAC+AZ-MoE")。**必须带上**: 控件在"不适用"时如果只写
+           "当前 agent 没有稀疏 MoE", 用户没法判断是自己选错了 agent、还是这个功能坏了
+           —— 实测就是这么被问的 ("负载均衡状态控件并没有显示")。
+        */
+        std::string agentName;
+        int  experts = 0;           /* 专家数 E */
+        int  topK = 0;              /* 每次前向激活几个专家 */
+        std::vector<long long> train;   /* 训练批的前向 (各专家被选中次数) */
+        std::vector<long long> infer;   /* 推理/搜索的前向 (= 合计 − 训练侧) */
+        std::vector<long long> total;   /* 生命周期合计 (splitReady=false 时只有它) */
+    };
+    bool getMoeLoad(MoeLoadSnapshot &out) const;
+    bool getMoeLoad(AgentType type, MoeLoadSnapshot &out) const;
+
+    /*
+     * ================================================================
+     *  [2026-10] "此刻哪个专家在工作" —— **无锁**实时路由读数
+     * ================================================================
+     *  为什么不能复用上面那个接口 (这是本接口存在的全部理由):
+     *    `getMoeLoad` 要在 `m_agentMutex` 上读, 而 **AI 的整段决策都持着那把锁**
+     *    (见 chessboard.cpp 的 aiThinkForAgentRaw: `env` 是所有 agent 共用的试走棋盘,
+     *    决策期间不许有第二个读者)。于是"在锁上读"的路径在**思考中会一直阻塞** ——
+     *    而"思考中"恰好是唯一想看实时路由的时刻。
+     *
+     *  做法: MoE 层在每次 forward 末尾把路由发布进一个无锁探针
+     *  (`RL::MoERouteProbe`), `getMoeLoad` 在**持锁**的那一次顺手把探针**指针**存进
+     *  `m_liveMoeProbe` (一个 atomic, 指针在层对象生命周期内稳定), 之后 GUI 线程就
+     *  可以按自己的节奏无锁地反复读它。**读的是原子快照, 不是 agent 内部状态。**
+     *
+     *  所以: 本函数不加锁、不阻塞、可以每几十毫秒调一次; 返回 false = 当前 agent 不是
+     *  带 MoE 的那几个 (或它的探针还没登记) —— 界面据此不画呼吸灯, 而不是画一排 0。
+     */
+    struct MoeLiveRoute {
+        /*
+           这两个上限**必须与 `RL::MoERouteProbe` 的一致**, 但它们写在这里是有意的:
+           chessboard.h 不包含 `rl/sparse_moe.hpp` (它很重, 而这里只需要一个指针),
+           所以不能拿那边的常量当数组维度。一致性由 chessboard.cpp 里的
+           `static_assert` 钉住 —— 那边一改, 这里**编译不过** (而不是悄悄截断)。
+        */
+        static constexpr int kMaxExperts = 32;
+        static constexpr int kMaxPicked = 32;
+
+        bool     available = false;   /* 指针登记过, 且读到了稳定快照 */
+        bool     active = false;      /* 最近 ~1 秒里真的有前向 (灯该亮) */
+        unsigned serial = 0;          /* 前向序号 —— 界面据此判断"是不是新的" */
+        int      experts = 0;
+        int      pickedCount = 0;
+        int      picked[kMaxPicked];  /* 最近一次前向选中的专家 */
+        float    pickedW[kMaxPicked]; /* 它对应的门控概率 */
+        bool     dense = false;       /* 全算 (等算力对照) */
+        float    heat[kMaxExperts];   /* 最近 ~1 秒的活跃强度 */
+        float    heatTotal = 0.0f;    /* Σheat (归一化用) */
+        double   ageSec = -1.0;       /* 距上一次前向多久 (秒) */
+    };
+    bool liveMoeRoute(MoeLiveRoute &out) const;
+
+    /*
      * 这个 agent 的权重文件在磁盘上长什么样 (存不存在、多大)。
      *
      * 为什么要放进面板: "权重到底载进来了没有"是**静默失效**的高发区 ——
@@ -687,9 +785,7 @@ signals:
     void busyStarted(const QString &title, const QString &message);
     void busyMessage(const QString &message);
     void busyFinished();
-    /* 回放状态变更信号 */
-    void replayIndexChanged(int index, int total);
-    void replayModeExited();
+    /* [2026-10 移除] replayIndexChanged / replayModeExited 两个回放信号已删 */
     /* 启动加载完成 */
     void startupComplete();
 public slots:
@@ -703,10 +799,7 @@ private:
     Stone *selectStone(const QPoint &point);
     bool moveStone(const QPoint &point);
     void process();
-    /* 回放内部: 将棋盘重置到指定步数 */
-    void applyReplayStep(int targetIndex);
-    /* 回放内部: 按数据库记录 (起点/终点坐标) 构造一步并落子 */
-    bool applyDbStep(const DBStep &dbStep);
+    /* [2026-10 移除] applyReplayStep / applyDbStep 两个回放内部函数已删 */
     /* AI决策 - 根据当前选中的agent类型选择走法 */
     Step aiThink(int color);
 
@@ -797,10 +890,7 @@ private:
     int m_currentGameId;
     int m_moveCount;
     bool m_dbEnabled;
-    /* 回放状态 */
-    int m_replayGameId;
-    int m_replayIndex;
-    QVector<DBStep> m_replaySteps;
+    /* [2026-10 移除] 回放状态 m_replayGameId / m_replayIndex / m_replaySteps 已删 */
     /* AI Agent */
     AgentType m_agentType;
 
@@ -1035,6 +1125,36 @@ public:
     int matchLearningBlockedCount() const { return m_matchLearningBlocked.load(); }
     long long humanEndFedCount() const { return m_humanEndFed.load(); }
     long long humanEndMissedCount() const { return m_humanEndMissed.load(); }
+
+    /*
+     * ================================================================
+     *  [2026-10] 人机终局反馈把当前 agent 归到哪一类 (可测的唯一入口)
+     * ================================================================
+     * 为什么把这件事从 `notifyHumanGameEnd` 里提出来做成一个纯函数:
+     *   这条判断原来内联在日志分支里, 于是它**错了也没人能钉住** —— 而它确实错过:
+     *   2026-10 用户看到的那行
+     *     "[human] 终局 红胜 (人赢了): PPO+MCTS 没有终局通道 (纯搜索 / 终局值随 rollout
+     *      进池的那几支), 无需反馈"
+     *   把 PPO+MCTS 与纯搜索并列 —— 而 PPO **在学** (每一手 `exploreAndTrain` ->
+     *   `learnSelfPlay`), 那句"无需反馈"读起来像"这一局白下了"。
+     *   提出来之后, `test_match [2.21]` 能直接对每一种 agent 类型断言它归哪一类, 而不是
+     *   靠读日志猜。
+     *
+     * 三类的区别是**机制**上的, 不是措辞上的:
+     *   * PureSearch          : 没有可训练参数 (AB 各档 / MCTS) —— 反馈无意义;
+     *   * RealDecisionSample  : 池里存了"真实决策样本", 终局可以挂上去 (SAC 系三支 +
+     *                           DQN+MCTS MoE)。**这是唯一"接得住"的一类**;
+     *   * RolloutTrained      : 在学, 但学习发生在自对弈/rollout 里 —— 人机里"结束这一局
+     *                           的那一手是**人**走的, 而它没有可挂的样本, 于是真实胜负只能
+     *                           经自举 `-V(s')` 与后续 rollout 间接进入回路
+     *                           (PPO 系 / DQN / DQN+AB / EVAB / SAC 还原版两支)。
+     */
+    enum HumanEndChannel {
+        HUMAN_END_PURE_SEARCH = 0,   /* 纯搜索: 没有可训练参数 */
+        HUMAN_END_REAL_SAMPLE,       /* 有"真实决策样本"可挂 -> notifyGameResult 会接住 */
+        HUMAN_END_ROLLOUT            /* 在学, 但样本来自 rollout, 没有可挂的样本 */
+    };
+    static HumanEndChannel humanEndChannel(AgentType type);
 private:
     /*
      * 当前这一手在替谁决策 (对弈里 "这一手是 A 方还是 B 方"; 人机里 AI 固定是冻结方)。
@@ -1467,7 +1587,22 @@ private:
      * (见 ChessBoard::getAgentSelfCheck 的说明)。
      */
     mutable std::mutex m_agentMutex;       /* 保护主agent权重读写 */
-    void backgroundTrainLoop();            /* 训练线程主循环 */
+
+    /*
+       [2026-10] 实时路由探针的**指针登记** (界面呼吸灯)。
+       为什么是"一个原子指针"而不是"每次去 agent 里找": 找那一步要在 `m_agentMutex`
+       上读 agent 内部, 而思考中那把锁被整段决策占着 —— 于是只能在**持锁的路径上**
+       (`getMoeLoad`, 每手棋/切换 agent 时都会走)顺手登记一次, 之后 GUI 线程无锁地读。
+
+       为什么指针是安全的: 探针住在 MoE 层里, 而层住在 agent 的网络里; 这几个常驻
+       agent 在本进程内**从不析构** (懒建之后一直留着), 所以指针在登记之后一直有效。
+       `nullptr` = 当前 agent 不是带 MoE 的那几个 -> 界面不画呼吸灯。
+    */
+    /*
+       mutable 的理由与 m_agentMutex 完全相同: 登记发生在 `getMoeLoad` 里, 而它是
+       **const 方法** (自检那一族约定), 但登记本身是写操作。
+    */
+    mutable std::atomic<const RL::MoERouteProbe *> m_liveMoeProbe{nullptr};    void backgroundTrainLoop();            /* 训练线程主循环 */
 };
 
 #endif // CHESSBOARD_H

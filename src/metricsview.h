@@ -10,6 +10,27 @@
 class QLabel;
 
 /*
+ * ============================================================================
+ *  ChartStyle —— 曲线控件与"专家负载"控件共用的面板配色（**唯一一处定义**）
+ * ============================================================================
+ * 为什么单独拎出来: 这几个颜色原来只长在 metricsview.cpp 的匿名命名空间里, 于是
+ * 别的控件想"和曲线一样的底板"只能自己抄一份 —— MoeLoadView 第一版就是这么干的:
+ * 它给自己涂了个**不透明**的 (250,250,252) 底, 而曲线用的是**半透明白**
+ * kPanelFill(255,255,255,170) 画圆角板、控件本身不填背景 (setAutoFillBackground(false),
+ * 四角露的是父级底色)。结果是相邻的两块控件看起来是两种东西 —— 用户报的
+ * "MoE 负载窗口的背景颜色和 loss 窗口不一致"就是这一条。
+ *
+ * 用法: 不填自身背景, 只画一块和 CurveChart 同样的圆角板:
+ *     p.setBrush(ChartStyle::kPanelFill);
+ *     p.setPen(QPen(ChartStyle::kPanelEdge, 1.0));
+ *     p.drawRoundedRect(QRectF(rect()).adjusted(0.5,0.5,-0.5,-0.5), 8.0, 8.0);
+ */
+namespace ChartStyle {
+extern const QColor kPanelFill;   /* 半透明白: 圆角板填充 */
+extern const QColor kPanelEdge;   /* 板边线 */
+}
+
+/*
  * CurveChart - 一个不依赖 Qt Charts 的轻量折线图控件
  * ============================================================================
  *

@@ -1,8 +1,8 @@
 # 中国象棋 (Qt6 + C++17) — 带 AI Agent 与强化学习内核
 
-一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**9 个可选 AI Agent**（从
+一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**7 个可选 AI Agent**（从
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
-自带稀疏 MoE），以及一整套**可复现的验证手段**（13 个 ctest 套件 + 5 个界面自动化脚本 +
+自带稀疏 MoE），以及一整套**可复现的验证手段**（13 个 ctest 套件 + 8 个界面自动化脚本 +
 一批手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement` /
 `bench_ppo_sims` / **`bench_diag`（诊断仪表盘：搜索健康度 / 战术题库 / value 校准）** /
 **`bench_anchor`（固定开局集 + 换先手成对计分 + Elo 置信区间）** / **`train_ppo`（无界面
@@ -129,10 +129,10 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
   （见 `docs/sac_learn_reward_2026_09.md` §1.1 与 `chessboard.h` 的 `RewardAccounting`）。
 * 对弈结束后**静默保存权重**到标准路径（不弹窗；几百 MB 的写盘会显示"请稍候"沙漏）
 * **后台持续训练**（2026-09 补齐）：当前选中的 agent 在后台线程里持续"自对弈 → 在线更新 →
-  写回主 agent"。**十一个有权重可训的 agent 全部接上**（PG / DQN / PPO+MCTS / PPO+MCTS-MLP /
-  DQN+MCTS / EVAB / SAC+AZ / SAC+AZ-MoE / SAC+AZ-59e5233 / SAC+AZ-59e5233-MoE / DQN+AB ——
-  PPO 的两种骨干、SAC 的两支与还原版的两种骨干各自都有独立权重；Alpha-Beta 与 MCTS
-  没有可训练权重）。
+  写回主 agent"。**九个界面上可选、且有权重可训的 agent 全部接上**（PPO+MCTS / PPO+MCTS-MLP /
+  DQN+MCTS / DQN+MCTS-MoE / EVAB / SAC+AZ / SAC+AZ-MoE / SAC+AZ-MoE-MLP / DQN+AB ——
+  PPO 的两种骨干、SAC 的三支各自都有独立权重；Alpha-Beta 与 MCTS 没有可训练权重。
+  **[2026-10]** PG / DQN / SAC-59e5233 两支也从界面与启动预加载里移除了，见上面那张表）。
   训练**只在"训练对局"模式下**在对弈期间照常进行（每轮把权重同步进主 agent ⇒ 一局之内
   模型会变，这条是明确选择的行为，见 `docs/issues_review.md` 零之二点二十三 §2b）；
   **评估/只对弈模式下它整体停摆**（P0-b：那两种模式声称"冻结"，而冻结必须包含权重不变 ——
@@ -149,22 +149,52 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
   **动作别名**（同一局面里有多少互不相同的着法被迫共用一个 Q 槽位）、**终局通道**
   （`getResult()` 判出的终局里，旧口径 `isGameOver()` 漏掉了多少局）、搜索/训练口径
   （根搜索展开覆盖率、值门控的 gap 与回滚、MoE 路由直方图……）。
-  **十六个 agent 全部实现了自检**（数据源 `AgentBase::selfCheckReport()`，由
+  **十六个 agent 类全部实现了自检**（数据源 `AgentBase::selfCheckReport()`，由
   `ChessBoard::getAgentSelfCheck()` 转发），另外纯搜索的那几支（Alpha-Beta 四档
   / MCTS）还会在面板里跑一次**决策合法性自检**（"这一步返回值在合法集里吗"）—— 它正是
   "agent 返回默认 Step 被误读成无棋可走"那类 bug 的回归指示器。
   刷新时机是"选中 agent / 每手预训练之后 / 启动加载完成"；启动时每个已加载的模型也会
   各打一行 `[selfcheck] <名字>: <表示层摘要>`。面板明确写着"这是表示/口径事实，**不是棋力**"。
-  按钮 **"全部模型自检"** 会把十六个 agent 排在一起 —— 编码/口径的差别只有横向对比才看得出来。
+  按钮 **"全部模型自检"** 会把**界面上实际提供的 13 个** agent 排在一起 —— 编码/口径的差别
+  只有横向对比才看得出来。**[2026-10]** 那 4 个被移出下拉框的 agent（PG / DQN / SAC 还原版
+  两支）也不再列在这里：它们不再被启动预加载 ⇒ 没有实例，列出来只会是 4 行"尚未被创建"。
+  （类的自检实现一个都没删，`test_sacaz` 仍在断言它们的文本。）
   自检面板第一段现在还会报**实测的隐层激活类型**（读 actor 第 2 层，不回显开关）与
   **实际生效的口径**（clampTarget / huberDelta / 叶子估值 / 动作空间）：上一轮那个
   "激活被换成 TanhNorm<Sigmoid>、棋力掉 26 个点"的回归，面板上原本一个字都看不出来。
+* **稀疏 MoE 负载控件**（2026-10，`src/moeloadview.{h,cpp}` 的 `MoeLoadView`，就在自检面板
+  上方）：每个专家分到多少流量的柱状图 + `1/E` 参考虚线 + `MaxVio`/有效专家读数，**双击可
+  放大**到独立窗口。存在的理由与自检面板同源：**路由坍缩是静默的** —— 前向照跑、loss 照降、
+  权重照存，只有把"谁分到多少流量"画出来才能看见（实测同一份代码上训练侧 MaxVio 可以是
+  **0.963** 也可以是 **0.006**，而其它任何读数都分不出来）。三个刻意选择：**按前向来源分开**
+  （训练批 / 搜索）—— 搜索前向在数量上压倒训练批，只看合计会把"搜索访问到的局面分布"当成
+  "训练批的路由分布"；**报 MaxVio + 有效专家而不是 max/min**（后者对"最弱专家是 1.1% 还是
+  2.7%"过敏）；**画一根 1/E 的参考线**（负载没有"越大越好"，它的意义完全相对于完美均衡）。
+  几个关键数字还写进 `accessibleName`，于是 `tools/verify_moe_load_view.ps1` 能直接断言读数
+  而不做像素识别。
+  **[2026-10 第二轮]** 控件上方另有一个**无锁**实时读数（"此刻哪个专家在工作"的呼吸高亮，
+  默认关）：AI 的整段决策都持着 `m_agentMutex`，所以任何**加锁**的读数在思考中会一直阻塞 ——
+  而那恰好是唯一想看它的时刻。做法是 MoE 层在每次前向末尾把路由发布进一个 seqlock 探针，
+  GUI 线程按 ~15 Hz 无锁读它（见 `docs/moe_gate_experiment_2026_10.md` §11）。
 
 ### 工程
 
 * 程序图标（窗口/任务栏 + exe 文件图标，由脚本生成）
 * 载入/保存权重时的沙漏等待窗（复用思考指示器；**快的操作不闪窗**，延迟 300 ms 才显示）
-* **启动时加载全部 7 组权重**（含稀疏 MoE 的 3×146 MB，约 10 s，沙漏全程给反馈）；
+* **启动时加载 9 组权重**（名单 = `chessboard.cpp` 的 `kWeightAgents`；本机实测
+  **启动到界面可用 ≈40.0 s**，其中 PPO+MCTS **17.6 s**（读 2×529 MB）、SAC+AZ-MoE
+  建网 2.9 s + 读 3×146 MB 12.0 s、DQN+AB 建网 1.1 s + 读 267 MB 3.7 s 三组占了大头；
+  沙漏全程给反馈）。
+  **[2026-10 目标/top-k 那一轮]** PPO+MCTS 的 TB 专家从 E=4/top-1 提到 **E=8/top-2**：
+  它的那一步 9.0 s → **17.6 s**（权重 530 MB → **1,057 MB**），于是整体
+  **29.5~30.0 s → 40.0 s**（`tools/measure_startup.ps1 -Tag ppoE8k2b`）。这正是这一轮
+  唯一的启动代价，也是 §13.5 那个"top-k 拿模拟次数换容量"取舍的一部分。
+  **[2026-10 更早那一轮]** 这里原来还有 PG / DQN / SAC-59e5233 两支，按用户口径从下拉框
+  与预加载里一起移除 ⇒ 实测 **40.8 s → 29.5~30.0 s**（省下的大头是还原版那个 TB 专家
+  骨干：建网 4.5 s + 读 440 MB 6.3 s）。量法：`tools/measure_startup.ps1`。
+  ⚠ 拿旧权重要注意：E/top-k 改动会让**存量权重作废**，那时启动日志里那一组会明确打出
+  `参数量不匹配 (文件 N 个元素, 当前网络 M 个) … 拒绝载入` —— 用**新鲜存下**的权重才量得到
+  "读 1,057 MB"那一档（第一次量到的 26.9 s 就是"载入被拒、跳过读盘"的假读数）。
   每组各记一条 `[weights] <名字>: N ms`，保存也记一条（慢了能一眼看出是哪一组）
 * 权重文件格式 v2：**逐比特无损** + 结构指纹 + 每张量 CRC32 + **原子写入**，
   并且**兼容旧的十进制文本格式**
@@ -173,29 +203,42 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 ## AI Agent
 
-界面上可选的 16 个 agent（`主界面 → 对战AI / A方 / B方`）：
+界面上可选的 14 个 agent（`主界面 → 对战AI / A方 / B方`）：
 
 | Agent | 说明 | 每步预算（本机实测） |
 |-------|------|---------------------|
 | **Alpha-Beta Pruning** | 经典 α-β + 静态搜索 | 深度 4，约 90 ms |
 | **Alpha-Beta L1 / L2 / L3** | **同一套搜索的三档弱等级**（只有深度不同：1 / 2 / 3）。**纯搜索、无权重**：既不训练也不上报训练损失。用途是当**陪练与标尺**——棋力可调、且完全不随训练漂移；与深度 4 那一档一起构成一条棋力阶梯 | 每步 0 / 3 / 34 ms |
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
-| **Policy Gradient** | REINFORCE + baseline，走子前在线训练 | 预训 64 步 |
-| **Deep Q-Network** | 双网 + 经验回放 + ε-greedy | 预训 64 步 |
-| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（E=4 top-1） | 400 次模拟，约 3.2 s |
+| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（**[2026-10] E=8 top-2**，此前是 4/1 —— 参数量 76 M → **207.8 M**、峰值工作集 → **3,301 MB**、**20.1 ms/模拟**，见 `docs/moe_gate_experiment_2026_10.md` §13）。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | 400 次模拟，约 **8.0 s**（E=8/top-2 实测；想要 ~3 s 就把 `chessboard.cpp` 的 `PPO_SIMS` 降到 160） |
 | **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~25×、容量小 ~18×，于是同一时间预算下模拟次数给到 4 倍 | 1600 次模拟，约 0.23~0.39 s |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
+| **DQN+MCTS (稀疏MoE+TB专家)** | 同一算法的另一个骨干（独立类 `DQNMCTSMOETbAgent`）：稀疏 MoE + TB 专家、规范视角 1263 维、PUCT + negamax 符号、Double DQN + clampTarget/Huber。权重独立（`weights/dqnmcts_moe_agent_*`） | 40 次模拟，约 175 ms |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
 | **SAC+AZ** | **SAC + MCTS + AlphaZero**：最大熵 critic 给 PUCT 搜索估值，α 自动调节；每次真实决策还会**从自己的搜索学一次**（不依赖"探索+预训练"勾选框） | 256 次模拟，约 12 ms |
 | **SAC+AZ (稀疏MoE+TB专家)** | 同上，骨干换成**稀疏路由 MoE + TransformerBlock 专家**。**[2026-09 dev-sacmoetb] 结构改成"共享骨干 + 三头"**（一份骨干 + 策略/Q1/Q2 三个头，而不是五张各背一套骨干的网），并且修掉了 TB 专家"请求 15 个头却只跑 3 个"的静默降级 —— 每样本训练代价 1/3.59、每模拟搜索代价 1/5.0、参数量 1/2.50，**π/Q/V 数值逐位不变**。权重文件因此换前缀（`weights/sacaz_shared_agent*`，4 个文件），旧权重载不进来 | 40 次模拟，约 160 ms |
-| **SAC+AZ (59e5233 行为还原版)** | 口径回到提交 `59e5233`：目标熵 0.98 / α 学习率 1e-3 / critic 不钳位且纯 MSE / 叶子全量估值。**独立的类** `SACAZLegacyAgent`（不继承 `SACAZAgent`），**权重文件独立**（`weights/sacaz_old_agent*`） | 256 次模拟，约 12 ms |
-| **SAC+AZ (59e5233 还原版, 稀疏MoE+TB专家)** | 同一支还原版的**另一个骨干**：同一个类、同一套 59e5233 口径，骨干换成**稀疏路由 MoE + TransformerBlock 专家**（与 SAC+AZ (稀疏MoE+TB专家) 同骨干，但**不**继承上面那两条结构修复 —— 行为还原版必须逐位复现历史）—— 用来把"骨干"与"口径"两个变量分开比 | 16 次模拟，约 160 ms |
+| **SAC+AZ (稀疏MoE+MLP专家)** | 同上，骨干换成 `MlpExpert`（E=8 top-2，独立类 `SACAZMoEMlpAgent`）：2.90 M 参数 / ~2.9 ms/模拟 | 40 次模拟，约 160 ms |
+| **DQN+AB** | 把 Alpha-Beta 当 DQN 的 planning head：网络给 AB 排序与叶子值，AB 的展开结果当 TD 目标（一步杀局面 8/8 命中，纯 Q-argmax 是 0/8） | 256 个搜索节点，约 0.8 s |
+
+> **[2026-10 用户口径] 下拉框移除了 4 个 agent：`Policy Gradient` / `Deep Q-Network` /
+> `SAC+AZ (59e5233 行为还原版)` / `SAC+AZ (59e5233 还原版, 稀疏MoE+TB专家)`** ——
+> 目的是**缩短启动时间**。这四个的**类、权重前缀、bench 与测试全都保留**（`test_sacaz`
+> [14] 节、`bench_sacaz_vs_ab --legacy`、`test_grad`、`test_dqnab` 仍在用），只是界面不再
+> 提供、启动也不再为它们预热。实测（`tools/measure_startup.ps1`，完整冷启动）：
+> **启动到界面可用 40.8 s → 29.5~30.0 s（−11 s）**，其中
+> `PG 146 ms + DQN 171 ms + 还原版(MLP) 43 ms + 还原版(MoE) 建网 4499 ms + 读 3×146 MB 6300 ms`
+> —— 也就是说**省下的大头是还原版那个 TB 专家骨干**（5 个 TB 专家网络 + 440 MB 权重）。
+> 还在预加载的是 9 组（PPO+MCTS 9.0 s / SAC+AZ-MoE 15.0 s / DQN+AB 4.8 s 三组占了大头）。
+> 代价：界面上再也选不到"当前口径 vs 59e5233 口径"的直接对弈，只能走 bench；那 4 个 agent
+> 也不再出现在"全部模型自检"的横向对照里（它们没有实例，列出来只会是 4 行"尚未被创建"）。
 
 > **"只换骨干"的三个配对**（PPO+MCTS 的 MLP/TB 专家、SAC+AZ 的 MLP/TB 专家、
 > SAC+AZ-59e5233 的 MLP/TB 专家）刻意共用同一个类与同一份搜索/训练/自检代码，构造时传
 > 不同的骨干枚举 —— 界面上并列，就是为了能直接对弈比较，而不是维护两份会漂移的实现。
 > 它们的权重文件、agent 名、参数量都不同；PPO 那对**交叉载入会被结构指纹当场拒绝**
 > （`test_match` [2.14] 钉住）。
+> ⚠ **[2026-10] 第三个配对（59e5233 的两支）已从下拉框移除**（省启动时间）：那个类与两种
+> 骨干都还在，`test_sacaz` [14] 节与 `bench_sacaz_vs_ab --legacy` 仍在跑，只是界面上选不到。
 >
 > **SAC 的两支与上面相反**：SAC+AZ 与 SAC+AZ (59e5233 行为还原版) 是**两份独立实现 +
 > 两个互不继承的 C++ 类**（`SACAZAgent` 与 `SACAZLegacyAgent`，后者自带一份 SAC 实现，
@@ -251,7 +294,7 @@ ctest --output-on-failure
 | `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** + **必输局面仍返回合法走法** + 十六个 agent 的自检与**两支 SAC 的权重文件名必须不同**（[2.11]）+ 五条后台训练支路（含 59e5233 版 SAC 的派生类 clone）+ **自动保存 × 后台训练并发**（[2.15]/[2.16]） |
 | `test_grad` | **有限差分核对 SIMD 之后的解析梯度** + MM 内核"累加 vs 覆盖"语义探针 |
 | `test_weights` | 权重格式：逐比特往返 / 坏文件拒绝 / 失败不改动网络 / 老格式兼容 |
-| `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 |
+| `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 / **[11] 实时路由探针**（逐次核对、MLP 门控那一支、热度按时间衰减、**多线程读不撕裂**） |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
 | **`probe_hvai_flow`** | **人机对弈状态机**（走**真实点击路径** `mousePressEvent`）：一局**由 AI 的落子结束**之后按"开局"，红方再走第一步，黑方必须应手；换对战 agent 之后同理；外加沙漏那一行显示的 agent 名。**进 ctest**（约 5–12 s） |
@@ -266,6 +309,57 @@ ctest --output-on-failure
 ```bat
 build\...\bench_moe.exe --games=4 --plies=30 --budget=60 --pretrain=3
 ```
+
+**`bench_gate_moe`** 是 MoE **门控变体**的受控实验（同样**不进 ctest** —— 它打印读数与判定，
+不是通过/失败，且带多种子）。三段：`[1]` 四条门控路径的解析梯度对有限差分；`[2]` 两个
+**可证伪**的合成任务（线性可分 vs XOR 型区域）；`[3]` 真实棋局状态（1710 维真实编码）上的
+路由偏斜与**均衡可达性**。完整结论见
+[`docs/moe_gate_experiment_2026_10.md`](docs/moe_gate_experiment_2026_10.md)：
+
+```bat
+build\...\bench_gate_moe.exe --quick                                  :: 冒烟 (~14 s)
+build\...\bench_gate_moe.exe --seeds=8 --steps=2000 --states=1200     :: 正式读数
+```
+
+**`bench_ppo_moe_balance`** 是同一个问题的**生产链路**版本（**不进 ctest** —— 跑真自对弈
+与真训练，分钟级，打印读数与判定而不是通过/失败）。与 `bench_gate_moe` 的分工：那一份
+刻意绕开 MCTS/训练、量"路由机制"（便宜）；这一份跑真 `trainSelfPlay` + 真
+`learnFromReplay`，量"**PPO 这条骨干的专家负载到底平不平**"。七个臂 = 线性/MLP 门控 ×
+（两条均衡路都关 / 只开辅助损失 / 辅助损失开到 10 / 辅助损失+无辅助损失偏置），
+每臂重建 agent、同 seed、同优化器步数，读数按**批边界**拆成训练侧/推理侧。
+
+```bat
+build\...\bench_ppo_moe_balance.exe --quick                                   :: 冒烟
+build\...\bench_ppo_moe_balance.exe --games=20 --batches=200 --seed=20240901  :: 正式读数
+build\...\bench_ppo_moe_balance.exe --backbone=tb --only=aux,lossfree         :: 界面现役配置
+```
+
+结论（两种子，20 局 × 30 手，200 次批学习）：**MLP 门控单独用会让负载更偏**
+（训练侧 MaxVio 0.364/0.516，是线性对照 0.183/0.186 的 2~3 倍），而**配上无辅助损失
+偏置均衡后回到 0.059/0.072（改善 5~7 倍）**；偏置臂在两个种子上都优于现状默认
+（0.041/0.046 vs 0.050/0.073）。**本工具不测棋力**，只回答"负载平不平"。
+见 [`docs/moe_gate_experiment_2026_10.md`](docs/moe_gate_experiment_2026_10.md) §12。
+
+**`bench_ppo_backbone_tb`** 量的是**骨干本身的代价**（**不进 ctest**，分钟级）——
+`src/rl/ppo.h` 的 `PPO_MOE_EXPERTS` / `PPO_MOE_TOPK` 是**编译期常量**，改它们的价格只能
+实测，而两种骨干（TB / MLP 专家）在同一个二进制里都能建（`RL::PPO::Backbone` 是运行时
+参数），所以一次跑完就能对比。四件事：**参数量 / ms 模拟 + 界面预算下的一步耗时 / 峰值
+工作集（由 `tools/measure_peak_working_set.ps1` 按 PID 采样）/ 训练侧负载 MaxVio**。
+
+```bat
+cmake --build <build> --target bench_ppo_backbone_tb
+<build>\bench_ppo_backbone_tb.exe --quick
+:: 峰值内存必须走外部采样器 (windows.h 的 PLANES 宏会撞 agent 的成员名, 见 §13.6)
+powershell -ExecutionPolicy Bypass -File tools\measure_peak_working_set.ps1 ^
+  -Exe build\...\bench_ppo_backbone_tb.exe -Args "--games=1 --plies=8 --ui-sims=400 --backbone=tb" ^
+  -LogFile build\mem_ppo_tb.txt
+```
+
+**[2026-10] TB 专家 E=4/top-1 → E=8/top-2 的实测代价**：参数量 76 M → **207.8 M**、
+**20.1 ms/模拟**（400 模拟 = **7.99 s/步**）、峰值工作集 **3,301 MB**、权重 530 MB →
+**1,057 MB**、界面冷启动 29.5~30.0 s → **40.0 s**。同一副骨干上的负载 A/B（`train_ppo
+--lossfree-bias=0|1`，8 局 × 12 手 × 12 模拟）：训练侧 MaxVio **0.900 → 0.120**。
+**棋力没有结论**（本工具不测棋力）。见同一份文档 **§13**。
 
 **`bench_ppo_vs_ab`** 是 PPO+MCTS 对 Alpha-Beta 的**静默**（无界面、不弹窗、不写权重）
 对弈基准，同样是手动跑的：交换先后手、随机开局、可选**等时间**（`--budget` 先标定
@@ -435,10 +529,16 @@ PPO 权重对 AB 深度 4 是 **0 胜 1 和 23 负**（Elo 差 −669），与"�
 | `tools/verify_app_icon.ps1` | ICO 结构 / 字形真的渲染 / 运行时加载 / exe 图标是"我们的" |
 | `tools/verify_chess_saves_weights.ps1` | 真界面跑完一场【Agent 对弈】，断言权重**真的写到标准路径**（对弈起来 → 对弈结束 → `weights/` 下出现非空的标准命名文件） |
 | `tools/verify_human_vs_ai.ps1` | 真界面**人机对弈**：脚本自己执红走到终局 → 点"开局" → 再走一步，看黑方还会不会应手（依赖 UIA 能定位到棋盘控件；状态机那条判据现在由 `probe_hvai_flow` 覆盖，见 `docs/agents_design.md` §22） |
+| `tools/verify_moe_load_view.ps1` | 真界面里的**稀疏 MoE 负载控件**：控件在无障碍树里、位置/尺寸可用、`accessibleName` 带机器可读摘要（`state=…/maxvio=…`）；`-SelectMoe` 还选中一个带稀疏 MoE 的 agent 并断言它不再报"不适用"；**`-PpoMoe`** 改为选中 **PPO+MCTS** 那一支，并额外断言摘要里带 `train=` 字段（训练侧/推理侧拆分就绪 —— 那是"均衡机制有没有生效"的唯一依据；`RL::PPO::finalizeMoeBatch()` 一旦漏接，控件照常画柱子而 `train=` 永远停在 `noforward`）；**`-Live`** 驱动一场对局，分四段钉住"**呼吸高亮**"开关（中间那一列的勾选框，**默认关**）：默认 `Off` → 关着时摘要 `hl=off` 且**完全没有 live 字段**（关 = 连探针都不读）→ 勾上后出现 `live=on live_serial=… live_top=…` 且**前向序号持续前进** → 取消勾选后 live 字段消失。那条读数走的是**无锁**探针（整段决策都持着 `m_agentMutex`，加锁的读数在思考中会一直阻塞），把它改回锁内这条检查就会红。见 `docs/moe_gate_experiment_2026_10.md` §11/§12 |
+| `tools/verify_ppo_moe_selfcheck.ps1` | 真界面里的 **PPO 自检面板**（2026-10）：选中 PPO+MCTS → 点"全部模型自检" → 从面板文本（UIA 的 `ValuePattern`）断言五件事：这段文本**属于 PPO**（不是 SAC 或别的 agent —— 面板内容跟着"棋盘最后建出来的那个 agent"走，只改下拉框是不够的，本脚本第一版就因此读到了 SAC 的文本）、**均衡口径那一行**报出 `Loss-Free`（偏置是非参数缓冲：不进权重/不进参数量/不进指纹，"这一支到底开没开"在别处一个读数都看不出来）、报 **MaxVio**、**训练侧/推理侧分开**、且**不再回退到 max/min**。见 `docs/moe_gate_experiment_2026_10.md` §12 |
 | `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） |
+| `tools/measure_startup.ps1` | **启动时间到底是多少、花在哪**：启动到"界面可用"（`selfPlayBtn` 可用 = `startupComplete`）的墙钟秒数 + 应用自己打的每条 `[weights] <名字>: N ms` + 启动自检里**实际加载了哪些模型**。README 里"40.8 s → 29.5~30.0 s"这个数字就是它量的（移除 PG/DQN/SAC 还原版两支那一轮）。注意 redirected stderr 是块缓冲的，脚本在杀进程前会等 3 s 把日志尾巴冲出来 |
 
 > 脚本有两个"血泪规则"写在注释里：**无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码**，
 > 所以要么纯 ASCII（窗口名用码位拼），要么带 BOM；两者混用会直接解析失败。
+> `verify_moe_load_view.ps1 -PpoMoe` 那次又验了一遍这条：新加的中文断言消息让整个脚本
+> 变成 `The Try statement is missing its Catch or Finally block` —— 注释里的中文没事，
+> **代码里的**中文才会（它被拆成非法字节，误导引号配对）。
 
 ---
 
@@ -498,6 +598,10 @@ chess/
 | [`docs/dev_sacmoetb_architecture.md`](docs/dev_sacmoetb_architecture.md) | **上面那一轮的架构图**：8 张 ASCII 图 —— 改动前（5 张独立网）与改动后（共享骨干 + 三头）的整网结构、`SparseMoE` 与 `TransformerBlock` 专家内部、头数被静默降级的机制、一次 MCTS 叶子估值的前向次数、一个训练样本的梯度流、两个口径的权重文件布局、一次决策的调用总览 |
 | [`docs/dev_sacmoetb_strength_2026_09.md`](docs/dev_sacmoetb_strength_2026_09.md) | **上面那一轮的棋力验证（对 MCTS 与 ABAgent level=1 对弈）**：新工具 `bench_sacmoetb_train`（固定开局集 + 成对换先 + 95% 区间 + 材料差诊断，且**逐行可复现**）；**十二条训练臂（各 60 局自对弈）没有一条量出棋力改善**；**等时间配对实测：对 MCTS 的得分率从 38.1% 提升到 47.5%（配对差 +9.4 个百分点，t=2.35，p≈0.021，80 局配对；胜局 0 → 10），对 AB L1 只有 +1.9%（t=0.54，不显著）** —— 也就是说第一轮那 6.45 倍提速（175 ms 预算下 8 次 → 55 次模拟）是一条**实测显著**的棋力提升；并把"训练推不动"从"数据不够"变成可读机制 —— **熵偏置 α·H ≈ 1.9 是游戏值域的两倍**，把 44% 的 TD 目标顶到钳位边界、把 0.029 量级的子力信号淹掉，而拿掉它 critic 又会塌成 0（两件事耦合）。另含：**§7 逐条实测了"critic 用 tanh / 奖励用 tanh 塑形 / α 用 Gumbel 调"三个提议**（都不能解决问题 —— ① 让 Q 间距掉 68%、② `tanh(0.029)` 就是恒等、③ 让被夹比例从 6.4% 涨到 23.7%），并由此得到 §7.3 那条反直觉结论：**`αH` 现在不是要拆掉的东西，而是唯一让 critic 不塌成 0 的脚手架**，真正的出口是"让 `E[minQ]` 在低数据量下非零"（更多数据 / 把子力或引擎评分蒸馏进 critic）；以及 §5.0 的一个工具缺陷修正：`MCTS` 构造函数会 `srand(time())` 覆盖 `--mcts-srand`，修之前所有 MCTS 读数都不是配对的 |
 | [`docs/sacmoetb_independent_classes_2026_09.md`](docs/sacmoetb_independent_classes_2026_09.md) | **把 SAC+AZ+MCTS 的稀疏 MoE 两支拆成"独立类"（用户口径）**：`SACAZMoETbAgent`（TB 专家）/ `SACAZMoEMlpAgent`（MLP 专家）与 `SACAZAgent`（纯 MLP）/ `SACAZLegacyAgent`（59e5233 还原版）**互不继承**，改一个文件碰不到另一个；全链路接线（CMake 14 个目标 / chessboard 注册 / **界面下拉新增 `AGENT_SACAZ_MOE_MLP`** / 5 个 bench 工具抽成模板 / 测试），工具侧接线收敛到 `test/sacaz_variants.h` 一处（变体枚举 + `withSacazAgent()` + `MoeInfo`/`TbHeadInfo` trait + `AnySac`）。**验证**：① 四个骨干的指纹与拆分前**逐行相同**（`bench_sacaz_vs_ab --depth=1`，含专家路由直方图）；② 训练侧**逐字节证据** —— TB 支拆分后存下的权重哈希与拆分前**完全相同**；③ `test_sacaz` **385 项断言 0 失败**（`[15b]` 奖励断言对三个类各跑一遍）；④ 全量构建 339/339；⑤ `ctest` 13/14（唯一失败是 `test_match` 的**预算过期** Timeout，改动前日志同一条，实测 314 断言 0 失败/1608 s，已把 TIMEOUT 900→2700 并写明依据）。**接线时抓到两个真 bug**：① `moeDense` 构造之后赋值 = 静默空操作（`dense-tb` 实际跑的是稀疏，topK=1/3305 次前向 vs 拆分前 topK=4/13804 次）；② 逐字副本让三个类**共用同一个 `sharedWeightPrefix()`** ⇒ 拆分后两个骨干会互相覆盖权重（已按类分开，且 TB 保留历史值以不动界面存量模型）。另含 §6 回答"**mlp 专家用独立骨干会不会更好**"：共享骨干参数少 2.48x、每步快 5.0x、训练快 2.7x，棋力上独立骨干无任何优势证据（16 局 34.4% vs 37.5%，分辨不了） |
+| [`docs/moe_gate_experiment_2026_10.md`](docs/moe_gate_experiment_2026_10.md) | **MoE 门控优化方案与受控实验**（`bench_gate_moe`，新工具）：把三个门控变体做进 `RL::SparseMoE`（**线性/MLP × softmax/标准 logistic × 无辅助损失偏置均衡**，默认路径**逐位不变**），并分三段验证。**[1]** 四条路径的解析梯度对有限差分**全部通过**（相对误差 1e-4~3e-3；MLP 模式下 `wg/bg` 两侧**恰好为 0** = 线性门控确被旁路）——过程中该工具**自己抓出一个真 bug**：`MM::ikkj` 是累加语义，MLP 分支的 `hGatePre` 漏了清零，导致门控输出跨前向次发散。**[2]** 两个**事先写下预测**的合成任务（线性可分 vs XOR 型区域 × 8 种子）：**MLP 门控确实买到"路由纯度"**（0.625→0.866；0.407→0.718）**但代价是负载更不均衡**（MaxVio 0.30→1.43~1.79、有效专家 3.9→2.0~2.5）——"更好的路由"与"更均衡的负载"在这份代码上**相互拉扯**；一条预测**被推翻**（线性可分任务上 MLP 并非无收益）。**[3a]** 同一门控、同一输入模长、**只换分布**：真实棋局状态 MaxVio 均值 **2.438** [1.10, 2.99]、有效专家 **1.60**，同尺度高斯 **0.134**、**4.00**（15 次里 15 次都是 4）⇒ **不均衡是状态分布几何的性质（真实状态随机对平均余弦 0.9032，几乎共线），不是门控结构的性质**，且用 14 秒、不用 TB 专家、不跑 MCTS 就复现了生产 agent 的偏斜读数。**[3b]** 把均衡当**唯一目标**优化门控：softmax + 辅助损失**即使 coef=10 也拉不动**（MaxVio 恒为理论最大 3.000、有效专家 1.00，而"门控迁移量"0.46~1.02 说明**梯度确实在动**），根因是**梯度正比于饿死专家自己的门控概率（≈0）**，放大系数乘的仍是 0；而**无辅助损失偏置**（不改梯度、只改 argmax 比较项）做到 **MaxVio 0.29~0.32、有效专家 4.00**。**更正一条先前推理**：softmax 耦合减项的"自动救援"只在**未饱和**区间成立，一旦饱和 `dz_c ∝ g_c → 0` 恰好失效。**回归**：`test_sparse_moe` 82/0、`test_sacaz` 452/0，同命令两次**逐行相同**（显式 `Random::setSeed`）。**明确没有得出的**：棋力结论（未跑 60 局训练臂与锚点 Elo）、[3b] 的 lossfree 档门控按构造冻结（隔离而非完整训练）、[3] 用的是随机走子而非 MCTS 分布。**§8 第二轮：把建议 1 落到两个 MoE agent 上** —— `SACAZMoETbAgent` 与 `SACAZMoEMlpAgent` 都加了 `lossFreeBias` / `lossFreeBiasRate`（默认关）与训练侧/推理侧分离计数；载具分别是 `bench_sacmoetb_train --lossfree-bias=1`（TB）与 `bench_sacaz_vs_ab --backbone=moe-mlp --lossfree-bias=1`（MLP，它是唯一支持四个骨干变体的工具，走新增的 `MoeBias<T>` trait）。**端到端实测**：TB 支训练侧 MaxVio **0.963 → 0.009**（最小份额 0.129 → 0.247）；MLP 支（8 专家、20 局热身、aux 保持构造默认 0.1）**0.318 → 0.006**（最小份额 0.102 → 0.124），推理侧也一起改善（0.250 → 0.225）；**偏置与 aux 可叠加**，不必先关掉辅助损失。**过程中修掉一个测量缺陷**：第一版按 `forward(x, inference)` 的标志位拆训练/推理，跑出来"推理侧"恒为 **0** —— 因为几个 SAC 骨干的搜索路径调的是 `trunk.forward(state)`（`inference` 用默认 false），改成**批边界**口径（`accumulateTrainBatch()` 在 `learnBatch` 训练循环之后累计）才正确。**默认值故意没翻**（本工程"默认逐位不变"的惯例，翻转是一行，见报告 §8.5）。回归：`test_sparse_moe` 82/0、`test_sacaz` 452/0。**§8.5 `chess` 程序已开启**：类的默认值仍是 `false`（bench 工具与历史读数保持可比），但**界面这一层已按建议 1 开启** —— `chessboard.cpp` 里与 `applyRewardMethod` 同形的 `applyLossFreeBias()`（常量 `SACAZ_MOE_LOSSFREE=true` / `RATE=0.01f`）被调在**四个点**上（两个构造工厂 + 两个后台训练 clone；漏掉 clone 会让训练用的那一支与决策实例不是同一个东西，而权重往返看不出来 —— 偏置不进权重/不进 `paramCount`/不进指纹）。`SACAZMoETbAgent::selfCheckReport()`（界面"模型自检"面板）新增路由均衡口径与训练侧/推理侧分离负载，让开关可审计。`SACAZLegacyAgent`（59e5233 还原版）**故意不加**（那个类的意义就是复现旧行为）。`chess.exe` 已重建并启动冒烟通过 |
+
+**§12（同一份文档）＝ 同一套均衡落到 PPO 骨干上**（用户口径："目前 ppo agent 的 MOE 负载不均衡，先修复这个问题"）。此前 PPO 这条**只有辅助损失** —— `RL::PPO` 里没有任何偏置回路，`PPOMCTSAgent` 也没有门控结构开关，于是 §3b 那条"只靠辅助损失拉不动负载"的结论在它身上**完全没被处理**。新增：`RL::PPO::moeLossFreeBias` / `moeLossFreeBiasRate`、`finalizeMoeBatch()`（批边界 = "记训练侧计数 + 走一次偏置回路"，且**必须在 `addAuxGradient` 之前** —— 后者末尾会清批统计）、`applyMoeBiasUpdate()`、`moeUsageSplit()`、`moeBiasSnapshot()`、`enableMlpGate()`，三条学习路径（`learnFromReplay` / `learnSelfPlay` / `trainStep`）都接了 `finalizeMoeBatch()`；`PPOMCTSAgent` 上同名的转发（`setLossFreeBias` / `enableMlpGate`（含幂等守卫）/ `moeUsageSplit` / `moeBiasSnapshot` / `resetMoeBatchStats`）；界面侧 `chessboard.cpp` 的三个常量（`PPO_MOE_LOSSFREE` **默认开** / `PPO_MOE_LOSSFREE_RATE=0.01` / `PPO_MOE_MLP_GATE_HIDDEN` **默认关**）+ `applyPpoBalance()` 唯一一处写法，接在 **14 个** PPO 构造点上（两个预加载、工厂两个 case、决策路径兜底 ×4、按需建网 ×2、后台兜底 ×2、训练 clone ×2 —— 漏掉 clone 会让"训练用的那一支"与决策实例不是同一个东西，而权重往返**看不出来**）。新工具 `bench_ppo_moe_balance`（七个臂 = 线性/MLP 门控 × 两条均衡路都关 / `aux=0.1` / `aux=10` / `aux`+偏置）跑**真自对弈 + 真 `learnFromReplay`**，读数按**批边界**拆训练侧/推理侧。**实测（两种子 20240901/777，各 20 局 × 30 手 × 24 模拟采数据 + 200 次批学习；MaxVio 0 = 完美均衡，E=8 时理论最大 7）**：`none` 0.183/0.186、`aux`（**现状默认**）0.050/0.073、`auxStrong` 0.020/0.029、**`lossfree` 0.041/0.046（最小份额 12.1%/12.1%）**、`mlp` 0.265/0.331、**`mlpFree` 0.059/0.072**、`mlpNone` 0.364/0.516。⇒ ① **MLP 门控单独用反而更偏**（是线性对照的 2~3 倍，与 §3[2] 的预测同向），**配上偏置均衡后回到 0.06~0.07（改善 5~7 倍）**；② 偏置臂在两个种子上都优于现状默认。**明确没有得出的**：棋力结论（**本工具不测棋力**，只回答"负载平不平"）；也**不能**说"辅助损失没用" —— 本工具里 `aux=10` 同样把训练侧拉到 0.02~0.03（口径与 §3b 的"冻结数据、只优化门控"合成设定不同），偏置胜在"用 1/1000 的系数、且**不往主目标注入任何梯度**"。还复现了 SAC 支那条提醒：**"偏置均衡"不等于"到处都均衡"**（推理侧由门控初始化与状态分布主导 —— 种子 777 的 MLP 支采集期推理侧 MaxVio 直接是理论最大的 **3.000**，训练批的均衡拉不动它）。**同轮又一次栽在"读数会说谎"上**（这是该文档第三次）：第一版把训练侧按 `moeUsageSplit` 的逐批增量算，跑出"`none` 臂训练侧 158 万次前向、推理侧 0"与"另一臂训练侧 0、推理侧 22160 次"**两种都错**的读数 —— 根因是 `usageBatch` = "自上次复位以来**所有**前向"，采集期的推理前向被算进了第一个训练批；修法两条缺一不可：在"采集/学习"边界显式划一刀（`PPOMCTSAgent::resetMoeBatchStats()`，**不影响任何数值**）+ 逐批改用 `moeUsage` 增量。回归钉：`test_ppomcts` **§[14]** 四条断言（`setLossFreeBias` 必须落到 `ppo` 的真源、`enableMlpGate` 幂等（第二次调用后骨干逐位不变）、开偏置后 `biasGate` 必须被推动而关时无快照、同种子两次关偏置跑出的最大份额与前向数完全相同）。**顺带回答用户那条口径**（"参考 SAC agent 使用三层 MLP 作为 MoE 的 gate 网络"）：已落地（三层 `d_model -> hidden(tanh) -> E`，与 SAC 两支同一个接口）但**默认仍关** —— 它不是均衡手段（方向相反）、会让存量权重作废（形状变了 ⇒ `Net::load` 拒载）、棋力无结论；正确用法是**与偏置均衡配对**。要开就改一处：`PPO_MOE_MLP_GATE_HIDDEN = 0` → `64`，然后必须重训这两支 PPO 权重 | **§13 ＝ PPO 的 TB 专家与 top-k：4/1 → 8/2**（用户口径："增加 ppo agent 的 TB 专家与 top-k 数量"，与 §9 对 SAC 的要求同型）。改的是 `src/rl/ppo.h` 顶部两个**编译期常量**（`PPO_MOE_EXPERTS` 4→8、`PPO_MOE_TOPK` 1→2），所以存量 `weights/ppomcts_agent*` 全部作废（`Net::load` 的参数量守卫**明确拒绝**）。 **实测代价**（新工具 `bench_ppo_backbone_tb` + `tools/measure_peak_working_set.ps1`，§13.2）：参数量 **76 M → 207.8 M**（actor 104,141,772 / critic 103,615,337）、**20.1 ms/模拟**（界面 400 模拟 = **7.99 s/步**）、批学习（批 32）2.9 → **5.8 s**、峰值工作集 **3,301 MB**、权重 530 MB → **1,057 MB**、界面冷启动 **29.5~30.0 s → 40.0 s**（PPO 那一组 9.0 → 17.6 s）。 **负载：E 越大越偏，所以 §12 的偏置均衡是配套前提** —— 同一副新骨干上的 A/B（8 局 × 12 手 × 12 模拟，每局 8 次批学习）训练侧 MaxVio **0.900 → 0.120**（最小份额 8.7% → 11.2%），推理侧反而略差（0.674 → 0.852），又一次复现"训练侧均衡不能外推到推理侧"。 **§13.5 那个取舍必须说清楚**：top-k 那一半是拿**模拟次数**换容量，而模拟次数是本工程唯一测出过棋力的杠杆（40/64/120 → 42.2%/50.0%/62.5%）；`PPO_SIMS` **故意没跟着改** —— 400 模拟 = 8.0 s/步，降到 **160 ≈ 3.2 s/步**（深挖余量只剩 4× 分支数），想"又快又深"就换 `PPO+MCTS (MLP专家)` 那一支（0.22 ms/模拟，1600 模拟 ≈ 0.35 s/步）。 **明确没有得出的**：棋力（本工具不测棋力；§9 在 SAC 支上量过同型问题，32 局只分出 4 局胜负、两组 95% 区间全跨 50%）。 **§13.6 两个"不报错只是结果不对"的坑**：① `#include <windows.h>` 的 `wingdi.h` 有 `#define PLANES 14`，而 `ppomcts_agent.h` 有一个成员 `PLANES`（19 个平面）—— 一撞之后**报错点在 agent 头文件里**（`error C2059`），病灶却在测量工具的 include 上，所以内存改由外部采样器量；② `learnFromReplay` 的步数**必须封顶**（每步要为 64 条样本各跑一遍 actor+critic 的前向+反向，207.8 M 参数上是 GB 级权重流量），第一版工具"能学多少学多少"跑了 **16 分钟还没结束**，并补上 `setvbuf(_IONBF)`（块缓冲会让被 kill 的进程一个字节输出都不留）。 |
+
 | [`docs/sacmoetb_pos_reward_2026_09.md`](docs/sacmoetb_pos_reward_2026_09.md) | **按局面动态分配"吃子 / 杀将"两个奖励权重（`rewardShape = 3`）**：用户口径"前期加强吃子奖励、后期重杀将奖励，两者都不应忽视"，以及**第二轮的修正**——"分阶段太过思维定势，因为局势是反复变化的，参考棋子的**数量与价值**评估局面来动态调整比例"。做法：把单调的"阶段钟"换成**局面评估 e**（`f_值` 剩余价值 + `f_数` 剩余**个数** + `f_势` **相对**子力差，默认三因子等权），两个倍数 `m_mat = 1 + matBoost·(1−e)` / `m_mate = 1 + mateBoost·e` 在默认 0.5/0.5 下**之和恒为 2.5** —— 即"固定奖励预算按局面动态分配"；两条都**永不归零**。含：为什么"个数"是独立一维（同样 1.0 价值，两个车 vs 十个兵对杀棋难度不同）、为什么优势用**相对差**（局势反复时 e 会**回摆**）、量纲不变量（`matBoost < 1.857`，默认 0.5 → 0.525 < 1.0）、以及**已知代价**：终局加权与 γ=0.99 折现方向相反，"磨到残局再杀"在 `Δ < 100·ln(1+boost)` 手内折现价值更高（b=0.5 → 40 手）。工具：`bench_sacmoetb_train --reward-shape=3 --pos-mat-boost=.. --pos-mate-boost=.. --pos-score-mode=..`；回归：`test_sacaz` **[15b]** 的 39 条断言；默认路径与 9706e82 **逐行相同**（只多一行配置打印）。**实测四条臂（各 60 局自对弈 + 16 局/锚点）**：吃子那一半有作用（对 AB 材料差 −2.51 → −2.26、对 MCTS +0.19 → +0.51，得分率一正一负都在噪声里、**没有棋力结论**），**杀将那一半完全没作用**；根因是一条新发现 —— **训练里"终局通道"极稀疏（当时实测为 0，§10.4 已更正为"协议特定、0 ~ 0.14%"）**：`TrainDiag` 新增的 `doneSamples/decisiveSamples` 实测 12 局自对弈（11296 样本）**done 样本 = 0**（`trainSelfPlay` 走到 120 手截断、截断步 `done` 仍为 false），于是 `mateBoost` 从 0 开到 10 存下来的权重**逐字节相同**（同一口径下 `matBoost` 0 vs 0.5 权重立刻不同，是阳性对照；换到 MoE-MLP / 60 局热身那个协议上 done 有 53/37504 = 0.14%，同一对照下权重**不同**：`221FB956…` vs `D419EF76…`）。⇒ **"后期重杀将"在自对弈里的作用面极窄（信号在万分之一的样本上），不是加权不够**；出路四条：让自对弈打到真终局（残局课程/换陪练）、把杀将信号搬到**即时**通道（将军/威胁的每步塑形）、把评分蒸馏进 critic、或**走人机对弈那条终局通道**（**§11**：人把 AI 将死时也会交付终局样本，`TrainDiag::externalTerminals` 是它的读数）。 |
 
 ---

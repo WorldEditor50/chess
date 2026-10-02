@@ -160,6 +160,10 @@
          <item>
           <widget class="QComboBox" name="matchModeCombo"/>
          </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="freeMoveRow">
          <item>
           <widget class="QCheckBox" name="freeMoveCheck">
            <property name="toolTip">
@@ -171,6 +175,19 @@
             <string>自由走子(调试)</string>
            </property>
           </widget>
+         </item>
+         <item>
+          <spacer name="freeMoveSpacer">
+           <property name="orientation">
+            <enum>Qt::Orientation::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
          </item>
         </layout>
        </item>
@@ -184,16 +201,6 @@
          </property>
         </widget>
        </item>
-       <item>
-        <widget class="QComboBox" name="recordcomboBox"/>
-       </item>
-        <item>
-         <widget class="QLabel" name="stepLabel">
-          <property name="text">
-           <string>step:0</string>
-          </property>
-         </widget>
-        </item>
         <item>
          <widget class="QLabel" name="timeLabel">
           <property name="text">
@@ -233,17 +240,53 @@
           </property>
          </widget>
         </item>
+       <!--
+         [2026-10 用户口径] "模型自检与模型信息显示" 从最右列 (metricsPanel) 搬到这里
+         (中间的 controlWidget) —— 原来它和曲线/逐局明细挤在 330px 的列里, 文字读不全。
+         搬过来后仍在 verticalSpacer 之前, 所以剩余空白照旧被 spacer 吃掉。
+         ⚠ MoeLoadView **不在这里** —— 用户口径是"自检在中间、MoE 负载在右侧", 所以它
+         由 mainwindow.cpp 插进最右列的 metricsPanel (比分那一行下面), 不跟着这一块走。
+       -->
        <item>
-        <widget class="QPushButton" name="prevBtn">
-         <property name="text">
-          <string>Previous Step</string>
-         </property>
-        </widget>
+        <layout class="QHBoxLayout" name="selfCheckTitleRow">
+         <item>
+          <widget class="QLabel" name="selfCheckTitleLabel">
+           <property name="text">
+            <string>模型自检 (自动更新)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="selfCheckAllBtn">
+           <property name="toolTip">
+            <string>把所有 agent 的自检报告排在一起 (横向对比编码/口径/权重文件); 之后每手会自动刷回当前 agent</string>
+           </property>
+           <property name="text">
+            <string>全部模型自检</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
        <item>
-        <widget class="QPushButton" name="nextBtn">
-         <property name="text">
-          <string>Next Step</string>
+        <widget class="QPlainTextEdit" name="selfCheckView">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>108</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>260</height>
+          </size>
+         </property>
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+         <property name="textInteractionFlags">
+          <set>Qt::TextInteractionFlag::TextSelectableByMouse|Qt::TextInteractionFlag::TextSelectableByKeyboard</set>
          </property>
         </widget>
        </item>
@@ -353,49 +396,6 @@
         <widget class="QLabel" name="gameListLabel">
          <property name="text">
           <string>逐局明细</string>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <layout class="QHBoxLayout" name="selfCheckTitleRow">
-         <item>
-          <widget class="QLabel" name="selfCheckTitleLabel">
-           <property name="text">
-            <string>模型自检 (自动更新)</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="selfCheckAllBtn">
-           <property name="toolTip">
-            <string>把九个 agent 的自检报告排在一起 (横向对比编码/口径/权重文件); 之后每手会自动刷回当前 agent</string>
-           </property>
-           <property name="text">
-            <string>全部模型自检</string>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-       <item>
-        <widget class="QPlainTextEdit" name="selfCheckView">
-         <property name="minimumSize">
-          <size>
-           <width>0</width>
-           <height>108</height>
-          </size>
-         </property>
-         <property name="maximumSize">
-          <size>
-           <width>16777215</width>
-           <height>260</height>
-          </size>
-         </property>
-         <property name="readOnly">
-          <bool>true</bool>
-         </property>
-         <property name="textInteractionFlags">
-          <set>Qt::TextInteractionFlag::TextSelectableByMouse|Qt::TextInteractionFlag::TextSelectableByKeyboard</set>
          </property>
         </widget>
        </item>

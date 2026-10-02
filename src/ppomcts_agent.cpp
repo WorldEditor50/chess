@@ -87,8 +87,74 @@ PPOMCTSAgent::PPOMCTSAgent(Chess &chess_,
 {
     totalWins[0] = 0;
     totalWins[1] = 0;
+    /*
+       [2026-10] 无辅助损失偏置均衡: 单一真源是 `RL::PPO` 的 `moeLossFreeBias` /
+       `moeLossFreeBiasRate` (成员, 可以在训练中途改), 本 agent 的同名成员只是"转发壳"
+       —— 沿用 SAC 那两个 MoE agent 的写法, 让"开均衡"在四条骨干上是同一句话。
+       默认 false ⇒ 与改动前逐位相同。
+    */
+    ppo.moeLossFreeBias = lossFreeBias;
+    ppo.moeLossFreeBiasRate = lossFreeBiasRate;
     ppo.exploringRate = 1.0f;
     std::srand((unsigned int)std::time(nullptr));
+}
+
+/*
+   ---- [2026-10] 均衡开关的 setter ----
+   为什么需要它 (而不是让调用方直接写两个成员): 单一真源在 `ppo` 里, 而 agent 上那两个
+   成员是构造时拷贝的**快照**。若调用方只改 agent 的成员, 真正生效的 `ppo.moeLossFreeBias`
+   还是旧值 —— 那正是本工程反复栽的"改了源码/改了旋钮但没生效"那一类静默失败。
+   把"写两处"收进一个函数, 调用方就不可能只写一半。
+   `train_ppo` / `bench_gate_moe` / `bench_ppo_mt` 都走这里。默认关。
+*/
+void PPOMCTSAgent::setLossFreeBias(bool on, float rate)
+{
+    lossFreeBias = on;
+    lossFreeBiasRate = (rate > 0.0f) ? rate : 0.0f;
+    ppo.moeLossFreeBias = lossFreeBias;
+    ppo.moeLossFreeBiasRate = lossFreeBiasRate;
+}
+
+/*
+   ---- [2026-10] MLP 门控 (三层: d_model -> hidden -> E) ----
+   与 `SACAZMoETbAgent::enableMlpGate` / `SACAZMoEMlpAgent::enableMlpGate` **同形同一套
+   理由** (三个类互不继承, 所以是三份实现而不是一份继承 —— 与那两个类之间的处理一致)。
+
+   为什么 PPO 这条骨干也该有它: 现状的线性门控只能用 E 张超平面切状态空间, 而真实棋局
+   状态的**方向几乎共线** (实测随机对平均余弦 0.9032, 见 docs/moe_gate_experiment_2026_10.md
+   的 [3a]) —— 在这么窄的一个锥里放超平面, 表达力先于均衡成为瓶颈。MLP 门控实测买到
+   路由纯度 +0.15~+0.31 (线性路由只能"两个专家凑一个区域")。
+
+   ⚠ 但它**不是**负载均衡的手段, 方向甚至相反 (MLP 门控的 MaxVio 0.30 -> 1.43~1.79)。
+   正确用法是**与无辅助损失偏置均衡配对**: 前者管"路由得更准", 后者管"负载别塌"。
+   这一点在 SAC 支上是实测过的 (chessboard.cpp 的 SACAZ_MOE_MLP_GATE_HIDDEN 注释)。
+
+   去重按**指针**做: 与 SAC 那两支同一个理由 —— 重复调用会重建张量并重抽一遍随机数,
+   功能上"碰巧"还行, 但白花内存与随机数, 而且"这一支的门控到底是哪一个"会变得说不清。
+*/
+void PPOMCTSAgent::enableMlpGate(int hidden)
+{
+    if (hidden < 1) {
+        return;
+    }
+    /*
+       幂等守卫 (**这一层是必须的**): 安装动作会重建张量并重抽一遍随机数, 所以重复调用
+       不是"无害的重复", 而是"把已经训练过的门控抹掉重来"。调用点分散在若干处
+       (构造工厂 / 按需建网 / 后台 clone / 训练 clone), 只要有一处重复就会静默毁掉训练
+       —— 一行比较把它变成不可能。`RL::PPO::enableMlpGate` 自己只有"意图层面"的守卫
+       (已经是 MLP 就返回), 挡不住"同一 hidden 被调第二次"。
+    */
+    if (gateMlpHidden == hidden) {
+        return;
+    }
+    /*
+       实际安装委派给 `RL::PPO` —— 本文件**不**直接摸稀疏 MoE 层:
+       `RL::ISparseMoE` 定义在 `rl/sparse_moe.hpp`, 而那一个头把 transformer/expert/net
+       全拉进来 (很重), 本 .cpp 一直刻意只依赖 `rl/layer.h` + `rl/loss.h`。
+       MoE 的责任留在 `RL::PPO` 里, 与 `resetMoeBatchStats` / `moeUsageSplit` 同一分工。
+    */
+    ppo.enableMlpGate(hidden);
+    gateMlpHidden = hidden;
 }
 
 /* AgentBase interface */
@@ -1078,55 +1144,86 @@ std::string PPOMCTSAgent::selfCheckReport() const
                   moeLayers, moeExperts, moeK, (double)moeAuxCoef,
                   actorParamCount(), criticParamCount());
     out += buf;
+    /*
+       ---- [2026-10] 路由均衡口径必须**自报** ----
+       与 SAC 那两支同一个理由: 无辅助损失偏置是**非参数缓冲** —— 不进权重文件、
+       不进 paramCount、不进结构指纹, 所以"这一支到底开没开"从别处**一个读数都看不出来**,
+       而它直接决定专家负载是 MaxVio≈0 还是 0.3~0.5 (见
+       docs/moe_gate_experiment_2026_10.md §12)。
+       门控结构同理: "以为开了 MLP 门控其实没开"完全静默。
+    */
+    std::snprintf(buf, sizeof(buf),
+                  "  均衡口径: %s (偏置 rate=%.4g) | 门控 %s (隐层 %d) | 偏置不进权重/"
+                  "不进参数量\n",
+                  ppo.moeLossFreeBias ? "辅助损失 + 无辅助损失偏置 (Loss-Free Balancing)"
+                                      : "**仅辅助损失 (改动前的行为)**",
+                  (double)ppo.moeLossFreeBiasRate,
+                  (gateMlpHidden > 0) ? "MLP 三层 (d->h->E)" : "线性 单层仿射 (出厂口径)",
+                  gateMlpHidden);
+    out += buf;
 
+    /*
+       ---- 专家负载: **按前向来源拆开**报 ----
+       `moeUsage` 读的是生命周期累计, 它混着"训练批的前向"与"MCTS 展开/叶子估值的前向",
+       而后者在数量上通常压倒前者 ⇒ 只看合计会把"搜索访问到的局面分布"当成"训练批的
+       路由分布", 于是**判不出均衡机制有没有生效** (这正是本工程栽过的那一类错读数)。
+       口径与界面上的 MoE 负载控件、bench_ppo_moe_balance 完全一致:
+         MaxVio = max_i share_i/(1/E) − 1 (0 = 完美均衡, 与 Loss-Free 论文同口径);
+         有效专家 = 份额 > 5% 的个数。**不报 max/min** —— 它对"最弱专家是 1.1% 还是 2.7%"
+         过敏, 容易把噪声当趋势 (那两个数只在诊断工具里留一份原始计数)。
+    */
+    std::vector<long long> trUsage, infUsage;
+    moeUsageSplit(trUsage, infUsage);
     std::vector<long long> usage;
     moeUsage(usage);   /* 两个网络的专家使用次数逐专家相加 (只读快照) */
     if (!usage.empty()) {
-        long long sum = 0;
-        long long mx = usage[0];
-        long long mn = usage[0];
-        int mxIdx = 0;
-        int dead = 0;
-        for (std::size_t e = 0; e < usage.size(); e++) {
-            const long long v = usage[e];
-            sum += v;
-            if (v > mx) { mx = v; mxIdx = (int)e; }
-            if (v < mn) { mn = v; }
-            if (v <= 0) { dead++; }
-        }
-        if (sum <= 0) {
-            /* 全 0 ≠ 路由塌陷: 更可能是"这份网络的用量计数根本没被记录" -> 说清楚 */
-            out += "  专家使用: 全为 0 (还没跑过前向, 或这份网络没开用量计数)"
-                   " -> 不能据此判路由塌陷\n";
-        } else {
-            const double mean = (double)sum / (double)usage.size();
-            std::snprintf(buf, sizeof(buf),
-                          "  专家使用: max %lld (第 %d 个) | min %lld | mean %.0f |"
-                          " max/mean %.2f | 从未被选中 %d 个\n",
-                          mx, mxIdx, mn, mean,
-                          (mean > 0.0) ? (double)mx / mean : 0.0, dead);
-            out += buf;
-            if (dead > 0) {
+        auto loadLine = [](const char *name, const std::vector<long long> &v,
+                           char *bufOut, std::size_t bufLen) {
+            long long tot = 0;
+            for (std::size_t i = 0; i < v.size(); i++) { tot += v[i]; }
+            if (tot <= 0) {
+                std::snprintf(bufOut, bufLen, "  %s: 无前向", name);
+                return;
+            }
+            double mx = 0.0, mn = 1.0;
+            int eff = 0;
+            for (std::size_t i = 0; i < v.size(); i++) {
+                const double sh = (double)v[i] / (double)tot;
+                if (sh > mx) { mx = sh; }
+                if (sh < mn) { mn = sh; }
+                if (sh > 0.05) { eff++; }
+            }
+            std::snprintf(bufOut, bufLen,
+                          "  %s: 前向 %lld | MaxVio %.3f | 最小份额 %.1f%% | 有效专家 %d/%d",
+                          name, tot, mx * (double)v.size() - 1.0, 100.0 * mn, eff,
+                          (int)v.size());
+        };
+        char lineTr[192], lineInf[192], lineAll[192];
+        loadLine("训练侧", trUsage, lineTr, sizeof(lineTr));
+        loadLine("推理侧", infUsage, lineInf, sizeof(lineInf));
+        loadLine("合计  ", usage, lineAll, sizeof(lineAll));
+        out += std::string("  MaxVio = max_share/(1/E) − 1 (0 = 完美均衡); 有效专家 = 份额 >5%\n");
+        out += std::string(lineTr) + "   <== 判均衡机制看这一列\n";
+        out += std::string(lineInf) + "   (搜索访问分布, 不是训练批的路由分布)\n";
+        out += std::string(lineAll) + "\n";
+        if (!trUsage.empty()) {
+            long long trTot = 0, trDead = 0;
+            for (std::size_t i = 0; i < trUsage.size(); i++) {
+                trTot += trUsage[i];
+                if (trUsage[i] <= 0) { trDead++; }
+            }
+            if (trTot <= 0) {
+                out += "  判读: 训练侧还没有前向 (没学过 / 这一支还没跑过批学习) -> "
+                       "不能据此判路由塌陷\n";
+            } else if (trDead > 0) {
                 std::snprintf(buf, sizeof(buf),
-                              "  判读: 有 %d 个专家从未被选中 -> 路由塌陷 (本工程实测过"
-                              "极端 [0,0,542,98]), 那份容量是白给的; 看 moeAuxCoef=%.2f\n",
-                              dead, (double)moeAuxCoef);
-                out += buf;
-            } else if (mean > 0.0 && (double)mx / mean > 3.0) {
-                std::snprintf(buf, sizeof(buf),
-                              "  判读: 最大专家是均值的 %.2f 倍 -> 负载偏心 (CV 大),"
-                              " 专家容量没被均匀使用\n",
-                              (double)mx / mean);
-                out += buf;
-            } else {
-                std::snprintf(buf, sizeof(buf),
-                              "  判读: 专家负载大致均匀 (max/mean %.2f) -> 没有路由塌陷\n",
-                              (mean > 0.0) ? (double)mx / mean : 0.0);
+                              "  判读: 训练侧有 %lld 个专家从未被选中 -> 路由塌陷;"
+                              " 看均衡口径那一行 (偏置均衡默认应已打开)\n", trDead);
                 out += buf;
             }
         }
     } else {
-        /* 骨干不是稀疏 MoE (MlpExpert) 时 moeUsage 为空 —— 说"不适用", 而不是印 0 个专家 */
+        /* 骨干不是稀疏 MoE 时 moeUsage 为空 —— 说"不适用", 而不是印 0 个专家 */
         out += "  专家使用: 这个骨干没有稀疏 MoE 层 -> 负载均衡不适用 (无专家可塌陷)\n";
     }
 

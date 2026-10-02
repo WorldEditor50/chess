@@ -101,6 +101,24 @@ file(GLOB APP_HEADER_DEPS
     ${SRC_DIR}/*.h
     ${SRC_DIR}/*.hpp)
 
+# ---------------------------------------------------------------------------
+# [2026-10 修] .ui / .qrc 也必须进依赖表。
+#
+# 实测到的静默失效 (用户报"界面上改了却看不到变化"): 改了 `mainwindow.ui` 之后,
+# AUTOUIC **确实**重新生成了 `chess_autogen/include/ui_mainwindow.h`, 但
+# `CMakeFiles/chess.dir/src/mainwindow.cpp.obj` 与 `chess.exe` 的时间戳**都没动**,
+# ninja 报 "no work to do" —— 也就是说 `mainwindow.cpp` 的编译语句里没有把这个
+# 生成头文件 (或 .ui 本身) 当输入。结果是: 界面改动被**静默丢弃**,
+# 而日志上一切正常 (既没有错误, 也有 "Configuring done")。
+#
+# 根因: 上面的 GLOB 只覆盖 *.h / *.hpp。OBJECT_DEPENDS 里没有 .ui, 于是
+# AUTOUIC 的重新生成与"重新编译 mainwindow.cpp"这两件事之间**断了链**。
+# 代价只有一次多余的重编 (改 .ui 时本来就该重编), 而收益是"改了就能看见"。
+# ---------------------------------------------------------------------------
+list(APPEND APP_HEADER_DEPS
+     ${SRC_DIR}/mainwindow.ui
+     ${SRC_DIR}/res.qrc)
+
 # ============================================================================
 # CHESS_CORE - 游戏层 (棋盘 + 引擎 + 全部 agent) 只编译**一次**
 # ============================================================================
@@ -311,6 +329,7 @@ set(APP_SOURCES
     ${SRC_DIR}/mainwindow.cpp
     ${SRC_DIR}/thinkingindicator.cpp
     ${SRC_DIR}/metricsview.cpp
+    ${SRC_DIR}/moeloadview.cpp
     ${SRC_DIR}/busydialog.cpp
     ${SRC_DIR}/mainwindow.ui
     ${SRC_DIR}/res.qrc
@@ -655,7 +674,19 @@ if(CHESS_BUILD_TESTS)
     ${SRC_DIR}/sacazmoetbagent.cpp
     ${SRC_DIR}/sacazmoemlpagent.cpp
         ${SRC_DIR}/sacazlegacyagent.cpp
-        ${SRC_DIR}/dqnabagent.cpp)
+        ${SRC_DIR}/dqnabagent.cpp
+        # [2026-10 修] dqnmctsmoetbagent.cpp 原来**漏在这个目标的清单里**
+        # (commit 4a6ba2f 加这个类时, 只把它加进了 CHESS_CORE 与另外几个目标)。
+        # 后果: 本目标编译了 chessboard.cpp (它引用 DQNMCTSMOETbAgent 的构造函数、
+        # selectMove、trainSelfPlay、moeExpertCount/moeTopK/moeUsage、save/loadModel、
+        # defaultWeightPrefix 等 10 个符号), 却没有编译它们的定义 ->
+        # **LNK2019 x10 + LNK1120**; 而同一个工程里 chess 目标链接正常
+        # (它走 CHESS_CORE 静态库, 那里有这个文件)。
+        # 用户报的"chessboard.cpp.obj LNK2019 指向 DQNMCTSMOETbAgent 构造函数"就是这一条
+        # —— 他构建的是整个工程 (Qt Creator 会连带构建这个目标), 不是单独构建 chess。
+        # ⚠ 教训: 新增一个 .cpp 要加到**每一个直接列源文件的目标**上, 不能只加
+        # CHESS_CORE; 只在 --target chess 下构建是查不出来的。
+        ${SRC_DIR}/dqnmctsmoetbagent.cpp)
     target_include_directories(repro_concurrency PRIVATE ${SRC_DIR})
     target_link_libraries(repro_concurrency PRIVATE
         RL_CORE
@@ -902,6 +933,93 @@ if(CHESS_BUILD_TESTS)
         AUTOUIC OFF
         AUTORCC OFF)
     chess_add_header_deps(bench_moe)
+
+    # ------------------------------------------- MoE 门控变体的受控实验 (2026-09)
+    # **不进 ctest**: 打印的是读数与判定, 不是通过/失败; [2][3] 带多个随机种子, 分钟级。
+    # 它回答三件事:
+    #   [1] MLP/logistic/偏置均衡三条新门控路径的解析梯度 (有限差分)
+    #   [2] 两个可证伪的合成任务: 线性可分区域 vs XOR 型区域, 看 MLP 门控到底买到什么
+    #   [3] 真实棋局状态 (1710 维真实编码) 上的路由偏斜与"均衡可达性"
+    # 手动跑:
+    #   cmake --build <build> --target bench_gate_moe
+    #   <build>/bench_gate_moe --quick                  # 冒烟 (~1 分钟)
+    #   <build>/bench_gate_moe --seeds=8 --steps=600    # 正式读数
+    add_executable(bench_gate_moe
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_gate_moe_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_include_directories(bench_gate_moe PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_gate_moe PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_gate_moe PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_gate_moe PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_gate_moe)
+
+    # ------------------------------------------- PPO 骨干的 MoE 负载均衡 A/B (2026-10)
+    # **不进 ctest**: 跑真实自对弈 + 真实训练, 分钟级, 而且它打印的是读数与判定而不是
+    # 通过/失败。与 bench_gate_moe 的分工: 那一份量"路由机制"(固定状态/合成任务, 便宜),
+    # 这一份量"生产训练链路上的均衡"(真 MCTS/真梯度/真优化器)。回答两件事:
+    #   Q1 只靠辅助损失 moeAuxCoef (哪怕开到 10) 能不能把专家负载拉平? -> 预期不能
+    #   Q2 换成"无辅助损失偏置均衡"(arXiv:2408.15664) 之后能不能? -> 预期能
+    # 手动跑:
+    #   cmake --build <build> --target bench_ppo_moe_balance
+    #   <build>/bench_ppo_moe_balance --quick                 # 冒烟 (~1 分钟)
+    #   <build>/bench_ppo_moe_balance --games=4 --batches=8    # 正式读数
+    add_executable(bench_ppo_moe_balance
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_moe_balance_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_ppo_moe_balance PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_moe_balance PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_moe_balance PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_moe_balance PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_moe_balance)
+
+    # ------------------------------------------- PPO 骨干 E/top-k 的代价实测 (2026-10)
+    # **不进 ctest**: 跑真实自对弈与批学习, 分钟级, 且它打印读数与判定而不是通过/失败。
+    # 存在的理由: `src/rl/ppo.h` 的 PPO_MOE_EXPERTS / PPO_MOE_TOPK 是**编译期常量**, 改它们
+    # 的代价只能靠实测 —— 而两种骨干在同一个二进制里都能建 (RL::PPO::Backbone 是运行时
+    # 参数), 所以"4/1 vs 8/2 贵多少"一次跑完。量四件事: 参数量 / ms/模拟 / 峰值工作集 /
+    # 训练侧负载 MaxVio。手动跑:
+    #   cmake --build <build> --target bench_ppo_backbone_tb
+    #   <build>/bench_ppo_backbone_tb --quick
+    add_executable(bench_ppo_backbone_tb
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_ppo_backbone_tb_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_include_directories(bench_ppo_backbone_tb PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_ppo_backbone_tb PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_ppo_backbone_tb PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_ppo_backbone_tb PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_ppo_backbone_tb)
 
     # ------------------------------------------- PPO+MCTS vs Alpha-Beta 静默对弈
     # **不进 ctest**: 同 bench_moe —— 跑真实对局、依赖随机开局, 而且默认双方用的是

@@ -20,6 +20,12 @@
 namespace RL {
 
 /*
+ * [2026-10] 实时路由探针 (界面呼吸灯) —— 定义在 rl/sparse_moe.hpp, 而本头文件**故意
+ * 不包含它** (那一份很重: transformer/expert/net 全在里面, 而这里只需要一个指针)。
+ */
+class MoERouteProbe;
+
+/*
  * ============================================================
  *  PPO 的稀疏 MoE 骨干配置 —— 换专家 / 换专家数 / 换 top-k 只改这一段
  * ============================================================
@@ -38,8 +44,38 @@ namespace RL {
  */
 constexpr int PPO_MOE_TB_HEADS = 16;
 constexpr int PPO_MOE_TB_DFF   = 360;
-constexpr int PPO_MOE_EXPERTS  = 4;
-constexpr int PPO_MOE_TOPK     = 1;
+/*
+ * ---- [2026-10] 用户口径: "增加 PPO agent 的 TB 专家与 top-k 数量": 4/1 -> 8/2 ----
+ *
+ * 两个数都是 `SparseMoE<Expert, NumExperts, TopK>` 的**编译期模板参数**, 所以这是
+ * 结构性改动: `paramCount()` 变了、内存布局变了、`weights/ppomcts_agent*` 的存量权重
+ * 全部作废 (`Net::load` 的参数量守卫**明确拒绝**, 不是静默错读 —— 那正是守卫存在的理由)。
+ *
+ * ---- 代价 (SAC 那两支同型改动的实测, 见 docs/moe_gate_experiment_2026_10.md §9) ----
+ *   E=4/top-1 -> E=8/top-2: 参数量 2.00x, 训练 20 局时间 1.88x, ms/步 1.90x,
+ *   峰值工作集 577 MB -> 1,138 MB (1.97x)。
+ *   两条不同的账要分开记:
+ *     * **加 E 只加内存**(参数量 ∝ E, 算力与 E 无关);
+ *     * **加 top-k 直接乘算力**(算力 ∝ k), 而"模拟次数"是本工程**唯一测出过棋力**的
+ *       杠杆 (40/64/120 模拟 -> 42.2% / 50.0% / 62.5%) ⇒ 这一半是拿唯一有效的旋钮
+ *       去换容量。所以界面预算 `PPO_SIMS` 必须跟着这次改动重算 (见 chessboard.cpp)。
+ *   PPO 这条还要多一层: 它**没有共享骨干**, actor 与 critic 各背一套完整 TB 专家
+ *   (SAC 那两支是共享骨干 + 三头)。所以同样的 E/k 下 PPO 的内存约是 SAC 的 2 倍 ——
+ *   实测值见本节末尾与 README。
+ *
+ * ---- 负载: 专家越多越不均衡, 所以偏置均衡是配套前提 (不是可选项) ----
+ *   SAC 支实测 (同一轮): E=4 训练侧 MaxVio 0.049, E=8 变 0.477 (**差一个数量级**);
+ *   开了无辅助损失偏置均衡之后 E=8 回到 0.050。PPO 这边已经默认开了同一个机制
+ *   (`moeLossFreeBias`, 见 chessboard.cpp 的 PPO_MOE_LOSSFREE), 所以这次改数
+ *   **必须**与它一起生效 —— 否则 E=8 会带回来一个 0.4~0.5 的负载偏斜。
+ *
+ * ---- 棋力: 这一轮同样**没有**结论 ----
+ *   SAC 支那次 32 局里只有 4 局分出胜负, 两组 95% 区间全跨 50%; PPO 这条更弱
+ *   (与 Alpha-Beta 的对局实测 0 胜), 所以**不要**把这次改动当成"更强"。它换来的是
+ *   容量与"两个专家一起投票"的路由表达力, 代价是明确的 (**每模拟的算力**)。
+ */
+constexpr int PPO_MOE_EXPERTS  = 8;
+constexpr int PPO_MOE_TOPK     = 2;
 
 using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
 
@@ -54,10 +90,11 @@ using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
  *   配置                        参数量     前向       前向+反向
  *   MlpExpert        E=8 top-2   2.15 M   0.139 ms    1.94 ms
  *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms
+ *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms   <- 现役 (2026-10)
  *
  * (数字来自 ppo.h 上面那张实测表; MLP 专家便宜 ~25×、容量小 ~18×。)
- * 选择方式见 `PPO::Backbone` —— 运行时参数, 默认仍是 TB 专家, 所以现役 agent、
- * 测试与 bench 的行为**逐位不变**。
+ * 选择方式见 `PPO::Backbone` —— 运行时参数。**默认仍是 TB 专家 (E=8/top-2)**, 所以
+ * 现役 agent 与测试跟着编译期常量走; 想比"便宜骨干"就在另一个 agent 那一支上看。
  */
 constexpr int PPO_MOE_MLP_EXPERTS = 8;
 constexpr int PPO_MOE_MLP_TOPK    = 2;
@@ -67,15 +104,18 @@ constexpr int PPO_MOE_MLP_TOPK    = 2;
  *
  * 骨干 (2026-09 第二次改版): **专家从 MlpExpert 换成 TransformerBlock**。
  *   旧: SparseMoE<MlpExpert, 8, 2>                  (便宜的 MLP 专家, 容量小)
- *   新: SparseMoE<TransformerBlock<16,360>, 4, 1>   (与 SAC+AZ 那条骨干同一族)
+ *   新: SparseMoE<TransformerBlock<16,360>, 8, 2>   (与 SAC+AZ 那条骨干同一族)
  * 第一次改版是"稠密 MOE<8,4> -> 稀疏路由" (下面那段注释), 那件事没有回退。
  *
- *   actorP  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Softmax(actionDim)
- *   critic  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Linear(1)
+ *   actorP  : state -> SparseMoE(E=8, top-2, 专家 = TB<16,360>) -> Tanh(h) -> Softmax(actionDim)
+ *   critic  : state -> SparseMoE(E=8, top-2, 专家 = TB<16,360>) -> Tanh(h) -> Linear(1)
+ *   (E/top-k 在 2026-10 按用户口径从 4/1 提到 **8/2** —— 代价账与"为什么必须同时开着偏置均衡"
+ *    见文件顶部那段注释。)
  *
- * 为什么换: MlpExpert 的容量被它的隐层宽度锁死 (2·d·h ≈ 0.18 M MAC/专家), 而
+ * 为什么换专家类型: MlpExpert 的容量被它的隐层宽度锁死 (2·d·h ≈ 0.18 M MAC/专家), 而
  * TransformerBlock 专家带完整的注意力 + FFN (4·d² + 2·d·d_ff ≈ 9.3 M MAC/专家) ——
- * 参数量 2.15 M -> 38.0 M (**17.7×**), 这是"专家"这个词在本工程里第一次真的代表容量。
+ * 参数量 2.15 M -> 38.0 M (**17.7×**, E=4/top-1 口径), 这是"专家"这个词在本工程里
+ * 第一次真的代表容量。
  *
  * 代价 (实测: 单网络, d=1440/h=64/头=8100, MSVC Release + AVX2;
  *       复现脚本 .r1build/bench_ppo_expert.cpp):
@@ -85,14 +125,21 @@ constexpr int PPO_MOE_MLP_TOPK    = 2;
  *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms     608 MB
  *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms    1205 MB
  *
- * **专家数与 top-k 一起从 8/2 降到 4/1**, 理由有两条, 都是实测而不是偏好:
- *   1. 内存: withGrad=true 时每个全连接张量有 w/g/v/m **四份** (见 rl/layer.h 的
- *      iFcLayer 构造函数), 于是 E=8/top-2 的 actor+critic ≈ 2.4 GB —— 训练侧直接
- *      不可用; E=4/top-1 是 1.22 GB, 与改版前同一量级。
- *   2. 算力: top-k 直接乘在算力上, 而一个 TB 专家比一个 MlpExpert 贵 ~50×,
- *      所以"容量不按 k 付费"这条稀疏 MoE 的性质在这里比 MLP 专家重要得多。
- *   这正是 SACAZAgent 那条 TB 骨干选 E=4/top-1 (MOE_TB_EXPERTS/MOE_TB_TOPK)
- *   的同一套理由。要回到"容量优先": 改上面 PPO_MOE_EXPERTS/PPO_MOE_TOPK 两个常量。
+ * 这张表就是"E/top-k 各买什么"的全部依据 —— **两笔账必须分开记**:
+ *   1. **内存** ∝ E: `withGrad=true` 时每个全连接张量有 w/g/v/m **四份** (见
+ *      rl/layer.h 的 iFcLayer 构造函数), 于是每个网络的四份缓冲从 608 MB 涨到
+ *      1205 MB。而 PPO 这条**没有共享骨干** —— actor 与 critic 各背一套完整专家
+ *      (SAC 那两支是共享骨干 + 三头) ⇒ 峰值内存约是表里那个数的**两倍**。
+ *   2. **算力** ∝ k, 与 E 无关: top-k 直接乘在每模拟的前向上 (3.59 -> 6.24 ms,
+ *      1.74×)。而"模拟次数"是本工程**唯一测出过棋力**的杠杆 (40/64/120 模拟 ->
+ *      42.2% / 50.0% / 62.5%), 所以 k 那一半是拿唯一有效的旋钮去换容量 —— 界面上
+ *      必须把预算按实测重算 (chessboard.cpp 的 PPO_SIMS), 不能当它免费。
+ *
+ * 历史上这两个数曾经从 8/2 **降到** 4/1 (理由就是上面那两笔账: E=8/top-2 的
+ * actor+critic ≈ 2.4 GB), 那次降级在 2026-10 按用户口径回退到 8/2 ⇒ 那批
+ * `weights/ppomcts_agent*` 权重随之作废 (`Net::load` 的参数量守卫会明确拒绝,
+ * 不是静默错读 —— 那正是守卫存在的理由)。要再切回"速度优先"或"容量优先", 改的仍然
+ * 只有文件顶部 PPO_MOE_EXPERTS / PPO_MOE_TOPK 两个常量 (改完必须重训这两支)。
  *
  * 第一次改版 (稠密 MOE -> 稀疏路由, 未回退): 稠密的 MOE 会把**全部**专家都算一遍
  * 再做门控加权和, 于是"专家数"直接乘在算力上 —— 那是稠密混合, 不是 MoE 的卖点。
@@ -299,6 +346,46 @@ public:
 
     /* 清掉 MoE 门控批统计, 让负载均衡辅助损失只反映本批的训练前向 */
     void resetMoeBatchStats();
+    /*
+       ================================================================
+       [2026-10] 批边界的两步: 先"结算本批", 再"注入辅助损失"
+       ================================================================
+       为什么必须有这两个函数而不是把逻辑塞进 applyGradients(): 批统计 (`usageBatch` /
+       `batchForwardCount`) 的**生命周期**是"上一次 resetMoeBatchStats() 到下一次",
+       而能读它的两个消费者要求的时机不同:
+
+         * `addAuxGradient(coef)`  —— 必须在**读完之后自己清空** (它的实现末尾就清了),
+           所以它只能在批的最后被调用**一次**;
+         * `updateLossFreeBias()` —— 同样读"本批各专家被选中多少次", 但它**不清**统计。
+           因此它必须排在 addAuxGradient **之前**, 否则读到的是全 0。
+
+       `finalizeMoeBatch()` 就是"按正确顺序做这两件事"的唯一入口, 且**默认配置下是空操作**
+       (`lossFreeBias=false` 时既不累计也不注入任何东西 —— 保持与改动前逐位相同)。
+       调用点: `learnFromReplay` / `learnSelfPlay` / `trainStep` 在 `applyGradients` 之前。
+    */
+    void finalizeMoeBatch();
+    /* 只做偏置控制回路那一半 (可单独调用; 见 finalizeMoeBatch 的说明) */
+    void applyMoeBiasUpdate();
+    /*
+       ================================================================
+       [2026-10] 把两层骨干的门控换成三层 MLP: `d_model -> hidden (tanh) -> E`
+       ================================================================
+       与 `RL::SparseMoE::enableMlpGate` 同一套机制 (线性门控只能用 E 张超平面切状态
+       空间; 真实棋局状态的方向几乎共线 ⇒ 表达力先于均衡成为瓶颈)。
+
+       ⚠ **必须在任何前向之前调用** —— 它会重建并重新初始化门控权重。
+       ⚠ **会让存量权重作废**: 线性门控是 `wg (E,d_model)`, MLP 门控是
+         `wg1 (hidden,d_model) + wg2 (E,hidden)`, 形状不同 ⇒ `Net::load` 的参数量守卫
+         明确拒绝, 只能从随机初始化重练 (`SparseMoE::read` 还会检查 `#GATE:mlp:<h>`
+         自描述标记, 所以"MLP 权重喂给线性网络"不会静默错位)。
+       ⚠ 它**不是**负载均衡的手段: 受控实验里 MLP 门控买到路由纯度 +0.15~0.31, 同时
+         把 MaxVio 从 0.30 推到 1.43~1.79。正确用法是与 `moeLossFreeBias` **配对**
+         (前者管路由得更准, 后者管负载别塌)。见
+         `docs/moe_gate_experiment_2026_10.md` 的 §0/§7。
+       ⚠ 幂等只在"意图"层面 (已经是 MLP 就直接返回): "同一个 hidden 重复调用"由调用方
+         (agent 的 `gateMlpHidden`) 去挡。真正的要求是**只调一次、在任何前向之前**。
+    */
+    void enableMlpGate(int hidden);
     /* 只累积梯度 (前向 + 反向), 不碰优化器 */
     void accumulateGrad(const Tensor &state, const Tensor &actionTarget, float valueTarget);
 
@@ -400,7 +487,25 @@ public:
     long long criticParamCount() const { return critic.paramCount(); }
     /* 把两个网络的专家使用次数**逐专家相加**输出 (长度 = 专家数) */
     void moeUsage(std::vector<long long> &out) const;
+    /*
+       [2026-10] 按**前向来源**拆开的专家使用次数 (长度 = 专家数)。
+         * `trainOut` = 各训练批的前向 (由 `finalizeMoeBatch()` 在批边界累计);
+         * `inferOut` = MCTS 展开 / 叶子估值 / 评测对弈的前向 (= 合计 − 训练侧)。
+       为什么必须拆: 搜索一次决策就要几十~几百次前向, 数量上压倒训练批 —— 只看合计会把
+       "搜索访问到的局面分布"当成"训练批的路由分布", 于是**判不出均衡机制有没有生效**。
+       与 SAC 那两个 MoE agent 的 `moeUsageSplit` 同一口径 (实现见 rl/sparse_moe.hpp 的
+       `ISparseMoE::usageSnapshotSplit`)。
+    */
+    void moeUsageSplit(std::vector<long long> &trainOut,
+                       std::vector<long long> &inferOut) const;
+    /* 读一份"无辅助损失偏置"的快照 (每个专家一个 b_i; 未开启时为空) */
+    void moeBiasSnapshot(std::vector<float> &out) const;
     void resetMoeUsage();
+    /*
+       [2026-10] "此刻哪个专家在工作"的**无锁**实时探针 (界面呼吸灯)。
+       取的是 **actor (策略网)** 那一层 —— 理由见 ppo.cpp 里的说明。
+    */
+    const MoERouteProbe *moeRouteProbe() const;
 
 public:
     int stateDim;
@@ -412,6 +517,34 @@ public:
     float exploringRate;
     /* 负载均衡辅助损失系数, <=0 关闭。与 SACAZAgent 的默认值一致 (0.1) */
     float moeAuxCoef;
+
+    /*
+       ================================================================
+       [2026-10] 无辅助损失偏置均衡 (Loss-Free Balancing, arXiv:2408.15664)
+       ================================================================
+       修的是 PPO 这条骨干上实测出来的缺陷: **只靠辅助损失, 专家负载根本拉不平**。
+       `docs/moe_gate_experiment_2026_10.md` 的 [3b] 在同一批真实棋局状态上做过受控对照:
+       `linear+softmax` 门控即使把 `coef` 开到 **10**, MaxVio 也恒为理论最大值 3.000、
+       有效专家 1.00 —— 根因是 **辅助损失的梯度正比于饿死专家自己的门控概率 (≈0)**,
+       放大系数乘的仍然是 0。而把均衡的作用点从"梯度"换到"top-k 的 argmax 比较项"之后,
+       同一实验里 MaxVio 降到 0.29~0.32、有效专家回到 4.00。
+
+       机制 (与 SAC 那两个 MoE agent 共用同一份实现, 见 rl/sparse_moe.hpp):
+           选择专家时比较  gate[i] + biasGate[i]
+           输出加权仍用    gate[i]            ← 偏置**不进**输出权重, 所以前向数值不变
+           每批结束后      biasGate[i] += rate * sign(mean_load − load_i)
+       它是**纯控制回路、不产生任何梯度** —— 这正是"调大 auxLossCoef" 与它的本质区别
+       (后者往主目标里注入干扰梯度)。
+
+       ⚠ 两个刻度坑 (SAC 支实测): 论文推荐 0.001, 但那是在"学习步密集"的设定下 ——
+       本工程的训练节拍很稀疏 (一局一步 RMSProp), 0.001 在会话尺度上几乎不动。
+       `docs/moe_gate_experiment_2026_10.md` §8 用的是 0.01。所以 rate 要**按学习步数**
+       选, 不能照抄论文。
+
+       **默认关**: 关着时走与改动前逐位相同的那条分支 (不碰偏置、不清批统计)。
+    */
+    bool  moeLossFreeBias = false;
+    float moeLossFreeBiasRate = 0.01f;
 
     /*
        ================================================================

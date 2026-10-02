@@ -133,6 +133,25 @@ struct Cfg {
     float clampTarget = 2.0f;
     float huberDelta = 1.0f;
     float aux = 0.1f;
+    /*
+       ---- [2026-10 门控实验] 无辅助损失的偏置均衡 ----
+       报告 `docs/moe_gate_experiment_2026_10.md` 的"建议 1": 在真实棋局状态分布上,
+       靠辅助损失的 softmax 门控**即使 coef=10 也拉不动负载**(MaxVio 恒为理论最大,
+       有效专家 1.00), 因为它的梯度正比于饿死专家自己的门控概率(≈0); 而本开关
+       **完全走 argmax、不产生梯度**, 在同一实验里做到 MaxVio 0.29~0.32、有效专家 4.00。
+       默认关 (= agent 的默认), 打开后仍可叠加 `--aux` (推荐设 `--aux=0` 做干净对照)。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = 0.001f;
+    /*
+       ---- [2026-10 门控实验] MLP 门控 (隐层宽度) ----
+       0 = 线性门控 (出厂口径)。>0 = 把骨干的线性门控换成
+       `d_model -> gateHidden (tanh) -> E -> softmax`, 即"三层 MLP"
+       (输入层 / 隐层 / 输出层; 2 个权重矩阵)。
+       必须在**任何** 前向/训练之前装上 —— 它在构造之后、trainSelfPlay 之前调用。
+       配套建议: 与 `--lossfree-bias=1` 一起用 (见 SACAZMoETbAgent::enableMlpGate)。
+    */
+    int gateHidden = 0;
     float gamma = 0.99f;
     int memory = 4096;
     int rewardShape = 0;
@@ -612,6 +631,9 @@ bool parseArgs(int argc, char **argv)
         else if (const char *v = val("--clamp"))     { g_cfg.clampTarget = (float)std::atof(v); }
         else if (const char *v = val("--huber"))     { g_cfg.huberDelta = (float)std::atof(v); }
         else if (const char *v = val("--aux"))       { g_cfg.aux = (float)std::atof(v); }
+        else if (const char *v = val("--lossfree-bias")) { g_cfg.lossFreeBias = (std::atoi(v) != 0); }
+        else if (const char *v = val("--lossfree-bias-rate")) { g_cfg.lossFreeBiasRate = (float)std::atof(v); }
+        else if (const char *v = val("--gate-hidden")) { g_cfg.gateHidden = std::atoi(v); }
         else if (const char *v = val("--gamma"))     { g_cfg.gamma = (float)std::atof(v); }
         else if (const char *v = val("--memory"))    { g_cfg.memory = std::atoi(v); }
         else if (const char *v = val("--reward-shape")){ g_cfg.rewardShape = std::atoi(v); }
@@ -687,7 +709,9 @@ void printConfig(const SACAZMoETbAgent &sac)
     std::printf("            : clamp=%.3g huber=%.3g aux=%.3g rewardShape=%d valueScale=%.3g rewardScale=%.3g "
                 "sparseLeaf=%d learnFromSearch=%d entropyInTarget=%.3g entropySlots=%d\n"
                 "            : [动态奖励] mateScoreMode=%d matBoost=%.3g mateBoost=%.3g (只有 rewardShape=3 读)\n"
-                "            : [实验轮] criticTanh=%d rewardTanhGain=%.3g alphaGumbel=%.3g alphaCeiling=%.3g entropyCenter=%d\n",
+                "            : [实验轮] criticTanh=%d rewardTanhGain=%.3g alphaGumbel=%.3g alphaCeiling=%.3g entropyCenter=%d\n"
+            "            : [门控实验] lossFreeBias=%d rate=%.4g (与 aux 独立; 两个都关 = 改动前的行为)\n"
+            "            : [门控实验] gate=%-22s (gateHidden=%d; 0 = 线性门控)\n",
                 (double)g_cfg.clampTarget, (double)g_cfg.huberDelta, (double)g_cfg.aux,
                 g_cfg.rewardShape, (double)g_cfg.valueScale, (double)g_cfg.rewardScale,
                 (int)g_cfg.sparseLeaf, (int)g_cfg.learnFromSearch,
@@ -696,7 +720,10 @@ void printConfig(const SACAZMoETbAgent &sac)
                 (double)g_cfg.mateRewardBoost,
                 (int)g_cfg.criticTanh, (double)g_cfg.rewardTanhGain,
                 (double)g_cfg.alphaGumbelSigma, (double)g_cfg.alphaCeiling,
-                (int)g_cfg.entropyCenter);
+                (int)g_cfg.entropyCenter,
+                (int)g_cfg.lossFreeBias, (double)g_cfg.lossFreeBiasRate,
+                (g_cfg.gateHidden > 0) ? "MLP (三层: d->h->E)" : "线性 (单层仿射)",
+                g_cfg.gateHidden);
     std::printf("参数量    : 唯一 %lld (actor.paramCount()=%lld, 共享口径下它会把骨干重复计入三张视图)\n",
                 sac.uniqueParamCount(), sac.actor.paramCount());
 }
@@ -722,6 +749,42 @@ void printDiag(const SACAZMoETbAgent &sac, const char *tag)
     }
     std::printf(" 没用到的专家=%d max/min=%.2f\n", unused,
                 (lo > 0) ? (double)hi / (double)lo : 0.0);
+    /*
+       [2026-10] **按前向来源拆开**的读数 —— 上面那一行是生命周期累计, 混着训练与
+       MCTS 推理; 判断"均衡机制在训练批上生效没有"只能看下面这两行。
+       MaxVio = max_i share_i / (1/E) - 1 (与 Loss-Free 论文同口径, 0 = 完美均衡);
+       有效专家 = 份额 >5% 的专家个数。
+    */
+    {
+        std::vector<long long> tr, inf;
+        sac.moeUsageSplit(tr, inf);
+        auto line = [&](const char *name, const std::vector<long long> &v) {
+            if (v.empty()) {
+                return;
+            }
+            long long tot2 = 0;
+            for (long long x : v) { tot2 += x; }
+            if (tot2 <= 0) {
+                std::printf("  专家负载(%s): 无前向\n", name);
+                return;
+            }
+            double mx = 0.0, mn = 1.0;
+            int eff = 0;
+            std::printf("  专家负载(%s): {", name);
+            for (std::size_t i = 0; i < v.size(); i++) {
+                const double sh = (double)v[i] / (double)tot2;
+                mx = std::fmax(mx, sh);
+                mn = std::fmin(mn, sh);
+                if (sh > 0.05) { eff++; }
+                std::printf("%lld%s", v[i], (i + 1 < v.size()) ? "," : "}");
+            }
+            const double maxVio = mx * (double)v.size() - 1.0;
+            std::printf(" 总=%lld MaxVio=%.3f 最小份额=%.3f 有效专家=%d\n",
+                        tot2, maxVio, mn, eff);
+        };
+        line("训练侧", tr);
+        line("推理侧", inf);
+    }
     const SACAZMoETbAgent::TrainDiag &D = sac.getTrainDiag();
     if (D.n > 0) {
         std::printf("  训练诊断: 样本=%lld 被夹=%lld(%.1f%%) |y|均=%.4f |Q|均=%.4f "
@@ -800,6 +863,19 @@ int main(int argc, char **argv)
     /* 训练/评测侧旋钮: 只写在**这个实例**上, 不改任何默认值 */
     sac.batchSize = g_cfg.batch;
     sac.replayEpochs = g_cfg.epochs;
+    /*
+       [2026-10] 无辅助损失的偏置均衡。必须在任何 trainSelfPlay/learnBatch **之前**
+       设置 —— 它在 learnBatch 里按批读取。默认 false 时是空操作 (行为与改动前逐位相同)。
+    */
+    sac.lossFreeBias = g_cfg.lossFreeBias;
+    sac.lossFreeBiasRate = g_cfg.lossFreeBiasRate;
+    /*
+       [2026-10 门控实验] MLP 门控必须在**任何前向之前**装上 (它会重建并重新初始化
+       门控权重)。这里紧跟构造之后调用, 早于下面所有 trainSelfPlay / 评测。
+    */
+    if (g_cfg.gateHidden > 0) {
+        sac.enableMlpGate(g_cfg.gateHidden);
+    }
     sac.targetTau = g_cfg.targetTau;
     sac.replaceTargetIter = g_cfg.targetIter;
     sac.entropyRatio = g_cfg.entropyRatio;

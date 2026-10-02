@@ -347,6 +347,27 @@ void SACAZMoEMlpAgent::moeUsage(std::vector<long long> &out) const
     m->usageSnapshot(out);
 }
 
+/* [2026-10] 实时路由探针 (界面呼吸灯; 见 rl/sparse_moe.hpp 的 MoERouteProbe) */
+const RL::MoERouteProbe *SACAZMoEMlpAgent::moeRouteProbe() const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    return (m != nullptr) ? m->routeProbe() : nullptr;
+}
+
+void SACAZMoEMlpAgent::moeUsageSplit(std::vector<long long> &trainOut,
+                                     std::vector<long long> &inferOut) const
+{
+    RL::Net &self = const_cast<RL::Net&>(actor);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    if (m == nullptr) {
+        trainOut.clear();
+        inferOut.clear();
+        return;
+    }
+    m->usageSnapshotSplit(trainOut, inferOut);
+}
+
 void SACAZMoEMlpAgent::resetMoeUsage()
 {
     for (std::size_t i = 0; i < actor.size(); i++) {
@@ -1811,6 +1832,48 @@ Step SACAZMoEMlpAgent::selectMove(int color, int simulations_, float temp, RL::T
     return Step();
 }
 
+void SACAZMoEMlpAgent::enableMlpGate(int hidden)
+{
+    if (hidden < 1) {
+        return;
+    }
+    /*
+       共享口径下 actor/q1/q2(+目标网) 是**同一个骨干层对象**的多张视图 —— 必须按指针
+       去重 (理由与 SACAZMoETbAgent::enableMlpGate 逐字相同)。
+    */
+    std::vector<RL::ISparseMoE *> seen;
+    auto install = [&seen, hidden](RL::Net &net) {
+        for (std::size_t li = 0; li < net.size(); li++) {
+            RL::ISparseMoE *m = dynamic_cast<RL::ISparseMoE *>(net[li]);
+            if (m == nullptr) {
+                continue;
+            }
+            bool dup = false;
+            for (std::size_t k = 0; k < seen.size(); k++) {
+                if (seen[k] == m) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            seen.push_back(m);
+            m->enableMlpGate(hidden);
+        }
+    };
+    install(actor);
+    install(q1);
+    install(q2);
+    install(q1Target);
+    install(q2Target);
+    if (trunkMode == TrunkMode::Shared) {
+        install(trunk);
+        install(trunkTarget);
+    }
+    gateMlpHidden = hidden;
+}
+
 void SACAZMoEMlpAgent::resetMoeBatchStats()
 {
     if (auxLossCoef <= 0.0f) {
@@ -2177,6 +2240,59 @@ float SACAZMoEMlpAgent::learnBatch(int batchSize_, int epochs)
        坍缩到少数专家、其余永远不训练。细节与有限差分验证见 rl/sparse_moe.hpp
        和 test/test_sparse_moe_main.cpp [6][7]。
     */
+    /*
+       ---- 训练侧前向计数 (批边界) ----
+       必须在这里: 本批的训练前向已经跑完 (usageBatch 记着它们), 而 addAuxGradient
+       末尾会把批统计清零。`usageSnapshotSplit` 的推理侧 = total − 训练侧。
+    */
+    if (trunkMode == TrunkMode::Shared) {
+        for (std::size_t li = 0; li < trunk.size(); li++) {
+            RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
+            if (moe != nullptr) {
+                moe->accumulateTrainBatch();
+            }
+        }
+    } else {
+        RL::Net *nets[3] = {&actor, &q1, &q2};
+        for (int ni = 0; ni < 3; ni++) {
+            for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                if (moe != nullptr) {
+                    moe->accumulateTrainBatch();
+                }
+            }
+        }
+    }
+
+    /*
+       ---- 无辅助损失的偏置均衡 (Loss-Free Balancing) ----
+       必须在 addAuxGradient **之前**: 后者末尾会把批统计清零, 而偏置更新要读的正是
+       "本批各专家被选中多少次"。默认 lossFreeBias=false 时整段是空操作
+       (两条路都关时**故意不**多做一次复位, 以保证默认路径逐位不变)。
+    */
+    if (lossFreeBias) {
+        if (trunkMode == TrunkMode::Shared) {
+            for (std::size_t li = 0; li < trunk.size(); li++) {
+                RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>(trunk[li]);
+                if (moe != nullptr) {
+                    moe->setLossFreeBias(true, lossFreeBiasRate);
+                    moe->updateLossFreeBias();
+                }
+            }
+        } else {
+            RL::Net *nets[3] = {&actor, &q1, &q2};
+            for (int ni = 0; ni < 3; ni++) {
+                for (std::size_t li = 0; li < nets[ni]->size(); li++) {
+                    RL::ISparseMoE *moe = dynamic_cast<RL::ISparseMoE*>((*nets[ni])[li]);
+                    if (moe != nullptr) {
+                        moe->setLossFreeBias(true, lossFreeBiasRate);
+                        moe->updateLossFreeBias();
+                    }
+                }
+            }
+        }
+    }
+
     if (auxLossCoef > 0.0f) {
         /*
            [2026-09 dev-sacmoetb] 共享口径下 actor/q1/q2 是**同一个 MoE 层对象**的

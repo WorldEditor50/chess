@@ -21,6 +21,8 @@
 /* 稀疏 MoE 层只需要指针/引用 (定义在 rl/sparse_moe.hpp, 由 .cpp 包含) */
 namespace RL {
 class ISparseMoE;
+/* [2026-10] 实时路由探针 —— 只返回指针, 所以这里前向声明就够 (同上一条的理由) */
+class MoERouteProbe;
 }
 
 /*
@@ -338,8 +340,47 @@ public:
     /* 各骨干的固定结构 (模板参数必须编译期确定, 所以不做成运行时成员) */
     static constexpr int MOE_MLP_EXPERTS = 8;
     static constexpr int MOE_MLP_TOPK = 2;
-    static constexpr int MOE_TB_EXPERTS = 4;
-    static constexpr int MOE_TB_TOPK = 1;
+    /*
+       ================================================================
+       [2026-10 用户口径] TB 专家数与 top-k: 4/1 -> **8/2**
+       ================================================================
+       这两个数是**模板参数** (`SparseMoE<Expert, NumExperts, TopK>`), 所以改的是
+       编译期结构 —— 代价与收益都跟着变, 逐条列在这里:
+
+       **代价 1: 现有权重全部作废。** 专家数变了 ⇒ `paramCount()` 变了 ⇒ `Net::load`
+       的参数量守卫会**明确拒绝**存量权重 (weights/sacaz_moe_tb*) —— 不是静默错读,
+       但那一支必须**从随机初始化重训**。
+
+       **代价 2: 内存 ×2。** 每个 TB 专家 ≈ 7.17 M 参数 (d_model=1263, d_ff=315,
+       15 头口径: 3·1260·1263 + 1263² + 2·1263·315)。E=4 的 MoE 层 28.7 M,
+       E=8 就是 57.4 M; 而 `withGrad=true` 时每个全连接张量有 w/g/v/m **四份**
+       (见 rl/layer.h), 所以训练时常驻内存随专家数线性翻倍。
+       实测 (共享骨干, 20 局自对弈): E=4/top-1 工作集 **577 MB**;
+       **E=8 已实测 = 1,138 MB (1.97x)**, 量法与命令见 chessboard.cpp 的
+       `createSACAZMoETbAgent` 注释与 build/gate_moe_out/E8k2_workingset.txt。
+       这是这一版之前被否掉的那个方向的直接代价
+       (rl/ppo.h 记着: 独立骨干口径下 E=8/top-2 的 actor+critic ≈ **2.4 GB** ⇒
+       不可用; 共享骨干把"5 张网各背一套"压成 1 份, 才让 E=8 重新变得可行)。
+
+       **代价 3: top-k 直接乘算力 —— 这条最贵。** 每步模拟的专家成本 ∝ k:
+       实测 E=4/top-1 是 **3.55 ms/模拟** (SAC 142.0 ms/步 @ 40 模拟),
+       top-2 就是 **~7.1 ms/模拟** ⇒ 同样 175 ms/步的界面预算下,模拟次数从 ~49
+       掉到 ~25。而**模拟次数是本工程唯一测出过强度的杠杆**
+       (40/64/120 模拟 -> 42.2% / 50.0% / 62.5% 得分率, 只有 120 那次区间不跨 50%)。
+       ⇒ 这一半改动是**拿"唯一有效的旋钮"去换容量**。
+
+       **为什么还是加上它 (用户的理由 + 我的保留)**: TB 专家的 d_model 被状态编码
+       锁死 (TransformerBlock 是 d→d), 所以**想加容量只能加专家数**; 而 E 单独增加
+       并不花算力 (算力只随 k 走)。要"只加容量、不动算力"就把下面 TOPK 改回 1 ——
+       那两个常量本来就是分开的。
+
+       ⚠ 判定只能用锚点 Elo (bench_anchor, ~80 Elo 分辨力)。"专家更多/更均衡"
+       **不是**棋力证据 (仓库明确写过: 不能拿专家分布不均当特化的证据)。
+       ⚠ 配套建议: 与 `lossFreeBias` 一起用 —— 专家越多越容易有专家饿死
+       (实测 E=4 时最弱专家到过 1.1% 份额)。
+    */
+    static constexpr int MOE_TB_EXPERTS = 8;
+    static constexpr int MOE_TB_TOPK = 2;
     static constexpr int MOE_TB_HEADS = 15;   /* d_model/15 = 84 维/头; 头越多越便宜 */
     static constexpr int MOE_TB_DFF = 315;    /* = d_model/4, 压住 TB 专家的 FFN 开销 */
 
@@ -435,6 +476,57 @@ public:
     */
     int expertHidden;         /* (本类不用: TB 专家的宽度由 MOE_TB_* 决定; 保留以对齐构造签名) */
     float auxLossCoef;        /* 稀疏 MoE 负载均衡辅助损失的系数 (0 = 关掉) */    int hiddenDim;
+    /*
+       ================================================================
+       [2026-09 门控实验] 无辅助损失的偏置均衡 (Loss-Free Balancing)
+       ================================================================
+       给每个专家一个只影响 **top-k 选择** 的偏置 b_i (不进输出加权), 每批按负载更新
+       b_i += rate * sign(mean_load - load_i)。它走 argmax 而不是损失, 所以**不产生任何
+       干扰梯度** —— 这与"把 auxLossCoef 调大"有本质区别 (后者会往主目标里注入梯度,
+       而实测的可用窗口只有 [0.1, 0.5))。依据: arXiv:2408.15664 Algorithm 1。
+
+       为什么这个开关**构造后设置也生效** (与 `moeDense` 不同): 它只翻层里的一个标志,
+       不需要重建网络。开关与速率在 `learnBatch` 里每批同步一次。
+
+       默认 false -> 行为与改动前**逐位相同**。
+       实测依据见 `docs/moe_gate_experiment_2026_10.md` [3b]: 在真实棋局状态分布上,
+       靠辅助损失的 softmax 门控即使 coef=10 也无法把负载从 MaxVio 3.00 拉下来
+       (梯度 ∝ 门控概率, 而饿死专家的概率≈0), 而本开关能做到 MaxVio 0.34。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = 0.001f;
+    /*
+       [2026-10] 开关的统一入口 (与 `PPOMCTSAgent::setLossFreeBias` 同形同名)。
+       为什么要有它而不是让调用方直接写上面两个成员: 界面上有**四个**构造点 + 两个
+       训练 clone 要接线, 手抄六个地方迟早漏一处, 而"漏掉"的表现只是"这一支还在用旧
+       路由" —— 面板上完全看不出来。收进一个 setter 之后, 接线点只需要记住一句话。
+       `rate <= 0` 一律夹成 0 (关掉回路), 不解释成"反向均衡"。
+    */
+    void setLossFreeBias(bool on, float rate = 0.001f)
+    {
+        lossFreeBias = on;
+        lossFreeBiasRate = (rate > 0.0f) ? rate : 0.0f;
+    }
+
+    /*
+       ================================================================
+       [2026-10 门控实验] 把骨干的**线性门控**换成带隐层的 MLP 门控
+       ================================================================
+       结构: d_model -> hidden (tanh) -> NumExperts -> softmax
+       即"三层 MLP"(输入层/隐层/输出层; 2 个权重矩阵)。默认**不装** (线性门控)。
+
+       为什么是"构造之后、训练之前调用"的普通成员函数, 而不是构造函数参数:
+       门控的张量只在 forward 里用, 所以建网之后、任何前向之前装上去与构造时装上去
+       在功能上等价 —— 唯一差别是**随机数消耗的次序**(门控初始值会与专家不同步),
+       而这一支是**从零训练**的, 没有 golden 权重需要保护。
+       代价是**现有权重文件作废**: MLP 门控的 wg1/wg2 形状与线性门控的 wg 不同,
+       `Net::load` 的参数量守卫会明确拒绝 (不静默错读)。
+
+       ⚠ 必须在**任何** forward / trainSelfPlay / selectMove 之前调用。
+    */
+    void enableMlpGate(int hidden);
+    /* 门控隐层宽度 (0 = 线性门控, 即出厂口径); 只读读数用 */
+    int gateMlpHidden = 0;
     float gamma;
     float learningRateActor;
     float learningRateCritic;
@@ -1025,13 +1117,42 @@ public:
     bool learnFromSearch = true;
 
     /*
-       把这一步的真实决策存成一条 AlphaZero 样本 (hasSearch=true) 并按需更新一次。
-       返回 true = 做过一次 learnBatch (界面据此上报损失曲线的点)。
+       ================================================================
+       [2026-10] recordDecisionSamples —— 只**记录**真实决策样本, 不立刻学
+       ================================================================
+       为什么需要它 (用户实测报的一条日志, 2026-10):
+       人机对弈终局时会打印
+           "[human] 终局 红胜 (人赢了): SAC+AZ-MoE 没有可挂的真实决策样本
+            (learnFromSearch 关着 / 这局还没走过一手) —— 这一局的输赢没有进学习回路"
+       根因: `notifyGameResult` 要把终局挂到**最后一条 hasSearch=true 的样本**上, 而那种
+       样本**只有** `learnFromSearchStep` 会写, 它又只在 `learnFromSearch` 打开时才被调用。
+       界面那一支 (`AGENT_SACAZ_MOE`) 的 `learnFromSearch` 是**关**的 (TB 骨干上
+       learnBatch(32) 实测 ~1.8 s/手, E=8/top-2 之后翻倍到 ~3.6 s/手 —— 界面上不可用),
+       于是这条通道**整条是死的**: 人把 AI 将死的那一局, 输赢被直接丢掉。
+       而"走人机对弈那条终局通道"正是本工程文档列出的、解决"终局样本 = 0"的四个出口之一
+       (docs/sacmoetb_pos_reward_2026_09.md §11) —— 对 TB 这一支它需要这个开关。
+
+       做法: 把"记录样本"与"学一次"**解耦**。打开它之后, 每步决策照样写一条
+       hasSearch=true 的样本进池 (含 π_MCTS 目标), 但**不调 learnBatch**。
+       代价几乎为零: 一次稀疏编码 + 一次 π 拷贝 (ACTION_DIM 个 float), 与那一步
+       270 ms 的搜索相比可忽略; 好处是终局能挂上去, 而那批样本会在**下一次**
+       learnBatch 时被训练 (界面上由"走子前先探索+预训练"那条路径触发)。
+       ⚠ 若界面上把预训练也关掉、且没有别的 learnBatch 调用点, 样本会留在池里
+       (受 maxMemorySize 限制) 而不被训练 —— 那仍然比"丢掉"好, 但别误以为它在学。
+
+       默认 false = 改动前的行为 (不记录、不学)。
+    */
+    bool recordDecisionSamples = false;
+
+    /*
+       把这一步的真实决策存成一条 AlphaZero 样本 (hasSearch=true), 并按需更新一次。
+       `learn = true` (默认) 时返回 true = 做过一次 learnBatch (界面据此上报损失曲线的点);
+       `learn = false` 时只入池、不更新 (见 `recordDecisionSamples`)。
        `piVisit` = 根节点的访问分布 (visitDistribution), `actionIdx` = 树里那一步的下标
        (父节点的 parentAction, 与 π 的下标同一套编码)。
     */
     bool learnFromSearchStep(int color, int actionIdx, const Step &step,
-                             const RL::Tensor &piVisit);
+                             const RL::Tensor &piVisit, bool learn = true);
 
     /*
        ================================================================
@@ -1189,9 +1310,24 @@ public:
     long long tbAttentionElements() const;
     /* 稀疏 MoE 的坍缩诊断: actor 的第一个稀疏 MoE 层的使用计数 */
     void moeUsage(std::vector<long long> &out) const;
+    /*
+       [2026-10] 按前向来源拆开的专家使用计数: `trainOut` = 训练批的前向 (learnBatch
+       里的 forward), `inferOut` = MCTS 展开/叶子估值的前向。
+       为什么必须分开: `moeUsage` 读的是生命周期累计, 而每步搜索的几十次叶子估值
+       在数量上通常压倒 `learnSteps × batch` 的训练前向 —— 于是那个直方图**主要反映
+       搜索访问到的局面分布**。要判断"均衡机制在训练批上有没有生效", 只能看 trainOut。
+    */
+    void moeUsageSplit(std::vector<long long> &trainOut, std::vector<long long> &inferOut) const;
     void resetMoeUsage();
     int moeExpertCount() const;
     int moeTopK() const;
+    /*
+       [2026-10] "此刻哪个专家在工作"的**无锁**探针 (actor 骨干里那个稀疏 MoE 层)。
+       界面拿它做呼吸灯 —— 取一次指针之后就可以在**不持 agent 锁**的情况下反复读,
+       这是必须的: 整段决策都持着 `m_agentMutex` (见 rl/sparse_moe.hpp 的 MoERouteProbe
+       与 chessboard.cpp 的 aiThinkForAgentRaw)。没有 MoE 层时返回 nullptr。
+    */
+    const RL::MoERouteProbe *moeRouteProbe() const;
     /* 掩码策略 π(·|s) */
     void policy(const RL::Tensor &state, const RL::Tensor &mask, RL::Tensor &pi);
     /* 在线双 Q (搜索与策略损失用) */

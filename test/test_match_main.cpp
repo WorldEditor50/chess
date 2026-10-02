@@ -2110,9 +2110,9 @@ int main(int argc, char *argv[])
                     mlp.moeExpertCount(), mlp.moeTopK(), mlp.actorParamCount(),
                     mlp.getName().c_str());
 
-        /* (1) 结构: 4/1 vs 8/2, 且 MLP 专家明显更小 */
+        /* (1) 结构: 两只都是 8/2 (TB 那一支 2026-10 从 4/1 提到 8/2), 且 MLP 专家明显更小 */
         CHECK(tb.moeExpertCount() == RL::PPO::MOE_EXPERTS && tb.moeTopK() == RL::PPO::MOE_TOPK,
-              "默认骨干 = TB 专家 (E=4 top-1), 与 PPO 的编译期常量一致");
+              "默认骨干 = TB 专家 (E/top-k 取自 RL::PPO 的编译期常量), 与 PPO 一致");
         CHECK(mlp.moeExpertCount() == RL::PPO::MOE_MLP_EXPERTS
                   && mlp.moeTopK() == RL::PPO::MOE_MLP_TOPK,
               "新 agent 的骨干 = MLP 专家 (E=8 top-2)");
@@ -2609,6 +2609,48 @@ int main(int argc, char *argv[])
        两节合起来才是完整的: 这里证明**棋盘真的调了**, 那里证明**调了之后发生了什么**。
     */
     std::printf("\n[2.21] 人机终局通道: 棋盘把结果交给 agent (人把 AI 将死的那个洞)\n");
+    /*
+       ---- [2026-10] 先钉"分类", 再钉"接线" ----
+       为什么单独钉分类: 用户实测日志里出现过
+         "[human] 终局 红胜 (人赢了): PPO+MCTS 没有终局通道 (纯搜索 / 终局值随 rollout
+          进池的那几支), 无需反馈"
+       —— 把 PPO+MCTS 与**纯搜索**并列, 而它每一手都在学。那句话只影响日志, 但它会让人
+       得出"人机对弈这一局对 PPO 白下了"的错误结论 (而真相是"真实胜负不回填到最后一手,
+       只经自举 -V(s') 与后续 rollout 间接进入")。分类做成纯函数之后, 这里能逐支断言。
+    */
+    {
+        using CB = ChessBoard;
+        const CB::AgentType pureSearch[] = { CB::AGENT_ALPHABETA, CB::AGENT_AB_L1,
+                                             CB::AGENT_AB_L2, CB::AGENT_AB_L3,
+                                             CB::AGENT_MCTS };
+        const CB::AgentType realSample[] = { CB::AGENT_SACAZ, CB::AGENT_SACAZ_MOE,
+                                             CB::AGENT_SACAZ_MOE_MLP,
+                                             CB::AGENT_DQNMCTS_MOE };
+        const CB::AgentType rollout[] = { CB::AGENT_PPOMCTS, CB::AGENT_PPOMCTS_MLP,
+                                          CB::AGENT_DQN, CB::AGENT_DQNMCTS,
+                                          CB::AGENT_DQNAB, CB::AGENT_EVAB,
+                                          CB::AGENT_SACAZ_OLD, CB::AGENT_SACAZ_OLD_MOE };
+        bool catPure = true, catReal = true, catRoll = true;
+        for (CB::AgentType t : pureSearch) {
+            catPure = catPure && (CB::humanEndChannel(t) == CB::HUMAN_END_PURE_SEARCH);
+        }
+        for (CB::AgentType t : realSample) {
+            catReal = catReal && (CB::humanEndChannel(t) == CB::HUMAN_END_REAL_SAMPLE);
+        }
+        for (CB::AgentType t : rollout) {
+            catRoll = catRoll && (CB::humanEndChannel(t) == CB::HUMAN_END_ROLLOUT);
+        }
+        std::printf("    分类      : 纯搜索 %d 支=%d, 真实决策样本 %d 支=%d, rollout %d 支=%d\n",
+                    (int)(sizeof(pureSearch) / sizeof(pureSearch[0])), (int)catPure,
+                    (int)(sizeof(realSample) / sizeof(realSample[0])), (int)catReal,
+                    (int)(sizeof(rollout) / sizeof(rollout[0])), (int)catRoll);
+        CHECK(catPure, "纯搜索几支 (AB 各档 / MCTS) 归 HUMAN_END_PURE_SEARCH");
+        CHECK(catReal, "SAC 三支 + DQN+MCTS-MoE 归 HUMAN_END_REAL_SAMPLE (唯一接得住的一类)");
+        /* 这一条就是那次日志里的错: PPO**不是**纯搜索 */
+        CHECK(catRoll, "PPO 两支 / DQN+AB / EVAB 等归 HUMAN_END_ROLLOUT (在学, 但无可挂样本)");
+        CHECK(CB::humanEndChannel(CB::AGENT_PPOMCTS) != CB::HUMAN_END_PURE_SEARCH,
+              "PPO+MCTS 不是纯搜索 (它每一手都在学)");
+    }
     {
         const bool savedPreTrain = board.isPreTrainEnabled();
         const int savedSteps = board.getPreTrainSteps();

@@ -1583,6 +1583,14 @@ void DQNMCTSMOETbAgent::moeUsage(std::vector<long long> &out) const
     m->usageSnapshot(out);
 }
 
+/* [2026-10] 实时路由探针 (界面呼吸灯; 见 rl/sparse_moe.hpp 的 MoERouteProbe) */
+const RL::MoERouteProbe *DQNMCTSMOETbAgent::moeRouteProbe() const
+{
+    RL::Net &self = const_cast<RL::Net&>(trunk);
+    RL::ISparseMoE *m = findSparseMoe(self);
+    return (m != nullptr) ? m->routeProbe() : nullptr;
+}
+
 void DQNMCTSMOETbAgent::resetMoeUsage()
 {
     RL::ISparseMoE *m = findSparseMoe(trunk);

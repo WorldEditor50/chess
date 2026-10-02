@@ -13,8 +13,11 @@
 
 namespace {
 
-const QColor kPanelFill(255, 255, 255, 170);
-const QColor kPanelEdge(224, 216, 189);
+/*
+   [2026-10] kPanelFill / kPanelEdge 原来在这里 —— 现在移到文件作用域的
+   `ChartStyle` 里 (见 metricsview.h 的说明): 曲线控件与 MoeLoadView 必须共用
+   同一份定义, 否则两块相邻的面板会长成两种颜色。
+*/
 const QColor kGrid(226, 220, 200);
 const QColor kZeroLine(180, 170, 145);
 const QColor kText(96, 88, 62);
@@ -59,6 +62,12 @@ QString fmtValue(double v, const QString &suffix)
 }
 
 } // namespace
+
+/* 与 MoeLoadView 共用的面板配色 (定义在这里, 声明在 metricsview.h) */
+namespace ChartStyle {
+const QColor kPanelFill(255, 255, 255, 170);
+const QColor kPanelEdge(224, 216, 189);
+}
 
 CurveChart::CurveChart(QWidget *parent)
     : QWidget(parent)
@@ -442,10 +451,10 @@ void CurveChart::paintEvent(QPaintEvent *)
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::TextAntialiasing, true);
 
-    /* ---- 底板 ---- */
+    /* ---- 底板 (配色与 MoeLoadView 共用, 见 ChartStyle) ---- */
     const QRectF panel = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-    p.setBrush(kPanelFill);
-    p.setPen(QPen(kPanelEdge, 1.0));
+    p.setBrush(ChartStyle::kPanelFill);
+    p.setPen(QPen(ChartStyle::kPanelEdge, 1.0));
     p.drawRoundedRect(panel, 8.0, 8.0);
 
     QFont small = font();

@@ -119,6 +119,58 @@ public:
                                        PPO_MOE_TB_DFF 决定, 见 rl/ppo.h) */
     float moeAuxCoef;               /* 稀疏 MoE 负载均衡辅助损失系数 */
     /*
+       ----------------------------------------------------------------
+       [2026-10] 无辅助损失偏置均衡 (Loss-Free Balancing, arXiv:2408.15664)
+       ----------------------------------------------------------------
+       为什么 PPO 这条骨干需要它: **只靠辅助损失拉不平负载** —— 实测在同一批真实棋局
+       状态上 `coef` 开到 10, MaxVio 仍恒为理论最大值 3.000、有效专家 1.00 (根因是辅助
+       损失的梯度正比于饿死专家自己的门控概率 ≈0, 放大系数乘的仍是 0)。
+       而把均衡的作用点换到"top-k 的 argmax 比较项"之后, 同一实验里 MaxVio 0.29~0.32、
+       有效专家 4.00。机制与刻度坑见 `src/rl/ppo.h` 里同名成员的说明; 受控实验见
+       `docs/moe_gate_experiment_2026_10.md` 的 [3b] 与 §8。
+
+       这两个成员是"转发": agent 构造时把它们交给 `ppo` (见 ppomcts_agent.cpp 的构造
+       函数) —— 与 SAC 那两个 MoE agent 暴露同名成员的**口径一致**, 于是"开均衡"这件事
+       在四条骨干上是同一个写法, 不必记住谁在哪一层。
+       **默认关**, 关着时与改动前逐位相同。
+    */
+    bool  lossFreeBias = false;
+    float lossFreeBiasRate = 0.01f;
+    /*
+       门控结构的本地记录: 0 = 线性 (默认), >0 = MLP 门控的隐层宽度。
+       真源是各 MoE 层自己的 `gateStruct/gateHidden`, 但这个数是"这一支到底是什么结构"
+       的唯一可读证据 —— 没有它, "以为开了 MLP 门控其实没开"是完全静默的。
+    */
+    int gateMlpHidden = 0;
+    /*
+       开/关均衡 (见上面的说明)。**必须用这个 setter**, 不要只改 agent 上的成员:
+       单一真源在 `ppo.moeLossFreeBias` 里, 只改一处会静默不生效。
+    */
+    void setLossFreeBias(bool on, float rate = 0.01f);
+
+    /*
+       ----------------------------------------------------------------
+       [2026-10] 门控结构: 线性 (默认) / 三层 MLP  (与 SAC 那两支同一个接口)
+       ----------------------------------------------------------------
+       现状的门控是 `wg·x + bg` 然后 softmax —— 也就是**用 E 张超平面切状态空间**。
+       三层版本是 `d_model -> hidden (tanh) -> E -> softmax`, 能表达"子力 且 位置 且
+       被将军"这类组合判据 (实测路由纯度 +0.15~+0.31)。
+       ⚠ 但它**不是负载均衡的手段**, 而且方向很可能相反: 同一份受控实验里 MLP 门控的
+       负荷反而更偏 (MaxVio 0.30 -> 1.43~1.79、有效专家 3.9 -> 2.0~2.5), 端到端在 SAC
+       支上"训练侧更均衡 (0.049->0.009) 而评测侧更偏 (0.264->0.598)"。所以正确用法是
+       **MLP 门控 + 无辅助损失偏置均衡配对**: 前者负责"路由得更准", 后者负责"负载别塌"
+       (见 docs/moe_gate_experiment_2026_10.md 的 §0/§7 与 chessboard.cpp 的同名常量)。
+
+       ⚠⚠ **打开它会让旧权重文件作废**: 线性门控的 `wg` 是 (E, d_model), MLP 门控是
+       `wg1(hidden,d_model) + wg2(E,hidden)` —— 形状不同, `Net::load` 的参数量守卫会
+       **明确拒绝**, 也就是从随机初始化重练。`Node` 侧还会写一行 `#GATE:mlp:<hidden>`
+       自描述标记, 所以"MLP 权重喂给线性网络"不会静默错位。
+       ⚠ 必须在**任何前向之前**调用 (构造点之后立刻): 它会重建并重新初始化门控权重。
+       `0` = 保持线性门控 (默认, 与改动前逐位相同)。
+    */
+    void enableMlpGate(int hidden);
+    int  mlpGateHidden() const { return gateMlpHidden; }
+    /*
        本实例的骨干 (构造时定, 之后不要改: 网络已经按它建好了)。
        公开是为了让自检面板与测试能读出来 —— 同一个类支撑两个界面 agent,
        面板上不写清骨干就会张冠李戴 (与 SACAZAgent 的 backbone 同理)。
@@ -704,7 +756,31 @@ public:
     long long actorParamCount() const { return ppo.actorParamCount(); }
     long long criticParamCount() const { return ppo.criticParamCount(); }
     void moeUsage(std::vector<long long> &out) const { ppo.moeUsage(out); }
+    /*
+       [2026-10] 按前向来源拆开的专家使用次数 (训练批 / 推理)。判"均衡机制有没有生效"
+       必须看**训练侧**那一列 —— 搜索前向在数量上压倒训练批, 只看合计会把"搜索访问到的
+       局面分布"当成"训练批的路由分布" (与 SAC 两个 MoE agent 的 moeUsageSplit 同口径)。
+    */
+    void moeUsageSplit(std::vector<long long> &trainOut,
+                       std::vector<long long> &inferOut) const
+    {
+        ppo.moeUsageSplit(trainOut, inferOut);
+    }
+    /* 读一份无辅助损失偏置的快照 (每个专家一个 b_i; 没开均衡时为空) */
+    void moeBiasSnapshot(std::vector<float> &out) const { ppo.moeBiasSnapshot(out); }
+    /*
+       [2026-10] 划出"训练批"的边界: 清掉 MoE 门控的批统计 (usageBatch / 门控概率和 /
+       输入和 / 前向次数), 保留生命周期累计。
+       为什么公开: 训练侧/推理侧的划分靠**批边界**而不是靠 `forward(inference=true)`
+       (本工程的搜索路径调的是默认值 false, 靠那个参数划分会得到"推理侧恒为 0")。
+       正常调用方不需要它 —— `learnFromReplay` / `learnSelfPlay` / `trainStep` 各自在
+       开头调一次。它公开是给**诊断工具**用的: 在"采完数据、开始学习"这个边界上划一刀,
+       否则那一段推理前向会被算进第一个训练批里 (读数直接失真, 而且看不出来)。
+    */
+    void resetMoeBatchStats() { ppo.resetMoeBatchStats(); }
     void resetMoeUsage() { ppo.resetMoeUsage(); }
+    /* [2026-10] 实时路由探针 (界面呼吸灯; 见 rl/sparse_moe.hpp 的 MoERouteProbe) */
+    const RL::MoERouteProbe *moeRouteProbe() const { return ppo.moeRouteProbe(); }
 
     /* Online training (human-vs-AI) */
     void beginOnline();

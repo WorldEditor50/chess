@@ -41,6 +41,10 @@
 * "还原回 59e5233"在代码上的落点不是"再写一份实现"，而是一个**派生类**
   `SACAZLegacyAgent`（`src/sacazlegacyagent.h`），对应界面类型
   `ChessBoard::AGENT_SACAZ_OLD`（下拉框"…(59e5233 行为还原版)"）。
+  > **[2026-10 变更]** 那一项**已从下拉框移除**（连同 `AGENT_SACAZ_OLD_MOE`、PG、DQN），
+  > 目的与实测代价/收益见 `README.md` 的 agent 表与 `chessboard.cpp` 的 `kWeightAgents`
+  > 注释：省了约 11 s 启动时间。**这个类、它的两个 Backbone、权重前缀与
+  > `test_sacaz` [14] 节的断言都还在** —— 只是界面上选不到、启动时也不预热。
   它复用 `SACAZAgent` 的全部算法，只钉住 4 个口径值（目标熵 0.98 / alpha lr 1e-3 /
   critic 不钳位+纯 MSE / 叶子全量估值），加一个独立权重前缀
   `weights/sacaz_old_agent`（后台训练临时前缀 `weights/_temp_train_sacaz_old`）。
