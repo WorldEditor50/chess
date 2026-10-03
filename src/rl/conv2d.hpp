@@ -384,7 +384,7 @@ public:
         return;
     }
 
-    virtual void write(std::ofstream &file) override
+    virtual void write(std::ostream &file) override
     {
         /* kernels */
         file<<kernels.toString()<<std::endl;
@@ -393,7 +393,7 @@ public:
         return;
     }
 
-    virtual void read(std::ifstream &file) override
+    virtual void read(std::istream &file) override
     {
         /* kernels */
         std::string ws;

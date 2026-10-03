@@ -11,8 +11,50 @@
 #include <functional>
 #include "tensor.hpp"
 #include "ilayer.h"
+#include "weightio.hpp"
 
 namespace RL {
+
+/*
+ * ---- 两个"内存当流"的小工具 (2026-10 对弈期间不落盘, 见 weightio.hpp) ----
+ *
+ * StringOutBuf: 把写进 ostream 的字节**追加**到 std::string 上 (不拷贝第二遍;
+ *   std::ostringstream 要先攒在它自己的缓冲里再 str() 拷一次, 146 MB 的权重上很明显)。
+ * ConstMemBuf : 把一块已有的内存当成只读 istream 的数据源 (**零拷贝**)。
+ *   为什么不用 std::istringstream(buffer): 它的构造函数会**拷贝整块** buffer, 而权重
+ *   文件到 146 MB —— 那份拷贝没有意义 (buffer 本来就已经在内存里了)。
+ * 两者都只服务权重序列化这一条路径, 所以放在这里而不是单开一个头文件。
+ */
+class StringOutBuf : public std::streambuf
+{
+public:
+    explicit StringOutBuf(std::string &out) : m_out(out) {}
+protected:
+    std::streamsize xsputn(const char *s, std::streamsize n) override
+    {
+        m_out.append(s, (std::size_t)n);
+        return n;
+    }
+    int overflow(int c) override
+    {
+        if (c != EOF) {
+            m_out.push_back((char)c);
+        }
+        return (c == EOF) ? EOF : c;
+    }
+private:
+    std::string &m_out;
+};
+
+class ConstMemBuf : public std::streambuf
+{
+public:
+    ConstMemBuf(const char *data, std::size_t size)
+    {
+        char *p = const_cast<char *>(data);
+        setg(p, p, p + size);
+    }
+};
 
 class Net
 {
@@ -307,19 +349,50 @@ public:
         return h;
     }
 
+    /*
+       ---- payload 的写出: 磁盘与内存**共用这一份** (2026-10) ----
+       两份实现迟早漂移, 而漂移的表现是"内存版与磁盘版写出的字节不同" —— 那是那种
+       查起来最贵的 bug (同一个网络, 两条路读回来的东西不一样)。所以格式只写在这里,
+       `save()` 只负责"把这一串字节送到哪儿去"。
+    */
+    void writePayload(std::ostream &os) const
+    {
+        os << kWeightMagic << " " << layers.size() << " "
+           << structureFingerprint() << "\n";
+        for (std::size_t i = 0; i < layers.size(); i++) {
+            layers[i]->write(os);
+        }
+    }
+
     int save(const std::string &fileName) const
     {
+        /*
+           [2026-10 用户口径 "对弈期间不更新保存模型权重"] 临时权重路径在对弈期间**改走
+           内存** (见 weightio.hpp): 写出的字节与磁盘版逐字节相同, 只是不落盘 ——
+           后台训练那一轮的往返因此照常跑完, 而 weights/ 目录里一个临时文件都不多。
+           返回 true = 已经接管, 这里**故意不碰磁盘** (读侧用的是同一个判据)。
+        */
+        if (WeightIO::shouldDivert(fileName)) {
+            std::string payload;
+            {
+                StringOutBuf buf(payload);
+                std::ostream os(&buf);
+                writePayload(os);
+                os.flush();
+                if (!os.good()) {
+                    return -1;
+                }
+            }
+            return WeightIO::divertWrite(fileName, std::move(payload)) ? 0 : -1;
+        }
+
         const std::string tmp = fileName + kWeightTmpSuffix;
         {
             std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
             if (!file.is_open()) {
                 return -1;
             }
-            file << kWeightMagic << " " << layers.size() << " "
-                 << structureFingerprint() << "\n";
-            for (std::size_t i = 0; i < layers.size(); i++) {
-                layers[i]->write(file);
-            }
+            writePayload(file);
             file.flush();
             if (!file.good()) {
                 /* 磁盘满 / 权限问题: 删掉半截的临时文件, 保留原文件 */
@@ -345,81 +418,14 @@ public:
 
     int load(const std::string &fileName)
     {
-        std::ifstream file(fileName, std::ios::binary);
-        if (!file.is_open()) {
-            return -1;
-        }
-
-        std::string firstLine;
-        if (!std::getline(file, firstLine)) {
-            std::cerr << "[weights] " << fileName << ": 空文件" << std::endl;
-            return -1;
-        }
-
         /*
-           先看第一行是不是 v2 的头。不是的话 (老文件, 第一行就是第一个张量) 要
-           **倒回文件开头**, 再按 v1 逐层读 —— 这样老权重文件不需要任何转换。
-        */
-        const std::size_t magicLen = std::strlen(kWeightMagic);
-        const bool isV2 = (firstLine.compare(0, magicLen, kWeightMagic) == 0);
-        std::streamoff payloadStart = 0;
-        if (isV2) {
-            std::istringstream hs(firstLine);
-            std::string magic;
-            std::size_t count = 0;
-            std::uint64_t fp = 0;
-            hs >> magic >> count >> fp;
-            if (count != layers.size()) {
-                std::cerr << "[weights] " << fileName << ": 层数不匹配 (文件 "
-                          << count << ", 当前网络 " << layers.size() << ")" << std::endl;
-                return -1;
-            }
-            if (fp != structureFingerprint()) {
-                std::cerr << "[weights] " << fileName << ": 结构指纹不匹配 (文件 "
-                          << fp << ", 当前网络 " << structureFingerprint()
-                          << ") —— 这个权重文件不是给这个网络的" << std::endl;
-                return -1;
-            }
-            payloadStart = (std::streamoff)file.tellg();
-        } else {
-            file.clear();
-            file.seekg(0, std::ios::beg);
-        }
-
-        /*
-           ============================================================
-            第一步: 预校验 paylaod 的**每一行**(但不改动网络)
-           ============================================================
-           为什么值得多读一遍: 载入失败时**绝不能**把网络改成半成品。各 agent 的
-           loadModel() 在失败时只返回 false (调用方看一眼就接着用), 如果这时某些
-           张量已经被写成了空张量 (解码失败时 fromString 返回的就是空张量), 下一次
-           前向就是越界读 —— 一个坏文件能把程序从"载入失败"升级成段错误。
-
-           每一行的编码都是自校验的: 形状要能解析、base64 长度要等于形状的乘积 ×
-           sizeof(T)、CRC32 要对得上。所以"所有行都能解码"等价于"这个文件完整"。
-        */
-        /*
-           ============================================================
-            第一步: 预校验 payload 的**每一行**(但不改动网络)
-           ============================================================
-           为什么值得多校验一遍: 载入失败时**绝不能**把网络改成半成品。各 agent 的
-           loadModel() 在失败时只返回 false (调用方看一眼就接着用), 如果这时某些
-           张量已经被写成了空张量 (解码失败时 fromString 返回的就是空张量), 下一次
-           前向就是越界读 —— 一个坏文件能把"载入失败"升级成段错误。
-
-           每一行的编码都是自校验的: 形状要能解析、base64 长度要等于形状的乘积 ×
-           sizeof(T)、CRC32 要对得上。所以"所有行都能解码"等价于"这个文件完整"。
-
-           **在内存里扫**: 权重文件一个可以到 146 MB, 实测
-             整块读进来           1075 MB/s
-             ifstream + getline 逐行 143 MB/s      <- 慢 7 倍, 而且下面"真正载入"那一遍
-                                                      还要再来一次
-           所以先把文件整块读进内存 (几十毫秒), 预校验直接在内存上用 memchr 切行 ——
-           省掉一次磁盘读和一整轮逐行流式读取。稀疏 MoE 那 3 个 146 MB 的文件因此从
-           ~15 秒降到 ~6 秒 (启动 19 s -> 10 s 量级)。
+           ---- 取字节: **内存优先, 磁盘回落** (2026-10 对弈期间的临时权重不落盘) ----
+           内存里有这一份 = 它是对弈期间写出来的临时权重 (见上面 save 的说明); 没有就按
+           原来的方式读磁盘 —— "改道关着"时这条路径与改动前逐字节相同。
         */
         std::string buffer;
-        {
+        const bool fromMemory = WeightIO::divertLookup(fileName, buffer);
+        if (!fromMemory) {
             std::ifstream in(fileName, std::ios::binary | std::ios::ate);
             if (!in.is_open()) {
                 std::cerr << "[weights] " << fileName << ": 打不开" << std::endl;
@@ -438,20 +444,79 @@ public:
                 return -1;
             }
         }
+        if (buffer.empty()) {
+            std::cerr << "[weights] " << fileName << ": 空文件" << std::endl;
+            return -1;
+        }
 
+        /*
+           第一行 (v2 的头, 或者 v1 的第一个张量) 从 **buffer 上切** —— 不再从 ifstream
+           上 getline。这样"内存"与"磁盘"两个来源走的是同一段解析代码, 不会因为两条来源
+           各自的实现而漂移。
+        */
+        const std::size_t firstEol = buffer.find('\n');
+        const std::size_t firstLen =
+            (firstEol == std::string::npos) ? buffer.size() : firstEol;
+        const std::string firstLine = buffer.substr(0, firstLen);
+
+        /*
+           先看第一行是不是 v2 的头。不是的话 (老文件, 第一行就是第一个张量) 要从
+           **开头**按 v1 逐层读 —— 这样老权重文件不需要任何转换。
+        */
+        const std::size_t magicLen = std::strlen(kWeightMagic);
+        const bool isV2 = (firstLine.compare(0, magicLen, kWeightMagic) == 0);
+        std::size_t payloadStart = 0;
+        if (isV2) {
+            std::istringstream hs(firstLine);
+            std::string magic;
+            std::size_t count = 0;
+            std::uint64_t fp = 0;
+            hs >> magic >> count >> fp;
+            if (count != layers.size()) {
+                std::cerr << "[weights] " << fileName << ": 层数不匹配 (文件 "
+                          << count << ", 当前网络 " << layers.size() << ")" << std::endl;
+                return -1;
+            }
+            if (fp != structureFingerprint()) {
+                std::cerr << "[weights] " << fileName << ": 结构指纹不匹配 (文件 "
+                          << fp << ", 当前网络 " << structureFingerprint()
+                          << ") —— 这个权重文件不是给这个网络的" << std::endl;
+                return -1;
+            }
+            payloadStart = (firstEol == std::string::npos) ? buffer.size() : firstEol + 1;
+        }
+
+        /*
+           ============================================================
+            第一步: 预校验 payload 的**每一行**(但不改动网络)
+           ============================================================
+           为什么值得多校验一遍: 载入失败时**绝不能**把网络改成半成品。各 agent 的
+           loadModel() 在失败时只返回 false (调用方看一眼就接着用), 如果这时某些
+           张量已经被写成了空张量 (解码失败时 fromString 返回的就是空张量), 下一次
+           前向就是越界读 —— 一个坏文件能把"载入失败"升级成段错误。
+
+           每一行的编码都是自校验的: 形状要能解析、base64 长度要等于形状的乘积 ×
+           sizeof(T)、CRC32 要对得上。所以"所有行都能解码"等价于"这个文件完整"。
+
+           **在内存里扫**: 权重文件一个可以到 146 MB, 实测
+             整块读进来           1075 MB/s
+             ifstream + getline 逐行 143 MB/s      <- 慢 7 倍, 而且下面"真正载入"那一遍
+                                                      还要再来一次
+           所以字节块要么来自**内存** (对弈期间改道的临时权重, 见本函数开头),
+           要么整块读进内存 (几十毫秒), 预校验直接在内存上用 memchr 切行 ——
+           省掉一次磁盘读和一整轮逐行流式读取。稀疏 MoE 那 3 个 146 MB 的文件因此从
+           ~15 秒降到 ~6 秒 (启动 19 s -> 10 s 量级)。
+        */
         std::size_t lineNo = 0;
         /*
            v2 文件的第一行是头 (CHWGT2 <层数> <指纹>), 它不是张量, 跳过;
-           老格式 (v1) 的第一行就是第一个张量, 所以从 0 开始。
+           老格式 (v1) 的第一行就是第一个张量, 所以从 0 开始 ——
+           这两件事已经在上面算成了 payloadStart (内存/磁盘两个来源走**同一段**代码)。
            (第一版忘了跳过头, 于是每个文件都在"第 1 个张量校验失败" —— 而这个
             错误又恰好被"载入失败不影响网络"那条保证掩盖住了: 网络是好的,
             只是什么都没载入。test_weights 立刻抓到了。)
         */
-        std::size_t scan = 0;
-        if (isV2) {
-            const std::size_t hdrEnd = buffer.find('\n');
-            scan = (hdrEnd == std::string::npos) ? buffer.size() : hdrEnd + 1;
-        }
+        std::size_t scan = payloadStart;
         /*
            **元素总数校验** (维度守卫)。
            为什么必须有: v2 的"结构指纹"只哈希**层的类型序列**, 不含任何维度 ——
@@ -503,18 +568,24 @@ public:
             return -1;
         }
 
-        /* 第二步: 真正载入 (从 payload 开头重新读一遍; 数据已经在系统缓存里) */
-        file.clear();
-        file.seekg(payloadStart, std::ios::beg);
+        /*
+           第二步: 真正载入 (从 payload 开头重新读一遍)。
+           数据源是**内存里的 buffer** (零拷贝的 ConstMemBuf), 不再是 ifstream ——
+           这样"内存里那份临时权重"与"磁盘上的文件"走的是同一条载入代码, 不会出现
+           "其中一种来源能载入、另一种不行"的分叉。
+        */
+        ConstMemBuf payloadBuf(buffer.data() + payloadStart,
+                               buffer.size() - payloadStart);
+        std::istream payload(&payloadBuf);
         Tensor::clearDecodeFailed();
         for (std::size_t i = 0; i < layers.size(); i++) {
-            layers[i]->read(file);
+            layers[i]->read(payload);
         }
         /*
-           file.fail() 用来抓"在行边界上被截断"的文件: 这种情况下每一行都是完整的
+           payload.fail() 用来抓"在行边界上被截断"的文件: 这种情况下每一行都是完整的
            (预校验会通过), 但行数不够, 最后几层的 getline 会失败。
         */
-        if (file.fail() || Tensor::lastDecodeFailed()) {
+        if (payload.fail() || Tensor::lastDecodeFailed()) {
             std::cerr << "[weights] " << fileName
                       << ": 张量数量不足 (文件被截断?), 这次载入不可信" << std::endl;
             return -1;

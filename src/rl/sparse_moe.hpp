@@ -1107,7 +1107,7 @@ public:
        这样"MLP 权重喂给线性网络"(或反之) 不会静默错位 (读侧会明确拒绝)。
        `biasGate` 故意不写: 它是控制回路状态, 不是参数。
     */
-    void write(std::ofstream &file) override
+    void write(std::ostream &file) override
     {
         if (gateStruct == GateStructure::Mlp) {
             file << "#GATE:mlp:" << gateHidden << std::endl;
@@ -1125,7 +1125,7 @@ public:
         }
     }
 
-    void read(std::ifstream &file) override
+    void read(std::istream &file) override
     {
         std::string s;
         std::getline(file, s);

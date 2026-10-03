@@ -521,7 +521,7 @@ void MambaLayer::softUpdateTo(iLayer *layer, float alpha)
     lerp(dst.b, b, alpha);
 }
 
-void MambaLayer::write(std::ofstream &file)
+void MambaLayer::write(std::ostream &file)
 {
     /* Input projection */
     file << (W_in.totalSize > 0 ? W_in.toString() : std::string("0,0")) << std::endl;
@@ -536,9 +536,9 @@ void MambaLayer::write(std::ofstream &file)
     file << b.toString() << std::endl;
 }
 
-void MambaLayer::read(std::ifstream &file)
+void MambaLayer::read(std::istream &file)
 {
-    auto parse = [](std::ifstream &f) -> Tensor {
+    auto parse = [](std::istream &f) -> Tensor {
         std::string s;
         std::getline(f, s);
         if (s == "0,0") return Tensor();

@@ -327,7 +327,7 @@ public:
         return;
     }
 
-    void write(std::ofstream &file) override
+    void write(std::ostream &file) override
     {
         file << wg.toString() << std::endl;
         file << b.toString()  << std::endl;
@@ -337,7 +337,7 @@ public:
         return;
     }
 
-    void read(std::ifstream &file) override
+    void read(std::istream &file) override
     {
         std::string s;
         std::getline(file, s); wg = Tensor::fromString(s);

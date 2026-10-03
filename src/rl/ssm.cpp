@@ -287,7 +287,7 @@ void SSM::softUpdateTo(iLayer *layer, float alpha)
     return;
 }
 
-void SSM::write(std::ofstream &file)
+void SSM::write(std::ostream &file)
 {
     file << A.toString() << std::endl;
     file << B.toString() << std::endl;
@@ -296,7 +296,7 @@ void SSM::write(std::ofstream &file)
     return;
 }
 
-void SSM::read(std::ifstream &file)
+void SSM::read(std::istream &file)
 {
     std::string s;
     std::getline(file, s); A = Tensor::fromString(s);

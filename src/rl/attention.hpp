@@ -328,7 +328,7 @@ public:
          return;
      }
 
-     virtual void write(std::ofstream &file) override
+     virtual void write(std::ostream &file) override
      {
          /* w */
          file<<wq.toString()<<std::endl;
@@ -337,7 +337,7 @@ public:
          return;
      }
 
-     virtual void read(std::ifstream &file) override
+     virtual void read(std::istream &file) override
      {
          /* w */
          std::string wqs;
@@ -571,7 +571,7 @@ public:
          return;
      }
 
-     virtual void write(std::ofstream &file) override
+     virtual void write(std::ostream &file) override
      {
          /* w */
          file<<w1.toString()<<std::endl;
@@ -584,7 +584,7 @@ public:
          return;
      }
 
-     virtual void read(std::ifstream &file) override
+     virtual void read(std::istream &file) override
      {
          /* w */
          std::string w1s;
@@ -951,7 +951,7 @@ public:
         return;
     }
 
-    void write(std::ofstream &file) override
+    void write(std::ostream &file) override
     {
         file << wo.toString() << std::endl;
         for (std::size_t i = 0; i < heads.size(); i++) {
@@ -960,7 +960,7 @@ public:
         return;
     }
 
-    void read(std::ifstream &file) override
+    void read(std::istream &file) override
     {
         std::string wos;
         std::getline(file, wos);

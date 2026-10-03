@@ -112,8 +112,17 @@ public:
     virtual int attnHeadsAllocated() const { return -1; }   /* 分配出来的 head 对象数 */
     virtual long long attnElements() const { return -1; }   /* numHeads * d_k^2 (单价来源) */
 
-    virtual void write(std::ofstream &file){}
-    virtual void read(std::ifstream &file){}
+    /*
+       ---- 权重读写: 参数是 `std::ostream/std::istream` (不是 ofstream/ifstream) ----
+       为什么必须是通用流: [2026-10 用户口径] "对弈期间不保存模型权重" 要求后台训练那一轮
+       的权重往返**改走内存** (见 weightio.hpp), 而内存版就是往 `std::ostringstream` 写、
+       从 `std::istringstream` 读。签名收在 `ofstream/ifstream` 上就写不了内存版, 只能
+       把整条往返复制一份 —— 那正是"两份实现迟早漂移"的形状。
+       所有调用点传的都是 ofstream/ifstream (派生类 → 基类引用), 所以这次改动对它们
+       是透明的; 写出来的**字节**也完全不变 (同一份代码, 只是流的类型不同)。
+    */
+    virtual void write(std::ostream &file){}
+    virtual void read(std::istream &file){}
 };
 
 }

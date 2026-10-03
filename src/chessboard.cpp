@@ -1,6 +1,11 @@
 #include "chessboard.h"
 #include "rl/cpuinfo.hpp"
 /*
+   [2026-10 用户口径 "对弈期间不更新保存模型权重"] 临时权重路径改走内存的通道。
+   放在 chessboard.cpp 顶层: 本文件里"武装/解除 + 三条边界"是它唯一的用法。
+*/
+#include "rl/weightio.hpp"
+/*
    [2026-10] 实时路由探针的**完整定义** (界面呼吸灯)。
    chessboard.h 只有它的前向声明 (那个头要保持轻), 而 `liveMoeRoute` 要读它的原子
    快照, 所以完整定义在这里要进来 —— 与下面几个 agent 的 .cpp 同一个做法。
@@ -1875,6 +1880,14 @@ void ChessBoard::mousePressEvent(QMouseEvent *event)
 
     /* 玩家走棋成功 → 判定是否将杀 / 困毙 / 和棋 */
     int result = chess.getResult(chess.sideToMove);
+    /*
+       ---- 对弈期间: 权重不落盘 (2026-10 用户口径) ----
+       "人机这一局"从**玩家落第一子**起算 (不按"按了开局"算: 启动后直接走子也是
+       一局棋, 而那时没人按过开局 —— 按"按过开局"算会漏掉这一整类用法)。
+       解除点是终局 (notifyHumanGameEnd, 三条终局路径都经过它) 或重开一局 (reset)。
+       幂等: 每走一手调一次也没关系 (状态没变时 updatePlayWeightDivert 直接返回)。
+    */
+    setHumanGameInProgress(true);
     if (result != Chess::RESULT_ONGOING) {
         state = STATE_TERMINATE;
         /*
@@ -2101,6 +2114,18 @@ void ChessBoard::reset()
         state = STATE_IDEL;
         condit.wakeAll();
     }
+    /*
+       ---- "开局"= 上一局到此为止 (2026-10 对弈期间权重不落盘) ----
+       解除而不是武装, 理由有两条:
+         * **"人机这一局"的起点是"玩家落第一子"** (见 mousePressEvent): 按下开局之后
+           可能很久都不落子, 那段时间算不算"对弈期间"没有客观答案, 而按"第一子"算
+           既明确又已经是"棋在下"的状态;
+         * **reset() 在界面之外被大量当成"摆回开局"的管道** (test/bench/probe 十几个
+           main 都调它)。在那里武装改道 = 那些工具**后续保存的权重全部改道到内存**,
+           盘上什么都不留 —— 不报错、只是文件不见了, 正是本工程最怕的那种静默失效。
+        (press 开局 时若上一局还没走完, 它也一样到此为止 —— 与棋盘被重摆这件事一致。)
+    */
+    setHumanGameInProgress(false);
     if (m_animTimer != nullptr) {
         m_animTimer->stop();
     }
@@ -2675,6 +2700,104 @@ static std::string frozenAuditPathOf(ChessBoard::AgentType type)
     return std::string("weights/_temp_match_frozen_audit_") + std::to_string((int)type);
 }
 
+/* ================================================================
+ *  ---- 对弈期间的"权重不落盘" (2026-10 用户口径) ----
+ * ================================================================
+ *
+ * 用户口径与三条边界写在 chessboard.h 的 public 段 (那里是给人看的), 机制写在
+ * rl/weightio.hpp (那里是实现)。这里只做三件事: 自检前缀判据、把两个作用域合到
+ * 那一个开关上、以及退出前的强制解除。
+ */
+
+/*
+ * 运行期自检: "所有临时权重路径都以 WeightIO 的前缀开头"。
+ * 改道的判据就是这个前缀, 而它一旦漂移 (有人新加一条临时路径用了别的名字/别的位置),
+ * "对弈期间不落盘"就会**静默失效**: 那一条临时文件照旧写盘, 而读数上与生效完全一样。
+ * 所以在第一次武装改道时核对一遍 —— 本工程的惯例是"约定必须有一条能响的检查"。
+ */
+static void verifyTransientWeightPathsOnce()
+{
+    static std::once_flag onceFlag;
+    std::call_once(onceFlag, []() {
+        const std::string paths[] = {
+            TMP_WEIGHTS,
+            TMP_WEIGHTS_PPOMCTS_MLP,
+            TMP_WEIGHTS_SACAZ,
+            TMP_WEIGHTS_SACAZ_MOE,
+            TMP_WEIGHTS_SACAZ_MOE_MLP,
+            TMP_WEIGHTS_SACAZ_OLD,
+            TMP_WEIGHTS_SACAZ_OLD_MOE,
+            TMP_WEIGHTS_DQNAB,
+            TMP_WEIGHTS_DQNMCTS_MOE,
+            /* 快照/审计那两条是拼出来的 (每种类型一个), 至少抽查两种类型 */
+            frozenSnapshotPathOf(ChessBoard::AGENT_SACAZ),
+            frozenSnapshotPathOf(ChessBoard::AGENT_DQNAB),
+            frozenAuditPathOf(ChessBoard::AGENT_PPOMCTS),
+        };
+        QStringList bad;
+        for (const std::string &p : paths) {
+            if (!RL::WeightIO::isTransientPath(p)) {
+                bad << QString::fromStdString(p);
+            }
+        }
+        if (!bad.isEmpty()) {
+            qWarning().noquote()
+                << QStringLiteral("[weights] 这些临时权重路径没命中 '%1' 前缀, "
+                                  "对弈期间它们会**照旧落盘** (改道对它们无效): %2")
+                       .arg(QString::fromLatin1(RL::WeightIO::kTransientPrefix),
+                            bad.join(QStringLiteral(", ")));
+        }
+    });
+}
+
+void ChessBoard::updatePlayWeightDivert()
+{
+    verifyTransientWeightPathsOnce();
+    const bool want = m_playDivertMatch.load() || m_playDivertHuman.load();
+    if (want == RL::WeightIO::divertEnabled()) {
+        return;                     /* 状态没变: 不重复打日志 (每手都会调到这里) */
+    }
+    RL::WeightIO::setDivertEnabled(want);
+    if (want) {
+        /*
+           计数从零开始: "本场改道了几次"才是报告要的数, 跨场累加会让第二场之后
+           的读数说不清是哪一场的 (与 m_frozenDecisions 每次归零同一条理由)。
+        */
+        RL::WeightIO::resetCounters();
+        qInfo().noquote()
+            << QStringLiteral("[weights] 对弈期间权重不落盘: 已开启 (临时权重路径 %1* "
+                              "改走内存 —— 后台训练照常, 退出时统一保存)")
+                   .arg(QString::fromLatin1(RL::WeightIO::kTransientPrefix));
+    } else {
+        qInfo().noquote()
+            << QStringLiteral("[weights] 对弈期间权重不落盘: 已关闭 "
+                              "(本场改道 %1 次 / %2 字节; 之后临时权重照旧写盘)")
+                   .arg((qlonglong)RL::WeightIO::divertedWrites())
+                   .arg((qlonglong)RL::WeightIO::divertedBytes());
+    }
+}
+
+bool ChessBoard::isPlayWeightDivertOn() const
+{
+    return RL::WeightIO::divertEnabled();
+}
+
+int ChessBoard::divertedWeightWrites() const
+{
+    return (int)RL::WeightIO::divertedWrites();
+}
+
+long long ChessBoard::divertedWeightBytes() const
+{
+    return RL::WeightIO::divertedBytes();
+}
+
+void ChessBoard::setHumanGameInProgress(bool on)
+{
+    m_playDivertHuman.store(on);
+    updatePlayWeightDivert();
+}
+
 /*
  * freezeOpponentToSnapshot - 取开场快照 + 建冻结实例
  *
@@ -2742,6 +2865,17 @@ bool ChessBoard::freezeOpponentToSnapshot(AgentType type, QString &outNote)
     }
     m_frozenOpponentType = type;
     m_frozenDecisions.store(0);      /* 本场重新计数 (见 frozenOpponentOverrideFor) */
+    /*
+       ---- 快照已经把冻结实例喂饱了 ⇒ 没开审计就可以放掉内存里那一份 (2026-10) ----
+       对弈期间 `m_frozenSnapshotPath` 是**写进内存**的 (它命中 weights/_temp 前缀 ⇒
+       走 rl/weightio.hpp 的改道), 而它在正常口径下只被"建冻结实例"读一次。
+       不开审计时那份字节再没人要 —— 留着就是"评估一场多占一份 B 方权重" (稀疏 MoE
+       是 3 x 146 MB)。开了审计则**必须留着**: 审计是拿"冻结实例现在的权重"与它逐字节
+       比, 而快照从未落盘, 放掉之后就没有比对方了 (见 auditFrozenOpponentWeights)。
+    */
+    if (!m_frozenWeightAudit) {
+        RL::WeightIO::drop(m_frozenSnapshotPath);
+    }
     outNote += QStringLiteral("B 方 (%1) 已冻结为**开场权重快照**: 独立实例, A 的学习"
                               "写不到它身上, 后台训练也不会碰它")
                    .arg(agentDisplayName(type));
@@ -2763,6 +2897,17 @@ void ChessBoard::releaseFrozenOpponent()
     if (m_frozenOpponent != nullptr) {
         delete m_frozenOpponent;
         m_frozenOpponent = nullptr;
+    }
+    /*
+       [2026-10 对弈期间不落盘] 这两份文件在对弈期间是**内存里**的 (改道), 所以下面那些
+       QFile::remove 会是 no-op —— 真正要放掉的是内存副本, 由这两句做。放在最前面:
+       路径稍后就被 clear(), 那时再也找不到它们了 (那就是"几百 MB 再也放不掉"的形状)。
+    */
+    if (!m_frozenSnapshotPath.empty()) {
+        RL::WeightIO::drop(m_frozenSnapshotPath);
+    }
+    if (!m_frozenAuditPath.empty()) {
+        RL::WeightIO::drop(m_frozenAuditPath);
     }
     if (!m_frozenSnapshotPath.empty()) {
         QFile::remove(QString::fromStdString(m_frozenSnapshotPath + "_actor"));
@@ -2798,15 +2943,26 @@ void ChessBoard::releaseFrozenOpponent()
  *
  * 只在 m_frozenWeightAudit 打开时调用 (它要额外写一次权重文件)。
  */
-static bool fileBytesEqual(const std::string &a, const std::string &b)
+/*
+ * [2026-10 对弈期间不落盘] 逐字节比对必须**走同一套"内存优先、磁盘回落"的读法**
+ * (见 rl/weightio.hpp): 对弈期间这两份权重都在内存里, 用 ifstream 去读会两个都打不开
+ * ⇒ 审计恒假 ⇒ 报告说"B 的权重变了", 而真相是"它们根本没在磁盘上"。
+ * 这是"机制生效了, 读数说它没生效"的典型形状, 也正是 weightFileWritten/Readable
+ * 那两处要一起改的原因。
+ */
+static bool weightBytesEqual(const std::string &a, const std::string &b)
 {
-    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
-    if (!fa.good() || !fb.good()) {
+    std::string sa, sb;
+    if (!RL::WeightIO::readBytes(a, sa) || !RL::WeightIO::readBytes(b, sb)) {
         return false;
     }
-    std::string sa((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
-    std::string sb((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
     return !sa.empty() && sa == sb;
+}
+
+/* 这一份权重此刻在不在 (内存里有, 或者磁盘上有) */
+static bool weightBlobExists(const std::string &path)
+{
+    return RL::WeightIO::exists(path);
 }
 
 bool ChessBoard::auditFrozenOpponentWeights()
@@ -2829,12 +2985,10 @@ bool ChessBoard::auditFrozenOpponentWeights()
     bool anyCompared = false;
     for (const char *sfx : kSuffixes) {
         const std::string a = m_frozenSnapshotPath + sfx;
-        std::ifstream probe(a, std::ios::binary);
-        if (!probe.good()) {
+        if (!weightBlobExists(a)) {
             continue;      /* 这个后缀不存在 (该 agent 不是这种文件布局) */
         }
-        probe.close();
-        if (!fileBytesEqual(a, audit + sfx)) {
+        if (!weightBytesEqual(a, audit + sfx)) {
             return false;
         }
         anyCompared = true;
@@ -3389,6 +3543,15 @@ bool ChessBoard::notifyHumanGameEnd(int result)
     if (result == Chess::RESULT_ONGOING) {
         return false;      /* 还有棋可走: 三个调用点都不会传它, 这是兜底 */
     }
+    /*
+       ---- 人机这一局结束 ⇒ 解除"对弈期间权重不落盘" (2026-10) ----
+       放在**所有提前 return 之前**: 下面有好几条"本模式下不写学习回路"的提前返回,
+       把解除写在后面就会漏掉它们 —— 而漏掉的表现是"这一局之后权重再也不落盘",
+       直到退出为止 (不崩、不报错, 只是盘上的临时文件从此不再更新)。
+       放在这里也保证"凡终局都解除": 人走的那一手将死 / AI 被将死 / 和棋三条路都经过
+       本函数 (见 mousePressEvent 与 process 的调用点)。
+    */
+    setHumanGameInProgress(false);
     const char *resText = (result == Chess::RESULT_RED_WIN)   ? "红胜 (人赢了)"
                         : (result == Chess::RESULT_BLACK_WIN) ? "黑胜 (AI 赢了)"
                         : (result == Chess::RESULT_DRAW)      ? "和棋"
@@ -4779,6 +4942,30 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         ChessBoard *self;
         ~FrozenGuard() { self->releaseFrozenOpponent(); }
     } frozenGuard{this};
+
+    /*
+       ---- 对弈期间: 权重不落盘 (2026-10 用户口径) ----
+       必须**早于**下面那句 freezeOpponentToSnapshot 武装: 评估模式的开场快照本身也是一份
+       权重文件, 它就在这场对弈的准备阶段写出来 —— 晚一步武装就漏掉它 (而那一份是
+       3 x 146 MB 量级, 正好是最该被拦下的那种)。
+
+       RAII: 正常结束 / 被中止 / 提前 return 三条路都要解除 (与 FrozenGuard 同一手法)。
+       两个作用域取或 (见头文件): 这里是"整场", 人机那一局是另一个开关。
+
+       ⚠ 训练对弈模式下后台训练**照常跑**, 它那一轮的权重往返因此走内存 —— 这就是本
+         开关存在的理由; 评估/只对弈模式下后台训练本来就被 isBackgroundTrainingPaused()
+         整体停摆, 那时改道只是"顺手也成立"。
+    */
+    m_playDivertMatch.store(true);
+    updatePlayWeightDivert();
+    struct PlayDivertGuard {
+        ChessBoard *self;
+        ~PlayDivertGuard()
+        {
+            self->m_playDivertMatch.store(false);
+            self->updatePlayWeightDivert();
+        }
+    } playDivertGuard{this};
     /*
        计数归零: 报告里的"B 方用快照走了几手"必须是**本场**的数 ——
        不归零的话, 一场没有快照的对局会带上上一场留下的数字 (那是假的读数)。
@@ -5588,6 +5775,16 @@ void ChessBoard::backgroundTrainLoop()
 
         /* ---- 克隆主agent权重到临时文件 ---- */
         const char *tmpWeights = tmpWeightsOf(type);
+        /*
+           ---- 先放掉上一轮留在内存里的那一份 (2026-10 对弈期间不落盘) ----
+           一轮的往返是"写种子 -> clone 读 -> clone 写回 -> 主 agent 读", 对弈期间这四步
+           都在内存里 (见 rl/weightio.hpp), 而这份字节的寿命就到"主 agent 读完"为止
+           (上一轮结尾已经 drop 过一次)。这里再 drop 一次是给"上一轮被中途丢弃"那种
+           情况兜底: 模式切换/暂停会让一轮在同步之前就 continue 掉, 那份内存副本就会
+           一直留到下一次写同一个路径 —— 单看内存不是灾难, 但"看不见的几百 MB" 不值得留。
+           在这一行之后才写种子, 所以这次 drop 不可能命中本轮要用的数据。
+        */
+        RL::WeightIO::drop(tmpWeights);
         bool seeded = false;
         {
             std::lock_guard<std::mutex> lock(m_agentMutex);
@@ -6053,6 +6250,17 @@ void ChessBoard::backgroundTrainLoop()
             default: break;
             }
         }
+
+        /*
+           ---- 一轮结束 ⇒ 放掉内存里的那一份临时权重 (2026-10 对弈期间不落盘) ----
+           对弈期间这条往返全在内存里 (见 rl/weightio.hpp), 而它的字节可能与整个网络
+           同量级 (稀疏 MoE 那几支是 3 x 146 MB)。**在这里 drop** 而不是等改道关闭:
+           改道可能整场对弈都开着, 放着不管就是"每一支都留一份在内存里"。
+           位置必须在**同步回主 agent 之后**: 上面那个 switch 用的还是这份字节。
+           另外每轮开头也会 drop 一次 (见那段注释): 万一某一轮在中途被丢弃 (模式切换 /
+           暂停), 那份内存副本就不会留到下一轮才放掉。
+        */
+        RL::WeightIO::drop(tmpWeights);
     }
 }
 
@@ -6095,6 +6303,26 @@ void ChessBoard::shutdownSave()
 int ChessBoard::saveAllInstantiatedAgentsOnExit()
 {
     QDir().mkpath("weights");
+
+    /*
+       ---- 退出保存之前: **强行解除**对弈期间的权重改道 (2026-10) ----
+       这是"不落盘"那条口径的最后一条边界: 用户完全可以在**一局棋下到一半**时关窗,
+       那时 m_playDivertHuman 还开着。标准权重路径 (下面 defaultWeightPath) 本来就不
+       受改道影响, 所以这条防线**不是**为了这一次保存 —— 它是为了"将来有人在退出路径上
+       写临时文件"的那一天: 改道还开着的话, 那些字节会写进内存, 然后随进程一起消失,
+       而日志上一切正常 (静默丢数据, 本工程最怕的形状)。
+       把判据写死在这里 (而不是靠"调用方记得先解除"), 是因为退出路径只有这一个入口。
+    */
+    if (RL::WeightIO::divertEnabled()) {
+        qInfo().noquote()
+            << QStringLiteral("[weights] 退出保存: 先解除对弈期间的权重改道 "
+                              "(本场改道 %1 次 / %2 字节) —— 标准权重路径本来就写磁盘")
+                   .arg((qlonglong)RL::WeightIO::divertedWrites())
+                   .arg((qlonglong)RL::WeightIO::divertedBytes());
+        m_playDivertMatch.store(false);
+        m_playDivertHuman.store(false);
+        RL::WeightIO::setDivertEnabled(false);
+    }
 
     const AgentType all[] = { AGENT_PG, AGENT_DQN, AGENT_PPOMCTS, AGENT_DQNMCTS,
                               AGENT_EVAB, AGENT_SACAZ, AGENT_SACAZ_MOE, AGENT_DQNAB,

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <limits>
 #include <functional>   /* OpponentPolicy 的"对手在这一手会怎么走" (P1) */
+#include "rl/weightio.hpp"   /* 对弈期间的临时权重改走内存 (2026-10) */
 #include "chess.h"
 
 /*
@@ -256,18 +257,29 @@ protected:
  * RL 层的 save()/load() 不返回状态 (Net::save() 返回的 -1 被丢掉了), 于是各 agent
  * 的 saveModel()/loadModel() 一律 `return true` —— 写盘失败时 GUI 照样弹"保存成功"。
  * 这里用"文件存在且非空"给出真实结果, 不改变 RL 层的接口。
+ *
+ * [2026-10 用户口径 "对弈期间不更新保存模型权重"] 判据里多了一条**内存**:
+ * 对弈期间后台训练那一轮的临时权重改走内存 (见 rl/weightio.hpp), 磁盘上**故意**
+ * 没有那些文件。不带这一条的话, 每一轮都会走进"种子权重写入失败, 跳过本轮" ——
+ * 表现是"一开对弈就完全不训练", 而原因与文件系统毫无关系 (那正是本工程最怕的
+ * 那种"机制生效了, 读数说它没生效"的失效)。
  */
 inline bool weightFileWritten(const std::string &path)
 {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.good()) {
-        return false;
-    }
-    return f.tellg() > 0;
+    /*
+       内存里那一份优先 (对弈期间的临时权重, 见 rl/weightio.hpp); 否则看磁盘上
+       "存在且非空" —— 后者是改动前的判据, 一个字节都不改。
+    */
+    return RL::WeightIO::exists(path);
 }
 
 inline bool weightFileReadable(const std::string &path)
 {
+    long long memBytes = 0;
+    if (RL::WeightIO::memorySize(path, memBytes)) {
+        return true;                      /* 内存里有这一份 (对弈期间) */
+    }
+    /* 磁盘那一支保持原语义: "能打开"即可 (空文件在这里算可读, 载入时自然失败) */
     std::ifstream f(path, std::ios::binary);
     return f.good();
 }

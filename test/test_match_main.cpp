@@ -30,8 +30,10 @@
 #include <cmath>
 #include <limits>      /* [2.7c] quiet_NaN: "这一次有没有产生可比的损失" */
 #include <algorithm>   /* std::count: 数自检报告有几行 */
+#include <filesystem>  /* [2.22] 对弈期间"临时权重目录没被动过"要按名字/大小/时间量 */
 #include <QVector>
 #include <QMetaObject>
+#include "rl/weightio.hpp"   /* [2.22] 改道判据本身 (临时前缀 vs 标准权重路径) */
 
 static int g_checks = 0;
 static int g_failed = 0;
@@ -115,6 +117,61 @@ static int nonFiniteWeightCount(const std::string &path)
         }
     }
     return bad;
+}
+
+/*
+ * ================================================================
+ *  [2.22] "对弈期间不落盘模型权重" 要用到的两个小工具
+ * ================================================================
+ *
+ * transientWeightDirState: weights/ 下所有临时权重文件此刻长什么样 ——
+ *   名字 + 大小 + 修改时间, 排序后拼成一串。
+ *   为什么不是"文件在不在": 后台训练那一轮**覆盖的是同一个文件**
+ *   (`weights/_temp_train.dat`), 所以"原地改写"在"存在性"上完全看不出来 ——
+ *   而"对弈期间一个权重文件都没写"这句话的真假恰恰就在"有没有被改写"上。
+ *   为什么只看 `_temp` 开头: 标准权重 (`weights/xxx_agent.dat`) 只在退出时写,
+ *   对局期间本来就不会动; 判据收在"临时权重"上, 与改道本身的边界完全一致。
+ *
+ * removeWeightFiles: 删掉一个多文件家族的全部文件 (前缀 + 各后缀)。
+ *   探针要在"磁盘上确实没有这一份"的前提下开始, 否则"读得回来"可能只是读到了
+ *   上一节留下的旧文件 (那种通过是假的)。
+ */
+static std::string transientWeightDirState()
+{
+    namespace fs = std::filesystem;
+    std::vector<std::string> items;
+    std::error_code ec;
+    fs::create_directories("weights", ec);
+    for (const fs::directory_entry &e : fs::directory_iterator("weights", ec)) {
+        if (ec) {
+            break;
+        }
+        const std::string name = e.path().filename().string();
+        if (name.rfind("_temp", 0) != 0) {
+            continue;                      /* 只看临时权重 (与改道的判据同一类) */
+        }
+        std::error_code ec2;
+        const long long size = (long long)fs::file_size(e.path(), ec2);
+        const long long mt =
+            (long long)fs::last_write_time(e.path(), ec2).time_since_epoch().count();
+        items.push_back(name + "|" + std::to_string(size) + "|" + std::to_string(mt));
+    }
+    std::sort(items.begin(), items.end());
+    std::string out;
+    for (const std::string &s : items) {
+        out += s;
+        out += "\n";
+    }
+    return out;
+}
+
+static void removeWeightFiles(const std::string &prefix)
+{
+    static const char *kSuffixes[] = { "", "_actor", "_critic", "_q1", "_q2",
+                                       "_trunk", "_v", "_a" };
+    for (const char *sfx : kSuffixes) {
+        std::remove((prefix + sfx).c_str());
+    }
 }
 
 int main(int argc, char *argv[])
@@ -2714,6 +2771,154 @@ int main(int argc, char *argv[])
         board.setAgentType(ChessBoard::AGENT_ALPHABETA);
         board.setPreTrainEnabled(savedPreTrain);
         board.setPreTrainSteps(savedSteps);
+    }
+
+    /* ================================================================
+     *  [2.22] 对弈期间不落盘模型权重 (2026-10 用户口径)
+     * ================================================================
+     *
+     * 用户口径 (原话): **"对弈期间不更新保存模型权重"**。
+     * 与用户确认过的收窄: 范围 = 人机对弈 + 界面"开始对弈"的整场, 两种都算;
+     * 程度 = **学习照常** (每手在线更新 + 后台训练), 但对弈期间**一个权重文件都不写**,
+     * 退出时统一保存 (唯一落盘点仍是 saveAllInstantiatedAgentsOnExit)。
+     *
+     * 做法 (见 rl/weightio.hpp): 对弈期间把**临时权重路径** (`weights/_temp*`) 的读写
+     * 改到内存 —— 后台训练那一轮的"写种子 -> clone 读 -> clone 写回 -> 主 agent 读"
+     * 因此照常跑完, 而 weights/ 目录里一个临时文件都不多。
+     *
+     * 三条断言缺一不可 (少任何一条, 这个机制都能"看起来生效"而其实没生效):
+     *   (1) **不落盘**: 整场对弈期间 weights/ 下的临时权重文件一个都没被动过
+     *       (名字 / 大小 / 修改时间前后完全相同 —— 覆盖写也算"动过");
+     *   (2) **学习照常**: 同一段时间里后台训练**真的跑完了一轮** (改道计数在涨),
+     *       否则第 (1) 条会被"训练本来就没跑起来"轻易满足 (最假的那种通过);
+     *   (3) **标准权重路径不受影响**: 退出保存写的还是磁盘 ——
+     *       把标准路径也改道 = "点了保存, 退出后全没了"的静默丢数据。这条用纯函数断言。
+     */
+    std::printf("\n[2.22] 对弈期间不落盘模型权重 (2026-10 用户口径)\n");
+    {
+        using CB = ChessBoard;
+        const std::string tp  = "weights/_temp_match_divert_probe.dat";
+        const std::string tp2 = "weights/_temp_match_divert_probe2.dat";
+        const std::string stdPg = CB::defaultWeightPath(CB::AGENT_PG);
+
+        /* ---- (0) 判据本身: 临时路径被抓, 标准权重路径**永不**被抓 ---- */
+        CHECK(RL::WeightIO::isTransientPath("weights/_temp_train.dat"),
+              "后台训练的临时前缀属于'临时权重路径' (它就是要被改道的那一类)");
+        CHECK(RL::WeightIO::isTransientPath(tp),
+              "本节的探针路径同样命中 (前缀 weights/_temp)");
+        CHECK(!RL::WeightIO::isTransientPath(stdPg),
+              "标准权重路径 (weights/pg_agent...) **不受改道影响** —— 退出保存必须照旧写盘");
+        CHECK(!board.isPlayWeightDivertOn(),
+              "非对弈期间改道是关的 (默认行为与改动前逐字节相同)");
+
+        /* ---- (1) 正对照: 非对弈期间保存**确实写盘** ---- */
+        CHECK(board.loadAgentModel(CB::AGENT_PG, pgHealthyPath),
+              "前置条件: 常驻 PG 装回健康权重 (见 main 开头那段)");
+        removeWeightFiles(tp);
+        removeWeightFiles(tp2);
+        CHECK(board.saveCurrentAgentModel(CB::AGENT_PG, tp), "非对弈期间保存报告成功");
+        const std::string diskBefore = readFileBytes(tp);
+        CHECK(!diskBefore.empty(),
+              "非对弈期间保存**确实写到了磁盘** (正对照: 没有它, 下面的'没有文件'"
+              " 什么也证明不了)");
+
+        /* ---- (2) 人机那一局: 改道开着, 保存不落盘, 但**读得回来** ---- */
+        board.setHumanGameInProgress(true);
+        CHECK(board.isPlayWeightDivertOn(), "人机对局进行中: 改道已打开");
+        removeWeightFiles(tp);     /* 删掉磁盘上那份 -> 之后读到的只可能来自内存 */
+        const int w0 = board.divertedWeightWrites();
+        CHECK(board.saveCurrentAgentModel(CB::AGENT_PG, tp),
+              "对弈期间的保存仍然报告成功 (它写的是内存里的那一份)");
+        CHECK(readFileBytes(tp).empty(), "对弈期间磁盘上**没有**写出这个权重文件");
+        CHECK(board.loadAgentModel(CB::AGENT_PG, tp),
+              "对弈期间这份权重**仍然能读回来** —— 改道拦的是落盘, 不是学习通道");
+        CHECK(board.divertedWeightWrites() == w0 + 1,
+              "改道计数 +1: 证明上面那句'没有文件'是**改道**造成的, 不是保存没发生");
+
+        /* 读回来的必须是同一份: 关掉改道后存一份, 与落盘版逐字节比 */
+        board.setHumanGameInProgress(false);
+        CHECK(!board.isPlayWeightDivertOn(), "人机这一局结束 -> 改道自动关闭");
+        CHECK(board.saveCurrentAgentModel(CB::AGENT_PG, tp2), "关掉改道后保存");
+        const std::string afterRoundTrip = readFileBytes(tp2);
+        CHECK(afterRoundTrip == diskBefore,
+              "内存往返 (存 -> 读 -> 再存) 与落盘版**逐字节相同** —— 改道不改变写出的字节");
+
+        /* ---- (3) 人机这一局的起止点: 落子开始, 终局/开局结束 ---- */
+        board.setHumanGameInProgress(true);
+        CHECK(board.isPlayWeightDivertOn(), "人机对局进行中 -> 改道打开 (可再入)");
+        board.setMatchMode(CB::MATCH_EVAL);   /* 让终局通知直接返回 (本模式下不写学习回路) */
+        board.notifyHumanGameEnd(Chess::RESULT_DRAW);
+        CHECK(!board.isPlayWeightDivertOn(),
+              "终局 -> 改道关闭 (人机三条终局路径都经过 notifyHumanGameEnd)");
+        board.setHumanGameInProgress(true);
+        board.reset();                        /* 按"开局" = 上一层棋到此为止 */
+        CHECK(!board.isPlayWeightDivertOn() && !board.isHumanGameInProgress(),
+              "按『开局』解除改道 —— 起点是**玩家落第一子**, 不是'按了开局'"
+              " (界面之外十几个 main 都拿 reset() 当'摆回开局'的管道, 在那里武装会让"
+              " 它们后续保存的权重全部改道到内存)");
+
+        /* ---- (4) 整场对弈: 临时权重一个都没被动, 而后台训练照常跑 ---- */
+        board.setMatchMode(CB::MATCH_TRAIN);
+        board.setAgentType(CB::AGENT_PG);
+        board.setPreTrainEnabled(true);
+        board.setPreTrainSteps(32);
+        board.setBackgroundTrainRound(1, 8);   /* 一轮缩到 8 手: 让"一轮"落在对局时长之内 */
+        board.startBackgroundTraining();
+        /*
+           局数与手数上限刻意给大 (20 局 x 200 手): 这一节要的是"测量窗口整段都落在对弈
+           进行中" (下面有一条断言直接钉这一点)。给小了的话, 跑得快的机器上对局会在 8 秒
+           窗口结束**之前**跑完 —— 那时"临时权重没被写"与"改道生效"就分不清了, 而且这种
+           失败是随机的 (比没有断言更坏)。窗口之后立刻中止, 所以测试时长不受它影响。
+        */
+        board.setMaxPliesPerGame(200);
+
+        ChessBoard::MatchStats divertStats;
+        std::thread divertWorker([&board, &divertStats]() {
+            divertStats = board.matchAgents(ChessBoard::AGENT_PG, ChessBoard::AGENT_PG, 20);
+        });
+        /*
+           等改道真的打开再取"对局前"的快照: 它由 matchAgents 开场置位, 在它之前发生的
+           写盘不算"对弈期间"的 (那时还没开始) —— 顺序搞反会让这一节随"上一轮后台训练
+           刚好写没写完"而随机红, 而随机红的断言等于没有断言。
+        */
+        for (int i = 0; i < 300 && !board.isPlayWeightDivertOn(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(board.isPlayWeightDivertOn(), "整场对弈进行中: 改道已打开");
+        const std::string snap1 = transientWeightDirState();
+        const int w1 = board.divertedWeightWrites();
+        /* 跑一会儿: 一轮后台训练 (8 手) 在这段时间里必然跑完至少一次 */
+        std::this_thread::sleep_for(std::chrono::seconds(8));
+        const std::string snap2 = transientWeightDirState();
+        const int w2 = board.divertedWeightWrites();
+        const bool stillRunning = board.isMatchRunning();
+        std::printf("    对弈中: 临时权重目录 %s, 改道写 %d -> %d 次, 对局仍在跑 = %d\n",
+                    (snap1 == snap2) ? "未变" : "**变了**", w1, w2, (int)stillRunning);
+        CHECK(snap1 == snap2,
+              "整场对弈期间 weights/ 下的临时权重**一个都没被写**"
+              " (名字/大小/修改时间前后完全相同, 覆盖写也会被抓到)");
+        CHECK(w2 > w1,
+              "同一段时间里后台训练**照常跑完了至少一轮** (改道计数在涨) —— 这半边不可省:"
+              " 否则'没有写盘'会被'训练根本没跑'满足");
+        CHECK(stillRunning, "这一段的两次测量都发生在**对弈进行中** (否则上一条是空测)");
+
+        board.abortMatch();
+        divertWorker.join();
+        board.stopBackgroundTraining();
+        CHECK(!board.isPlayWeightDivertOn(), "整场结束后改道自动关闭");
+        CHECK(divertStats.aborted, "本场按中止收尾 (这一节只关心改道, 不关心比分)");
+        std::printf("    对弈结束后: 改道写 %d 次 (全场), 磁盘上仍无新增临时权重 = %d\n",
+                    board.divertedWeightWrites(),
+                    (int)(transientWeightDirState() == snap2));
+
+        /* 复原 (后面的小节接着用同一个 board) */
+        removeWeightFiles(tp);
+        removeWeightFiles(tp2);
+        board.setAgentType(CB::AGENT_ALPHABETA);
+        board.setMaxPliesPerGame(300);
+        board.setPreTrainEnabled(false);
+        board.setPreTrainSteps(0);
+        board.setMatchMode(CB::MATCH_TRAIN);
     }
 
     /* ---------------------------------------------------------------- 3. 中止 */

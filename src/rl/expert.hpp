@@ -192,14 +192,14 @@ public:
         l3.softUpdateTo(&p->l3, alpha);
     }
 
-    void write(std::ofstream &file) override
+    void write(std::ostream &file) override
     {
         l1.write(file);
         l2.write(file);
         l3.write(file);
     }
 
-    void read(std::ifstream &file) override
+    void read(std::istream &file) override
     {
         l1.read(file);
         l2.read(file);

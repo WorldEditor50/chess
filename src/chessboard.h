@@ -511,6 +511,55 @@ public:
     void abortMatch() { m_matchAbort = true; }
     bool isMatchRunning() const { return m_matchRunning.load(); }
 
+    /*
+     * ================================================================
+     *  ---- 对弈期间的"权重不落盘" (2026-10 用户口径) ----
+     * ================================================================
+     * 用户口径 (原话): **"对弈期间不更新保存模型权重"**。
+     * 与用户确认过的两条口径:
+     *   1. **范围** = 人机对弈 + 界面"开始对弈"的整场, 两种都算;
+     *   2. **程度** = **学习照常** (每手在线更新 + 后台训练), 但对弈期间
+     *      **一个权重文件都不写** —— 唯一落盘点仍是退出时的
+     *      saveAllInstantiatedAgentsOnExit()。
+     *
+     * 机制 (实现放在 rl/weightio.hpp): 对弈期间把**临时权重路径**
+     * (`weights/_temp*`, 也就是后台训练那一轮的往返文件 + 评估模式的开场快照/审计)
+     * 的读写改到内存里。它在 `Net::save/load` 上只判一次, 所以**所有 agent 自动适用**
+     * (十几个类各写一遍"内存版往返"就是十四份迟早漂移的实现)。
+     *
+     * 代价 (写清楚, 别被当成免费): 一轮训练里该 agent 的临时权重会在内存里多留一份
+     * (稀疏 MoE 那几支约 400 MB), 一轮结束就 drop 掉 —— 峰值 +1 份, 不累积。
+     *
+     * 三条边界:
+     *   * **标准权重路径不受影响** (退出保存照旧写盘): 把标准路径也改道 = "点了保存,
+     *     退出后全没了"的静默丢数据;
+     *   本类的两个开关分别对应两条路径 (对人机那一局 / 对整场对弈), 取或 ——
+     *     用两个标志而不是一个引用计数, 是为了"对弈中人机终局"这类交叠不会提前解开;
+     *   * **退出时强制关掉** (见 saveAllInstantiatedAgentsOnExit): 用户完全可以
+     *     在一局棋下到一半时关窗。
+     *
+     * ---- 人机这一局的起止点 (刻意的选择, 说清楚免得被当成漏了一段) ----
+     *   * 起点 = **玩家落第一子** (mousePressEvent 里那一步成功之后);
+     *   * 终点 = **终局** (notifyHumanGameEnd, 人机三条终局路径都经过它) 或 **"开局"**
+     *     (reset 把棋盘重摆 = 上一局到此为止)。
+     *   为什么起点不是"按下开局": 按下开局之后可能很久都不落子, 那段时间算不算"对弈期间"
+     *   没有客观答案。更要紧的是**界面之外**: `reset()` 在 test/bench/probe 十几个 main 里
+     *   都是"摆回开局"的管道, 在那里武装改道会让那些工具后续保存的权重**全部改道到内存**
+     *   (盘上什么都不留, 且不报错) —— 这正是本工程最怕的静默失效。
+     *   整场对弈那一侧没有这个问题: 它只在 matchAgents 里武装 (RAII, 三条退出路径都解除)。
+     */
+    bool isPlayWeightDivertOn() const;
+    /* 诊断: 改道发生了多少次 / 多少字节 —— "机制生效"与"没生效"必须有不同读数 */
+    int divertedWeightWrites() const;
+    long long divertedWeightBytes() const;
+    /*
+     * 人机那一局的进行状态 (只由本类内部调用: reset()/"玩家走子"/终局三处)。
+     * 公开读的那一半给测试与其他面板用; **置位那一半公开**是为了让测试能在不真的
+     * 走一盘棋的情况下把"对弈期间"这一段钉住 (见 test_match 的 [2.22])。
+     */
+    bool isHumanGameInProgress() const { return m_playDivertHuman.load(); }
+    void setHumanGameInProgress(bool on);
+
     /* 保存当前agent的权重文件 */
     bool saveCurrentAgentModel(AgentType agentType, const std::string &filepath);
     /*
@@ -1433,6 +1482,18 @@ public:
     /* ---- Agent 对弈状态 (对弈线程写, 状态条/前缀读, 故用 atomic) ---- */
     std::atomic<bool> m_matchRunning{false};
     std::atomic<bool> m_matchAbort{false};
+    /*
+       ---- 对弈期间的权重不落盘 (2026-10): 两个作用域, 取或 ----
+       m_playDivertMatch: matchAgents 整场 (RAII 置位/清除, 三条退出路径都走)
+       m_playDivertHuman: 人机那一局 (reset()/"玩家走子"置位, 终局清除)
+       为什么不是"一个引用计数": 计数要配对, 而"对弈跑到一半玩家按开局/人机终局"
+       这类交叠里, 配对错误的表现就是"改道提前解开" —— 那等于这条口径静默失效。
+       两个布尔取或没有配对问题。两者都只在 GUI 线程 / 对弈线程的变化点写。
+    */
+    std::atomic<bool> m_playDivertMatch{false};
+    std::atomic<bool> m_playDivertHuman{false};
+    /* 把两个作用域重新合到 WeightIO 的开关上 (状态没变就什么都不做) */
+    void updatePlayWeightDivert();
     std::atomic<int> m_matchGameNo{0};
     std::atomic<int> m_matchGames{0};
     /*

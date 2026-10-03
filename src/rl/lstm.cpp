@@ -367,7 +367,7 @@ void RL::LSTM::softUpdateTo(iLayer *layer, float rho)
     return;
 }
 
-void RL::LSTM::write(std::ofstream &file)
+void RL::LSTM::write(std::ostream &file)
 {
     /* input gate */
     file<<wi.toString()<<std::endl;
@@ -391,9 +391,9 @@ void RL::LSTM::write(std::ofstream &file)
     return;
 }
 
-void RL::LSTM::read(std::ifstream &file)
+void RL::LSTM::read(std::istream &file)
 {
-    auto parse = [](std::ifstream &file, Tensor &w, Tensor &u, Tensor &b)->void
+    auto parse = [](std::istream &file, Tensor &w, Tensor &u, Tensor &b)->void
     {
         std::string ws;
         std::getline(file, ws);

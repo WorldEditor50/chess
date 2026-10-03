@@ -493,7 +493,7 @@ public:
        顺序: wg, bg, w1, w2, b, 然后每个专家的权重, 再每个投影的权重。
        (与旧 ScaledConcat 的顺序不同 —— 那个实现没进过任何权重文件: 它只出现在
         dqn.cpp 一棵 #elif 0 的分支里, 见该文件的说明。) */
-    void write(std::ofstream &file) override
+    void write(std::ostream &file) override
     {
         file << wg.toString() << std::endl;
         file << bg.toString() << std::endl;
@@ -508,7 +508,7 @@ public:
         }
     }
 
-    void read(std::ifstream &file) override
+    void read(std::istream &file) override
     {
         std::string s;
         std::getline(file, s); wg = Tensor::fromString(s);
@@ -735,7 +735,7 @@ public:
          return;
      }
 
-     virtual void write(std::ofstream &file) override
+     virtual void write(std::ostream &file) override
      {
          /* w */
          file<<w1.toString()<<std::endl;
@@ -748,7 +748,7 @@ public:
          return;
      }
 
-     virtual void read(std::ifstream &file) override
+     virtual void read(std::istream &file) override
      {
          /* w */
          std::string w1s;
@@ -1002,7 +1002,7 @@ public:
          return;
      }
 
-     virtual void write(std::ofstream &file) override
+     virtual void write(std::ostream &file) override
      {
          /* w */
          file<<w0.toString()<<std::endl;
@@ -1016,7 +1016,7 @@ public:
          return;
      }
 
-     virtual void read(std::ifstream &file) override
+     virtual void read(std::istream &file) override
      {
          /* w */
          std::string w0s;
@@ -1235,7 +1235,7 @@ public:
          return;
      }
 
-     virtual void write(std::ofstream &file) override
+     virtual void write(std::ostream &file) override
      {
          /* w */
          file<<w1.toString()<<std::endl;
@@ -1248,7 +1248,7 @@ public:
          return;
      }
 
-     virtual void read(std::ifstream &file) override
+     virtual void read(std::istream &file) override
      {
          /* w */
          std::string w1s;

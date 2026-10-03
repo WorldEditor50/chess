@@ -162,8 +162,8 @@ public:
     /* Parameter ops */
     void copyTo(iLayer *layer) override;
     void softUpdateTo(iLayer *layer, float alpha) override;
-    void write(std::ofstream &file) override;
-    void read(std::ifstream &file) override;
+    void write(std::ostream &file) override;
+    void read(std::istream &file) override;
 
     /* Test */
     static void test();

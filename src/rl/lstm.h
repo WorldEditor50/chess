@@ -1,4 +1,4 @@
-﻿#ifndef LSTM_H
+#ifndef LSTM_H
 #define LSTM_H
 #include <iostream>
 #include <memory>
@@ -190,8 +190,8 @@ public:
     /* parameter */
     virtual void copyTo(iLayer* layer) override;
     virtual void softUpdateTo(iLayer* layer, float rho) override;
-    virtual void write(std::ofstream &file) override;
-    virtual void read(std::ifstream &file) override;
+    virtual void write(std::ostream &file) override;
+    virtual void read(std::istream &file) override;
     static void test();
 };
 
