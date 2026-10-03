@@ -1097,13 +1097,22 @@ RESULT: PASS
 >
 > | 项 | AGENT_SACAZ（当前口径） | AGENT_SACAZ_OLD（59e5233） |
 > |---|---|---|
-> | 目标熵 `entropyRatio` | 0.5 | **0.98** |
+> | 目标熵 `entropyRatio` | **0.98** | **0.98**（两支相同，见下） |
+> | α 的上界 | **按 α·H 定**：`alphaHBudget=3.0`（⇒ α ≤ 3/Ĥ ≈ 1.0，夹到上界本身） | `alpha.clamp(0.02, 0.02, 5.0)`（越界**弹回 0.02**） |
 > | `learningRateAlpha` | 5e-3 | **1e-3** |
 > | critic 目标 | 夹 ±2（`clampTarget=2`） | **不夹**（0） |
 > | Huber δ | 1.0 | **关**（0，纯 MSE） |
 > | 叶子估值 | 稀疏头（只算合法列） | **全量 Q** |
 > | 权重前缀 | `weights/sacaz_agent` | **`weights/sacaz_old_agent`** |
 > | 后台训练临时前缀 | `weights/_temp_train_sacaz` | **`weights/_temp_train_sacaz_old`** |
+>
+> **上表怎么读（2026-10 校正两处）**：`entropyRatio` 那一行原来写"当前 0.5"是**旧账**——
+> 2026-09 已经改回 0.98（`docs/issues_review.md:2553` 记了这条修法），本文件漏改；
+> `grep -n 'entropyRatio\s*=' src/*.cpp src/*.h` 在 2026-10 是**零命中**，也就是说
+> 两支的 0.98 都只来自各自构造函数的初始化表。`α 的上界` 那一行是本轮新增的
+> （`docs/sac_alpha_bound_2026_10.md`）：**当前口径不再用"α 的硬上界"**，而是
+> 按 `α·H` 定（`alphaHBudget=3.0` ⇒ α ≲ 3/Ĥ ≈ 1.0），还原版保持 `clamp(0.02,0.02,5.0)`
+> （注意它的语义是"越界弹回 0.02"）。
 >
 > **权重为什么必须分开**（用户口径）：两者参数结构完全相同（都是 iFcLayer 的 w/b），
 > 结构指纹**挡不住**串权重；而训练口径不同 ⇒ 共用前缀等于"后训练的那一支静默覆盖另一支"，

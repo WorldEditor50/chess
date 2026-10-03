@@ -110,6 +110,16 @@ struct Cfg {
     */
     float clampTarget = -1.0f, huberDelta = -1.0f, entropyRatio = -1.0f, alphaLr = -1.0f;
     /*
+       ---- [2026-10] α 的两个上界旋钮 ----
+       `--alpha-ceiling`   : 直接夹 α (类默认 5.0)。
+       `--alpha-h-budget`  : 夹 **α·H** —— 真正线性进 TD 目标的是 α·H, 不是 α:
+                             `y = r − γ(E[minQ] + α·H)`。上界 = 预算 / 本批 H 均值,
+                             所以"熵项最多能把目标顶多远"是被**按构造**限住的,
+                             与 H 有没有响应、目标熵可不可达都无关。
+       负数 = 不覆盖 (用类默认值; 两个都为负时 = 改动前逐位相同)。
+    */
+    float alphaCeiling = -1.0f, alphaHBudget = -1.0f;
+    /*
        --no-sparse-leaf: 搜索叶子估值走**全量**(128 槽下一次只要算 128 列, 稀疏头省不了
        什么, 却多走一条与训练不同的代码路径)。类里默认开着; 59e5233 那一支是关的。
     */
@@ -159,6 +169,7 @@ Cfg g;
 struct Given {
     bool rewardShape = false, clamp = false, huber = false;
     bool entropyRatio = false, alphaLr = false;
+    bool alphaCeiling = false, alphaHBudget = false;
     bool entropyInTarget = false, entropySlots = false, valueScale = false;
     bool targetTau = false, targetIter = false;
     bool searchLearn = false, sparseLeaf = false;
@@ -190,6 +201,8 @@ struct Caliber {
     double clampTarget = 0.0, huberDelta = 0.0, entropyInTarget = 0.0, valueScale = 0.0;
     bool entropySlots = false, sparseLeaf = true;
     double entropyRatio = 0.0, alphaLr = 0.0;
+    /* [2026-10] α 的上界: 直接的 (alphaCeiling) 与**按 α·H 定的** (alphaHBudget) */
+    double alphaCeiling = 0.0, alphaHBudget = 0.0;
     /* 目标网同步率 */
     bool hasTargetSyncSwitches = true;
     double targetTau = 1e-3;
@@ -210,6 +223,8 @@ static const char *forbiddenForLegacy(const Given &gv)
     if (gv.entropySlots)   { return "--entropy-slots"; }
     if (gv.targetTau)      { return "--target-tau"; }
     if (gv.targetIter)     { return "--target-iter"; }
+    if (gv.alphaCeiling)   { return "--alpha-ceiling"; }
+    if (gv.alphaHBudget)   { return "--alpha-h-budget"; }
     return nullptr;
 }
 
@@ -548,6 +563,8 @@ int main(int argc, char **argv)
         else if (const char *v = val("--huber"))   { g.huberDelta = (float)std::atof(v); g_given.huber = true; }
         else if (const char *v = val("--entropy-ratio")) { g.entropyRatio = (float)std::atof(v); g_given.entropyRatio = true; }
         else if (const char *v = val("--alpha-lr")) { g.alphaLr = (float)std::atof(v); g_given.alphaLr = true; }
+        else if (const char *v = val("--alpha-ceiling")) { g.alphaCeiling = (float)std::atof(v); g_given.alphaCeiling = true; }
+        else if (const char *v = val("--alpha-h-budget")) { g.alphaHBudget = (float)std::atof(v); g_given.alphaHBudget = true; }
         else if (const char *v = val("--entropy-in-target")) { g.entropyInTarget = (float)std::atof(v); g_given.entropyInTarget = true; }
         else if (std::strcmp(a, "--entropy-slots") == 0) { g.entropySlots = true; g_given.entropySlots = true; }
         else if (const char *v = val("--value-scale")) { g.valueScale = (float)std::atof(v); g_given.valueScale = true; }
@@ -644,6 +661,14 @@ int main(int argc, char **argv)
         if (g.alphaLr >= 0.0f)      { sac->learningRateAlpha = g.alphaLr; }
         if (g.entropyInTarget >= 0.0f) { sac->entropyInTarget = g.entropyInTarget; }
         if (g.entropySlots)         { sac->entropySlotsAsLegal = true; }
+        /*
+           [2026-10] α 的上界。注意 `--alpha-ceiling` 是**构造之后**才设的: 类构造函数
+           里按 alphaCeiling 夹过一次初值 0.2 (见 sacazagent.cpp)。本轮的用法都是
+           ceiling >= 1.0 (不触及 0.2), 所以这里不改初值 —— 若以后要用 < 0.2 的 ceiling
+           做消融, 必须连初值一起处理, 否则第一个 batch 的 α 是 0.2。
+        */
+        if (g.alphaCeiling >= 0.0f) { sac->alphaCeiling = g.alphaCeiling; }
+        if (g.alphaHBudget >= 0.0f) { sac->alphaHBudget = g.alphaHBudget; }
         if (g.valueScale >= 0.0f)   { sac->valueScale = g.valueScale; }
         if (g.targetTau >= 0.0f)    { sac->targetTau = g.targetTau; }
         if (g.targetIter > 0)       { sac->replaceTargetIter = g.targetIter; }
@@ -664,6 +689,8 @@ int main(int argc, char **argv)
         cal.huberDelta = (double)sac->huberDelta;
         cal.entropyRatio = (double)sac->entropyRatio;
         cal.alphaLr = (double)sac->learningRateAlpha;
+        cal.alphaCeiling = (double)sac->alphaCeiling;
+        cal.alphaHBudget = (double)sac->alphaHBudget;
         cal.entropyInTarget = (double)sac->entropyInTarget;
         cal.entropySlots = sac->entropySlotsAsLegal;
         cal.valueScale = (double)sac->valueScale;
@@ -704,9 +731,10 @@ static void runBench(Chess &board, AgentT &sac, MCTS &mcts, const Caliber &cal)
                 " 关了就等于改动前的行为)\n", (int)cal.searchLearn);
     if (cal.hasCriticSwitches) {
         std::printf("学习口径   : clampTarget=%.2f huberDelta=%.2f 熵比=%.3f alphaLr=%.4f "
-                    "| 叶子估值=%s\n"
+                    "| α 上界 %.2f / α·H 预算 %.2f (0 = 关) | 叶子估值=%s\n"
                     "             (实际生效值; 59e5233 是 0 / 0 / 0.98 / 1e-3 / 全量)\n",
                     cal.clampTarget, cal.huberDelta, cal.entropyRatio, cal.alphaLr,
+                    cal.alphaCeiling, cal.alphaHBudget,
                     cal.sparseLeaf ? "稀疏头" : "全量");
     } else {
         /*
@@ -807,13 +835,25 @@ static void runBench(Chess &board, AgentT &sac, MCTS &mcts, const Caliber &cal)
             const DiagDelta dx(diagPrev, now);
             diagPrev = now;
             if (dx.n > 0) {
-                std::printf("              [①] α %.4f→%.4f | y夹前均值|y| %.2f (符号 %+.2f, "
+                /*
+                   [2026-10] 这一行现在把**α·H 当主口径**印在最前面 (含它占 |y| 的比例):
+                   进 TD 目标的是 α·H 而不是 α, 所以"α 大不大"这个问题只能由
+                   "αH 相对 |y| 有多大"来回答; α 的绝对值配上一个与 H 无关的上界
+                   (5.0 / 1.0) 是没法解释的。同时给出 H<H̄ 的两个口径:
+                   前者是**当前生效**的目标熵, 后者是"分母换成合法槽位数"的反事实。
+                */
+                std::printf("              [①] α %.4f→%.4f (αH %+.2f = |y| 的 %.0f%%) | "
+                            "y夹前均值|y| %.2f (符号 %+.2f, "
                             "最大 %.2f) 被夹 %.0f%% | V %+.2f = E[minQ] %+.2f + αH %+.2f | "
-                            "H %.2f vs H̄ %.2f (H<H̄ %.0f%%) | Qspread %.3f | 槽位/着法 %.1f/%.1f\n",
-                            dx.alphaFirst, dx.alphaLast, dx.yPreAbsMean, dx.yPreMean,
+                            "H %.2f vs H̄ %.2f (H<H̄ %.0f%%, 槽位口径 %.0f%%) | "
+                            "Qspread %.3f | 槽位/着法 %.1f/%.1f\n",
+                            dx.alphaFirst, dx.alphaLast, dx.vEntMean,
+                            (dx.yPreAbsMean > 1e-9) ? 100.0 * dx.vEntMean / dx.yPreAbsMean : 0.0,
+                            dx.yPreAbsMean, dx.yPreMean,
                             dx.yPreAbsMax, 100.0 * dx.clampFrac(),
                             dx.vMean, dx.vQMean, dx.vEntMean,
                             dx.hMean, dx.hBarMean, 100.0 * dx.hBelowFrac(),
+                            100.0 * dx.hBelowSlotsFrac(),
                             dx.qSpreadMean, dx.slotsMean, dx.legalMean);
             }
         }

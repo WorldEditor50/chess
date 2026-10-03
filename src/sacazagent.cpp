@@ -1836,6 +1836,12 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     float lossSum = 0.0f;
     int n = 0;
     float alphaGrad = 0.0f;
+    /*
+       [2026-10] 本批 H 的累加 (只为 `alphaHBudget`: 上界 = budget / Ĥ)。
+       单独一个局部量而不是复用 `trainDiag.hSum` —— 诊断量是**自构造起**的累计值,
+       拿它当分母会把"这一批"的上界算成历史均值, 而且会污染只读的诊断语义。
+    */
+    double hBatchSum = 0.0;
 
     for (int ep = 0; ep < epochs; ep++) {
     for (int it = 0; it < batchSize_; it++) {
@@ -2034,6 +2040,7 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
         }
         const float Hbar = entropyRatio * std::log((float)lc);
         alphaGrad += (H - Hbar);
+        hBatchSum += (double)H;
         n++;
 
         /*
@@ -2145,8 +2152,40 @@ float SACAZAgent::learnBatch(int batchSize_, int epochs)
     /*
        [2026-09 实验轮] `alphaCeiling` 默认 5.0 = 改动前逐位相同。
        实测 α 会被推到上界, 而 α·H 是 TD 目标里的主项之一 ⇒ 上界决定"目标被顶多远"。
+
+       [2026-10] **上界按 α·H 定, 不按 α 定** —— `alphaHBudget` (>0 时生效):
+         Ĥ = 本批 H 的均值, 于是上界 = min(alphaCeiling, alphaHBudget / Ĥ)。
+       为什么这一步是必要的 (而不是把 5.0 换成 1.0 了事): 进 TD 目标的是 `α·H`
+       (`y = r − γ(E[minQ] + α·H)`), 而 α 的控制器在本 agent 里**没有不动点** ——
+       π 实际落在 128 个哈希槽位上 (有碰撞), 所以 `H ≤ log(槽位数) < log(着法数) = H̄/熵比`,
+       梯度 `H − H̄` 恒为负, α 被单向顶到上界。上界只是"顶到哪", 不是"停不停"。
+       按 `α·H ≤ budget` 夹则**按构造**限住了真正进目标的那一项, 与 H 的响应性无关。
+       `alphaHBudget <= 0` = 关 = 与改动前逐位相同。
     */
-    alpha.clamp(0.02f, 0.02f, (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f);
+    if (alphaHBudget > 0.0f) {
+        /*
+           [2026-10] 新口径: 上界 = min(alphaCeiling, alphaHBudget / 本批 H 均值),
+           越界时**夹到上界本身**。
+
+           为什么这里**不能**用下面那一行 `clamp`: `GradValue::clamp(c0, ci, cn)`
+           的语义是"越界就置成 ci"(= rl/parameter.hpp), 也就是"α 跑出上界 ⇒ 弹回 0.02"。
+           那会让"α 想变大"变成"α 归零" —— 一条锯齿 (实测: 上界压到 1.0 的那一档
+           撞上过 —— α 末值 0.683, 而过程中到过 0.02; 见 docs/sac_alpha_bound_2026_10.md §3)。
+           α·H 预算关着时 (<=0) 走 else 分支, 老口径一行都不动。
+        */
+        const double hBar = hBatchSum / (double)n;
+        float aMax = (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f;
+        if (hBar > 1e-6) {
+            const double byBudget = (double)alphaHBudget / hBar;
+            if (byBudget < (double)aMax) { aMax = (float)byBudget; }
+        }
+        if (aMax < 0.02f) { aMax = 0.02f; }
+        if (!(alpha[0] >= 0.02f)) { alpha[0] = 0.02f; }   /* 过小 / NaN -> 下界 */
+        if (alpha[0] > aMax) { alpha[0] = aMax; }
+    } else {
+        /* 老口径 (逐位不变): 注意它的上界语义是"越界置成 0.02", 见上面的说明 */
+        alpha.clamp(0.02f, 0.02f, (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f);
+    }
     alphaSample = -1.0f;   /* 批结束后清掉采样值 (批外一律用学到的 alpha[0]) */
 
     /*
@@ -2742,11 +2781,24 @@ std::string SACAZAgent::selfCheckReport() const
                               : "(跟得上在线网)");
     out += buf;
     std::snprintf(buf, sizeof(buf),
-                  "alpha=%.3f (自动调节, 界 [0.02, 5]) | 目标熵 %.2f x log(合法着法数) |"
+                  "alpha=%.3f (自动调节, 界 [0.02, %.2f]%s) | 目标熵 %.2f x log(%s) |"
                   " azWeight=%.2f | c_puct=%.2f | 模拟次数=%d | gamma=%.2f\n",
-                  (double)getAlpha(), (double)entropyRatio, (double)azWeight,
+                  (double)getAlpha(),
+                  (double)((alphaCeiling > 0.0f) ? alphaCeiling : 5.0f),
+                  (alphaHBudget > 0.0f) ? " 且 α·H <= 该预算 (真正进 TD 目标的是 α·H)"
+                                        : "",
+                  (double)entropyRatio,
+                  entropySlotsAsLegal ? "合法槽位数, 可达靶子)" : "合法着法数)",
+                  (double)azWeight,
                   (double)c_puct, simulations, (double)gamma);
     out += buf;
+    if (alphaHBudget > 0.0f) {
+        std::snprintf(buf, sizeof(buf),
+                      "alpha·H 预算: %.2f (上界 = 预算 / 本批 H 均值 ⇒ 熵项按构造不超过它;"
+                      " 观测口径见 TrainDiag 的 vEntSum/n)\n",
+                      (double)alphaHBudget);
+        out += buf;
+    }
     /*
        **口径行的价值**: AGENT_SACAZ 与 AGENT_SACAZ_OLD 用的是同一份算法, 差别只剩
        下面这一行的几个数 (再加大括号里的激活)。不印出来, "两个 SAC 谁强"就没法归因。

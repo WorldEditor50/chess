@@ -1950,6 +1950,8 @@ float SACAZMoEMlpAgent::learnBatch(int batchSize_, int epochs)
     float lossSum = 0.0f;
     int n = 0;
     float alphaGrad = 0.0f;
+    /* [2026-10] 本批 H 的累加, 只为 `alphaHBudget` (上界 = 预算 / Ĥ)。见 sacazagent.cpp。 */
+    double hBatchSum = 0.0;
 
     for (int ep = 0; ep < epochs; ep++) {
     for (int it = 0; it < batchSize_; it++) {
@@ -2148,6 +2150,7 @@ float SACAZMoEMlpAgent::learnBatch(int batchSize_, int epochs)
         }
         const float Hbar = entropyRatio * std::log((float)lc);
         alphaGrad += (H - Hbar);
+        hBatchSum += (double)H;
         n++;
 
         /*
@@ -2342,7 +2345,25 @@ float SACAZMoEMlpAgent::learnBatch(int batchSize_, int epochs)
        [2026-09 实验轮] `alphaCeiling` 默认 5.0 = 改动前逐位相同。
        实测 α 会被推到上界, 而 α·H 是 TD 目标里的主项之一 ⇒ 上界决定"目标被顶多远"。
     */
-    alpha.clamp(0.02f, 0.02f, (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f);
+    if (alphaHBudget > 0.0f) {
+        /*
+           [2026-10] 上界 = min(alphaCeiling, alphaHBudget / 本批 H 均值), 越界夹到**上界本身**。
+           为什么不用上面那行 `clamp`: 它的语义是"越界置成 ci"(rl/parameter.hpp),
+           即"α 跑出上界就弹回 0.02" —— 那是锯齿, 不是夹逼。见 sacazagent.cpp。
+        */
+        const double hBarBatch = hBatchSum / (double)n;
+        float aMax = (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f;
+        if (hBarBatch > 1e-6) {
+            const double byBudget = (double)alphaHBudget / hBarBatch;
+            if (byBudget < (double)aMax) { aMax = (float)byBudget; }
+        }
+        if (aMax < 0.02f) { aMax = 0.02f; }
+        if (!(alpha[0] >= 0.02f)) { alpha[0] = 0.02f; }
+        if (alpha[0] > aMax) { alpha[0] = aMax; }
+    } else {
+        /* 老口径 (逐位不变) */
+        alpha.clamp(0.02f, 0.02f, (alphaCeiling > 0.0f) ? alphaCeiling : 5.0f);
+    }
     alphaSample = -1.0f;   /* 批结束后清掉采样值 (批外一律用学到的 alpha[0]) */
 
     /*
@@ -2937,11 +2958,24 @@ std::string SACAZMoEMlpAgent::selfCheckReport() const
                               : "(跟得上在线网)");
     out += buf;
     std::snprintf(buf, sizeof(buf),
-                  "alpha=%.3f (自动调节, 界 [0.02, 5]) | 目标熵 %.2f x log(合法着法数) |"
+                  "alpha=%.3f (自动调节, 界 [0.02, %.2f]%s) | 目标熵 %.2f x log(%s) |"
                   " azWeight=%.2f | c_puct=%.2f | 模拟次数=%d | gamma=%.2f\n",
-                  (double)getAlpha(), (double)entropyRatio, (double)azWeight,
+                  (double)getAlpha(),
+                  (double)((alphaCeiling > 0.0f) ? alphaCeiling : 5.0f),
+                  (alphaHBudget > 0.0f) ? " 且 α·H <= 该预算 (真正进 TD 目标的是 α·H)"
+                                        : "",
+                  (double)entropyRatio,
+                  entropySlotsAsLegal ? "合法槽位数, 可达靶子)" : "合法着法数)",
+                  (double)azWeight,
                   (double)c_puct, simulations, (double)gamma);
     out += buf;
+    if (alphaHBudget > 0.0f) {
+        std::snprintf(buf, sizeof(buf),
+                      "alpha·H 预算: %.2f (上界 = 预算 / 本批 H 均值 ⇒ 熵项按构造不超过它;"
+                      " 观测口径见 TrainDiag 的 vEntSum/n)\n",
+                      (double)alphaHBudget);
+        out += buf;
+    }
     /*
        **口径行的价值**: AGENT_SACAZ 与 AGENT_SACAZ_OLD 用的是同一份算法, 差别只剩
        下面这一行的几个数 (再加大括号里的激活)。不印出来, "两个 SAC 谁强"就没法归因。
