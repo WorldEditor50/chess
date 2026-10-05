@@ -2437,9 +2437,68 @@ static bool testPpoMoeLoadBalance()
 /* ================================================================
  *  主函数
  * ================================================================ */
-int main()
+/*
+ *  测试 15: 价值探针 valueOfPosition (2026-10, 界面"价值评估"曲线的采样入口)
+ *
+ *  为什么它需要断言: 这是一条**新加的只读探针**, 而它踩的坑正是"未分配张量 ->
+ *  越界写 -> 整个程序在第一次采样时崩掉"。本轮实测: 界面对局开始几秒后**窗口直接
+ *  消失**, 脚本后面所有断言都读不到控件 —— 那种失败在读数上完全看不出来, 只能靠
+ *  一条直接的断言挡住。
+ *
+ *  钉三件与权重无关的结构性事实 (随机初始化权重下, 数值本身没有意义, 所以不判数值):
+ *    * 拿得到值, 且是有限值 (NaN 会把整条折线画没);
+ *    * **不改 agent 手里的棋盘** (内部临时换棋盘再还原; 不还原 = "AI 在一个不存在的
+ *      局面上下棋", 极难查);
+ *    * 同一局面连着问两次给同一个数 (确定性 —— 否则曲线上的抖动是假的)。
+ */
+static bool testValueProbe()
 {
-    /* 这些程序是分钟级的训练基准: 关掉 stdout 缓冲, 这样重定向到文件或用管道
+    bool ok = true;
+    printf("\n--- \xe6\xb5\x8b\xe8\xaf\x95""15: \xe4\xbb\xb7\xe5\x80\xbc\xe6\x8e\xa2\xe9\x92\x88 "
+           "(valueOfPosition; \xe4\xbb\xb7\xe5\x80\xbc\xe8\xaf\x84\xe4\xbc\xb0\xe6\x9b\xb2\xe7\xba\xbf\xe7\x94\xa8) ---\n");
+
+    Chess env;
+    env.reset();
+    env.sideToMove = Stone::COLOR_RED;
+    PPOMCTSAgent agent(env, 32, 0.99f, 0.005f, 1.414f, 32, 0.1f, /*withGrad=*/true);
+
+    /* agent 自己那份棋盘的签名 (还原检查用): 存活棋子的位置 + 走子方 */
+    auto sigOf = [](const Chess &c) {
+        unsigned long long h = 1469598103934665603ull;
+        for (int i = 0; i < 32; i++) {
+            const Stone *s = c.stones[i];
+            const int x = (s == nullptr || !s->alive) ? -1 : s->pos.x;
+            const int y = (s == nullptr || !s->alive) ? -1 : s->pos.y;
+            h = (h ^ (unsigned long long)(x * 100 + y)) * 1099511628211ull;
+        }
+        return h ^ (unsigned long long)c.sideToMove;
+    };
+    const unsigned long long before = sigOf(agent.chess);
+
+    Chess probe;
+    probe.reset();
+    probe.sideToMove = Stone::COLOR_BLACK;
+
+    double v1 = 0.0, v2 = 0.0, vr = 0.0;
+    const bool got1 = agent.valueOfPosition(probe, Stone::COLOR_BLACK, v1);
+    const bool got2 = agent.valueOfPosition(probe, Stone::COLOR_BLACK, v2);
+    const bool gotR = agent.valueOfPosition(probe, Stone::COLOR_RED, vr);
+    const bool finite = got1 && std::isfinite(v1) && gotR && std::isfinite(vr);
+    const bool deterministic = got1 && got2 && (v1 == v2);
+    const bool restored = (sigOf(agent.chess) == before);
+
+    printf("    V(黑方视角, 随机权重) = %.6f   V(红方视角) = %.6f\n", v1, vr);
+    printf("    拿得到值+有限 %s | 两次同一个数 %s | 探针后棋盘已还原 %s\n",
+           finite ? "ok" : "**FAIL**", deterministic ? "ok" : "**FAIL**",
+           restored ? "ok" : "**FAIL**");
+    ok = ok && finite;
+    ok = ok && deterministic;
+    ok = ok && restored;
+    return ok;
+}
+
+int main()
+{    /* 这些程序是分钟级的训练基准: 关掉 stdout 缓冲, 这样重定向到文件或用管道
        采集时也能实时看到进度 (默认的块缓冲会在崩溃/被 kill 时把输出全部丢掉)。 */
     setvbuf(stdout, NULL, _IONBF, 0);
     std::printf("  SIMD: %s\n", RL::cpuinfo::describe().c_str());
@@ -2468,6 +2527,7 @@ int main()
     const bool reuseOk = testTreeReuse();
     const bool maskedOk = testMaskedTrainHead();
     const bool moeBalanceOk = testPpoMoeLoadBalance();
+    const bool valueProbeOk = testValueProbe();
 
     printf("\n========================================\n");
     printf("  PPO+MCTS Agent \xe6\xb5\x8b\xe8\xaf\x95\xe5\xae\x8c\xe6\x88\x90!\n");
@@ -2475,5 +2535,5 @@ int main()
 
     /* 符号约定/目标分布这类"不会自己报错"的问题要能反映到退出码上 */
     return (signOk && targetOk && puctOk && loadOk && noiseOk && replayOk && mirrorOk
-            && sparseOk && reuseOk && maskedOk && moeBalanceOk) ? 0 : 1;
+            && sparseOk && reuseOk && maskedOk && moeBalanceOk && valueProbeOk) ? 0 : 1;
 }

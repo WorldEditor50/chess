@@ -45,37 +45,54 @@ class MoERouteProbe;
 constexpr int PPO_MOE_TB_HEADS = 16;
 constexpr int PPO_MOE_TB_DFF   = 360;
 /*
- * ---- [2026-10] 用户口径: "增加 PPO agent 的 TB 专家与 top-k 数量": 4/1 -> 8/2 ----
+ * ---- [2026-10 第二次口径] 用户口径: "将 sac agent 与 ppo agent 的 TB 专家数量降为 4,
+ *      top-k 变为 1": 8/2 -> 4/1 (回到 2026-10 之前那一档) ----
  *
  * 两个数都是 `SparseMoE<Expert, NumExperts, TopK>` 的**编译期模板参数**, 所以这是
  * 结构性改动: `paramCount()` 变了、内存布局变了、`weights/ppomcts_agent*` 的存量权重
  * 全部作废 (`Net::load` 的参数量守卫**明确拒绝**, 不是静默错读 —— 那正是守卫存在的理由)。
+ * 这一次是**往回切**, 所以下面 8/2 的那笔账保留成历史记录 (它是"要不要再提上去"的
+ * 唯一依据), 而当前生效的是 4/1 那一列。
  *
- * ---- 代价 (SAC 那两支同型改动的实测, 见 docs/moe_gate_experiment_2026_10.md §9) ----
- *   E=4/top-1 -> E=8/top-2: 参数量 2.00x, 训练 20 局时间 1.88x, ms/步 1.90x,
- *   峰值工作集 577 MB -> 1,138 MB (1.97x)。
+ * ---- 两档的实测账 (同一张表, 见本节末尾与 README) ----
+ *   E=4/top-1 (**当前**): 参数量 actor 52,388,888 + critic 51,862,453 = **104.3 M**;
+ *                          单网络前向 3.59 ms; **11.02 ms/模拟 ⇒ 400 模拟 = 4.31 s/步**;
+ *                          峰值工作集 **1,608 MB**  (2026-10 换回来当天用
+ *                          `bench_ppo_backbone_tb --ui-sims=400` + `measure_peak_working_set.ps1` 实测)
+ *   E=8/top-2 (已回退):     参数量 75.3 M/网络 (actor+critic **207.8 M**); 单网络前向 6.24 ms;
+ *                          **20.1 ms/模拟 ⇒ 400 模拟 = 7.99 s/步**; 峰值工作集 3,301 MB
+ *   ⇒ 两条实测比值: 参数量 **1.99×**、每模拟 **1.82×**、峰值内存 **2.05×** —— 与"参数 ∝ E、
+ *     算力 ∝ k"的预期一致 (E 与 k 同时减半, 所以两个方向都省一半)。
+ *   SAC 支同型改动 (共享骨干, 20 局自对弈): 参数量 2.00x, 训练 20 局时间 1.88x, ms/步 1.90x,
+ *   峰值工作集 577 MB -> 1,138 MB (1.97x); **本次切回 4/1 后 `test_sacaz` 整轮
+ *   324.9 s -> 162.9 s (1.99x)** —— 那是这一支最直接的一条总账读数。
  *   两条不同的账要分开记:
  *     * **加 E 只加内存**(参数量 ∝ E, 算力与 E 无关);
  *     * **加 top-k 直接乘算力**(算力 ∝ k), 而"模拟次数"是本工程**唯一测出过棋力**的
- *       杠杆 (40/64/120 模拟 -> 42.2% / 50.0% / 62.5%) ⇒ 这一半是拿唯一有效的旋钮
- *       去换容量。所以界面预算 `PPO_SIMS` 必须跟着这次改动重算 (见 chessboard.cpp)。
+ *       杠杆 (40/64/120 模拟 -> 42.2% / 50.0% / 62.5%) ⇒ 8/2 那一半是拿唯一有效的旋钮
+ *       去换容量。**这次切回 4/1 就是把那个旋钮换回来**: 界面预算 `PPO_SIMS` 仍是 400
+ *       (用户 2026-10 口径: "保持 400, 恢复到历史配对"), 于是每步墙钟从 8.0 s 回到 ~3.2 s,
+ *       而**搜索深度一点没减** —— 这正是这次改动的收益所在 (见 chessboard.cpp 的 PPO_SIMS)。
  *   PPO 这条还要多一层: 它**没有共享骨干**, actor 与 critic 各背一套完整 TB 专家
  *   (SAC 那两支是共享骨干 + 三头)。所以同样的 E/k 下 PPO 的内存约是 SAC 的 2 倍 ——
- *   实测值见本节末尾与 README。
+ *   实测值见本节末尾与 README (E=8/top-2 时 actor+critic ≈ 2.4 GB / 峰值工作集 3,301 MB;
+ *   4/1 那一档是它的一半量级, 换成"可用"的关键就是这一步)。
  *
  * ---- 负载: 专家越多越不均衡, 所以偏置均衡是配套前提 (不是可选项) ----
  *   SAC 支实测 (同一轮): E=4 训练侧 MaxVio 0.049, E=8 变 0.477 (**差一个数量级**);
- *   开了无辅助损失偏置均衡之后 E=8 回到 0.050。PPO 这边已经默认开了同一个机制
- *   (`moeLossFreeBias`, 见 chessboard.cpp 的 PPO_MOE_LOSSFREE), 所以这次改数
- *   **必须**与它一起生效 —— 否则 E=8 会带回来一个 0.4~0.5 的负载偏斜。
+ *   开了无辅助损失偏置均衡之后 E=8 回到 0.050。PPO 这边默认开着同一个机制
+ *   (`moeLossFreeBias`, 见 chessboard.cpp 的 PPO_MOE_LOSSFREE)。
+ *   ⇒ 切回 E=4 之后**偏斜本来就小**(0.049 那一档), 均衡机制**继续开着**即可 ——
+ *     它是"专家越多越需要"的东西, 但关掉它换不来什么, 反而丢掉 E 再变大时的保护。
  *
- * ---- 棋力: 这一轮同样**没有**结论 ----
+ * ---- 棋力: 两档都**没有**结论 ----
  *   SAC 支那次 32 局里只有 4 局分出胜负, 两组 95% 区间全跨 50%; PPO 这条更弱
- *   (与 Alpha-Beta 的对局实测 0 胜), 所以**不要**把这次改动当成"更强"。它换来的是
- *   容量与"两个专家一起投票"的路由表达力, 代价是明确的 (**每模拟的算力**)。
+ *   (与 Alpha-Beta 的对局实测 0 胜)。所以**不要**把这次改动当成"更强"或"更弱"——
+ *   它换来的是"每步 3.2 s 而不是 8.0 s"+ 峰值内存减半, 代价是容量 (38 M vs 75 M)。
+ *   真要棋力结论只有锚点对局 (bench_anchor, ~80 Elo 分辨力)。
  */
-constexpr int PPO_MOE_EXPERTS  = 8;
-constexpr int PPO_MOE_TOPK     = 2;
+constexpr int PPO_MOE_EXPERTS  = 4;
+constexpr int PPO_MOE_TOPK     = 1;
 
 using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
 
@@ -89,12 +106,15 @@ using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
  *
  *   配置                        参数量     前向       前向+反向
  *   MlpExpert        E=8 top-2   2.15 M   0.139 ms    1.94 ms
- *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms
- *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms   <- 现役 (2026-10)
+ *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms   <- 现役 (2026-10 第二次口径)
+ *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms   (2026-10 第一次口径, 已回退)
  *
  * (数字来自 ppo.h 上面那张实测表; MLP 专家便宜 ~25×、容量小 ~18×。)
- * 选择方式见 `PPO::Backbone` —— 运行时参数。**默认仍是 TB 专家 (E=8/top-2)**, 所以
+ * 选择方式见 `PPO::Backbone` —— 运行时参数。**默认是 TB 专家 (E=4/top-1)**, 所以
  * 现役 agent 与测试跟着编译期常量走; 想比"便宜骨干"就在另一个 agent 那一支上看。
+ * ⚠ MLP 专家那一档**不动** (它本来就是 E=8/top-2, 而且算力便宜 ~25x): 本次回退只改了
+ *   文件顶部的 `PPO_MOE_EXPERTS / PPO_MOE_TOPK` 这一对 (TB 专家), 这正是"两个骨干各有
+ *   一套常量"的意义 —— 改一支不会连坐另一支。
  */
 constexpr int PPO_MOE_MLP_EXPERTS = 8;
 constexpr int PPO_MOE_MLP_TOPK    = 2;
@@ -107,10 +127,10 @@ constexpr int PPO_MOE_MLP_TOPK    = 2;
  *   新: SparseMoE<TransformerBlock<16,360>, 8, 2>   (与 SAC+AZ 那条骨干同一族)
  * 第一次改版是"稠密 MOE<8,4> -> 稀疏路由" (下面那段注释), 那件事没有回退。
  *
- *   actorP  : state -> SparseMoE(E=8, top-2, 专家 = TB<16,360>) -> Tanh(h) -> Softmax(actionDim)
- *   critic  : state -> SparseMoE(E=8, top-2, 专家 = TB<16,360>) -> Tanh(h) -> Linear(1)
- *   (E/top-k 在 2026-10 按用户口径从 4/1 提到 **8/2** —— 代价账与"为什么必须同时开着偏置均衡"
- *    见文件顶部那段注释。)
+ *   actorP  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Softmax(actionDim)
+ *   critic  : state -> SparseMoE(E=4, top-1, 专家 = TB<16,360>) -> Tanh(h) -> Linear(1)
+ *   (E/top-k 在 2026-10 先按用户口径从 4/1 提到 8/2, 同月又按用户口径**降回 4/1**
+ *    —— 两笔账都留在文件顶部那段注释里, 不要只留一半。)
  *
  * 为什么换专家类型: MlpExpert 的容量被它的隐层宽度锁死 (2·d·h ≈ 0.18 M MAC/专家), 而
  * TransformerBlock 专家带完整的注意力 + FFN (4·d² + 2·d·d_ff ≈ 9.3 M MAC/专家) ——
@@ -135,11 +155,14 @@ constexpr int PPO_MOE_MLP_TOPK    = 2;
  *      42.2% / 50.0% / 62.5%), 所以 k 那一半是拿唯一有效的旋钮去换容量 —— 界面上
  *      必须把预算按实测重算 (chessboard.cpp 的 PPO_SIMS), 不能当它免费。
  *
- * 历史上这两个数曾经从 8/2 **降到** 4/1 (理由就是上面那两笔账: E=8/top-2 的
- * actor+critic ≈ 2.4 GB), 那次降级在 2026-10 按用户口径回退到 8/2 ⇒ 那批
- * `weights/ppomcts_agent*` 权重随之作废 (`Net::load` 的参数量守卫会明确拒绝,
- * 不是静默错读 —— 那正是守卫存在的理由)。要再切回"速度优先"或"容量优先", 改的仍然
- * 只有文件顶部 PPO_MOE_EXPERTS / PPO_MOE_TOPK 两个常量 (改完必须重训这两支)。
+ * 历史上这两个数已经来回切过三次, 每次的代价都是同一笔 (存量权重作废 + 重训):
+ *   8/2 -> 4/1 (E=8/top-2 的 actor+critic ≈ 2.4 GB, 不可用)
+ *   4/1 -> 8/2 (2026-10 第一次用户口径)
+ *   8/2 -> 4/1 (**2026-10 第二次用户口径, 当前生效**) —— 那批
+ *   `weights/ppomcts_agent.dat_actor/_critic` (实测 529.7 MB / 527.0 MB) 随之作废,
+ *   `Net::load` 的参数量守卫会**明确拒绝**它们 (不是静默错读 —— 那正是守卫存在的理由),
+ *   所以这一支必须**从随机初始化重训**。
+ * 要再切回"容量优先", 改的仍然只有文件顶部 PPO_MOE_EXPERTS / PPO_MOE_TOPK 两个常量。
  *
  * 第一次改版 (稠密 MOE -> 稀疏路由, 未回退): 稠密的 MOE 会把**全部**专家都算一遍
  * 再做门控加权和, 于是"专家数"直接乘在算力上 —— 那是稠密混合, 不是 MoE 的卖点。
@@ -428,6 +451,93 @@ public:
         留给 A/B 用, 也是"两种口径下同一批数据怎么学"的对照。
     */
     bool maskedTrainHead = true;
+
+    /*
+       ================================================================
+       [2026-10] 行为克隆 (BC): **只更新 actor, critic 一个字节都不动**
+       ================================================================
+       为什么单独一对入口, 而不是"把 accumulateGradSparse 的 valueTarget 传 0":
+       那条路**一定会**跑一次 critic 前向 + 反向 (rl/ppo.cpp 的末尾几行), 于是
+       "BC 不碰价值头"这条承诺就只能靠约定, 而不能靠结构与测试。这里把 critic
+       整段摘掉, 于是它是一条**可断言**的性质 (test_bc 用权重校验和钉住)。
+
+       三条口径 (与 PPO 的在线学习**刻意不同**, 这是监督学习):
+         * **纯交叉熵**: 信任域 (clipEps / ratio) 与熵奖励都是 PPO 的机制 ——
+           BC 没有"旧策略"这回事, 也不该用熵奖励去偏离老师。所以 BC 路径**不读**
+           `clipEps` / `entropyCoef` (它们仍是在线路径的旋钮)。
+         * **合法列口径 (R2)**: 走 forwardTrunk + sparseLogits, softmax 的分母是
+           该局面的**完整合法集** (Z ≡ 1) —— 与在线训练同一个学习问题, 于是
+           "BC 预训练出来的先验"与"在线继续训下去"是同一个归一化口径。
+           `maskedTrainHead=false` 或稀疏路径不可用时退回**全量 8100 维**口径
+           (那正是 `bench_ppo_distill --actor=1` 在 2026-09 用的那一条, 留作对照臂;
+           两个口径的概率尺度差一个 1/Z, 而 Z 依赖网络状态: 随机初始化的网络上实测
+           **0.006**, 旧口径 bc 权重上实测 **0.51~0.59** —— 任何情况下都不可混用权重
+           做增量对比)。
+         * **MoE 辅助损失只注入 actor**: critic 这一批根本没有前向, 它的门控批统计
+           是**别的批**的残留 —— 注进去等于用别的批的负载去推 critic 的路由。
+
+       调用序列 (批的边界是硬约束): `resetMoeBatchStats()` ->
+       N 次 `bcGradSparse` -> 一次 `bcApplyGradients(lr)`。
+    */
+    /*
+       BC 一次梯度累积的**结果** (为什么用枚举而不是 bool: 三种情形的后续处理完全
+       不同 —— 稀疏口径是生产路径, 全量口径是对照臂, 目标落空是**必须报警的缺陷**;
+       用一个 bool 表达它们必然在读日志时丢掉信息)。
+    */
+    enum class BcOutcome {
+        Sparse = 0,      /* 走了合法列掩码口径 (R2), 参与了一次 actor 反向 */
+        Dense,           /* 退回全量 8100 维口径 (对照臂 / 头不支持稀疏) */
+        TargetMissed     /* **目标不在合法集里**: 丢弃这条样本, 计数, 不反向 */
+    };
+    BcOutcome bcGradSparse(const Tensor &state,
+                           const std::vector<int> &legalIdx,
+                           const std::vector<int> &targetIdx,
+                           const std::vector<float> &targetProb);
+    /* 全量口径的 actor 交叉熵 (对照臂 / 稀疏路径不可用时的回退) */
+    void bcGradDense(const Tensor &state, const Tensor &target);
+    /* 应用累积的 BC 梯度: 只更新 actor, 只写 lastActorLoss */
+    void bcApplyGradients(float lr);
+
+    /*
+       BC 的读数 (**只读累计**, 不参与任何计算):
+         bcSamples      : 累积的 BC 样本数 (只数**真正参与更新**的那些)
+         bcSteps        : 累积的 actor 优化器步数
+         bcSparseSteps  : 走稀疏(R2 合法列)口径的样本数 —— 与 bcSamples 一起读才知道
+                          "这批到底学的哪个口径" (退回全量时它不动, 而损失曲线不会说)
+         bcTargetMisses : **目标不在合法集里**而被丢弃的样本数。这是 BC 最阴的一种
+                          静默失败, 而且它**不是零梯度**:
+                              t ≡ 0  =>  L = −Σ t·log π ≡ **0**   (损失读数完美)
+                                        dL/dz = π − t = **π ≠ 0**  (梯度是"把该局面
+                                        所有合法 logit 一起抬高", 对这条样本无效而
+                                        对别的局面实实在在地改权重)
+                          所以内核**丢弃**它并计数; 非零就说明**造样本那一层**的
+                          视角/索引算错了。
+    */
+    long long bcSamples = 0;
+    long long bcSteps = 0;
+    long long bcSparseSteps = 0;
+    long long bcTargetMisses = 0;
+    double bcLossSum = 0.0;
+    std::size_t bcSampleCount = 0;
+
+    /*
+       [内部内核] 稀疏策略路径的前后半段。`accumulateGradSparse` (在线) 与
+       `bcGradSparse` (BC) **共用**它们: 两条路的第一步与最后一步是同一件事, 各写
+       一份必然漂移 (本工程记过很多次"改一处必须改两处"的账), 而中间那一步
+       (dlogit 怎么算) 才是两者真正的差别。
+       外部不要直接调用 —— 它们是实现细节, 不是 API。
+    */
+    bool sparsePolicyForward(const Tensor &state,
+                             const std::vector<int> &legalIdx,
+                             const std::vector<int> &targetIdx,
+                             const std::vector<float> &targetProb,
+                             std::vector<float> &probs,
+                             std::vector<float> &tgt,
+                             double &ce,
+                             bool &degenerate);
+    void sparsePolicyBackward(const Tensor &state,
+                              const std::vector<int> &legalIdx,
+                              const std::vector<float> &dlogit);
     /* 把累积的梯度一次性应用 (注入 MoE 辅助损失 -> RMSProp), 然后清零 */
     void applyGradients(float lr);
 

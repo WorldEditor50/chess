@@ -54,6 +54,7 @@ set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # configure, and headers are not passed to the compiler as translation units.
 # Add new rl/*.cpp here when you add a file.
 set(RL_SOURCES
+    ${SRC_DIR}/rl/bc.cpp
     ${SRC_DIR}/rl/bcq.cpp
     ${SRC_DIR}/rl/convdqn.cpp
     ${SRC_DIR}/rl/convpg.cpp
@@ -91,13 +92,20 @@ set_target_properties(RL_CORE PROPERTIES
 # rl/layer.h rebuilds nothing and incremental builds silently produce STALE
 # binaries. Declaring the headers as explicit object dependencies of every
 # source keeps incremental builds correct regardless of locale.
+#
+# [2026-10 修] GLOB 必须带 CONFIGURE_DEPENDS —— 否则这份依赖表**冻结在 configure
+# 那一刻**: 之后**新增**的头文件根本不在表里, 改它 ninja 报 "no work to do" 而
+# 产物是旧的。本工程真的踩到了 (新增 src/bcrun.hpp 后改它, `--soft=1` 的新报告行
+# **没有出现**, 而 build.ninja 里 grep 不到 bcrun.hpp; 同目录的 bcagent.hpp 有 366 处
+# 引用)。这与上面那段 .ui 的坑是同一类: **改了源码而二进制没变, 日志上一切正常**。
+# 代价: ninja 每次构建会重新 glob 一遍 (毫秒级)。
 # ---------------------------------------------------------------------------
-file(GLOB RL_HEADER_DEPS
+file(GLOB RL_HEADER_DEPS CONFIGURE_DEPENDS
     ${SRC_DIR}/rl/*.h
     ${SRC_DIR}/rl/*.hpp)
 set_property(SOURCE ${RL_SOURCES} APPEND PROPERTY OBJECT_DEPENDS ${RL_HEADER_DEPS})
 
-file(GLOB APP_HEADER_DEPS
+file(GLOB APP_HEADER_DEPS CONFIGURE_DEPENDS
     ${SRC_DIR}/*.h
     ${SRC_DIR}/*.hpp)
 
@@ -1580,6 +1588,70 @@ if(CHESS_BUILD_TESTS)
         AUTOMOC ON
         AUTOUIC OFF)
     chess_add_header_deps(bench_match_modes)
+
+    # ------------------- 行为克隆 (BC) 训练器: PPO / SAC 四支共用 (不进 ctest)
+    # **不进 ctest**: 它跑 AB 搜索打标签 + 真训练, 分钟级, 且打印的是读数而不是
+    # 通过/失败 (与 bench_ppo_distill / train_ppo 同一类)。
+    #
+    # 为什么需要它 (背景): 2026-09 的 BC 只存在于 `bench_ppo_distill --actor=1` 里,
+    # 而且是**全量 8100 维 softmax** 的旧口径; SAC 三支**完全没有** BC 路径。
+    # 本工具把它落成生产路径 (合法列掩码口径, 与在线训练同一个学习问题), 见
+    # docs/behavior_cloning_2026_10.md。
+    #   cmake --build <build> --target train_bc
+    #   <build>/train_bc --agent=ppo-mlp --positions=4000 --depth=3 --save=weights/bc_ppo
+    #   <build>/train_bc --agent=sac --positions=4000 --depth=3 --epochs=8
+    add_executable(train_bc
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/train_bc_main.cpp)
+    target_include_directories(train_bc PRIVATE ${SRC_DIR})
+    target_link_libraries(train_bc PRIVATE
+        CHESS_CORE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(train_bc PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(train_bc PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(train_bc)
+
+    # ------------------- 行为克隆 (BC) 的回归测试 (进 ctest)
+    # 盯的是"BC 的口径与承诺", 而不是棋力:
+    #   [1] 掩码交叉熵的解析梯度 == π − t (与 maskedSoftmaxBackward 的等价形式对照)
+    #   [2] 非法列的梯度**恰好**为 0 (不是"很小")
+    #   [3] 单局面过拟合: p(老师) -> ~1, CE -> ~0 (符号/方向错的话它只会变大)
+    #   [4] BC **不碰 critic** (PPO / SAC 独立口径的权重校验和不变; 共享口径下
+    #       骨干会变而 Q 头不变)
+    #   [5] 权重往返: BC 存的权重能被同一个 agent 载回来, 读数逐位相同
+    #   [6] 负对照: 老师着法不在合法集时 sampleFrom 报 TeacherIllegal, 内核报
+    #       TargetMissed 并**丢弃**该样本 (而不是静默产出一条没有信息却会改权重的样本)
+    #   [7] 口径对照: masked=0 (全量 8100) 也能降 CE, 但两个口径的**归一化**不同 ——
+    #       合法列口径下合法集的概率和 == 1 (Z ≡ 1), 全量口径下 Z < 1
+    #   [8] SAC-MoE-MLP 冒烟 (同一套胶水在稀疏 MoE 骨干上也要能跑)
+    # 用小网络 (hidden=16 / expert=16) 与 AB 深度 1~2, 秒级完成。
+    add_executable(test_bc
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bc_main.cpp)
+    target_include_directories(test_bc PRIVATE ${SRC_DIR})
+    target_link_libraries(test_bc PRIVATE
+        CHESS_CORE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_bc PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_bc PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(test_bc)
+    add_test(NAME test_bc COMMAND test_bc)
+    # 与 test_match 同一条理由 (见那一处注释): 从普通 shell 启动 ctest 时 PATH 里没有
+    # Qt 的 bin, 进程会以 0xc0000135 (找不到 DLL) 秒退 —— 看起来像"测试挂了", 其实是
+    # 环境问题。用 ENVIRONMENT_MODIFICATION 而不是 ENVIRONMENT, 因为 PATH 自己就是
+    # 用 ';' 分隔的, 直接塞进 ENVIRONMENT 会被当成多条环境设置。
+    set(_qt_bin_dir_bc "${Qt6_DIR}/../../../bin")
+    cmake_path(NORMAL_PATH _qt_bin_dir_bc)
+    set_tests_properties(test_bc PROPERTIES TIMEOUT 900
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir_bc}")
 
     # ------------------- PG "lastLoss 变非有限值且不复位" 的定位探针 (不进 ctest)
     # test_match [2.7b] 曾经时真时假 (一次绿一次红), 根因就是 dpg.lastLoss 会变成

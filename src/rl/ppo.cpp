@@ -1,4 +1,5 @@
 #include "ppo.h"
+#include "bc.h"          /* 行为克隆的口径层: targetCoveredByLegal (BC 的"目标落空"闸门) */
 #include "layer.h"
 #include "loss.h"
 #include "sparse_moe.hpp"
@@ -466,6 +467,139 @@ void RL::PPO::addReplay(const Tensor &state,
 }
 
 /* ------------------------------------------------------------------
+ *  [内部内核] 稀疏策略路径的前后半段 (在线 R2 与 BC 共用)
+ * ------------------------------------------------------------------
+ *  为什么把这两段从 accumulateGradSparse 里**原样搬出来**: 在线 (R2) 与 BC (行为克隆)
+ *  的第一件事 (骨干 -> 头的合法列 -> 合法集 softmax) 与最后一件事 (头的合法行权重
+ *  梯度 + 往下传 -> Net::backwardFrom) 是**同一件事**, 中间那一步才是差别
+ *  (在线是 ratio 裁剪 / BC 是 p − t)。各写一份的话, "合法列口径"这条曾经修过缺陷
+ *  (Z ≡ 1) 的东西就会有两份, 迟早只剩一份是对的 —— 本工程在 actionMasked / 稀疏头
+ *  那条线上已经吃过同一个亏。
+ *
+ *  两个函数都是实现细节, 不是 API (头文件里也写明了"外部不要直接调用")。
+ * ------------------------------------------------------------------ */
+
+/*
+ *  前半段: 骨干 -> 头的合法列 logits -> 合法集上的 softmax -> 目标对齐 -> CE 数值。
+ *
+ *  `degenerate` = 合法集上的指数和不是有限正数 (极端 logit 溢出)。这时 probs 保持
+ *  **未归一化**的原值, 且调用方必须让 dlogit 恒为 0 (不更新) —— 与改动前的分支
+ *  逐位相同。
+ *  返回 false = 走不了稀疏路径 (头不支持 / 形状不符), 调用方自己决定回退方式。
+ */
+bool RL::PPO::sparsePolicyForward(const Tensor &state,
+                                  const std::vector<int> &legalIdx,
+                                  const std::vector<int> &targetIdx,
+                                  const std::vector<float> &targetProb,
+                                  std::vector<float> &probs,
+                                  std::vector<float> &tgt,
+                                  double &ce,
+                                  bool &degenerate)
+{
+    probs.clear();
+    tgt.clear();
+    ce = 0.0;
+    degenerate = true;
+
+    /* ---- 1) 前向: 骨干到 h, 头只算合法列 ---- */
+    Tensor &h = actorP.forwardTrunk(state);
+    std::vector<float> logits;
+    if (!actorP.sparseLogits(h, legalIdx, logits) || logits.size() != legalIdx.size()) {
+        return false;
+    }
+
+    const std::size_t n = logits.size();
+    /* 合法集上的数值稳定 softmax (与 R1 的推理路径同一口径) */
+    float m = logits[0];
+    for (std::size_t i = 1; i < n; i++) {
+        if (logits[i] > m) { m = logits[i]; }
+    }
+    probs.assign(n, 0.0f);
+    double sum = 0.0;
+    for (std::size_t i = 0; i < n; i++) {
+        const float e = std::exp(logits[i] - m);
+        probs[i] = e;
+        sum += (double)e;
+    }
+    degenerate = !(sum > 1e-12) || !std::isfinite(sum);
+    if (!degenerate) {
+        const float inv = (float)(1.0 / sum);
+        for (std::size_t i = 0; i < n; i++) { probs[i] *= inv; }
+    }
+
+    /* ---- 2) 目标对齐到合法集的顺序 (线性查找: n ~ 40, 可忽略) ---- */
+    tgt.assign(n, 0.0f);
+    for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
+        const int a = targetIdx[k];
+        for (std::size_t i = 0; i < n; i++) {
+            if (legalIdx[i] == a) { tgt[i] += targetProb[k]; break; }
+        }
+    }
+
+    /* CE 数值 (上报口径, 与改动前一致) */
+    for (std::size_t i = 0; i < n; i++) {
+        if (tgt[i] > 0.0f) {
+            ce -= (double)tgt[i] * std::log((double)probs[i] + 1e-8);
+        }
+    }
+    return true;
+}
+
+/*
+ * ------------------------------------------------------------------
+ *  [内部内核] 稀疏策略路径的后半段: dlogit 已经算好, 落头的权重梯度 + 往下传
+ * ------------------------------------------------------------------
+ *  头的权重/偏置梯度只落在合法行; 往下传的梯度 ei = Wᵀ_legal·d 也只由合法行构成,
+ *  之后交给 Net::backwardFrom 走骨干 (头那一层不再走通用 backward)。
+ */
+void RL::PPO::sparsePolicyBackward(const Tensor &state,
+                                   const std::vector<int> &legalIdx,
+                                   const std::vector<float> &dlogit)
+{
+    const std::size_t headIndex = actorP.size() - 1;
+    RL::iFcLayer *head = dynamic_cast<RL::iFcLayer *>(actorP[headIndex]);
+    if (head == nullptr) {
+        return;     /* 调用方已经检查过; 这里只是不让它变成空指针解引用 */
+    }
+    const std::size_t n = dlogit.size();
+    Tensor &h = actorP[headIndex - 1]->o;
+
+    const std::size_t in = head->inputDim;
+    const std::size_t wRow = (std::size_t)head->w.sizes[0];     /* == in (行主序) */
+    const float *hd = h.val.data();
+    const float *wd = head->w.val.data();
+    float *gwd = head->g.w.val.data();
+    float *gbd = head->g.b.val.data();
+    std::vector<float> ei(in, 0.0f);
+    for (std::size_t i = 0; i < n; i++) {
+        const float d = dlogit[i];
+        if (d == 0.0f) {
+            continue;       /* 梯度恰好为 0: 这一行不用动 (常见于 p == t 的槽位) */
+        }
+        const std::size_t a = (std::size_t)legalIdx[i];
+        const float *wrow = wd + a * wRow;
+        float *grow = gwd + a * wRow;
+        for (std::size_t k = 0; k < in; k++) {
+            grow[k] += d * hd[k];
+            ei[k] += wrow[k] * d;
+        }
+        if (head->bias && a < head->g.b.size()) {
+            gbd[a] += d;
+        }
+    }
+
+    /* ---- 骨干反向: 从头的前一层开始 (头那一层的 backward 已经手工做完) ---- */
+    if (headIndex >= 1) {
+        Tensor &eiTensor = actorP[headIndex - 1]->e;
+        eiTensor = Tensor(in, 1);
+        for (std::size_t k = 0; k < in; k++) {
+            eiTensor[k] = ei[k];
+        }
+        actorP.backwardFrom(headIndex - 1, state);
+    }
+}
+
+/* ------------------------------------------------------------------
  *  accumulateGradSparse (R2): 训练侧只算合法列
  *
  *  与 accumulateGrad 的差别只有 Actor 那一路 (critic 一字未改):
@@ -477,6 +611,9 @@ void RL::PPO::addReplay(const Tensor &state,
  *
  *  这样每条样本省掉的是: 8100 行前向 + 8100 行反向 + 一次 8100 维 softmax/Jacobian,
  *  换成 ~40 行。语义上换掉了归一化口径 (Z ≡ 1)。
+ *
+ *  [2026-10 行为克隆] 第一件事与最后一件事已经抽成上面的两个内核函数, 与
+ *  `bcGradSparse` (BC) 共用; 本函数保留的是**在线**那一条 dlogit (ratio 裁剪 + 熵项)。
  * ------------------------------------------------------------------ */
 void RL::PPO::accumulateGradSparse(const Tensor &state,
                                    const std::vector<int> &legalIdx,
@@ -505,10 +642,12 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         return;
     }
 
-    /* ---- 1) 前向: 骨干到 h, 头只算合法列 ---- */
-    Tensor &h = actorP.forwardTrunk(state);
-    std::vector<float> logits;
-    if (!actorP.sparseLogits(h, legalIdx, logits) || logits.size() != legalIdx.size()) {
+    /* ---- 1) 前向 + 2) 目标对齐 + CE 数值 (与 BC 共用同一份实现) ---- */
+    std::vector<float> probs, tgt;
+    double ce = 0.0;
+    bool degenerate = false;
+    if (!sparsePolicyForward(state, legalIdx, targetIdx, targetProb,
+                             probs, tgt, ce, degenerate)) {
         Tensor dense((std::size_t)actionDim, 1);
         dense.zero();
         for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
@@ -521,33 +660,7 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         return;
     }
 
-    const std::size_t n = logits.size();
-    /* 合法集上的数值稳定 softmax (与 R1 的推理路径同一口径) */
-    float m = logits[0];
-    for (std::size_t i = 1; i < n; i++) {
-        if (logits[i] > m) { m = logits[i]; }
-    }
-    std::vector<float> probs(n, 0.0f);
-    double sum = 0.0;
-    for (std::size_t i = 0; i < n; i++) {
-        const float e = std::exp(logits[i] - m);
-        probs[i] = e;
-        sum += (double)e;
-    }
-    const bool degenerate = !(sum > 1e-12) || !std::isfinite(sum);
-    if (!degenerate) {
-        const float inv = (float)(1.0 / sum);
-        for (std::size_t i = 0; i < n; i++) { probs[i] *= inv; }
-    }
-
-    /* ---- 2) 目标对齐到合法集的顺序 (线性查找: n ~ 40, 可忽略) ---- */
-    std::vector<float> tgt(n, 0.0f);
-    for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
-        const int a = targetIdx[k];
-        for (std::size_t i = 0; i < n; i++) {
-            if (legalIdx[i] == a) { tgt[i] += targetProb[k]; break; }
-        }
-    }
+    const std::size_t n = probs.size();
 
     /*
        ---- 3) 策略项: 纯交叉熵 (旧口径) 或 PPO 裁剪代理目标 (给了 oldProb 时) ----
@@ -619,14 +732,6 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         }
     }
 
-    /* CE 数值 (上报口径, 与改动前一致) */
-    double ce = 0.0;
-    for (std::size_t i = 0; i < n; i++) {
-        if (tgt[i] > 0.0f) {
-            ce -= (double)tgt[i] * std::log((double)probs[i] + 1e-8);
-        }
-    }
-
     /*
        诊断钩子 (2026-09, 默认关闭): `test_grad` 的 E 节要确认"解析梯度是否等于
        p − t"。把 (probs, dlogit) 暴露出去比在测试里重新推一遍可靠 ——
@@ -640,40 +745,8 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
         }
     }
 
-    /* ---- 4) 头的权重/偏置梯度 (只落合法行) + 往下传的梯度 ei ---- */
-    const std::size_t in = head->inputDim;
-    const std::size_t wRow = (std::size_t)head->w.sizes[0];     /* == in (行主序) */
-    const float *hd = h.val.data();
-    const float *wd = head->w.val.data();
-    float *gwd = head->g.w.val.data();
-    float *gbd = head->g.b.val.data();
-    std::vector<float> ei(in, 0.0f);
-    for (std::size_t i = 0; i < n; i++) {
-        const float d = dlogit[i];
-        if (d == 0.0f) {
-            continue;       /* 梯度恰好为 0: 这一行不用动 (常见于 p == t 的槽位) */
-        }
-        const std::size_t a = (std::size_t)legalIdx[i];
-        const float *wrow = wd + a * wRow;
-        float *grow = gwd + a * wRow;
-        for (std::size_t k = 0; k < in; k++) {
-            grow[k] += d * hd[k];
-            ei[k] += wrow[k] * d;
-        }
-        if (head->bias && a < head->g.b.size()) {
-            gbd[a] += d;
-        }
-    }
-
-    /* ---- 5) 骨干反向: 从头的前一层开始 (头那一层的 backward 已经手工做完) ---- */
-    if (headIndex >= 1) {
-        Tensor &eiTensor = actorP[headIndex - 1]->e;
-        eiTensor = Tensor(in, 1);
-        for (std::size_t k = 0; k < in; k++) {
-            eiTensor[k] = ei[k];
-        }
-        actorP.backwardFrom(headIndex - 1, state);
-    }
+    /* ---- 4) + 5) 头的权重/偏置梯度 (只落合法行) + 骨干反向 (与 BC 共用) ---- */
+    sparsePolicyBackward(state, legalIdx, dlogit);
 
     /* ---- Critic: 与全量路径完全一致 (只多一条值域约束, 见 ppo.h 的 clampValue) ---- */
     const double vt = (clampValue > 0.0f)
@@ -700,6 +773,168 @@ void RL::PPO::accumulateGradSparse(const Tensor &state,
     batchLossSum += err * err;
     batchActorLossSum += ce;
     batchLossCount++;
+}
+
+/* ==================================================================
+ *  行为克隆 (BC, 2026-10) —— 只更新 actor
+ *
+ *  与 accumulateGradSparse 的两处刻意差异 (口径, 不是优化):
+ *    1. 策略项**恒为纯交叉熵**: 不读 clipEps (没有旧策略, 信任域无从谈起),
+ *       也不加熵奖励 (老师给的分布就是目标, 用熵去偏离它没有道理)。
+ *    2. **critic 整段不存在**: 没有前向、没有反向、没有诊断累加、没有损失账本。
+ *       "BC 不碰价值头"因此是结构性的, 而不是约定 (test_bc 用权重校验和钉住)。
+ * ================================================================== */
+
+void RL::PPO::bcGradDense(const Tensor &state, const Tensor &target)
+{
+    /*
+       全量 8100 维口径的 actor 交叉熵 —— 这是 `bench_ppo_distill --actor=1` 在
+       2026-09 用的那条路 (当时它是**唯一**的 BC 路径, 而在线训练已经换成 R2 合法列
+       口径 ⇒ 两条路的归一化口径不一致)。现在它是 BC 的**对照臂**:
+         * `maskedTrainHead = false` 时显式选它;
+         * 稀疏路径不可用 (头不是"稀疏可算"的) 时回退到它。
+       语义差别是可测的: 全量 softmax 会把概率质量分给非法槽位, 合法集上的总质量
+       Z < 1 (实测均值 0.51~0.59), 于是同一个老师在两种口径下算出的 CE 不同 ——
+       **两个口径的权重不能混着做增量对比**。
+    */
+    Tensor &policy = actorP.forward(state);     /* 数值必须在 backward 之前读 */
+    double ce = 0.0;
+    for (std::size_t i = 0; i < policy.size() && i < target.size(); i++) {
+        if (target[i] > 0.0f) {
+            ce -= (double)target[i] * std::log((double)policy[i] + 1e-8);
+        }
+    }
+    Tensor ceLoss = Loss::CrossEntropy::df(policy, target);
+    actorP.backward(state, ceLoss);
+
+    bcLossSum += ce;
+    bcSampleCount++;
+}
+
+RL::PPO::BcOutcome RL::PPO::bcGradSparse(const Tensor &state,
+                                        const std::vector<int> &legalIdx,
+                                        const std::vector<int> &targetIdx,
+                                        const std::vector<float> &targetProb)
+{
+    /*
+       ---- 0) 目标必须落在合法集里 (两个口径都要查) ----
+       这一条**不是**可选的健全性检查: 目标落空时损失恒为 0 (读数完美), 而梯度是
+       π 而不是 0 (见 ppo.h 的 bcTargetMisses 说明) —— 那是"用一条没有信息的样本
+       改权重"。宁可丢弃并把它数出来。
+    */
+    if (!targetCoveredByLegal(legalIdx, targetIdx, targetProb)) {
+        bcTargetMisses++;
+        return BcOutcome::TargetMissed;
+    }
+
+    const std::size_t headIndex = actorP.size() - 1;
+    RL::iFcLayer *head = (actorP.size() >= 2)
+                             ? dynamic_cast<RL::iFcLayer *>(actorP[headIndex])
+                             : nullptr;
+
+    /* 目标摊开只用于回退/对照臂 */
+    auto denseTarget = [&](Tensor &out) {
+        out = Tensor((std::size_t)actionDim, 1);
+        out.zero();
+        for (std::size_t k = 0; k < targetIdx.size() && k < targetProb.size(); k++) {
+            const int a = targetIdx[k];
+            if (a >= 0 && a < actionDim) {
+                out[(std::size_t)a] += targetProb[k];
+            }
+        }
+    };
+
+    /* ---- 回退/对照: 全量口径 ---- */
+    if (!maskedTrainHead || head == nullptr || legalIdx.empty() ||
+        !actorP.sparseOutputSupported() || head->g.w.size() < head->w.size()) {
+        Tensor dense;
+        denseTarget(dense);
+        bcGradDense(state, dense);
+        bcSamples++;
+        return BcOutcome::Dense;
+    }
+
+    std::vector<float> probs, tgt;
+    double ce = 0.0;
+    bool degenerate = false;
+    if (!sparsePolicyForward(state, legalIdx, targetIdx, targetProb,
+                             probs, tgt, ce, degenerate)) {
+        Tensor dense;
+        denseTarget(dense);
+        bcGradDense(state, dense);
+        bcSamples++;
+        return BcOutcome::Dense;
+    }
+
+    const std::size_t n = probs.size();
+
+    /*
+       ---- 纯交叉熵: dL/dz_i = p_i − t_i ----
+       (与在线路径同一个"直接给 logit 梯度"的写法; 不走 dL/dπ 再乘雅可比 ——
+        那边要写 −t/π, 在 p → 0 时会爆, 见 accumulateGradSparse 里的长注释。)
+    */
+    std::vector<float> dlogit(n, 0.0f);
+    if (!degenerate) {
+        for (std::size_t i = 0; i < n; i++) {
+            dlogit[i] = probs[i] - tgt[i];
+        }
+    }
+
+    /*
+       诊断钩子: 与在线路径**同格式** (probs, dlogit 交替), 于是 test_bc 可以直接
+       断言"BC 的解析梯度 == p − t"以及"非法列的 dlogit 恰好为 0"。
+    */
+    if (gradProbe != nullptr) {
+        gradProbe->clear();
+        for (std::size_t i = 0; i < n; i++) {
+            gradProbe->push_back(probs[i]);
+            gradProbe->push_back(dlogit[i]);
+        }
+    }
+
+    sparsePolicyBackward(state, legalIdx, dlogit);
+
+    bcLossSum += ce;
+    bcSampleCount++;
+    bcSamples++;
+    bcSparseSteps++;
+    return BcOutcome::Sparse;
+}
+
+void RL::PPO::bcApplyGradients(float lr)
+{
+    /*
+       ---- 稀疏 MoE 的负载均衡辅助损失: **只注入 actor** ----
+       在线路径 (applyGradients) 会往两个网络都注入; BC 这一批 critic 根本没有
+       前向, 它的门控批统计还是**上一批**(甚至是搜索/评测前向)的残留 —— 注进去
+       等于用别的批的负载去推 critic 的路由, 而这一批的承诺是"critic 一个字节都
+       不动"。批次总次数与门控概率和**没有**再乘一个批, 所以只在有样本时调它。
+
+       顺序与在线路径一致 (批统计 -> 辅助梯度 -> 优化器); 调用方负责在批的开头
+       `resetMoeBatchStats()`, 否则统计里会混进上一批的推理前向。
+    */
+    if (bcSampleCount > 0 && moeAuxCoef > 0.0f) {
+        std::vector<ISparseMoE*> actorMoes = sparseMoeLayers(actorP);
+        for (std::size_t i = 0; i < actorMoes.size(); i++) {
+            actorMoes[i]->addAuxGradient(moeAuxCoef);
+        }
+    }
+
+    /* 优化器只调 actor 的 (与在线路径同一个 rho/decay) */
+    actorP.RMSProp(lr, 0.9f, 0.001f);
+    bcSteps++;
+
+    /*
+       损失账本: **只写 lastActorLoss** (BC 的批平均 CE)。
+       `lastLoss` 是 critic 的 MSE, 这一批没有 critic 前向 —— 写它只会把界面曲线
+       变成假数据 (与 accumulateGrad 那段"backward 之后读输出会恒为常数"是同一类
+       教训: 一个与训练状态无关的读数比没有读数更坏)。
+    */
+    if (bcSampleCount > 0) {
+        lastActorLoss = bcLossSum / (double)bcSampleCount;
+    }
+    bcLossSum = 0.0;
+    bcSampleCount = 0;
 }
 
 bool RL::PPO::learnFromReplay(std::size_t batchSize, int epochs, float lr)

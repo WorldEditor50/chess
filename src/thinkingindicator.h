@@ -71,9 +71,14 @@ protected:
 
 private:
     void tick();
-    void drawHalo(QPainter &p, const QPointF &c) const;
-    void drawParticles(QPainter &p, const QPointF &c) const;
-    void drawHourglass(QPainter &p, const QPointF &c) const;
+    /*
+       [2026-10 用户口径] 三个绘制函数都接一个缩放因子 s: 表盘区的几何按控件高度等比
+       缩放, 而**字号与底部三行文字不缩** (缩了就从"小"变成"看不清")。
+       详见 .cpp 文件头那段 kDialRegionH 的说明。
+    */
+    void drawHalo(QPainter &p, const QPointF &c, qreal s) const;
+    void drawParticles(QPainter &p, const QPointF &c, qreal s) const;
+    void drawHourglass(QPainter &p, const QPointF &c, qreal s) const;
 
     QTimer m_timer;
     QElapsedTimer m_clock;

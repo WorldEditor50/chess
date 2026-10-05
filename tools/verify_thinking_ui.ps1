@@ -1,4 +1,4 @@
-# tools/verify_thinking_ui.ps1
+﻿# tools/verify_thinking_ui.ps1
 #
 # Reproducible check for the "AI is thinking" feedback added in
 # docs/issues_review.md section "零之二点八". Launches chess.exe, locates the
@@ -165,6 +165,50 @@ function Wait-UiReady([int]$timeoutMs) {
     return $false
 }
 
+# [2026-10] Select a combo row by its visible text instead of by index.
+# Why: the agent list is edited over time (PG/DQN were removed in 2026-10), so "item 1" is
+# not a stable way to say "MCTS" -- and the failure mode is silent: a different, much faster
+# agent gets picked and the pixel assertions below then measure nothing at all.
+function Select-AgentItemByName([int]$comboIndex, [string]$nameMatch) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ComboBox)
+    $combos = (Get-Root).FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants, $cond)
+    if ($combos.Count -le $comboIndex) { throw "combo $comboIndex not found" }
+    $cb = $combos.Item($comboIndex)
+    $expand = $null
+    if (-not $cb.TryGetCurrentPattern(
+            [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) {
+        throw "combo $comboIndex cannot be expanded"
+    }
+    $expand.Expand()
+    Start-Sleep -Milliseconds 600
+    $liCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem)
+    $items = $cb.FindAll([System.Windows.Automation.TreeScope]::Descendants, $liCond)
+    $target = $null
+    $found = ""
+    foreach ($it in $items) {
+        $n = ""
+        try { $n = [string]$it.Current.Name } catch { continue }
+        if ($n -like ("*" + $nameMatch + "*")) { $target = $it; $found = $n; break }
+    }
+    if ($target -eq $null) {
+        $expand.Collapse()
+        throw "combo $comboIndex has no item matching '$nameMatch' (count=$($items.Count))"
+    }
+    $r = $target.Current.BoundingRectangle
+    ClickAt ([int]($r.X + $r.Width / 2)) ([int]($r.Y + $r.Height / 2))
+    Start-Sleep -Milliseconds 500
+    if ($cb.Current.ExpandCollapseState -ne
+        [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Collapse()
+    }
+    return $found
+}
+
 function Select-AgentItem([int]$comboIndex, [int]$itemIndex) {
     $cond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -249,7 +293,14 @@ try {
     # the focus order - which changed as soon as the metrics panel was added - and
     # on the controls already being enabled. UIA is focus independent, and it
     # fails loudly if the combo is not there.)
-    $agi = Select-AgentItem 0 1
+    #
+    # [2026-10 fix] This used to be `Select-AgentItem 0 1` (combo 0, item index 1) with the
+    # comment claiming "index 1 is MCTS". That broke when PG/DQN were removed from the
+    # dropdown (2026-10): index 1 became "Alpha-Beta L1", whose whole search takes ~1 ms --
+    # far shorter than one sample -- and this script then reported
+    # "thinking_strip_frames = 0 / 90", a FAIL that says nothing about the widget.
+    # Selecting by NAME is immune to the list being edited.
+    $agi = Select-AgentItemByName 0 "MCTS"
     Write-Output ("agent selected = {0}" -f $agi)
 
     # status strip occupies widget-local x 64..534, y 2..24; sample its right

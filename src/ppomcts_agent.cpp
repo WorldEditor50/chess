@@ -715,6 +715,41 @@ double PPOMCTSAgent::evaluateLeaf(RL::Tensor &leafStateScratch)
     return (double)ppo.value(leafStateScratch);
 }
 
+/*
+ * valueOfPosition - 价值探针 (2026-10, 界面的"价值评估"曲线)
+ *
+ * 与 evaluateLeaf 的差别 (这是它能存在的理由): evaluateLeaf 是**搜索内部**的一步, 它
+ * 对终局给真实胜负、非终局才问 critic —— 那是"搜索看到的价值"; 而 EV/校准要的是
+ * "**critic 对这个局面**说了什么", 所以这里**不判终局**, 老老实实问网络。
+ *
+ * 口径: 返回值是**走子方 (color) 视角**的估值 —— 与 z (那一手的真实结果, 同视角)
+ * 直接可比。视角搞反会让 EV 掉成负数, 而看起来像"critic 坏了" (见 rl/diag.h 的
+ * zFromGameResult)。
+ *
+ * 棋盘临时换/还原: agent 的 `chess` 是决策用的临时棋盘, 直接改它会留下"AI 在一个
+ * 不存在的局面上下棋"这种极难查的状态 —— 与本文件里 BC 的 sampleFrom 同一纪律。
+ */
+bool PPOMCTSAgent::valueOfPosition(Chess &pos, int color, double &out)
+{
+    Chess before = chess;
+    chess = pos;
+    /*
+       ⚠ 张量**必须先按维度分配**: `encodeStateFor` 开头是 `state.zero()`, 它对一个
+       零尺寸的张量是空操作, 而随后的 `state(idx) = …` 会直接越界写 —— 表现是**整个
+       程序在第一次采样的那一刻崩掉**(本轮实测: 界面对局开始几秒后窗口消失, 脚本后面
+       所有断言都读不到控件)。本工程在 SAC 那一侧踩过同一个坑 (未分配张量 -> 0xC0000005)。
+    */
+    RL::Tensor st(STATE_DIM, 1);
+    encodeStateFor(color, st);
+    const float v = ppo.value(st);
+    chess = before;
+    if (!std::isfinite((double)v)) {
+        return false;               /* NaN 不上曲线 (会把整条折线画没) */
+    }
+    out = (double)v;
+    return true;
+}
+
 /* ------------------------------------------------------------------
  *  rootDiag: 把根的访问/Q/先验整理成诊断量 (只读, 2026-09)
  *

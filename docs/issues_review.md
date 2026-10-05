@@ -1624,12 +1624,17 @@ R1 让先验的实际尺度变成 `p_full/Z`（Z 均 0.51–0.59），等于把�
 
 ### 已知缺口（明确列出，不含糊）
 
-* **BC 蒸馏路径还没走 R2**：`bench_ppo_distill` 直接调 `actorP.forward` +
-  `CrossEntropy::df` + `actorP.backward` 训 actor（不走回放池），所以生产可用权重
-  （`bc8k_*`/`bc20k`）仍是**旧口径**训练出来的。迁移它需要三件事：给每个样本存 legalIdx、
-  在训练循环里改用稀疏口径（还要把 critic 那一路剥出去，免得顺手把 critic 也按 valueTarget=0
-  训了）、以及把 `actorMetrics` 的 CE / P(AB) 换成合法集口径（旧口径在 R2 权重上无意义）。
-  这三件都不难，但本轮没做 —— 所以 **R2 目前只在自对弈/回放这条生产路径上生效**。
+* ~~**BC 蒸馏路径还没走 R2**~~ **[2026-10 已解决，见 `docs/behavior_cloning_2026_10.md`]**：
+  这条缺口当初列出的三件事**都做了**，而且是按它写的那样做的 ——
+  ① 样本里存 `legalIdx`（`BCSample`）；② 训练循环改用稀疏口径，并且把 critic 那一路
+  **整段剥出去**（`RL::PPO::bcGradSparse` + `bcApplyGradients`：不跑 critic 前向/反向、
+  不写 `lastLoss`，"BC 不碰价值头"因此是**可断言**的而不是约定）；③ `actorMetrics` 的
+  CE / P(AB) 换成合法集口径（`BC::evaluate`，且口径跟随训练臂，对照臂才可比）。
+  落点是一个新工具 `train_bc`（PPO 与 **SAC 三支**共用一套胶水，SAC 此前完全没有 BC 路径），
+  `bench_ppo_distill` **保持原样**（它是全量口径的历史 bench，§7.7~§7.11 引用它的读数；
+  它的那条口径现在在 `train_bc --masked=0` 里作为**对照臂**保留）。
+  实测（4000 局面 / AB 深度 3 / 8 epoch，同数据同老师同种子）：合法列口径的留出 top-1
+  **35.71%** vs 全量口径 **21.68%**，训练时间 43.5 s vs 87.6 s（**差一个 Z ≈ 0.5 的归一化**）。
 * **R2 之后 `weights/` 下的旧权重全部作废**（不同学习问题训出来的先验不能混用）：
   现有 `verify_on/off`、`distill`、`bc8k_*`、`bc20k` 仍然能载入（格式未变），但**不要与
   R2 训练的权重混着比较先验尺度**。
@@ -3159,6 +3164,385 @@ MoE 专家使用 (合计): E=4 top-1 | MaxVio 0.819 | 最小份额 0.2% | 有效
   （"未正常退出则这一场的训练成果丢失"），这次没有把它变得更差。
 * **没做的事**：没有把"每手在线更新"本身改成异步/内存池；没有动 `weights/` 之外的任何文件；
   没有改评估/只对弈模式下"后台训练整体停摆"那条既有语义。
+
+---
+
+## 零之二点三十三、`test_match [2.7c]` 实验3 在 **HEAD 上就已经是红的**（2026-10，顺带发现）
+
+**这不是行为克隆那一轮引入的**，而是做 BC 回归时跑全量 `test_match` 顺带发现的；
+记下来的价值在于"别再把它当成某个新改动的锅"。
+
+**症状**（断言原文）：`[2.7c] 实验3` 要求"同一份起始权重 + 同一标准开局 + 只换对手
+（AB-L1 → AB-L3）⇒ 第一次训练损失**必须相同**"（判据是"对手的着法没有进入训练数据"）。
+现在它给出两个不同的数：
+
+| 二进制 | 对手=AB-L1 | 对手=AB-L3 | 结果 |
+|---|---|---|---|
+| 当前工作区（BC 那一轮）第 1 次 | 0.0403055549 | 0.0325776041 | FAIL |
+| 当前工作区（BC 那一轮）第 2 次 | 0.0579772778 | 0.0419436842 | FAIL |
+| **`git worktree` 出来的干净 HEAD（0bd7fcb）** | **0.0491477288** | **0.0187247433** | **FAIL** |
+
+复现（干净 HEAD 那一次是真的换了一棵树、重新配置 + 编译，测试从同一个工作目录跑）：
+```
+git worktree add ..\chess_head HEAD
+cmake -S chess_head -B chess_head\build -G Ninja -DCMAKE_PREFIX_PATH=C:/Qt/6.9.2/msvc2022_64 -DCMAKE_BUILD_TYPE=Release
+cmake --build chess_head\build --target test_match
+cd chess_head\build && test_match.exe         :: 需要该目录下有 weights\ (快照路径是相对路径)
+```
+> ⚠ 踩到过一次**假象**：第一次在 `chess_head\build` 里跑时那个目录**没有 `weights\`**，
+> 于是"快照起始权重 = **失败**"、后面的比较根本没成立 —— 看起来像"HEAD 与工作区不一样"，
+> 其实是工作目录不对。测试的临时权重路径是相对路径，**必须从含有 `weights/` 的目录跑**。
+
+**为什么断言的前提不再成立**（两条都属于 HEAD，且都不是本轮改的）：
+
+1. **回放池不在快照范围内**。`实验3` 用 `saveCurrentAgentModel` / `loadAgentModel` 还原权重，
+   但 `RL::PPO::load` 只载 actor/critic —— **不碰 `replay`**（全仓唯一的 `clearReplay()`
+   在 `dqnabagent.h` 里）。而 PPO 的第一次"上报损失"来自 `learnFromReplay(batch=64, ...)`：
+   它**从池里随机抽 64 条**。第二场开始时池子里已经装着第一场（含更早几节）灌进去的几百条样本
+   ⇒ 两次抽到的 batch 必然不同 ⇒ 两个"第一次损失"必然不同。**这条与时机无关，是确定性的**，
+   与"三次运行三次失败"一致。
+2. **训练对局模式下后台训练线程照常把权重同步回主 agent**（"一局之内模型会变"是文档化的
+   既定行为）。一轮的落点是否早于"第一次上报损失"与时机有关，而 **E=8/top-2 之后一轮的时长
+   变了**（commit `b471796`）。
+
+**所有记录在案的通过日志都在 2026-09-25/26**（`.r1build/p0a_*.log` / `ctest_after.log` /
+`humangame_verify.log`，10 份，L1 与 L3 逐位相同），而最近两次提交（`b471796` PPO TB 8/2、
+`3bbc426` 临时权重改道，都是 2026-10-03）都晚于它们 —— 也就是说这条断言**在最近这两轮之后
+就没有再被记录为通过过**。
+
+**没做的事（如实写）**：没有把上面两条机制**隔离到哪一条是主因**（要隔离得分别关掉
+"回放池复用"与"后台训练"重跑两次 40 手的 TB 对局，各约 20 分钟）；**也没有改这条断言**
+（改它要先决定正确口径：是把池子一起快照、还是把断言改成"同池 + 后台训练停摆"下比较）。
+它现在的状态是：**红的，且与本轮的 BC 改动无关**。
+
+---
+
+## 零之二点三十四、`verify_match_ui.ps1` **默认参数**跑不过：是检查自己的两条错（2026-10，做 BC 回归时踩到）
+
+**症状**：不带任何参数跑 `tools/verify_match_ui.ps1`，日志里**逐条 PASS、找不到任何一条 FAIL**，
+最后却打印 `RESULT: FAIL`；而 `-Full` 加上大超时跑**同样这份二进制**是 `RESULT: PASS`。
+也就是说"红"这个结论当时**没有证据支撑**——最后那行 `$ok` 是十几个布尔量的与，谁掉成 `$false`
+得靠人去比对（这一轮为此读了整个脚本）。
+
+**两条原因（都在检查侧，不在产品里）**：
+
+1. **默认路径"0 局"却要求逐局明细行**。默认（不加 `-Full`）是"开局 3 s 后按停止对弈"，
+   实测这一场是 `共 0 局 / 9 手 [已中止]`（AB-L1 vs EVAB 约 470 ms/手，3 s 连 10 手都走不到），
+   而逐局行**只在局末**才发（`chessboard.cpp` 里 `emit matchGameFinished(st.games, games, …)`
+   紧跟在 `st.games++` 之后）。于是 `$listOk = ($gameLines.Count -ge 1) -and …` 恒为 `$false`。
+   修法：把该项判定改成**看适用性**——`共 0 局` 且 0 条逐局行时**跳过**（并打印跳过原因），
+   只有"已完成 ≥1 局却没有逐局行"才判失败（那才是明细丢失的真 bug）。`-Full` 仍然严格检查它。
+2. **默认 `-StartupTimeoutSec 30` 比冷启动还短**。实测冷启动 ≈ 40 s（`-LogFile` 里的
+   `[weights]` 行：`PPO+MCTS: 17.1 s` + `SAC+AZ-MoE 读权重: 11.3 s` + `DQN+AB: 3.6 s`），
+   于是默认路径每次都在 `start button never became enabled within 30 s` 上**假失败**。
+   默认值提到 **120 s**（与 README 记录的"启动约 40 s"一致，留 3 倍余量）。
+
+**修完的实测**（同一份二进制，都是真界面 UIA 驱动）：
+
+| 调用 | 结果 |
+|---|---|
+| `verify_match_ui.ps1`（默认参数） | **PASS**（`list has per-game lines = True  (已完成 0 局, 逐局行 0 条)`，跳过原因已打印） |
+| `verify_match_ui.ps1 -Full -TimeoutSec 300 -StartupTimeoutSec 150 -LogFile …` | **PASS**（含逐局行 `True`、双击放大窗口读数与源标签逐字一致、`chess.exe` 无残留） |
+
+**顺带修的一条（本轮真的踩了两次）**：用编辑工具改写 `tools\*.ps1` 会**丢掉 UTF-8 BOM**
+（`verify_match_ui.ps1` 在 HEAD 里是 `EF BB BF`，改完头三个字节变成 `23 20 74` = `# t`）。
+脚本自己的注释就写着这条：丢 BOM 后 Windows PowerShell 按 ANSI 解码中文，中文串被拆成乱码，
+报出来的却是一堆**和真正原因毫无关系**的语法错。所以改完必须核一遍：
+```powershell
+[System.IO.File]::ReadAllBytes("tools\verify_match_ui.ps1")[0..2]   # 要 EF BB BF
+```
+本轮已给三个脚本补上 BOM 并重跑确认行为不变：BC 那条（`verify_bc_ui.ps1`，新建时也没带 BOM）
+对局中 BC + tab 切换仍 **PASS**；`verify_thinking_ui.ps1`（HEAD 里本来就没有 BOM，属于
+历史遗留，本机 ANSI 代码页恰好是 UTF-8 所以一直没炸）补 BOM 后仍 **PASS**；
+`verify_match_ui.ps1` 两种跑法都 **PASS**。**没有**去动其它 8 个同样没带 BOM 的
+`tools\*.ps1`（HEAD 上就这样，与本轮无关，避免无谓 diff）。
+
+---
+
+## 零之二点三十五、"双击行为曲线没反应"：一句 `if (m_bcChart != nullptr)` 把接线静默跳过了（2026-10，用户报）
+
+**用户口径**："双击行为曲线窗口后弹出窗口放大显示"。当时的实际状态是**双击没有任何反应**，
+而且这是本工程最贵的一类失败——**静默**：能编译、启动无警告、日志无异常，只有用户双击时
+"什么都没发生"。
+
+**原因（一行执行顺序，不是逻辑错）**：`m_bcChart` 在 `setupChartTabs()` 里才 `new`
+（构造函数第 400 行调用），而它的双击接线写在**先跑**的 `setupMetricsPanel()` 里（第 393 行）：
+
+```cpp
+if (m_bcChart != nullptr) {          // 第 393 行时它还是 nullptr ⇒ 整块被跳过
+    connect(m_bcChart, &CurveChart::doubleClicked, this, [this]() { openLargeChart(...); });
+}
+```
+
+损失/奖励两张图的接线在同一个函数里、但用的是**本来就存在**的 `ui->lossChart` /
+`ui->rewardChart`，所以只有 BC 那一条被跳过——于是"两张图能放大、第三张不能"。
+
+**修法**：接线搬到**创建它的同一个函数**（`setupChartTabs()` 末尾），并在原处留注释说明
+"这里不能接、原因是什么"。判据是"接线与创建同处"而不是"记住两个函数的调用先后"。
+
+**顺带发现的两处**（都会让放大窗口读起来和源控件不是一回事，属同一类"看起来没坏"的缺陷）：
+
+1. 放大窗口的数字**没有 `%`**：`CurveChart` 的 `suffix` 是控件自己的状态，`follow()` 同步数据
+   时不会带上；而 `openLargeChart` 里那行 `setValueSuffix(source == ui->lossChart ? QString() :
+   QString())` 两个分支一模一样，等于没设。现在放窗口在每次同步时从源控件抄一份
+   （新增 `CurveChart::valueSuffix()`）。
+2. 放大窗口里**没有 CE**：窗口的读数行是**从曲线数据重新格式化**出来的，而 CE 刻意不在曲线上
+   （百分比 vs 交叉熵，不同量纲）。现在 `CurveChartDialog::follow(source, extraReadout)` 多接
+   一个**回调**（每次同步重新问一遍），CE 那段的格式抽成 `MainWindow::bcFidelityCeTail()`，
+   图下标签与放大窗口**共用一份**。
+
+**实测证据**（`tools/verify_bc_ui.ps1` 新增断言，用 `mouse_event` 真双击 —— UIA 只有 Invoke、
+没有双击模式）：
+
+```
+PASS  double-click on the BC curve opens the enlarged window (行为克隆保真度 (放大))
+info  mirror vs source label = True  (strip the prefix, compare the rest)
+PASS  the enlarged window mirrors the source readout (incl. the CE tail)
+PASS  the enlarged window carries the CE (it is not a chart series)
+PASS  the enlarged window closes again
+```
+
+回归：`verify_match_ui.ps1 -Full` **PASS**（损失那张图的放大窗口与"读数镜像"断言都没被带坏）、
+`ctest -E "test_match|test_mcts"` **14/14 通过**。
+
+**方法论（这条值得抄下来）**：新控件**在别处创建**时，接线必须与创建同处；"创建"与"接线"
+分在两个函数里、靠 `if (ptr != nullptr)` 兜底，等价于**没有接线也没有报错**。
+这条断言也因此刻意**不只**判"窗口存在"——那样"窗口开了但少一个数"照样通过；
+它把放大窗口读数与源标签**去前缀后逐字比较**，于是"镜像"是可证伪的。
+
+---
+
+## 零之二点三十六、BC 的老师从"对手"改成"下拉框选的 AB"：口径、取样轮次、人机路径（2026-10，用户口径）
+
+**用户口径（原话）**：*"行为克隆勾选框改成下拉框选择要克隆的 abagent，与将要对弈的对方
+agent 或者人类棋手无关，训练的时候参考下拉框选择的 abagent 的决策进行行为克隆训练"*。
+
+这一条**不是换控件**，是换口径 —— 老师从"场上的对手"变成"下拉框里那一档 AB"，于是三件事
+必须一起改（只改一件就会留下"看着能用其实没生效"的洞）：
+
+| # | 上一版 | 这一版 | 不改会怎样 |
+|---|---|---|---|
+| 1 | 老师 = **对面那个 AB**（`abDepthOf(who) > 0` 时把**对手**那一手当标签） | 老师 = **下拉框那一档**（`m_bcTeacherDepth`，0 = 关）：在**局面副本**上现场 `ABAgent(depth).getBestMove(color)` | 对手换成 MCTS 或人，就"没有老师"了 —— 而这正是用户要摆脱的耦合 |
+| 2 | 采样轮次 = **对手(AB)走的那一手**（`bcTeacherHere` → 走子方是 AB） | 采样轮次 = **学生自己走的那一手**（走子方 `bcSupported`） | 老师不在场上了，就没有"对手那一手"可抄；而且"学生自己的局面"才是它真要做决策的分布 |
+| 3 | 可用条件 = `bcInMatchAvailable(a,b)`："恰好一边 AB + 一边可训练" | `bcHasStudent(a,b)` = A/B **任一侧**能做学生；人机那条路的学生 = "对战AI" 那一支 | 配对条件里已经没有"老师"这一半，留着旧判据会出现"下拉框亮着但场上什么也没发生" |
+
+**新增的人机路径**（用户口径里的"人类棋手"）：`humanTurnAiMoveForTest`（`aiThink` 与测试钩子
+**共用**的那一份）在决策之后、落子之前调 `bcSampleForHumanTurn` —— 自己从棋盘锁里拷一份局面，
+再走与对局循环**同一段** `bcOnStudentMove`；三个闸门逐条对齐（老师 ≠ 关 / 模式 = 训练对局 /
+这一支能做学生），否则"人机能偷偷改权重"会重演 P0-b 那个洞。人机没有"场"的概念 ⇒ 读数
+**按一局**归零（第一次采样时 `exchange` 归零一次，终局/重开清标志），报告正文因此
+**每做一次更新就刷新一次**（面板在别的时机整段 `setPlainText`，只在场末写的话人机里读不到
+任何读数 —— 那会表现成"勾了没用"）。
+
+**两个刻意的实现细节**（都是"看起来一样、其实不一样"的类型）：
+
+* **老师那一手用局面副本搜**：AB 搜索会真的 `moveForward/moveBack` 并**改 `history`**，
+  直接拿样本局面去搜，搜索过程就会被写进这条样本的**状态编码**（编码要看规则历史），
+  样本当场被污染且看不出来。⇒ `Chess teacherBoard = pos;` 再搜。
+* **实时进度行带上 `[teacher-depth=N]`**：对局进行中面板只在**追加**实时行（整段重写发生在
+  面板刷新时机，而脚本把每手预训练关了），所以"老师是哪一档"必须在那一行里 —— 否则检查只能
+  等到对局结束才断言得到（`verify_bc_ui.ps1` 第一版就是这么假失败的：FAIL 时那行字其实已经
+  在面板里了）。
+
+**实测证据**：
+
+| 检查 | 结果 |
+|---|---|
+| `tools/verify_bc_ui.ps1`（学生 = PPO+MCTS-MLP，**对手刻意选成 MCTS（非 AB）**，下拉框选 `depth=1`） | **PASS**：`dropdown enabled with a student + a non-AB opponent`、实时行 `samples=1 updates=1 ... [teacher-depth=1]`、汇总 `samples=8 updates=8 targetMissed=0`、保真度 `top-1=37.50% P(teacher)=31.73% CE=1.6630`、双击放大窗口读数与源标签逐字一致。**（2026-10 软目标那一轮把默认老师改成 `depth=2` 并勾上软目标，实时行因此变成 `[teacher-depth=2 soft=1]`，汇总多 `soft=1` 与 `targetH=0.1733` —— 见下面那条追加）** |
+| 负对照：`MCTS vs Alpha-Beta L1`（**场上没有学生**） | 下拉框**置灰**（旧口径下的负对照"没有 AB 对手"已经不再是理由） |
+| `probe_hvai_flow` 的 `[E]` 节（**人机**：真实点击 → AI 应手 → 读 `bcReportText()`） | **失败项: 0**：`samples=1 updates=1 targetMissed=0 [teacher-depth=1]`；把下拉框拨回"关"重下一局，`samples` **不再增长** |
+| `ctest -E "test_match\|test_mcts"` | **14/14 通过** |
+
+**这条也顺带修正了 `verify_bc_ui.ps1` 自己的三条假失败**（与产品无关，属检查的方法学）：
+① 读"对局中的读数"必须读**实时行**，不能等报告正文；② Qt 的下拉框项是**懒建**的
+（不展开时 `FindAll(Descendants)` 返回 0 个），要展开后取**前后差集**（直接枚举会把对局明细
+列表、面板文本一起算进来）；③ 保真度读数要等 **≥8 次 actor 更新**（`kBcFidEvery=4` ×
+窗口下界 `kBcFidMin=8`）才会出现，不等就是掷骰子（同一脚本两次运行一次 25 条样本、一次 3 条，
+后者把"暂无"读成了"没有 CE"）。
+
+### 附：用户追问"勾选行为克隆训练后能否勾选 rollout 预训练"（2026-10）
+
+**答案：能，两者互相独立**（代码核对：BC 那条路一行都没碰 `preTrainCheck`；BC 下拉框的启用
+判据也不看它）。但"能开"不等于"都真的在跑"——所以给报告加了一个机器可读的计数器
+**`onlineSteps=`**（= 这一场里**在线训练/探索+预训练**上报过多少次损失；PPO 那一支的在线训练
+就是这条路），并给 `verify_bc_ui.ps1` 加了 `-KeepPreTrain` 路径来量它：
+
+| 调用 | BC 读数 | 在线训练读数 |
+|---|---|---|
+| `verify_bc_ui.ps1`（默认：脚本把预训练关掉，只为了让检查快） | `samples=8 updates=8` | **`onlineSteps=0`** |
+| `verify_bc_ui.ps1 -KeepPreTrain`（两者同开） | `samples=8 updates=8` | **`onlineSteps=8`** |
+
+两条都 `RESULT: PASS`。`onlineSteps=0` 那一栏是这条检查的**对照**：它证明这个计数器不是
+恒为正的装饰（"加了计数器"与"计数器真的在区分两种情形"是两件事）。
+
+⚠ 这个断言的第一版去读损失曲线的 **HelpText**（`count=`）：实测 Qt 的 UIA 桥**根本不暴露
+HelpText**（读出来是空串）。这条同时解释了一个老现象 —— `verify_match_ui.ps1` 里
+"loss chart = " 那一行**从来没有打印过**，因为它在 `if ($desc -ne "")` 后面被静默跳过了。
+**结论（值得抄）**：要断言"某条路有没有真的跑"，必须有**产品自己打印的机器可读计数器**，
+不能指望无障碍属性。
+
+两个代价（都写进文档了）：**读数会混**（损失曲线是在线训练口径，BC 的 CE 在面板/BC tab，
+且 BC 刻意不写 `lastLoss` ⇒ BC 的更新在损失曲线上一个点都没有）、**每手更慢**（预训练每手
+多跑 ≤`preTrainSteps` 步 rollout + 一次 `learnBatch`，而 BC 是每手一次更新 ⇒ 同样时间里
+BC 更新更少）。
+
+---
+
+## 零之二点三十七、人机对弈的 BC 曲线**从来没有建过线**（2026-10 用户口径："补上人机对弈 BC 训练的 BC 曲线显示"）
+
+**缺口的形态（又一次静默失败）**：BC 保真度那两条线是在 `MainWindow::resetMetricsForMatch`
+里建的，而它只被 `ChessBoard::matchStarted` 触发 —— 那是 **Agent 对 Agent 才有的"场开始"**。
+人机对战没有这个信号，于是曲线**永远没有序列**；而 `CurveChart::addPoint` 在序列不存在时是
+**静默 `return`**：
+
+```cpp
+void CurveChart::addPoint(int series, double value) {
+    if (series < 0 || series >= m_series.size()) { return; }   // ← 没有线就默默丢掉这个点
+```
+
+⇒ 表现是"人机里 BC 明明在训练（面板 `samples=`/`updates=` 一直在涨），曲线却一直空白"，
+而"空白"在界面上**没有任何读数**能区分下面两种完全不同的原因：
+(a) 没建线（缺陷）；(b) 建了线但样本不够（保真度第一个点要 ≥8 次 actor 更新）。
+
+**修法三件事**（都在"把静默那一半堵掉"）：
+
+1. 新增信号 `ChessBoard::humanGameStarted`，在 `setHumanGameInProgress` 的 **false→true 跳变**
+   （= 玩家落下本局第一子）发一次 —— 人机没有"场"，所以**每局一次**，与"人机 BC 读数按局归零"
+   同一口径；按"玩家第一子"而不是"按了开局"算，与"对弈期间权重不落盘"那条起算口径逐字一致。
+2. 建线判据抽成**唯一一处** `MainWindow::armBcChartSeries(studentAvailable, teacherDepth, humanMode)`，
+   两种模式共用（对局：`matchStarted`；人机：`humanGameStarted`），并**清线**——横轴是
+   "这一场/这一局的第几次 actor 更新"，不清线会把两局的 4,8,12… 接成一条假时间轴。
+3. 面板里留一行**机器可读**的"曲线准备好了没有"：
+   `[BC] 曲线已建线 (chart-armed): 老师=… [teacher-depth=N] [mode=human|match]` ——
+   于是 (a)/(b) 两种"空白"当场分得开（这也是验证脚本唯一的抓手）。
+   另给 `CurveChart` 的 **accessibleName** 加 `· n=<点数>` 后缀：Qt 的 UIA 桥**不暴露
+   Description**（读出来是空串），所以"曲线真的在长"只能靠 Name 观察。
+
+**实测证据**（真界面 UIA，`tools/verify_bc_ui.ps1` 的 human game 段；脚本盲走红兵，AI 会把红方
+将军/将死 —— 用户在自己屏幕上看到的"被将军了 / 黑方已经胜利"就是这个）：
+
+```
+PASS  human game: the AI side is a BC-capable student  (PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家))
+info  arm marker: [BC] 曲线已建线 (chart-armed): 老师=Alpha-Beta L1(深1) [teacher-depth=1] [mode=human]
+PASS  human game: the BC curve got armed (series created) [chart-armed]
+PASS  human game: BC produced a live line in this game (samples=)
+PASS  human game: >= 8 updates, so the BC curve drew points (chart n=1)
+RESULT: PASS
+```
+
+回归：`verify_match_ui.ps1`（默认路径）**PASS**、`ctest -E "test_match|test_mcts"` **14/14 通过**。
+
+**这条也留下一个口径提醒**（写进 README 与 BC 文档 §6.6 了）：人机模式的曲线**每局清零**，
+而保真度第一个点要 **≥8 手**（AI 每应一手算一条样本）⇒ **一局没下满 8 手就是空的**。
+这不是缺陷，但如果希望"被速杀也看得到曲线"，可选的改法是"人机按**连续几局**累计"或"降低
+人机那条路的窗口下界"—— 两者都是**口径改动**，本轮没做（用户口径只要求把显示补上）。
+
+**方法论**（本轮又踩了三条，都写进了脚本注释）：
+① PowerShell 里 `@($a, $b, $c, $row - 1)` 会被解析成 `(数组) - 1`（逗号比算术绑得紧）⇒
+`op_Subtraction` 运行期错误；② `$x -ne ""` 对 `$null` 是 **True** —— 忘了初始化 `$armLine`
+会让"拿到了吗"这条断言**假通过**，而检查其内容的两条真失败（同一份日志里出现互相矛盾的结论）；
+③ 用 `LastIndexOf("[mode=human]")` 去切面板文本会**从 marker 行内部切开**，把 `chart-armed`
+那半截切掉 ⇒ 提取出来永远是空串。三条都不是产品问题，但都会让"验证"给出错误结论。
+
+---
+
+## 零之二点三十八、新增一个头文件之后，改它**不会触发重编**：`file(GLOB)` 冻结在 configure 那一刻（2026-10，做软目标时踩到）
+
+**形态（第四类静默失败：改了源码，二进制没变）**：本轮新增了 `src/bcrun.hpp`（BC 的运行层），
+之后在它里面给 `train_bc` 的报告加了两行（`平均 H(t): 训练 … / 留出 …` 与 `KL 口径 …`）。
+重新构建 `train_bc` 的输出是：
+
+```
+[1/1] Linking CXX executable train_bc.exe
+```
+
+**只有 link，没有 compile** —— 于是链接出来的还是**旧的 `train_bc_main.obj`**，跑出来的报告
+一个字都没变。差一点被读成"我改的那一段没生效"，而实际是"我改的文件根本不在依赖表里"。
+
+**根因**（对着 `build.ninja` 查的，不是推理）：
+
+```bat
+> findstr /C:"bcrun.hpp" build.ninja
+(无匹配)
+> findstr /C:"bcagent.hpp" build.ninja | find /c /v ""
+366
+```
+
+同目录、同后缀、同一份 `OBJECT_DEPENDS` 机制，`bcagent.hpp` 有 366 处引用而 `bcrun.hpp`
+**一处都没有**。原因是本工程为了让头文件改动触发重编（见 `CMakeLists.txt` 那段"MSVC 的
+`/showIncludes` 是本地化输出、ninja 存不下依赖"的说明）用的是：
+
+```cmake
+file(GLOB APP_HEADER_DEPS ${SRC_DIR}/*.h ${SRC_DIR}/*.hpp)
+```
+
+而 **`file(GLOB)` 在 configure 时求值**：`bcrun.hpp` 是本轮**新建**的，自那以后没重新
+configure 过 ⇒ 它从没进过这张表。这与上面 `mainwindow.ui` 那个坑（"改了 .ui 却看不到变化"）
+是**同一类**：改了源码而二进制没变，构建日志上一切正常。
+
+**修法**：两个 GLOB 都加 `CONFIGURE_DEPENDS`（CMake ≥ 3.12），ninja 每次构建会重新 glob 一遍
+（毫秒级），此后**新增**头文件也自动进依赖表。已写进 `CMakeLists.txt` 的注释里
+（连同这次的复现命令），免得下次又被同一块石头绊倒。
+
+**顺带一条纪律**：这次的教训不是"记得重新 configure"，而是 **"改了一个新文件之后，
+必须确认真的是 `Building CXX` 而不是只有 `Linking`"** —— 增量构建的正确性靠的是依赖表，
+而依赖表可能是空的。凡是"改了报告/读数却没看到变化"，先 `findstr` 一下头文件名在不在
+`build.ninja` 里。
+
+---
+
+## 零之二点三十九、"勾了软目标却没效果"：老师选 L1 时它**本来就该**退化成 one-hot；以及由此暴露的两处（2026-10）
+
+**形态**：软目标（多深度一致，见 `docs/behavior_cloning_2026_10.md` §9）在界面上是老师下拉框
+右边的复选框。第一版验证脚本用老师 = `Alpha-Beta L1(深1)` 跑，于是：
+
+```
+FAIL  the report carries a POSITIVE average target entropy H(t) (soft target really is a distribution)  (targetH=0)
+```
+
+**这**不是产品缺陷，是**机制的正确退化**：`softTargetFromAB` 是"深度 1..D 各投一票"，
+而 D 就是老师档位 —— **D=1 时只有一票**，唯一候选的概率是 1 ⇒ `H(t)=0` ⇒ 与 one-hot **完全一致**。
+`test_bc [9]` 里那条"深度 1 必须退化成 one-hot"钉的正是这个性质。所以真问题有两个，都不是"算错了"：
+
+1. **产品侧：读数没有自解释**。用户勾了软目标、老师停在 L1 时看到 `targetH=0`，分不清
+   "开关没生效"和"退化了"。修法：报告里在这一情形下**明说原因与下一步动作** ——
+   `⚠ 深度=1 时**只有一票** ⇒ 目标退化成 one-hot (H(t)=0), 软目标此时与默认口径**完全一致**;
+   想真的用软目标请把老师选成 L2 或更深`。（"空白/零值必须自解释"是本工程反复出现的同一类要求，
+   见价值曲线那条"没有点要说原因"。）
+2. **检查侧（又是脚本自己的假失败）**：脚本用 depth=1 去断言"`H(t)>0`"，
+   而 depth=1 下那条断言**必然**失败 —— 检查的设计与产品的口径不一致。
+   修法：默认老师改成 **`depth=2`**，并且把期望档位从 `-TeacherItemMatch` 里**解析**出来
+   （`$TeacherDepth`），脚本里所有 `teacher-depth=N` 断言都用它 ⇒ "选 depth=2 而断言写 depth=1"
+   这种漂移再也不会发生。
+   同一次还修了另一条同源假失败：实时行新增 `soft=` 之后变成 `[teacher-depth=2 soft=1]`，
+   而老正则 `\[teacher-depth=([0-9]+)\]` 要求数字后面紧跟 `]` ⇒ **产品完全正确**却失配。
+
+**顺带落了一个开关**（用户口径 *"不进行人机对弈测试"*）：`verify_bc_ui.ps1` 的 human game 段
+会**真的在屏幕上下一局棋**（盲走红兵 ⇒ 用户看着自己被将军/将死），现在可以 `-SkipHuman`
+整段跳过。⚠ 跳过时那一段**不产生任何断言**（不是"当成通过"），日志里留一行
+`info  跳过 human game 段 (-SkipHuman)`，其余各段照常跑。
+
+**实测证据**（`verify_bc_ui.ps1 -SkipHuman`，本机 Release 真界面）：
+
+```
+PASS  bcSoftCheck exists (the soft-target switch next to the dropdown)
+PASS  the soft-target switch defaults to OFF  (Off)
+PASS  soft-target switch enabled together with the teacher dropdown
+PASS  soft-target switch really turned ON  (On)
+PASS  the in-match BC produced samples + updates (live line)
+      ([BC] ... samples=1 updates=1 批=1 CE=2.3068 (目标落空 0) [teacher-depth=2 soft=1])
+PASS  the live line says the teacher is the dropdown's depth=2 entry
+PASS  the live line reports the soft-target switch as ON (soft=1)
+PASS  the per-match BC summary reached the panel
+      ((match-summary): samples=8 updates=8 targetMissed=0 onlineSteps=0 soft=1)
+PASS  the report carries a POSITIVE average target entropy H(t)  (targetH=0.1733)
+info  跳过 human game 段 (-SkipHuman): 这一段会真的在人机上下一局棋
+RESULT: PASS
+```
+
+**一条口径提醒**（写进 README 与 BC 文档 §9 了）：`targetH` 在 depth=2 上只有 **0.17** 量级
+（深搜与浅搜选同一手的比例很高）。它是**老师侧**的量、与好坏无关；`H(t)` 越大说明这个局面上
+"老师自己都不确定"，此时 CE 高**不代表**学生差 —— 要判学生好不好看 `CE − H(t)`（KL）。
 
 ---
 

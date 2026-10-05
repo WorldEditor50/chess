@@ -1867,7 +1867,7 @@ Step SACAZMoETbAgent::selectMove(int color, int simulations_, float temp, RL::Te
         } else if (recordDecisionSamples) {
             /*
                [2026-10] 只记录、不学。界面那一支 (AGENT_SACAZ_MOE) 的 learnFromSearch
-               是关的 (TB 骨干上 learnBatch(32) ~1.8 s/手, E=8/top-2 后 ~3.6 s/手),
+               是关的 (TB 骨干上 learnBatch(32) ~1.8 s/手; E=8/top-2 那一版是 ~3.6 s/手),
                但**终局通道必须有这条样本可挂** —— 否则人机对弈那一局的输赢直接丢掉
                (用户实测日志: "没有可挂的真实决策样本 ... 这一局的输赢没有进学习回路")。
                记录本身的代价 (一次稀疏编码 + π 拷贝) 相比这一步的搜索可忽略。

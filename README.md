@@ -2,11 +2,12 @@
 
 一个用 Qt6 写的中国象棋程序：完整的棋规、可玩的界面、**7 个可选 AI Agent**（从
 Alpha-Beta 到 SAC + MCTS + AlphaZero）、一个**纯 C++ 的强化学习内核**（SIMD 加速、
-自带稀疏 MoE），以及一整套**可复现的验证手段**（13 个 ctest 套件 + 8 个界面自动化脚本 +
+自带稀疏 MoE），以及一整套**可复现的验证手段**（14 个 ctest 套件 + 8 个界面自动化脚本 +
 一批手动基准：`bench_moe` / `bench_ppo_vs_ab` / `bench_ppo_mt` / `bench_policy_agreement` /
 `bench_ppo_sims` / **`bench_diag`（诊断仪表盘：搜索健康度 / 战术题库 / value 校准）** /
 **`bench_anchor`（固定开局集 + 换先手成对计分 + Elo 置信区间）** / **`train_ppo`（无界面
-常驻训练器）** / **`probe_dqnmcts_aliasing`（DQN+MCTS 的表示能力探针：动作别名 / 状态
+常驻训练器）** / **`train_bc`（行为克隆训练器：PPO 与 SAC 两条线共用一套口径）** /
+**`probe_dqnmcts_aliasing`（DQN+MCTS 的表示能力探针：动作别名 / 状态
 不可分性 / 终局奖励通道 / 回放池新信息量）** 等）。
 
 > 这个工程的写法偏"工程审计"风格：每个非显然的决定都写成注释，每个结论都有实测数字，
@@ -178,6 +179,19 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
   自检面板第一段现在还会报**实测的隐层激活类型**（读 actor 第 2 层，不回显开关）与
   **实际生效的口径**（clampTarget / huberDelta / 叶子估值 / 动作空间）：上一轮那个
   "激活被换成 TanhNorm<Sigmoid>、棋力掉 26 个点"的回归，面板上原本一个字都看不出来。
+* **行为克隆入口**（2026-10，用户口径："行为克隆勾选框改成下拉框选择要克隆的 abagent，
+  **与将要对弈的对方 agent 或者人类棋手无关**，训练的时候参考下拉框选择的 abagent 的决策
+  进行行为克隆训练"）：A/B 面板上一个**下拉框** `行为克隆训练` —— `关 / Alpha-Beta L1 / L2 /
+  L3 / (深度=4)`。**老师由它选，与对手是谁无关**：对手是别的 agent、是 AB 的某一档、
+  还是人机里的**人**，都照常克隆；场上只要有一支能做 BC 的 agent（PPO 两支 / SAC 三支）就选得动。
+  学生的**每个局面**都由所选那一档 AB 现场搜一手当标签，学生每走一手就更新一次**策略头**。
+  读数进下面的自检面板（对局中逐次一行，整场一条摘要），对局期间下拉框锁定，
+  只在"训练对局"模式下生效。曲线在 `行为克隆 (BC)` 那个 tab 里（双击可放大）。
+  真界面验证见 `tools/verify_bc_ui.ps1`（含"场上没有学生时是灰的"负对照、
+  "对手刻意选成非 AB"的正面证据、以及"程序真的被关掉"的复查）；**人机那条路**由
+  `probe_hvai_flow` 的 `[E]` 节钉住（真实点击 → AI 应手 → 报告里有样本与更新）。
+  见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) §6.5。
+
 * **稀疏 MoE 负载控件**（2026-10，`src/moeloadview.{h,cpp}` 的 `MoeLoadView`，就在自检面板
   上方）：每个专家分到多少流量的柱状图 + `1/E` 参考虚线 + `MaxVio`/有效专家读数，**双击可
   放大**到独立窗口。存在的理由与自检面板同源：**路由坍缩是静默的** —— 前向照跑、loss 照降、
@@ -197,20 +211,30 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 * 程序图标（窗口/任务栏 + exe 文件图标，由脚本生成）
 * 载入/保存权重时的沙漏等待窗（复用思考指示器；**快的操作不闪窗**，延迟 300 ms 才显示）
-* **启动时加载 9 组权重**（名单 = `chessboard.cpp` 的 `kWeightAgents`；本机实测
-  **启动到界面可用 ≈40.0 s**，其中 PPO+MCTS **17.6 s**（读 2×529 MB）、SAC+AZ-MoE
+* **启动时加载 9 组权重**（名单 = `chessboard.cpp` 的 `kWeightAgents`；**E=8/top-2 那一轮的
+  实测**：启动到界面可用 ≈40.0 s，其中 PPO+MCTS **17.6 s**（读 2×529 MB）、SAC+AZ-MoE
   建网 2.9 s + 读 3×146 MB 12.0 s、DQN+AB 建网 1.1 s + 读 267 MB 3.7 s 三组占了大头；
   沙漏全程给反馈）。
-  **[2026-10 目标/top-k 那一轮]** PPO+MCTS 的 TB 专家从 E=4/top-1 提到 **E=8/top-2**：
-  它的那一步 9.0 s → **17.6 s**（权重 530 MB → **1,057 MB**），于是整体
-  **29.5~30.0 s → 40.0 s**（`tools/measure_startup.ps1 -Tag ppoE8k2b`）。这正是这一轮
-  唯一的启动代价，也是 §13.5 那个"top-k 拿模拟次数换容量"取舍的一部分。
+  **[2026-10 目标/top-k 第二轮，当前生效]** PPO+MCTS 的 TB 专家按用户口径从 E=8/top-2
+  **降回 E=4/top-1**（`rl/ppo.h`）⇒ 它的那一步 **17.6 s → ~9 s**、权重 1,057 MB → 530 MB，
+  整体启动时间也回到 ~30 s 那一档。⚠ **存量 `weights/ppomcts_agent.dat_*`（530/527 MB）
+  与 `weights/sacaz_moe*` 随之作废**：启动日志里那一组会明确打出
+  `参数量不匹配 (文件 N 个元素, 当前网络 M 个) … 拒绝载入` —— 这是守卫在正常工作，
+  不是载入坏了。
+  ⚠⚠ **代价是"这一档的启动读数暂时量不准"**：载入被拒 ⇒ 那一组**跳过读盘**，启动时间会
+  量出一个偏小的假读数（本工程在 E=8 那一轮就踩过一次：第一次量到 26.9 s 就是假的）。
+  真实读数必须等这一支**重训并重新存盘**之后再量（`tools/measure_startup.ps1`）。
+  **[2026-10 第一轮（已回退）]** 当时从 E=4/top-1 提到 **E=8/top-2**：那一步 9.0 s → **17.6 s**
+  （权重 530 MB → **1,057 MB**），整体 **29.5~30.0 s → 40.0 s**
+  （`tools/measure_startup.ps1 -Tag ppoE8k2b`）。这两轮合起来说明同一件事：**启动时间里
+  PPO+MCTS 那一组基本就是它的权重文件大小**。
   **[2026-10 更早那一轮]** 这里原来还有 PG / DQN / SAC-59e5233 两支，按用户口径从下拉框
   与预加载里一起移除 ⇒ 实测 **40.8 s → 29.5~30.0 s**（省下的大头是还原版那个 TB 专家
   骨干：建网 4.5 s + 读 440 MB 6.3 s）。量法：`tools/measure_startup.ps1`。
   ⚠ 拿旧权重要注意：E/top-k 改动会让**存量权重作废**，那时启动日志里那一组会明确打出
   `参数量不匹配 (文件 N 个元素, 当前网络 M 个) … 拒绝载入` —— 用**新鲜存下**的权重才量得到
-  "读 1,057 MB"那一档（第一次量到的 26.9 s 就是"载入被拒、跳过读盘"的假读数）。
+  真实读数（第一次量到的 26.9 s 就是"载入被拒、跳过读盘"的假读数）。这条在**每次**切
+  E/top-k 时都会重演一次（2026-10 两个方向各一次）。
   每组各记一条 `[weights] <名字>: N ms`，保存也记一条（慢了能一眼看出是哪一组）
 * 权重文件格式 v2：**逐比特无损** + 结构指纹 + 每张量 CRC32 + **原子写入**，
   并且**兼容旧的十进制文本格式**
@@ -226,7 +250,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **Alpha-Beta Pruning** | 经典 α-β + 静态搜索 | 深度 4，约 90 ms |
 | **Alpha-Beta L1 / L2 / L3** | **同一套搜索的三档弱等级**（只有深度不同：1 / 2 / 3）。**纯搜索、无权重**：既不训练也不上报训练损失。用途是当**陪练与标尺**——棋力可调、且完全不随训练漂移；与深度 4 那一档一起构成一条棋力阶梯 | 每步 0 / 3 / 34 ms |
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
-| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（**[2026-10] E=8 top-2**，此前是 4/1 —— 参数量 76 M → **207.8 M**、峰值工作集 → **3,301 MB**、**20.1 ms/模拟**，见 `docs/moe_gate_experiment_2026_10.md` §13）。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | 400 次模拟，约 **8.0 s**（E=8/top-2 实测；想要 ~3 s 就把 `chessboard.cpp` 的 `PPO_SIMS` 降到 160） |
+| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（**[2026-10 第二轮] E=4 top-1**；上一轮曾按用户口径提到 8/2 —— actor+critic 207.8 M、20.1 ms/模拟、峰值 3,301 MB，同月又按用户口径降回，见 `docs/moe_gate_experiment_2026_10.md` §13/§14 与 `rl/ppo.h` 顶部）。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | 400 次模拟，约 **4.31 s**（E=4/top-1 实测；E=8/top-2 那一档要 7.99 s —— **模拟次数刻意保持 400**：切回 4/1 等于免费把每步拿回 3.7 s，搜索深度不变） |
 | **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~25×、容量小 ~18×，于是同一时间预算下模拟次数给到 4 倍 | 1600 次模拟，约 0.23~0.39 s |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **DQN+MCTS (稀疏MoE+TB专家)** | 同一算法的另一个骨干（独立类 `DQNMCTSMOETbAgent`）：稀疏 MoE + TB 专家、规范视角 1263 维、PUCT + negamax 符号、Double DQN + clampTarget/Huber。权重独立（`weights/dqnmcts_moe_agent_*`） | 40 次模拟，约 175 ms |
@@ -294,7 +318,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 ## 测试与验证
 
-### `ctest`（13 个套件，全过）
+### `ctest`（14 个套件，全过）
 
 ```bat
 ctest --output-on-failure
@@ -313,10 +337,12 @@ ctest --output-on-failure
 | `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 / **[11] 实时路由探针**（逐次核对、MLP 门控那一支、热度按时间衰减、**多线程读不撕裂**） |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
+| **`test_bc`** | **行为克隆的口径与承诺**（**167 断言**，实测 2.2 s）：解析梯度两条独立路径一致 + 中心差分 / **非法列梯度恰好为 0** / 单局面过拟合 P(老师)→1 / **BC 不碰 critic**（权重文件字节摘要：PPO critic、SAC q1/q2、共享口径的 Q 头各自钉住）/ 权重往返逐位相同 / **目标落空的负对照**（老师着法不在合法集 → 丢弃 + 计数，而不是产出一条没有信息却会改权重的样本）/ 两个口径的**归一化差别**（合法列 Σ=1 vs 全量 Z≈0.006）/ SAC-MoE-MLP 冒烟 / **[9] 软目标（多深度一致）**：`Σp == 1`、每项都是合法着法、同着法合并、深度 1 退化成 one-hot（`H(t)=0`）、未归一权重被强制归一、**一个候选不合法 ⇒ 整条样本作废**、单老师重载 == 单候选多老师重载、`CE == H(t) + KL(t‖π)` 的手算对照。见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) |
+| **`test_match [2.7c] 实验3`** | ⚠ **当前是红的，且是既有问题**（`git worktree` 出来的干净 HEAD 复现同样失败）：它要求"只换对手 ⇒ 第一次训练损失相同"，而**回放池不在快照/还原范围内**（`RL::PPO::load` 不碰 `replay`）⇒ 第二场抽到的 batch 天然不同；训练对局模式下后台训练线程还会在对弈期间同步权重。时间线与两条候选机制见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点三十三"。另外整场 `test_match` 在 2700 s 预算下**超时**（既有记录，属预算过期） |
 | **`probe_hvai_flow`** | **人机对弈状态机**（走**真实点击路径** `mousePressEvent`）：一局**由 AI 的落子结束**之后按"开局"，红方再走第一步，黑方必须应手；换对战 agent 之后同理；外加沙漏那一行显示的 agent 名。**进 ctest**（约 5–12 s） |
 | **`repro_concurrency`** | **"对弈 × 后台训练"并发的最小复现**（对弈跑在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；**故意不进 ctest**）。用法 `repro_concurrency.exe [轮数] [每局手数] [agent枚举值]` |
 
-`test_ppomcts` 也在这 13 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
+`test_ppomcts` 也在这 14 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
 置换表 / **PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）。
 
 另外有 **`bench_moe`**（骨干 A/B/C/D 等时间对弈基准）**故意不进 ctest** —— 它跑真实对局、
@@ -371,11 +397,30 @@ powershell -ExecutionPolicy Bypass -File tools\measure_peak_working_set.ps1 ^
   -LogFile build\mem_ppo_tb.txt
 ```
 
-**[2026-10] TB 专家 E=4/top-1 → E=8/top-2 的实测代价**：参数量 76 M → **207.8 M**、
-**20.1 ms/模拟**（400 模拟 = **7.99 s/步**）、峰值工作集 **3,301 MB**、权重 530 MB →
-**1,057 MB**、界面冷启动 29.5~30.0 s → **40.0 s**。同一副骨干上的负载 A/B（`train_ppo
---lossfree-bias=0|1`，8 局 × 12 手 × 12 模拟）：训练侧 MaxVio **0.900 → 0.120**。
-**棋力没有结论**（本工具不测棋力）。见同一份文档 **§13**。
+**[2026-10 第一轮，已回退] TB 专家 E=4/top-1 → E=8/top-2 的实测代价**：参数量 76 M →
+**207.8 M**、**20.1 ms/模拟**（400 模拟 = **7.99 s/步**）、峰值工作集 **3,301 MB**、
+权重 530 MB → **1,057 MB**、界面冷启动 29.5~30.0 s → **40.0 s**。
+同一副骨干上的负载 A/B（`train_ppo --lossfree-bias=0|1`，8 局 × 12 手 × 12 模拟）：
+训练侧 MaxVio **0.900 → 0.120**。**棋力没有结论**（本工具不测棋力）。见同一份文档 **§13**。
+
+**[2026-10 第二轮，当前生效] 用户口径"TB 专家降为 4、top-k 变为 1"：8/2 → 4/1。**
+上面那一整段代价**原路退回**，而且是**当天重新量的**（同一副工具、同一台机器）：
+
+| 读数 | E=8/top-2（上一轮） | **E=4/top-1（现在）** | 比值 |
+|---|---:|---:|---:|
+| PPO actor+critic 参数 | 207.8 M | **104.3 M** | 1.99× |
+| 每模拟 | 20.1 ms | **11.02 ms** | 1.82× |
+| 400 模拟 / 步 | 7.99 s | **4.31 s** | 1.85× |
+| 峰值工作集 | 3,301 MB | **1,608 MB** | 2.05× |
+| SAC 支 `test_sacaz` 整轮 | 324.9 s | **162.9 s** | 1.99× |
+
+而 `PPO_SIMS` **仍是 400**（用户口径"保持 400，恢复到历史配对"）⇒ 每步墙钟减半而
+**搜索深度一点没减**（模拟次数是本工程唯一测出过棋力的杠杆，所以省下来的算力刻意**不**换别的）。
+同一改动也落在 SAC 那一支（`SACAZMoETbAgent::MOE_TB_EXPERTS/TOPK`）。
+⚠ **两支的存量权重全部作废**（PPO `weights/ppomcts_agent.dat_*`、SAC `weights/sacaz_moe*`），
+必须从随机初始化重训 —— 参数量守卫会明确拒绝旧文件，不会静默错读。
+量法：`bench_ppo_backbone_tb --games=1 --plies=8 --calib-sims=8 --ui-sims=400 --learn-steps=2
+--backbone=tb` + `tools/measure_peak_working_set.ps1`；SAC 那一行就是 `ctest -R test_sacaz`。
 
 **`bench_ppo_vs_ab`** 是 PPO+MCTS 对 Alpha-Beta 的**静默**（无界面、不弹窗、不写权重）
 对弈基准，同样是手动跑的：交换先后手、随机开局、可选**等时间**（`--budget` 先标定
@@ -434,8 +479,145 @@ Zobrist 键登记进置换表，下一步落子走到同一局面就直接**换�
 1.1e-3（头）/3.5e-4（骨干），且**非法行的梯度恰好为 0**（全量口径下是 1.9e-04）。副作用确认：
 R2 权重上"全量 softmax"已无意义（Z≈0.005，非法槽位从未被训练）—— 所以 `PPO::action()`、
 `sparsePolicyHead=false`、`--ab=1` 这些不要在 R2 权重上用。**c_puct 重扫的结论是"扫不出
-落点"**（80 模拟下 6 个取值选点逐位相同，400/1200 下落进 ±6% 噪声），保持 1.414。缺口：
-BC 蒸馏路径仍是旧口径。见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十七"。
+落点"**（80 模拟下 6 个取值选点逐位相同，400/1200 下落进 ±6% 噪声），保持 1.414。
+[2026-10] 缺口"BC 蒸馏路径仍是旧口径"**已解决**：新工具 `train_bc` 把这件事实现在**生产路径**上
+（合法列掩码口径、与在线训练同一个学习问题，并且把 critic 那一路整段剥出去 —— 所以"BC 不碰
+价值头"是可断言的），同时给 **SAC 三支补上了此前完全没有的 BC 路径**。
+`bench_ppo_distill` 保持原样（§7.7~§7.11 引用它的全量口径历史读数），那条口径作为
+`train_bc --masked=0` 的**对照臂**保留。见
+[`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) 与
+[`docs/issues_review.md`](docs/issues_review.md) 的"零之二点十七"。
+
+### 行为克隆训练器 `train_bc`（2026-10）
+
+**本工程唯一一条"从监督信号出发"的训练路径**：老师 = `ABAgent` 深度 D 的根选点（one-hot），
+学生 = agent 的**策略头**（actor），损失 = 该局面**完整合法集**上的掩码交叉熵
+（`dL/dz = π − t`，非法列恒为 0）。
+
+**两条入口，一份口径**：
+
+* **界面（主入口）**：A/B 对弈面板上一个**下拉框** **`行为克隆训练`** ——
+  `关 / Alpha-Beta L1(深1) / L2(深2) / L3(深3) / (深度=4)`，它选的**就是老师**，
+  **与对手是谁无关**（对手是别的 agent、是 AB 某一档、还是人机里的**人**，都照常克隆）。
+  学生的**每个局面**都由所选那一档 AB 现场搜一手当标签（在局面副本上搜，不碰对局棋盘），
+  学生每走一手就当场更新一次**策略头**。
+  读数贴进下面的**模型自检面板**（对局期间逐次一行 `samples= / updates= / CE= / teacher-depth=`，
+  整场结束后一份摘要 `match-summary: …`）。对局中下拉框锁定（选择是**这一场**的），
+  只在"训练对局"模式下生效（评估/只对弈模式下权重必须不变，而 BC 是学习）。
+  这条路由 `tools/verify_bc_ui.ps1` 在真界面上验证（含"场上没有学生时是灰的"负对照，
+  而且**对手刻意选成 MCTS** —— 用来证明老师不是从对手身上继承的）；
+  **人机那条路**由 `probe_hvai_flow` 的 `[E]` 节（训练本身：真实点击 → AI 应手 → 报告里有样本）
+  **加上** `verify_bc_ui.ps1` 的 human game 段（曲线本身：真点棋盘下一局 → 断言面板出现
+  `chart-armed … [mode=human]`，并在走满 8 手时断言曲线真的画出了点）一起钉住。
+  ⚠ **曲线在人机模式下每局清零**，而保真度第一个点要 **≥8 手**（AI 每应一手算一条样本）——
+  一局没下满 8 手就是空的（那是口径，不是缺陷）；验证脚本盲走红兵会被 AI 将军/将死，
+  所以那一段默认只跑 75 s。
+  ⚠ **没有**"单独跑一次 BC"的按钮（用户口径："不另外单独做行为克隆训练"）。
+* **能和"探索+预训练"（rollout 预训练）同时开吗？能**（2026-10 用户提问）：两者**互相独立** ——
+  BC 那条路一行都没碰 `preTrainCheck`，反过来预训练也不影响 BC 的下拉框。两条路各自改**同一张
+  策略头**，所以读数分开给：BC 的在面板/BC tab（`samples= / updates= / CE=`），在线训练的在
+  损失曲线。报告里的 **`onlineSteps=`** = 这一场在线训练上报过多少次损失 ⇒
+  `0` 就是"没跑"（实测：预训练关掉时 `onlineSteps=0`，与 BC 同开时 `onlineSteps=8`，
+  而 BC 自己的 `updates=8` 在两种情况下都成立）。代价两条：**读数会混**（损失曲线是在线训练的
+  口径，别与 BC 的 CE 比大小），**每手更慢 ⇒ 同样时间里 BC 更新更少**。
+  量它用 `tools\verify_bc_ui.ps1 -KeepPreTrain`（默认路径刻意把预训练关掉，只为了让检查跑得快）。
+  详见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) §6.5.1。
+* **命令行**：`train_bc`（参数全开，含 `--save`、`--masked=0` 对照臂）。
+  两条路用的是**同一套口径**（`BCSample` + 合法集上的掩码交叉熵 `dL/dz = π − t`）。
+* **原理**（"为什么这些式子写出来就是行为克隆"）：目标 = 老师的 one-hot 选点，BC = 在这个目标上做
+  **最大似然**，而最小化 CE ≡ **逐状态最小化到老师的（前向）KL**；一条样本的解析梯度就是
+  `∂L/∂z = π − t`（非法列**恰好 0**），"目标落空"**不是**零梯度（`L ≡ 0` 但 `dL/dz = π ≠ 0`）；
+  只训策略头是**原理要求**（数据里没有回报，拿去训 critic/Q 就是灌噪声）。
+  三个读数也由它推出来：**A（一致率）= 目标的硬侧**、**P(老师) = 软侧**、**CE = 目标函数本身**，
+  而 `A − P = q(1−m₁) − (1−q)m₀` ⇒ **A 在 P 上方 = 分布尖（果断）、P 在 A 上方 = 摊平**。
+  见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) **§2.5**。
+* **软目标（多深度一致）—— "不直接用 onehot、先算个概率分布会不会更好？"**（2026-10 用户提问）：
+  老师下拉框**右边**多了一个复选框 `软目标 (多深度一致)`，**默认不勾**。勾上之后老师不再只给
+  "最深那一层的一手"，而是 **深度 1..D 各投一票**（票数/D 当概率）—— 于是损失仍是合法集上的
+  交叉熵，但它的**下界变成 H(t)**：`CE = H(t) + KL(t‖π)`，**永远降不到 0**。
+  所以报告里多印一行 `targetH=`，实时行多一个 `soft=1`：**软目标的 CE 与 one-hot 的 CE 绝对值
+  不可比**（一次 A/B 里 H(t) ≈ 0.44~0.48），要比就比 `CE − H(t)` 或 top-1。
+  **为什么不用"根分值 softmax"**：`ABAgent` 的根循环是窗口写法（`beta = r / alpha = r`），
+  非最优孩子返回的是**界**而不是精确分值 ⇒ 拿它做 softmax 等于在裁剪 artifact 上克隆。
+  实测（4000 局面 / 深度 3 / 8 epoch / **4 个种子**成对比较，两臂只差 `--soft=1`）：
+  **两个指标方向相反，两个都必须报** ——
+  可比口径 **留出 KL（`CE − H(t)`）4/4 个种子都更低**（均值 2.379 → 1.866，−21%），
+  而硬口径 **留出 top-1 略低**（38.59% → 36.78%，−1.8 pp，3/4 个种子且单种子符号不一致
+  ⇒ 只能算"没变好"，不能说"变差"）；**`train − 留出` 差 4/4 都更小**（0.427 → 0.280），
+  策略熵不塌，代价约 **+12~14%** 打标签时间 ⇒ 落成**可选开关**，默认关
+  （换默认等于**悄悄换掉所有人读数的口径**：软目标的 CE 与 one-hot 的 CE 不是同一把尺）。
+  命令行对应 `train_bc --soft=1 [--soft-depths=N]`；口径的 105 条断言在 `test_bc [9]` 段
+  （含 `CE == H(t) + KL` 的手算对照、"深度 1 必须退化成 one-hot"、"一个候选不合法 ⇒ **整条**样本作废"）。
+  详见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) **§9**。
+
+**效果怎么看（可视化）**：右侧"训练损失"那一格现在是一个 **三个 tab** 的控件（`训练损失 (loss)` / `行为克隆 (BC)` / `价值评估 (value)`）—— BC 那个 tab 画 **一致率（策略头 top-1 == 老师那一手）**
+与 **P(老师着法)** 两条线（同为百分比，一根纵轴不混量纲；CE 与它们不同量纲 ⇒ 放图下的读数行），
+横轴 = actor 更新次数，每 4 次更新一个点、窗口 = 最近 64 条样本。**双击曲线弹出放大窗口**
+（900×560 可缩放可移到别的屏幕，与损失/奖励那两张同一个入口；窗口里的读数与图下那行**逐字一致**，
+含不在曲线上的 CE —— 它是个回调，所以窗口开着时 CE 跟着对局更新）。导出 CSV 里多一段
+"行为克隆保真度"。每场开始时换线；**没选老师（下拉框 = 关）或场上没有学生时不建线**
+（两条空平线会被读成"保真度 0"）。
+**[2026-10] 人机对弈也画**：那条路原先**没有建线**（人机没有 `matchStarted`），而
+`CurveChart::addPoint` 在序列不存在时是**静默 return** ⇒ "BC 在训练、曲线一直空"。现在由
+`ChessBoard::humanGameStarted`（玩家落下本局第一子）触发建线，两种模式共用同一份
+`MainWindow::armBcChartSeries`，并在面板里留一行机器可读的状态：
+`[BC] 曲线已建线 (chart-armed): 老师=… [teacher-depth=N] [mode=human|match]`。
+⚠ 人机模式**每局清零**（横轴 = 本局第几次 actor 更新），而保真度第一个点要 **≥8 手** —— 一局没下满 8 手就是空的。
+曲线控件的**无障碍名**（`accessibleName`）末尾带 `· n=<点数>`：Qt 的 UIA 桥不暴露 Description，
+所以这是"曲线真的在长"唯一的机器可读通道（脚本据此断言人机那条路真的画出了点）。
+⚠ 一致率是 BC 的**训练目标本身**：它是**代理指标，不是棋力**（实测过"一致率涨 9 倍而胜率不动"，
+棋力只有 `bench_anchor` 能回答）—— 这句话写在那张图的标题里。
+见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) §6.6 / §6.6.1。
+
+**`价值评估 (value)` tab（2026-10，用户口径："增加一个 tab 显示价值评估曲线"）**：画的是 critic 的
+**两条无量纲质量曲线**，**不是**损失 —— 损失（critic 的 MSE）的目标是**自举**的，"损失在降"可与
+"价值是错的"并存。**线 1 = EV(z = 真实胜负 ±1/0)**（"V 能不能预测胜负"）；**线 2 = ρ(z = 引擎口径
+折扣回报 γ=0.99)**（"V 与'子力+胜负'的走向是否同向"，**尺度无关**）。读数行给 `EV_eng`、校准误差、
+两个 `Var(z)`、`pairs`、第几局，以及**为什么没有点**。
+**0 = 没有信息，1 = 完美，< 0 = 反着**（0 线天然在图里）。实测两次：
+`PPO+MCTS-MLP vs MCTS`：ρ = **+0.346…+0.508**、`EV_eng +0.117`、pairs 249；
+`PPO+MCTS-MLP vs Alpha-Beta L3`：ρ = **+0.609…+0.631**、`EV_eng +0.164`、pairs 62。
+⚠ 三条实测踩出来的规矩（都写进 `docs/training_optimization.md` §11）：**z 必须用引擎口径逐手
+累加**（用"学习/引擎两本账"的 `reward*` 会在一局内混口径 ⇒ 与 AB/MCTS 对弈时读数被拉到负数）；
+**跨口径要用 ρ 而不是 EV**（EV 尺度敏感，实测被尺度差拉到 −24.3）；**只覆盖 PPO 两支**（SAC 的
+批评家是 Q(s,a)、口径不同 ⇒ 不采，界面上说明），只在对局那条路采样，**EV/ρ 好 ≠ 棋力好**。
+见 [`docs/training_optimization.md`](docs/training_optimization.md) §11。
+
+```bat
+:: 界面: 启动 chess.exe -> A/B 面板把"行为克隆训练"选成某一档 Alpha-Beta (老师, 与对手无关)
+::       -> 场上至少一侧是 PPO/SAC (学生) -> 开始对弈 (或人机对弈)
+:: 命令行:
+cmake --build <build> --target train_bc
+<build>\train_bc.exe --agent=ppo-mlp --positions=4000 --depth=3 --epochs=8 --opening=8 --save=weights/bc_ppo
+<build>\train_bc.exe --agent=sac     --positions=4000 --depth=3 --epochs=8 --opening=8 --save=weights/bc_sac
+<build>\train_bc.exe --agent=ppo-mlp --masked=0 ...      :: 全量 8100 维口径的对照臂
+<build>\train_bc.exe --agent=ppo-mlp --positions=4000 --depth=3 --epochs=8 ^
+                    --seed=20240901 --soft=1 --soft-depths=3   :: 软目标 (多深度一致), 见 §9
+```
+
+* 软目标的开关在界面上是老师下拉框右边的 `软目标 (多深度一致)` 复选框（默认关）；
+  命令行是 `--soft=1 [--soft-depths=N] [--soft-linear=0|1]`。**读数纪律**：
+  软目标的 CE 下界是 `H(t)`（`CE = H(t) + KL`），所以它的 CE 与 one-hot 的**不可比绝对值**，
+  报告里的 `targetH=` 必须一起看。成对 A/B（4 个种子）：可比口径的**留出 KL 4/4 都更低**、
+  硬口径的 top-1 略低（3/4，符号不一致）、`train−留出` 差 4/4 更小，代价 +12~14% ⇒ 默认关。
+  见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) §9。
+
+* `--agent=` **ppo**（TB 专家，界面现役，建网/内存最贵）/ **ppo-mlp**（便宜 ~25x）/
+  **sac** / **sac-moe-mlp** / **sac-moe**（TB）；`--shared=1` 切 SAC 的共享骨干口径。
+* **只动策略头**：PPO 的 BC 路径整段不含 critic 前向/反向（也不写 `lastLoss`）；
+  SAC 独立口径下 `q1`/`q2` 逐字节不变；SAC **共享**口径下骨干会变（共享表示的固有代价）
+  而 **Q 头自己的权重不变** —— 三种情形在 `test_bc` 里分开断言。
+* **三个"静默失败"各有读数**：目标落空（`bcTargetMisses`，注意它**不是零梯度**：
+  `L ≡ 0` 而 `dL/dz = π`）、口径静默退回全量（`bcSparseSteps` vs `bcSamples`）、
+  critic 被顺手训了（权重文件字节摘要 + `lastLoss`）。
+* **实测**（4000 局面 / AB 深度 3 / 8 epoch，同数据同老师同种子）：留出集 prior top-1
+  PPO **2.26% → 35.71%**、SAC **1.38% → 41.73%**，留出 CE 分别降 1.42× / 1.58×，
+  train−留出 CE 差 0.53~0.57 nats（落在"数据受限"区间）；
+  **全量口径对照臂**的留出 top-1 只有 21.68%、训练时间翻倍（87.6 s vs 43.5 s）——
+  R2 之后要存 BC 权重就该用合法列口径。
+* **边界**：这是**模仿**，上限就是老师；`top-1/CE/P(老师)` **都不是棋力证据**
+  （§7.10 实测过"一致率涨 9 倍而胜率不动"）；棋力只有 `bench_anchor` 能回答。
+  详见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md)。
 
 ### 诊断仪表盘 `bench_diag`（2026-09）
 
@@ -492,6 +674,7 @@ build\...\bench_anchor.exe --a=weights/run_10k --ab-depth=4 --budget=100 --openi
 |---|---|
 | `train_ppo` | 和棋**分原因**（三次重复 / 60 回合自然限着 / **台架截断**）/ 手数 / 吃子 / 开局多样性 / 吞吐（局/小时）/ value MSE / MoE 专家负载；逐局 + 汇总写进 TB 长表 CSV |
 | `bench_anchor` | 固定开局集（确定性生成 + FNV 指纹，**指纹不同即不可比**）→ 每个开局换先手下两局 → 得分率、**Elo 差与其 95% 区间**、和棋构成、双方 ms/步；`--budget=MS` 把 PPO 的模拟次数按 AB 实测耗时标定成等时间 |
+| `train_bc` | **行为克隆**（老师 = AB 深度 D 的选点，学生 = 策略头）：标注成本 ms/局面 + 三个"不合格"分桶（老师无有效着法 / 局面无合法着法 / **老师着法不在合法集**）+ 训练/留出两套读数（prior top-1 / P(老师) / CE / 策略熵）+ **过拟合证据**（train−留出 CE 差）+ 口径自检（`bcSparseSteps` vs `bcSamples`、目标落空条数、critic 未被碰）；PPO / SAC 四支 agent 共用一套口径，见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) |
 
 **它们第一次运行就报出了最重要的一件事**：60 ply 手数上限下，训练里的"和棋"几乎全是
 **台架截断**（`截断 1.000`），而规则里的 60 回合自然限着需要 120 半回合 —— 在 GUI 的训练
@@ -536,8 +719,8 @@ PPO 权重对 AB 深度 4 是 **0 胜 1 和 23 负**（Elo 差 −669），与"�
 
 | 脚本 | 验证什么 |
 |------|----------|
-| `tools/verify_match_ui.ps1` | 真界面选 agent → 开局 → 断言比分/逐局明细/曲线有数据/**静默保存权重**/**双击放大窗与源控件逐字一致**；`-TwoMatches` 再打一场，断言奖励读数**仍然只有两条线**（每场换线不留空线） |
-| `tools/verify_thinking_ui.ps1` | 采样像素：思考中状态条出现、空闲/结束后干净 |
+| `tools/verify_match_ui.ps1` | 真界面选 agent → 开局 → 断言比分/逐局明细/曲线有数据/**静默保存权重**/**双击放大窗与源控件逐字一致**；`-TwoMatches` 再打一场，断言奖励读数**仍然只有两条线**（每场换线不留空线）。**[2026-10]** 默认参数这条路是"开局 3 s 就按停止"的冒烟：它只该验"起得来 / 读数在动 / 按钮能回来"，**逐局明细行要 `-Full` 才检查**（逐局行只在局末落一条，0 局的场次本来就一条都没有 —— 旧版把它当失败，于是默认路径恒 `RESULT: FAIL` 且日志里找不到任何一条 FAIL 行）。默认 `-StartupTimeoutSec` 也从 30 提到 **120**（实测冷启动 ≈ 40 s，30 s 必然假失败）。两条的来龙去脉见 `docs/issues_review.md` 零之二点三十四 |
+| `tools/verify_thinking_ui.ps1` | 采样像素：思考中状态条出现、空闲/结束后干净。**[2026-10 两处]**：① 沙漏控件从 200 px 缩到 136 px（用户口径）之后这条检查照常 PASS（`thinking_ctrl_animating = 3/29`、`max_diff = 2382`）；② 它原来用 **下拉框下标** 选 agent（`Select-AgentItem 0 1` + 注释"index 1 = MCTS"），而 2026-10 把 PG/DQN 移出下拉框之后 **index 1 变成了 Alpha-Beta L1**（整步搜索 ~1 ms）⇒ 状态条来不及被采样，脚本报 `thinking_strip_frames = 0 / 90` —— 一条与控件毫无关系的假 FAIL。现在改成**按名字选**（`Select-AgentItemByName 0 "MCTS"`），列表再被编辑也不会静默选错 |
 | `tools/verify_busy_ui.ps1` | 启动载入权重时弹沙漏、载完收起（**不残留**） |
 | `tools/verify_eager_load.ps1` | **启动时加载所有模型**的两个后果：启动沙漏出现并收起；首次使用稀疏 MoE 变体**不再**弹沙漏（回到懒加载就会 FAIL），且对局确实在推进 |
 | `tools/verify_agent_combo.ps1` | **每个 agent 都能在界面上被选中**：把 `src/mainwindow.cpp` 的 `kAgents` 解析出来当期望值，展开三个下拉框，逐条断言它们**可见**（只"在模型里"不算 —— Qt 的 `maxVisibleItems` 默认 10，第 11 项曾被折叠在滚动区里，见 `issues_review.md` C23） |
@@ -547,8 +730,9 @@ PPO 权重对 AB 深度 4 是 **0 胜 1 和 23 负**（Elo 差 −669），与"�
 | `tools/verify_human_vs_ai.ps1` | 真界面**人机对弈**：脚本自己执红走到终局 → 点"开局" → 再走一步，看黑方还会不会应手（依赖 UIA 能定位到棋盘控件；状态机那条判据现在由 `probe_hvai_flow` 覆盖，见 `docs/agents_design.md` §22） |
 | `tools/verify_moe_load_view.ps1` | 真界面里的**稀疏 MoE 负载控件**：控件在无障碍树里、位置/尺寸可用、`accessibleName` 带机器可读摘要（`state=…/maxvio=…`）；`-SelectMoe` 还选中一个带稀疏 MoE 的 agent 并断言它不再报"不适用"；**`-PpoMoe`** 改为选中 **PPO+MCTS** 那一支，并额外断言摘要里带 `train=` 字段（训练侧/推理侧拆分就绪 —— 那是"均衡机制有没有生效"的唯一依据；`RL::PPO::finalizeMoeBatch()` 一旦漏接，控件照常画柱子而 `train=` 永远停在 `noforward`）；**`-Live`** 驱动一场对局，分四段钉住"**呼吸高亮**"开关（中间那一列的勾选框，**默认关**）：默认 `Off` → 关着时摘要 `hl=off` 且**完全没有 live 字段**（关 = 连探针都不读）→ 勾上后出现 `live=on live_serial=… live_top=…` 且**前向序号持续前进** → 取消勾选后 live 字段消失。那条读数走的是**无锁**探针（整段决策都持着 `m_agentMutex`，加锁的读数在思考中会一直阻塞），把它改回锁内这条检查就会红。见 `docs/moe_gate_experiment_2026_10.md` §11/§12 |
 | `tools/verify_ppo_moe_selfcheck.ps1` | 真界面里的 **PPO 自检面板**（2026-10）：选中 PPO+MCTS → 点"全部模型自检" → 从面板文本（UIA 的 `ValuePattern`）断言五件事：这段文本**属于 PPO**（不是 SAC 或别的 agent —— 面板内容跟着"棋盘最后建出来的那个 agent"走，只改下拉框是不够的，本脚本第一版就因此读到了 SAC 的文本）、**均衡口径那一行**报出 `Loss-Free`（偏置是非参数缓冲：不进权重/不进参数量/不进指纹，"这一支到底开没开"在别处一个读数都看不出来）、报 **MaxVio**、**训练侧/推理侧分开**、且**不再回退到 max/min**。见 `docs/moe_gate_experiment_2026_10.md` §12 |
-| `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） |
-| `tools/measure_startup.ps1` | **启动时间到底是多少、花在哪**：启动到"界面可用"（`selfPlayBtn` 可用 = `startupComplete`）的墙钟秒数 + 应用自己打的每条 `[weights] <名字>: N ms` + 启动自检里**实际加载了哪些模型**。README 里"40.8 s → 29.5~30.0 s"这个数字就是它量的（移除 PG/DQN/SAC 还原版两支那一轮）。注意 redirected stderr 是块缓冲的，脚本在杀进程前会等 3 s 把日志尾巴冲出来 |
+| **`tools/verify_bc_ui.ps1`** | 真界面里的**对局中行为克隆**（2026-10，口径改后重写）：选 A = PPO+MCTS(MLP 专家)、**B = MCTS（刻意选一个非 AB 的对手）** → 断言**没有**"单独跑 BC"的按钮了、**旧勾选框也没了**（换成老师下拉框）→ 断言下拉框列出 `关 (off)` 与四档 Alpha-Beta → 负对照："场上没有学生"（MCTS vs Alpha-Beta L1）时下拉框**是灰的** → 换回这一对断言下拉框亮起（**对手不是 AB 也亮** —— 这就是新口径的核心证据）→ 断言**软目标复选框存在且默认不勾** → 在下拉框里选 `depth=2`（**勾上"软目标 (多深度一致)"** —— 老师用 depth=2 是刻意的：depth=1 只有一票，软目标会退化成 one-hot，`targetH>0` 这条断言就必然是假失败）→ 关掉每手预训练 → 开始对弈 → 断言对弈期间下拉框**锁定** → 从面板读到**第一条实时行**（`samples= / updates= / CE= / teacher-depth=2 soft=1`，实测 `samples=1 updates=1 批=1 CE=2.3068`）→ **等到 ≥8 次 actor 更新**（保真度读数的下界）→ 主动按"停止"结束这一场 → 读**本场汇总**与报告正文（`match-summary: … soft=1` + **`软目标 (soft targets …): 软样本=8/8 targetH=0.1733`** —— `targetH>0` 就是"目标真的变成了分布"的证据）→ **切到 tab 页**断言 BC 保真度曲线与它的读数行都在（`bcChart` / `bcValueLabel`，读数行里带 CE）→ **双击曲线**断言放大窗口弹出、读数与源标签逐字一致、关得掉 → 断言下拉框解锁 → **杀掉进程并复查 `Get-Process chess` 为空**。整场约 1.5~3 分钟。脚本是 ASCII-only（无 BOM 的 .ps1 会被按 ANSI 解码，代码里的中文会直接把脚本解析坏）—— 产品侧的汇总行、实时行、两个 tab 的文字因此刻意带 ASCII 记号（`match-summary` / `teacher-depth=` / `(loss)` / `(BC)`）。**人机那条路**由两半钉住：它驱动不了决策那条状态机（`probe_hvai_flow` 的 `[E]` 节负责：真实点击 → AI 应手 → 报告里 `samples=1 updates=1 targetMissed=0 [teacher-depth=1]`，再把下拉框拨回"关"断言样本不再增长），而**曲线本身**由本脚本最后的 **human game 段**负责（⚠ 该段可用 **`-SkipHuman`** 整段关掉，见下）：选"对战AI" = PPO+MCTS-MLP、老师 = `depth=2`、按"开局" → **真的点棋盘**下这一局（盲走红兵，会被 AI 将军/将死 ⇒ 终局弹窗自动关掉并开新局，默认只跑 75 s）→ 断言面板出现 `[BC] 曲线已建线 (chart-armed): … [teacher-depth=2] [mode=human]`（**这条就是"曲线显示"本身的证据**）→ 断言这一局有 `samples=` 行 → **若面板走到 `samples=8`，则断言曲线真的画出了点**（`bcChart` 的无障碍名末尾 `· n=<点数>`，实测 `n=1`；没到 8 手时打印"跳过 + 原因"，因为人机曲线**每局清零**、第一个点要 ≥8 手）。六条踩坑记在 `docs/behavior_cloning_2026_10.md` §6.5（最关键的三条：**必须等启动加载完成再断言**、**隐藏 tab 页里的控件在 UIA 树里不存在，得先切 tab**、**读对局中的读数要读实时行（报告正文只在面板刷新时机重写）**）。**[2026-10] `-SkipHuman`**：人机段会**真的在屏幕上下一局棋**（盲走红兵，用户会看着自己被将军/将死），用户口径"不进行人机对弈测试" ⇒ 该段可整段跳过；跳过时**不产生任何断言**（不是"当成通过"），日志里留一行 `info  跳过 human game 段 (-SkipHuman)` |
+| **`tools/verify_value_curve.ps1`** | 真界面里的**价值评估曲线**（2026-10，用户口径"增加一个 tab 显示价值评估曲线"）：选 A/B = **PPO+MCTS 两支**（只有它们有标量 V 头）→ **把 2 局真打到底**（`verify_bc_ui.ps1` 会中途 abort，而 EV 只在**局结束时**算）→ 切到 `价值评估 (value)` tab → 读三样：曲线的点数（无障碍名末尾 `· n=<点数>`）、读数行（两种 z 口径的 EV + 校准误差 + 两个 `Var(z)` + `pairs` + **为什么没有点**）、面板里的 `[value] …` 行。断言刻意落在"**状态必须自描述**"上：曲线空着是**合法结果**（见 `docs/training_optimization.md` §11.2 的三种原因），真正的 bug 是**空白且不说原因** |
+| `tools/make_app_icon.ps1` | 生成程序图标（改了能重跑，二进制资源可审） || `tools/measure_startup.ps1` | **启动时间到底是多少、花在哪**：启动到"界面可用"（`selfPlayBtn` 可用 = `startupComplete`）的墙钟秒数 + 应用自己打的每条 `[weights] <名字>: N ms` + 启动自检里**实际加载了哪些模型**。README 里"40.8 s → 29.5~30.0 s"这个数字就是它量的（移除 PG/DQN/SAC 还原版两支那一轮）。注意 redirected stderr 是块缓冲的，脚本在杀进程前会等 3 s 把日志尾巴冲出来 |
 
 > 脚本有两个"血泪规则"写在注释里：**无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码**，
 > 所以要么纯 ASCII（窗口名用码位拼），要么带 BOM；两者混用会直接解析失败。
@@ -573,18 +757,20 @@ chess/
 │   ├── busydialog.*        # 载入/保存权重时的"请稍候"弹窗 (复用上面的沙漏)
 │   ├── metricsview.*       # 自绘折线图 + 双击放大窗口
 │   ├── *_agent.* / abagent.* / mcts.* / evagent.*   # 9 个 agent
+│   ├── bcagent.hpp                                 # 行为克隆的 agent 胶水层 (PPO + SAC 三支共用一套口径)
 │   ├── sacazlegacyagent.h                          # 第 10 个 agent: 59e5233 还原版 (派生于 sacazagent)
 │   ├── app.rc app.ico app.png res.qrc              # 程序图标与资源
 │   └── rl/                 # RL 内核 -> RL_CORE (纯 C++, 不含 Qt)
 │       ├── tensor.hpp net.hpp layer.h ...          # 张量/网络/层
 │       ├── simd_ops.hpp simd/ cpuinfo.hpp          # SIMD 分派与内核
 │       ├── moe.hpp sparse_moe.hpp                  # 稠密 / 稀疏 MoE
+│       ├── bc.h bc.cpp                             # 行为克隆的口径层 (BCSample / 掩码 CE 与它的解析梯度)
 │       ├── diag.h                                  # 诊断指标核心 (熵/CE/KL/EV/校准 + 和棋原因分桶 + CSV)
 │       └── dqn.cpp dpg.cpp ppo.cpp sac.cpp ...     # RL 算法
-├── test/                   # 13 个 ctest 套件 + 多个手动基准（含 bench_diag 诊断仪表盘）
+├── test/                   # 14 个 ctest 套件 + 多个手动基准（含 bench_diag 诊断仪表盘）
 │                           #   (bench_moe / bench_ppo_vs_ab / bench_ppo_mt /
 │                           #    bench_policy_agreement / bench_ppo_sims / bench_diag /
-│                           #    train_ppo / bench_anchor / probe_dqnmcts_aliasing)
+│                           #    train_ppo / train_bc / bench_anchor / probe_dqnmcts_aliasing)
 │                           #   注意: test_dqnmcts 有断言 (16 条) 且按失败数返回退出码,
 │                           #   但因为它要跑 ~340 s, 刻意不注册进 ctest
 ├── tools/                  # 界面验证脚本 + 图标生成
@@ -601,7 +787,8 @@ chess/
 |------|------|
 | [`docs/agents_design.md`](docs/agents_design.md) | 各 agent 的设计与实测；§12 参数量理论分析；§13–16 界面可视化/EVAB 修复/沙漏等待/静默保存与图标；**§17 PPO 系列训练效率改造（P1–P7）与实测**（梯度累积/回放池/访问分布目标/镜像增广/多线程分身及其访存瓶颈）；**§20 完备 MDP 的公共化与推广**；**§21 DQN+MCTS 的表示闸门与自检面板**（探针四个读数 + 为什么损失与自对弈胜率都答不了"值不值得继续训"）；**§22 人机对弈的状态机**（应手线程的生命周期 / 终局两条路的区别 / 沙漏那一行 agent 名的语义 / 怎么把这条 UI 路径变成可自动化的断言） |
 | [`docs/issues_review.md`](docs/issues_review.md) | **问题清单与修复进度**（A/B/C 编号）、优化方法汇总（含实测数字）、当前待办。**零之二点十九**：PPO+MCTS 正确性审计（PUCT 的 Q 符号反了 / `loadModel` 静默成功 / 枚举混比 / 模拟数退化 / 搜索看不见将杀）；**零之二点二十**：诊断指标矩阵与当前瓶颈定位（EV<0 ⇒ 该修 value 而不是搜索参数） |
-| [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项。**§9.5** 是 2026-09 的诊断矩阵与负面结果 |
+| [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项。**§9.5** 是 2026-09 的诊断矩阵与负面结果；**§7.7–7.11** 是行为克隆那一整条线的来龙去脉（价值头蒸馏没用 → BC 是杠杆 → 数据 scaling → 代理指标涨 9 倍而胜率不动）；**§11** 是 2026-10 的界面**价值评估曲线**（EV/校准接进 GUI：两种 z 口径、"为什么没有点"、"整局累计回报当 z 会把 EV 拉到 −24"那个坑） |
+| [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) | **行为克隆（PPO + SAC）**：四层结构（口径层 `rl/bc.*` / 内核层 `rl/ppo.*` / 胶水层 `bcagent.hpp` / 工具 `train_bc`）、**§2.5 原理**（最大似然 = 逐状态最小化到老师的前向 KL；`∂L/∂z = π − t` 与"目标落空不是零梯度"；只训策略头是原理要求；两种训练分布；**A/P/CE 三个读数与 `A − P = q(1−m₁) − (1−q)m₀`**，即"一致率在 P 上方 = 分布尖"）、口径（老师 = AB 选点、合法列掩码 CE、只动策略头）、稀疏内核被在线与 BC 共用的那次重构及回归证据、**实测读数表**（PPO 留出 top-1 2.26%→35.71%、SAC 1.38%→41.73%；全量口径对照臂 21.68% 且慢一倍）、三个"静默失败"与各自的读数、边界与已知缺口 |
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |

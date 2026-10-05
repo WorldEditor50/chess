@@ -214,6 +214,165 @@ static void secMoeAndCalib()
     }
 }
 
+/*
+ *  [3b] "价值评估曲线"的口径 (2026-10)
+ *
+ *  这一批断言钉的是**曲线会不会给出假读数**, 而不是公式本身 (公式在 [1]/[1b] 里):
+ *    * 每手结果 z 必须按**走子方视角**折算 —— 视角搞反会让 EV 掉成负数, 而看起来像
+ *      "价值头坏了" (本工程在 BC 的 color 视角上踩过同型的坑);
+ *    * **Var(z) == 0 (全和棋) 时不许出点**: EV = 0 在那一刻是"无定义"而不是"V 很差",
+ *      而曲线上的 0 看起来就像"和常数预测一样烂";
+ *    * 样本不足 (n < minPairs) 时也不出点 —— 否则 EV 的抖动会被读成趋势。
+ */
+static void secValueDiag()
+{
+    std::printf("\n[3b] 价值评估 (EV/校准) 的口径: 视角折算与'无方差不出点'\n");
+    using namespace RL::Diag;
+
+    /* ---- z 的视角: 红胜时, 红方那几手 z=+1, 黑方那几手 z=-1 ---- */
+    {
+        const std::vector<double> v = { 0.5, -0.5, 0.2, -0.1 };
+        const std::vector<int> mover = { 0 /*红*/, 1 /*黑*/, 0, 1 };
+        std::vector<double> z;
+        zFromGameResult(v, mover, 0 /*红胜*/, z);
+        CHECK_EQ((long long)z.size(), 4, "每一手都要有一个 z");
+        checkNear("红胜: 红方那一手 z = +1", z[0], 1.0, 1e-12);
+        checkNear("红胜: 黑方那一手 z = -1", z[1], -1.0, 1e-12);
+        checkNear("红胜: 红方那一手 z = +1 (第 3 手)", z[2], 1.0, 1e-12);
+        checkNear("红胜: 黑方那一手 z = -1 (第 4 手)", z[3], -1.0, 1e-12);
+
+        std::vector<double> z2;
+        zFromGameResult(v, mover, 1 /*黑胜*/, z2);
+        checkNear("黑胜: 红方那一手 z = -1", z2[0], -1.0, 1e-12);
+        checkNear("黑胜: 黑方那一手 z = +1", z2[1], 1.0, 1e-12);
+
+        std::vector<double> z3;
+        zFromGameResult(v, mover, -1 /*和*/, z3);
+        checkNear("和棋: 双方都是 0", z3[0], 0.0, 1e-12);
+        checkNear("和棋: 双方都是 0 (黑)", z3[1], 0.0, 1e-12);
+    }
+
+    /* ---- 视角搞反 -> EV 掉成负数 (这就是为什么上面那条必须有) ---- */
+    {
+        std::vector<double> v, z;
+        for (int i = 0; i < 100; i++) {
+            const double zi = (i % 2 == 0) ? 1.0 : -1.0;
+            z.push_back(zi);
+            v.push_back(-zi);              /* 符号反了 = 视角错了 */
+        }
+        const double ev = explainedVariance(z, v);
+        CHECK(ev < 0.0, "视角/符号反了时 EV 必须为负 (否则这条诊断没有区分度)");
+    }
+
+    /* ---- 完美预测: EV = 1, 校准误差 = 0, 且 ok ---- */
+    {
+        std::vector<double> v, z;
+        for (int i = 0; i < 200; i++) {
+            const double zi = (i % 2 == 0) ? 1.0 : -1.0;
+            z.push_back(zi);
+            v.push_back(zi);
+        }
+        const ValueDiag d = valueDiagOf(v, z, 64, 10);
+        CHECK(d.ok, "样本足够且有方差时应当出点");
+        checkNear("完美预测的 EV = 1", d.ev, 1.0, 1e-9);
+        checkNear("完美预测的校准误差 = 0", d.calibErr, 0.0, 1e-9);
+        CHECK_EQ(d.n, 200, "样本数要如实报出");
+    }
+
+    /* ---- 全和棋 (z ≡ 0): **不许出点**, 而且原因要与"V 很差"分得开 ---- */
+    {
+        std::vector<double> v, z(200, 0.0);
+        for (int i = 0; i < 200; i++) { v.push_back((i % 2 == 0) ? 0.5 : -0.5); }
+        const ValueDiag d = valueDiagOf(v, z, 64, 10);
+        CHECK(!d.ok, "全和棋时不许出点 (EV 在这一刻是无定义, 不是 0)");
+        CHECK(!d.zHasVariance, "全和棋: zVar == 0 (这就是不出点的原因)");
+        CHECK(d.enough, "样本数是够的 —— 所以这条失败不能归因到'样本不足'");
+    }
+
+    /* ---- 样本不足: 也不许出点 ---- */
+    {
+        std::vector<double> v, z;
+        for (int i = 0; i < 10; i++) {
+            const double zi = (i % 2 == 0) ? 1.0 : -1.0;
+            z.push_back(zi);
+            v.push_back(zi);
+        }
+        const ValueDiag d = valueDiagOf(v, z, 64, 10);
+        CHECK(!d.ok, "样本不足 (10 < 64) 时不许出点");
+        CHECK(d.zHasVariance, "但方差是有的 —— 原因只能是样本不足");
+    }
+
+    /* ---- return-to-go (第二种 z 口径): 手算的例子上逐个核对 ---- */
+    {
+        /*
+           3 手, 即时奖励 [1, 2, 3], γ = 0.5, 三手都采到 V:
+             G_0 = 1 + 0.5*2 + 0.25*3 = 2.75
+             G_1 = 2 + 0.5*3           = 3.50
+             G_2 = 3                   = 3.00
+        */
+        const std::vector<double> stepRew = { 1.0, 2.0, 3.0 };
+        const std::vector<int> mover = { 0, 1, 0 };
+        const std::vector<int> idx = { 0, 1, 2 };
+        std::vector<double> z;
+        zFromDiscountedReturnToGo(stepRew, mover, idx, 0.5, z);
+        CHECK_EQ((long long)z.size(), 3, "每一手都要有一个 z (return-to-go)");
+        checkNear("G_0 = 2.75", z[0], 2.75, 1e-12);
+        checkNear("G_1 = 3.50", z[1], 3.50, 1e-12);
+        checkNear("G_2 = 3.00", z[2], 3.00, 1e-12);
+
+        /*
+           只采到第 1 手时, 它后面的**所有**手仍要计入 (含没采样的那些) ——
+           漏掉对手的手, z 就不是回报, 而这条错在曲线上看不出来。
+        */
+        const std::vector<int> only1 = { 1 };
+        std::vector<double> z1;
+        zFromDiscountedReturnToGo(stepRew, mover, only1, 0.5, z1);
+        CHECK_EQ((long long)z1.size(), 1, "只采一手时只出一个 z");
+        checkNear("只采第 1 手: G_1 仍 = 3.50", z1[0], 3.50, 1e-12);
+
+        /* 越界下标不许崩, 也不许发出非有限值 */
+        const std::vector<int> bad = { 99 };
+        std::vector<double> zb;
+        zFromDiscountedReturnToGo(stepRew, mover, bad, 0.5, zb);
+        CHECK_EQ((long long)zb.size(), 1, "越界下标也要给出一个元素");
+        CHECK(std::isfinite(zb[0]), "越界下标给有限值 (不能是 NaN, 曲线会被画没)");
+    }
+
+    /* ---- ρ (尺度无关): 跨口径下唯一还能读的量 (2026-10 用户实测逼出来的) ---- */
+    {
+        std::vector<double> x, y, yneg, yconst, yscaled;
+        for (int i = 0; i < 50; i++) {
+            const double v = (double)i;
+            x.push_back(v);
+            y.push_back(v);              /* 完全同向 */
+            yneg.push_back(-v);          /* 完全反向 */
+            yconst.push_back(3.0);       /* 常数 -> 无定义 */
+            yscaled.push_back(v * 0.1 - 7.0);   /* 同向但**尺度与偏置都不同** */
+        }
+        checkNear("ρ(同向) = 1", pearson(x, y), 1.0, 1e-9);
+        checkNear("ρ(反向) = -1", pearson(x, yneg), -1.0, 1e-9);
+        checkNear("ρ(常数序列) = 0 (无定义)", pearson(x, yconst), 0.0, 1e-12);
+        checkNear("ρ 尺度/偏置无关 (×0.1−7 仍是 1)", pearson(x, yscaled), 1.0, 1e-9);
+        CHECK(std::isfinite(pearson(x, y)), "ρ 必须是有限值 (NaN 会把整条折线画没)");
+    }
+
+    /* ---- 滚动窗口: FIFO 裁到 cap, 且 v/z 必须同步裁 (错位 = 假 EV) ---- */    {
+        std::vector<double> vw, zw;
+        for (int g = 0; g < 5; g++) {
+            std::vector<double> v, z;
+            for (int i = 0; i < 10; i++) {
+                v.push_back((double)(g * 10 + i));
+                z.push_back((g == 0) ? -1.0 : 1.0);       /* 最早那一局全是负 */
+            }
+            appendWindow(vw, zw, v, z, 25);
+        }
+        CHECK_EQ((long long)vw.size(), 25, "窗口裁到 cap = 25");
+        CHECK_EQ((long long)zw.size(), 25, "z 跟着一起裁 (否则 v/z 错位)");
+        CHECK_EQ((long long)vw.front(), 25, "留下的是**最新**的那批 (FIFO)");
+        checkNear("v/z 对位: v=25 的 z 是 +1", zw.front(), 1.0, 1e-12);
+    }
+}
+
 static void secQForParent()
 {
     std::printf("\n[4] qForParent 的负号 (与 PUCT 同型, 不能再错一次)\n");
@@ -632,6 +791,7 @@ int main()
     secEntropy();
     secValue();
     secMoeAndCalib();
+    secValueDiag();          /* [3b] 价值评估曲线的口径 (视角折算 / 无方差不出点) */
     secQForParent();
     secCsvShape();
     secBehaviorAgg();

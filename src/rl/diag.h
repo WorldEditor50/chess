@@ -276,6 +276,200 @@ inline double calibrationError(const std::vector<CalibBucket> &buckets)
 }
 
 /* ---------------------------------------------------------------------------
+ *  1b. "价值评估曲线"的口径 (2026-10): 从一次对局到 (V, z) 对, 再到 EV/校准
+ * ---------------------------------------------------------------------------
+ *
+ * 为什么单独成函数 (而不是在 ChessBoard 里就地写几行):
+ *   这里的每一条都是**Ground truth 的口径** —— 视角折算错、无方差时出了个点、
+ *   样本不足就报 EV, 三种都会让曲线上出现**看起来很正常**的假读数。写成纯函数
+ *   ⇒ `test_diag` 能用几条断言把它们钉死 (与 explainedVariance/calibration 同一做法)。
+ *
+ * 口径 (必须与 V 的视角一致, 见下面 zFromGameResult 的注释):
+ *   V  : **走子方视角**的估值 (PPO critic 的输出口径就是这样)
+ *   z  : 同一手对应的**真实结果**, 也是走子方视角 (+1 赢 / 0 和 / −1 输)
+ *   mover[i] : 第 i 手是谁走的 —— 0 = 红, 1 = 黑;  winner: 0 = 红胜, 1 = 黑胜, −1 = 和
+ */
+inline void zFromGameResult(const std::vector<double> &v,
+                            const std::vector<int> &mover,
+                            int winner,
+                            std::vector<double> &zOut)
+{
+    zOut.clear();
+    const std::size_t n = (v.size() < mover.size()) ? v.size() : mover.size();
+    zOut.reserve(n);
+    for (std::size_t i = 0; i < n; i++) {
+        if (winner < 0) {
+            zOut.push_back(0.0);                 /* 和棋: 双方都是 0 */
+        } else {
+            zOut.push_back((mover[i] == winner) ? 1.0 : -1.0);
+        }
+    }
+}
+
+/*
+ * 第二种 z 口径 (2026-10, 用户实测"完成 4 轮对弈都没有曲线"之后补的):
+ *   **本局最终的"学习口径回报"** (走子方视角), 而不是 ±1 胜负。
+ *
+ * 为什么必须有它: 胜负口径的 z 只有三个取值, 当被采样的那些手**结果符号全一样**时
+ * Var(z) = 0 ⇒ EV 无定义 ⇒ 曲线刻意不出点 (那是对的, 见 ValueDiag 的注释)。但实测里
+ * 这种情形**很常见**: 只采到一边的手 (对手不是 PPO) 而它一路输 ⇒ 全是 −1 ⇒ 曲线永远空。
+ * 而"回报口径"的 z 是连续量 (材质塑形 + 步代价 + 终局), 几乎总是有方差, 于是曲线能用;
+ * 而且它**更贴近 critic 的训练目标** (critic 学的就是这个回报, 不是 +1/−1)。
+ *
+ * 口径: `retRed` / `retBlack` = 本局**从红/黑视角累计**的学习口径回报 (未打折),
+ * 由调用方 (ChessBoard::playMatchGame 的出参) 给出; 每一手的 z 取"走这一手那一方"的那个数。
+ */
+inline void zFromGameReturns(const std::vector<double> &v,
+                             const std::vector<int> &mover,
+                             double retRed, double retBlack,
+                             std::vector<double> &zOut)
+{
+    zOut.clear();
+    const std::size_t n = (v.size() < mover.size()) ? v.size() : mover.size();
+    zOut.reserve(n);
+    for (std::size_t i = 0; i < n; i++) {
+        zOut.push_back((mover[i] == 0 /*红*/) ? retRed : retBlack);
+    }
+}
+
+/*
+ * 第二种 z 口径 (2026-10): **该手之后的折扣回报** (return-to-go), 与 critic 训练用的
+ * γ 同口径。这是"V 到底准不准"的**正牌标签** —— 它就是 critic 的目标本身。
+ *
+ * 为什么不是"本局累计回报"(第一版就是这么写的, 实测立刻暴露问题):
+ *   EV 是**尺度敏感**的: `EV = 1 − Var(z−V)/Var(z)`。把"整局累计回报"当 z (实测量级
+ *   ~0.05) 而 V 的量级是 0.2~1 时, `Var(z−V)` 会被尺度差主导 ⇒ EV 读到 **−24.3**,
+ *   看起来像"critic 烂到极点", 而真实原因只是**两个数不是同一个口径**。
+ *   折扣回报-to-go 与 V 同源同尺度, 这才是有意义的对照。
+ *
+ * 参数: `stepRew[k]` = 第 k 手的即时奖励 (学习口径, **走子方视角**);
+ *       `mover[k]`   = 第 k 手是红(0)还是黑(1);
+ *       `sampleIdx`  = 要算 z 的那些手的下标 (只算了 V 的那些手)。
+ * 输出: zOut 与 sampleIdx 一一对应, z = Σ_{k≥i} γ^(k−i) · stepRew[k]。
+ */
+inline void zFromDiscountedReturnToGo(const std::vector<double> &stepRew,
+                                      const std::vector<int> &mover,
+                                      const std::vector<int> &sampleIdx,
+                                      double gamma,
+                                      std::vector<double> &zOut)
+{
+    zOut.clear();
+    const std::size_t n = (stepRew.size() < mover.size()) ? stepRew.size() : mover.size();
+    zOut.reserve(sampleIdx.size());
+    for (std::size_t s = 0; s < sampleIdx.size(); s++) {
+        const int i0 = sampleIdx[s];
+        if (i0 < 0 || (std::size_t)i0 >= n) {
+            zOut.push_back(0.0);
+            continue;
+        }
+        double g = 0.0;
+        double disc = 1.0;
+        for (std::size_t k = (std::size_t)i0; k < n; k++) {
+            g += disc * stepRew[k];
+            disc *= gamma;
+        }
+        zOut.push_back(g);
+    }
+}
+
+/*
+ * 皮尔逊相关系数 ρ(x, y) —— **尺度无关**的"同向性"读数 (2026-10)。
+ *
+ * 为什么价值评估那条曲线需要它 (用户实测三次之后定的):
+ *   `explainedVariance` 是**尺度敏感**的: `EV = 1 − Var(z−V)/Var(z)`。当 V 与 z 不同源
+ *   (实测: V 是学习口径量级, 而 z 若取"引擎口径回报"就差 10 倍) 时, EV 会被尺度差吃满,
+ *   读到一个**很大的负数**(实测过 −24.3), 看起来像"critic 烂到极点", 其实只是两个数
+ *   不在同一个尺度上。而 ρ 只看"同向性": ρ>0 同向、≈0 无区分度、<0 反了。
+ *   于是"V 与那个 z 到底有没有关系"这件**唯一能在跨口径下回答的事**由 ρ 承担。
+ *
+ * 口径: 任一序列方差为 0 (或长度不足 2) 时返回 0 —— 调用方必须**自己判方差**
+ * (与 ValueDiag::zHasVariance 同一纪律: "无定义"不许伪装成 0)。
+ */
+inline double pearson(const std::vector<double> &x, const std::vector<double> &y)
+{
+    const std::size_t n = (x.size() < y.size()) ? x.size() : y.size();
+    if (n < 2) {
+        return 0.0;
+    }
+    double mx = 0.0, my = 0.0;
+    for (std::size_t i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
+    mx /= (double)n;
+    my /= (double)n;
+    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+    for (std::size_t i = 0; i < n; i++) {
+        const double dx = x[i] - mx;
+        const double dy = y[i] - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if (sxx <= 1e-18 || syy <= 1e-18) {
+        return 0.0;                 /* 有常数序列 -> 相关系数无定义 */
+    }
+    const double r = sxy / std::sqrt(sxx * syy);
+    if (r > 1.0) { return 1.0; }
+    if (r < -1.0) { return -1.0; }
+    return safe(r);
+}
+
+/* 追加进滚动窗口并把总量裁到 cap (FIFO)。窗口的语义 = "最近这些手/这些局"。 */
+inline void appendWindow(std::vector<double> &vWin, std::vector<double> &zWin,
+                         const std::vector<double> &v, const std::vector<double> &z,
+                         std::size_t cap)
+{
+    const std::size_t n = (v.size() < z.size()) ? v.size() : z.size();
+    for (std::size_t i = 0; i < n; i++) {
+        vWin.push_back(v[i]);
+        zWin.push_back(z[i]);
+    }
+    if (cap > 0 && vWin.size() > cap) {
+        const std::size_t drop = vWin.size() - cap;
+        vWin.erase(vWin.begin(), vWin.begin() + (std::ptrdiff_t)drop);
+        zWin.erase(zWin.begin(), zWin.begin() + (std::ptrdiff_t)drop);
+    }
+}
+
+/*
+ * 一次"价值评估"读数。`ok = false` 表示**这一批不该出点**, 而原因必须能说清:
+ *   * zVar ≈ 0  : 全是和棋(或同一结果) —— EV 按定义无解。**这不是"V 很差"**,
+ *                 而是"这一批没有任何胜负可供校准"(本工程实测过 100% 和棋的场景,
+ *                 第一次踩这条时读数是 EV = 0, 看起来像"V 和常数一样烂")。
+ *   * n < minPairs : 样本太少, EV 的方差大到没有意义。
+ */
+struct ValueDiag {
+    bool ok = false;
+    double ev = 0.0;            /* 解释方差 (1 = 完美, 0 = 与"永远预测均值"同水平) */
+    double calibErr = 0.0;      /* 校准误差 (0 = 完美) */
+    double zVar = 0.0;          /* Var(z): == 0 时上面两个都无定义 */
+    int n = 0;                  /* 参与统计的 (V, z) 对数 */
+    bool enough = false;        /* n >= minPairs */
+    bool zHasVariance = false;  /* zVar > 1e-9 */
+};
+
+inline ValueDiag valueDiagOf(const std::vector<double> &v,
+                             const std::vector<double> &z,
+                             int minPairs = 64,
+                             int nBuckets = 10)
+{
+    ValueDiag d;
+    d.n = (int)((v.size() < z.size()) ? v.size() : z.size());
+    d.enough = (d.n >= (minPairs > 0 ? minPairs : 1));
+    if (d.n <= 0) {
+        return d;
+    }
+    d.zVar = variance(z);
+    d.zHasVariance = (d.zVar > 1e-9);
+    if (!d.zHasVariance) {
+        return d;                       /* ok 保持 false: 无定义, 不许出点 */
+    }
+    d.ev = explainedVariance(z, v);
+    const std::vector<CalibBucket> bk = calibration(v, z, nBuckets);
+    d.calibErr = calibrationError(bk);
+    d.ok = d.enough;
+    return d;
+}
+
+/* ---------------------------------------------------------------------------
  *  2. 逐手搜索诊断 (老师体检)
  * ------------------------------------------------------------------------- */
 

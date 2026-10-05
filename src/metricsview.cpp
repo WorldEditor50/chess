@@ -226,7 +226,18 @@ void CurveChart::addPoint(int series, double value)
 */
 void CurveChart::updateAccessibility()
 {
-    setAccessibleName(m_title);
+    /*
+       [2026-10] accessibleName = 标题 + ` · n=<点数>`。
+       为什么把点数塞进 **Name**(而不是只放 Description): 自动化脚本能**稳定读到**的只有
+       Name —— 实测 Qt 的 UIA 桥根本没暴露 Description(它映射到 HelpText, 读出来是空串;
+       `tools/verify_match_ui.ps1` 里那句 "loss chart = " 因此从来没有打印过东西)。
+       而"曲线是不是真的在长"正是最该被断言的一件事: `addPoint` 在序列不存在时是
+       **静默 return**, 于是"BC 在训练、曲线却空着"在界面上**没有任何可读证据** ——
+       2026-10 人机那条路的缺口就是这么活过全部测试的(见 mainwindow.cpp 的
+       armBcChartSeries / humanGameStarted)。末尾是 ASCII 记号, 与自检面板里的
+       MaxVio / Loss-Free 同一个做法: 机器要读的记号用 ASCII。
+    */
+    setAccessibleName(m_title + QStringLiteral(" · n=%1").arg(sampleCount()));
     QString d;
     for (int i = 0; i < m_series.size(); ++i) {
         const Series &s = m_series[i];
@@ -627,13 +638,15 @@ CurveChartDialog::CurveChartDialog(const QString &title, QWidget *parent)
     layout->addWidget(buttons, 0);
 }
 
-void CurveChartDialog::follow(CurveChart *source)
+void CurveChartDialog::follow(CurveChart *source,
+                             const std::function<QString()> &extraReadout)
 {
     if (m_source != nullptr) {
         disconnect(m_source, &CurveChart::dataChanged, this,
                    &CurveChartDialog::syncFromSource);
     }
     m_source = source;
+    m_extra = extraReadout;
     if (m_source != nullptr) {
         connect(m_source, &CurveChart::dataChanged, this,
                 &CurveChartDialog::syncFromSource);
@@ -659,7 +672,23 @@ void CurveChartDialog::syncFromSource()
         const int idx = m_chart->addSeries(src.name, src.color);
         m_chart->setPoints(idx, src.pts);
     }
+    /*
+       纵轴单位也要抄过来 (2026-10): suffix 是**控件自己的状态**, 数据同步不会带上它。
+       不抄的话"保真度"那张图 (%) 放大之后数字没有 "%", 与源控件不是同一个读数。
+    */
+    m_chart->setValueSuffix(m_source->valueSuffix());
     if (m_readout != nullptr) {
-        m_readout->setText(m_chart->readoutText(QStringLiteral("读数")));
+        QString t = m_chart->readoutText(QStringLiteral("读数"));
+        /*
+           再问一次"不在曲线上的数"(例如 BC 那条 CE)。放在**每次同步**里问, 于是
+           窗口开着时它跟着对局更新; 回调没给 (其余两张图) 就什么都不加。
+        */
+        if (m_extra) {
+            const QString extra = m_extra();
+            if (!extra.isEmpty()) {
+                t += extra;
+            }
+        }
+        m_readout->setText(t);
     }
 }

@@ -921,12 +921,16 @@ bench_ppo_moe_balance --backbone=tb --only=aux,lossfree     :: 界面现役的 T
 
 ## 13. 第七轮（2026-10）：PPO 的 TB 专家与 top-k —— 4/1 → 8/2
 
+> ⚠ **[2026-10 同月已被 §14 回退]** 本节量出来的代价全部成立，但这一档**已经不是现役**：
+> 用户随后要求"将 sac agent 与 ppo agent 的 TB 专家数量降为 4，top-k 变为 1"。
+> 本节保留为**历史记录**（它是"要不要再提上去"的唯一依据），**当前生效值见 §14**。
+
 用户口径：**"增加 ppo agent 的 TB 专家与 top-k 数量"**（与 §9 对 SAC 那一支的要求同型）。
 改的是 `src/rl/ppo.h` 顶部的两个编译期常量：
 
 ```cpp
-constexpr int PPO_MOE_EXPERTS = 8;   // 4 -> 8
-constexpr int PPO_MOE_TOPK    = 2;   // 1 -> 2
+constexpr int PPO_MOE_EXPERTS = 8;   // 4 -> 8   (2026-10 又被 §14 改回 4)
+constexpr int PPO_MOE_TOPK    = 2;   // 1 -> 2   (2026-10 又被 §14 改回 1)
 ```
 
 ### 13.1 为什么必须把代价量出来（而不是照抄 §9 的 SAC 数字）
@@ -1014,14 +1018,14 @@ E=8 才不至于带回来一个 0.4~0.7 量级的偏斜。
 `chessboard.cpp` 的 `PPO_SIMS` 注释里写了这三条与各自的数，改一个数字就能切；想"又快
 又深"就换 `PPO+MCTS (MLP专家)` 那一支（0.22 ms/模拟，1600 模拟 ≈ 0.35 s/步）。
 
-三档对照（同一台机器，实测）：
+三档对照（同一台机器，实测；**这张表是 §13 当时的快照，现役那一档见 §14**）：
 
 | 配置 | 每模拟 | 界面预算 | 一步决策 | 备注 |
 |---|---:|---:|---:|---|
-| TB E=4/top-1（改前） | ~8 ms | 400 | ~3.2 s | 已不存在（常量已改） |
-| **TB E=8/top-2（现在）** | **20.1 ms** | **400** | **7.99 s** | `PPO_SIMS` 现值 |
-| TB E=8/top-2 + 降到 160 模拟 | 20.1 ms | 160 | ~3.2 s | 深挖余量只剩 4× 分支数 |
-| MLP E=8/top-2（另一支） | 0.22 ms | 1600 | ~0.35 s | 骨干便宜 ~90× |
+| TB E=4/top-1（§13 改前 → **§14 又改回来了，现在就是它**） | 11.02 ms | 400 | **4.31 s** | §14 实测；"~8 ms/~3.2 s" 是 §13 当时的旧读数 |
+| **TB E=8/top-2（§13 当时）** | **20.1 ms** | **400** | **7.99 s** | 已按用户口径回退，见 §14 |
+| TB E=8/top-2 + 降到 160 模拟 | 20.1 ms | 160 | ~3.2 s | 深挖余量只剩 4× 分支数（§13 讨论过、**没采用**） |
+| MLP E=8/top-2（另一支） | 0.22 ms | 1600 | ~0.35 s | 骨干便宜 ~90×（**这一支没动过**） |
 
 ### 13.6 顺带记下的两个坑（都"不报错、只是结果不对"）
 
@@ -1060,3 +1064,95 @@ train_ppo 同上 --lossfree-bias=1 --lossfree-bias-rate=0.01
 build 目录里那份）与 `weights/_temp_match_selfplay_probe_ppo_*` 都是 **E=4/top-1 时代**的，
 `Net::load` 的参数量守卫会**明确拒绝**（不是静默错读）。这一支要从随机权重重训；
 新口径存下来的是 **各 ~529 MB**（实测，`weights/ppomcts_agent.dat_*`）。
+
+---
+
+## 14. 第八轮（2026-10，同月）：按用户口径把 TB 专家与 top-k **降回 4/1**
+
+> 用户原话：**"将 sac agent 与 ppo agent 的 TB 专家数量降为 4，top-k 变为 1"**。
+
+这一节是 §13 的**逆操作**，所以它的价值不在"又量了一遍"，而在三件事：
+**把回退的收益量出来**、**保留两档的实测对照**（下次想再提上去时有依据）、
+以及**记下这次改动必然带来的两个后果**（权重作废 + `PPO_SIMS` 那个取舍怎么定）。
+
+### 14.1 改的是哪两个常量（以及**不**改什么）
+
+| 位置 | 常量 | 8/2 → 4/1 |
+|---|---|---|
+| `src/rl/ppo.h` | `PPO_MOE_EXPERTS` / `PPO_MOE_TOPK` | ✅ 改（TB 专家那一档） |
+| `src/sacazmoetbagent.h` | `MOE_TB_EXPERTS` / `MOE_TB_TOPK` | ✅ 改（`AGENT_SACAZ_MOE` 那一支） |
+| `src/rl/ppo.h` | `PPO_MOE_MLP_EXPERTS` / `PPO_MOE_MLP_TOPK` | ❌ **不动**（MLP 专家本来就是 8/2，且便宜 ~25×） |
+| `src/sacazmoemlpagent.h` / `sacazagent.h` / `sacazlegacyagent.h` | 各自的 `MOE_MLP_*` | ❌ 不动 |
+| `src/sacazmoetbagent.h` | 该类里的 `MOE_MLP_EXPERTS/TOPK` | ❌ 不动 —— 而且它在本类里**没有消费者**（已加注释说明，免得被照着推断） |
+
+一句话：**"TB 专家"是这两支的骨干，"MLP 专家"是另两支**，两套常量本来就是分开的
+（这正是当初把它们分成两对的目的：改一支不连坐另一支）。
+
+### 14.2 实测对照（同一台机器、同一副工具，**同一天**量的）
+
+| 读数 | E=8/top-2（§13） | **E=4/top-1（本轮）** | 比值 | 量法 |
+|---|---:|---:|---:|---|
+| PPO actor 参数 | — | **52,388,888** | | `bench_ppo_backbone_tb --backbone=tb` |
+| PPO critic 参数 | — | **51,862,453** | | 同上 |
+| PPO actor+critic | 207.8 M | **104.3 M** | **1.99×** | 同上 |
+| 每模拟 | 20.1 ms | **11.02 ms** | **1.82×** | 同上（小标定 8 次） |
+| 400 模拟 / 步（界面预算） | 7.99 s | **4.31 s** | **1.85×** | 同上（含根建立等固定开销） |
+| 峰值工作集 | 3,301 MB | **1,608 MB** | **2.05×** | `tools/measure_peak_working_set.ps1` |
+| SAC 支 `test_sacaz` 整轮 | 324.9 s | **162.9 s** | **1.99×** | `ctest -R test_sacaz` |
+
+三条读法：
+1. **参数量与内存精确减半**（1.99× / 2.05×）—— 参数 ∝ E，而 `withGrad=true` 时每个全连接
+   有 w/g/v/m 四份缓冲，所以内存跟着线性翻。
+2. **每模拟只省 1.82× 而不是 2×** —— 算力 ∝ k（top-2 → top-1 是精确的 2 倍），但一次模拟
+   里还有**不随 k 变**的固定开销（根建立 / 合法着法生成 / 置换表 / 叶子那一路），
+   小样本下它按比例更显眼。这不是误差，是"k 只乘专家那一部分"的直接体现。
+3. **`test_sacaz` 的 1.99×** 是最干净的一条总账：它是端到端、同种子、同断言的整轮耗时，
+   除了 E/k 没有任何变量。
+
+⚠ **`PPO_SIMS` 刻意保持 400**（用户口径："保持 400，恢复到历史配对"）。理由与本文件 §13.5
+那条取舍**完全相反**：那里是"加了 top-k 要不要把模拟次数降下来付账"，这里是"省下来的算力
+要不要换回搜索"。本轮答案是**不换** —— 于是每步墙钟从 7.99 s 降到 4.31 s，而**搜索深度一点
+没减**（400 模拟相对分支数 38.7 的深挖余量与改前一致）。要把这 3.7 s 再换成搜索，就把
+`chessboard.cpp` 的 `PPO_SIMS` 抬到 ~1000（回到 ~10 s/步）—— 那是一个需要用户开口的取舍。
+
+### 14.3 两个必然后果（都不是"顺手一提"，是会真的踩到的）
+
+1. **存量权重全部作废**：`weights/ppomcts_agent.dat_actor`（529.7 MB）/`_critic`（527.0 MB）
+   与 SAC 那一支的 `weights/sacaz_moe*` 都是 8/2 时代的。`Net::load` 的参数量守卫会
+   **明确拒绝**（日志里是 `参数量不匹配 (文件 N 个元素, 当前网络 M 个) … 拒绝载入`），
+   不是静默错读 —— 但这也意味着**启动日志里那一组会"读得飞快"**，把启动时间量出一个
+   **偏小的假读数**。量启动时间前必须先重训/重存这两支。
+2. **MoE 负载读数不能跨这次改动比较**：E=4 时的偏斜本来就小（训练侧 MaxVio 0.049 那一档），
+   而"无辅助损失偏置均衡"是**默认开着**的 —— 本次改动**没有**动它（关掉它换不来什么，
+   反而丢掉 E 再变大时的保护）。所以看到 E=4 的 MaxVio 变小，那是 E 的效果，不是均衡开关的效果。
+
+### 14.4 回归
+
+| 检查 | 结果 |
+|---|---|
+| 全量构建 | **448 步全绿**（无 error / 无 warning-as-error） |
+| `ctest -E "test_match\|test_mcts\|test_ppomcts"` | **14/14 通过**（`test_sacaz` 324.9 → **162.9 s**） |
+| `test_ppomcts`（不进 ctest，人工跑） | **exit=0**（含 `[14]` MoE 均衡那一段） |
+| 结构自证 | `bench_ppo_backbone_tb` 打出 `=== 骨干 TB<16,360> (界面 AGENT_PPOMCTS) (E=4 top-1) ===` |
+
+### 14.5 复现命令
+
+```bat
+:: 结构 + 参数量 + ms/模拟 + 界面预算下一步的耗时
+cmake --build <build> --target bench_ppo_backbone_tb
+<build>\bench_ppo_backbone_tb.exe --games=1 --plies=8 --calib-sims=8 --ui-sims=400 ^
+                                 --learn-steps=2 --backbone=tb
+
+:: 峰值工作集 (必须走外部采样器, 见 §13.6 的 windows.h 坑)
+powershell -ExecutionPolicy Bypass -File tools\measure_peak_working_set.ps1 ^
+  -Exe <build>\bench_ppo_backbone_tb.exe ^
+  -Args "--games=1 --plies=8 --calib-sims=8 --ui-sims=400 --learn-steps=2 --backbone=tb" ^
+  -LogFile .r1build\mem_ppo_tb_e4.txt
+
+:: SAC 那一支的总账 (改前 324.9 s / 改后 162.9 s)
+ctest -R test_sacaz --output-on-failure
+
+:: PPO 那一支 (不进 ctest)
+<build>\test_ppomcts.exe
+```
+

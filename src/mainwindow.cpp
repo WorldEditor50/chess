@@ -15,6 +15,10 @@
 #include <QComboBox>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QTextCursor>      /* BC 的进度行要追加到自检视图末尾 (2026-10) */
+#include <QTabWidget>       /* "训练损失 / 行为克隆"两个 tab (2026-10 用户口径) */
+#include <QLabel>           /* BC 曲线下面的读数行 (代码里建) */
+#include <QVBoxLayout>      /* tab 页的布局 */
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QListWidgetItem>
@@ -242,6 +246,40 @@ MainWindow::MainWindow(QWidget *parent)
     populateAgentComboBox();
 
     /*
+       ---- [2026-10] "对局中行为克隆"那个勾选框的接线 ----
+       勾选框本身在 populateAgentComboBox 里建 (与 matchModeRow 后面那四行同一处);
+       这里接三件事:
+         1. 板子上的 bcProgress 一行 -> 追加进自检面板 (对局期间的实时读数);
+         2. A/B 两个下拉框一变就重算"能不能勾" (老师/学生换了);
+         3. 启动完成后再刷一次 (启动前 agent 实例还没建出来, 判据要用到类型而不是实例,
+            所以严格说这里只是为了让 tooltip 的文字在启动后立刻是正确的)。
+    */
+    QObject::connect(ui->gameWidget, &ChessBoard::bcProgress, this,
+                     [this](const QString &line) {
+                         if (ui->selfCheckView == nullptr) {
+                             return;
+                         }
+                         ui->selfCheckView->moveCursor(QTextCursor::End);
+                         ui->selfCheckView->insertPlainText(line + QStringLiteral("\n"));
+                         ui->selfCheckView->moveCursor(QTextCursor::End);
+                     });
+    QObject::connect(ui->matchAComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     this, [this](int) { updateBcMatchControlsEnabled(); });
+    QObject::connect(ui->matchBComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     this, [this](int) { updateBcMatchControlsEnabled(); });
+    /*
+       "对战AI" 那一支也要接: 人机对战时**学生就是它** (老师来自 BC 下拉框, 与"对面"
+       是人是 AI 无关 —— 2026-10 口径)。不接的话, 在人机模式下把 AI 换成 PPO/SAC 之后
+       BC 下拉框还是灰的, 用户看到的是"功能没生效"。
+    */
+    if (ui->agentComboBox != nullptr) {
+        QObject::connect(ui->agentComboBox,
+                         QOverload<int>::of(&QComboBox::currentIndexChanged),
+                         this, [this](int) { updateBcMatchControlsEnabled(); });
+    }
+    updateBcMatchControlsEnabled();
+
+    /*
        ================================================================
        [2026-10 门控实验] 稀疏 MoE 专家负载的可视化小控件
        ================================================================
@@ -364,6 +402,16 @@ MainWindow::MainWindow(QWidget *parent)
     /* ---- 指标曲线与逐局明细 (右侧面板, 见 metricsview.h) ---- */
     setupMetricsPanel();
 
+    /*
+       ---- [2026-10 用户口径] "训练损失 / 行为克隆" 两个 tab ----
+       必须**在** setupMetricsPanel 之后: 它把 .ui 里的 lossChart(+读数行) 搬进第一个
+       tab 页, 而 setupMetricsPanel 刚把这两张图的标题/窗口/接线配好 (搬动的是配好的控件)。
+    */
+    setupChartTabs();
+    /* BC 保真度采样 -> 那条曲线 (对局线程 emit, auto 连接排队投递到 GUI 线程) */
+    QObject::connect(ui->gameWidget, &ChessBoard::bcFidelitySample, this,
+                     &MainWindow::onBcFidelitySample);
+
     /* Agent选择 (与你对战的AI; 你执红, 它执黑) */
     connect(ui->agentComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onAgentSelected);
@@ -479,8 +527,7 @@ MainWindow::MainWindow(QWidget *parent)
             }
         });
 
-    /* ---- Agent 对弈进度 ---- */
-    connect(ui->gameWidget, &ChessBoard::matchStarted, this,
+    QObject::connect(ui->gameWidget, &ChessBoard::matchStarted, this,
         [this](const QString &a, const QString &b, int games) {
             ui->matchResultLabel->setText(
                 QString("对弈 %1 vs %2 · 共 %3 局 · 进行中").arg(a, b).arg(games));
@@ -508,6 +555,25 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QString &scoreLine) {
             ui->scoreLabel->setText(QString("当前比分: %1").arg(scoreLine));
         });
+    /*
+       ---- [2026-10] 人机对弈: 每局开始时给"行为克隆"那条曲线建线 ----
+       人机那条路没有 `matchStarted`(它只是"人对 AI", 不是"一场几局的比赛"), 只有
+       `humanGameStarted`(玩家落下本局第一子)。缺了这一步的后果是**静默**的:
+       `CurveChart::addPoint` 在序列不存在时直接 return ⇒ 人机里 BC 明明在训练
+       (面板有 samples=/updates=), 曲线却一直空着。用户 2026-10 报的就是这个。
+       建线判据与 Agent 对局那条路**共用** armBcChartSeries(见它的注释)。
+    */
+    connect(ui->gameWidget, &ChessBoard::humanGameStarted, this, [this]() {
+        armBcChartSeries(ChessBoard::bcSupported(humanAiSide()),
+                         ui->gameWidget->bcTeacherDepth(), /*humanMode=*/true);
+    });
+    /*
+       ---- [2026-10] 价值评估曲线的一个点 (每局结束时一次) ----
+       与 BC 那条一样是**跨场连续**的 (窗口本身跨局滚动), 所以不在 resetMetricsForMatch
+       里清线 —— 它量的是"当前这个 critic 准不准", 清掉就只剩最后一局的点数了。
+    */
+    connect(ui->gameWidget, &ChessBoard::valueDiagSample, this,
+            &MainWindow::onValueDiagSample);
     /* ---- 指标曲线采样 ---- */
     connect(ui->gameWidget, &ChessBoard::trainLossSample, this,
         [this](double loss, const QString &agent, int step) {
@@ -593,6 +659,12 @@ MainWindow::MainWindow(QWidget *parent)
             /* 启动加载完成: 现在才有 agent 可以自检 (之前都是 nullptr) */
             requestSelfCheckPanelUpdate(false);
             /*
+               BC 控件同理 (2026-10): 启动加载之前 `getAgentType()` 读得到类型, 但
+               **实例还没建**(预加载要几十秒) —— 那段时间把按钮点亮会让用户按下去
+               得到一个"要现建网"的 BC (几十秒的额外等待, 而且与他以为的状态不符)。
+            */
+            updateBcMatchControlsEnabled();
+            /*
                ---- 把"有没有载入模型"顶到对局列表最上面 (2026-09, 用户报障) ----
                报障是"点击开局模型未载入": 查下来代码没错 (weights/ 是 gitignore 的运行期
                产物, 没存过就是空的), 但这句话原来只在日志与自检面板里 —— 用户按"开局"
@@ -616,6 +688,7 @@ MainWindow::MainWindow(QWidget *parent)
     ui->matchBComboBox->setEnabled(false);
     ui->gamesSpin->setEnabled(false);
     ui->preTrainStepsSpin->setEnabled(false);
+    updateBcMatchControlsEnabled();     /* BC 也一起置灰 (启动加载期间没有实例可用) */
     ui->timeLabel->setText("正在加载...");
     ui->exploreLabel->setText("探索+预训练: -");
     ui->matchResultLabel->setText("对弈结果: -");
@@ -1041,19 +1114,286 @@ void MainWindow::populateAgentComboBox()
            对齐放在 MainWindow 构造函数**末尾**那一次统一调用 (见那里的说明)。
         */
     }
+
+    /*
+       ================================================================
+       ---- [2026-10 用户口径] 对局中行为克隆: 一个**下拉框**选老师 ----
+       ================================================================
+       用户口径 (原话): **"行为克隆勾选框改成下拉框选择要克隆的 abagent，与将要对弈的
+       对方 agent 或者人类棋手无关，训练的时候参考下拉框选择的 abagent 的决策进行行为
+       克隆训练"**。于是这里是一个下拉框 (第一项 = 关), 而不是勾选框:
+
+         * **老师由它选**, 与这一场的对手是谁完全无关 —— 对手是 AB 某一档、是别的
+           agent、还是人机里的**人**, 都照常克隆;
+         * 每一项对应一档 Alpha-Beta 的深度 (L1/L2/L3/(深度=4)), 深度是**唯一**的老师
+           参数, 所以 itemData 直接存深度 (0 = 关);
+         * 文本里刻意带 ASCII 记号 (`off` / `depth=1`…): verify_bc_ui.ps1 要用 UIA
+           按名字选中某一项, 而那个脚本必须 ASCII-only (无 BOM 的 .ps1 会被按 ANSI
+           解码, 中文会把脚本解析坏)。与自检面板里的 "MaxVio / Loss-Free" 同一个做法。
+
+       为什么放在中间这一列、且用代码插入: 与上面四行 (对手入训 / 动态奖励 / 每轮训练
+       局数 / 呼吸高亮) 同一套理由; 而"能不能选"这件事**跟着 A/B 两个下拉框走**, 放在
+       它们附近才看得懂 (见 updateBcMatchControlsEnabled 的说明)。
+    */
+    QHBoxLayout *rowBc = nullptr;
+    {
+        QWidget *host = ui->matchModeRow->parentWidget();
+        QBoxLayout *vb = (host != nullptr) ? qobject_cast<QBoxLayout *>(host->layout())
+                                           : nullptr;
+        int at = (vb != nullptr) ? vb->indexOf(ui->matchModeRow) : -1;
+        if (vb != nullptr && at >= 0) {
+            /* 插在 matchModeRow 之后、上面那四行**之前**: 它是"这一场怎么学"的开关,
+               与"模式 / 对手入训 / 动态奖励"是一组; 呼吸高亮是显示开关, 排在后面。 */
+            rowBc = new QHBoxLayout();
+            vb->insertLayout(at + 1, rowBc);
+        }
+    }
+    {
+        QLabel *lab = new QLabel(QStringLiteral("行为克隆训练:"), this);
+        lab->setObjectName(QStringLiteral("bcTeacherLabel"));
+        QComboBox *cb = new QComboBox(this);
+        cb->setObjectName(QStringLiteral("bcTeacherCombo"));
+        /*
+           文本 = "关" + 四档 Alpha-Beta。名字用 ChessBoard::bcTeacherName (唯一来源),
+           所以这里选的档位与 A/B 下拉框里的叫法逐字一致 (不会出现"下拉框写 L2、
+           报告里印深3"那种看起来像功能坏了的错位)。
+           深度与档位一一对应, itemData 存的就是深度。
+        */
+        cb->addItem(QStringLiteral("关 (off)"), 0);
+        for (int d = 1; d <= 4; d++) {
+            cb->addItem(QStringLiteral("克隆 %1 (depth=%2)")
+                            .arg(ChessBoard::bcTeacherName(d)).arg(d), d);
+        }
+        cb->setCurrentIndex(0);          /* 默认关 (与"动态奖励 / 对手入训"同一个口径) */
+        cb->setToolTip(QStringLiteral(
+            "对局中行为克隆 (BC): 选一个 **Alpha-Beta 老师**, 学生的每个局面都由它当标签\n\n"
+            "选好之后 (默认**关**):\n"
+            "  * **与对手是谁无关** —— 对手是 AB 的某一档、是别的 agent、还是人机里的\n"
+            "    人类棋手, 都照常克隆;\n"
+            "  * 只在这一局/这一场、且只在\"训练对局\"模式下生效 (评估/只对弈里权重必须不变);\n"
+            "  * **学生每走一手** => 那个局面 + \"下拉框这一档 AB 在该局面上搜出来的一手\"\n"
+            "    = 一条监督样本 => 立刻更新一次**策略头**;\n"
+            "  * 损失 = 该局面**完整合法集**上的掩码交叉熵 (dL/dz = π − t, 非法列恒为 0),\n"
+            "    与在线训练同一个归一化口径, 也与命令行 train_bc 同一套口径;\n"
+            "  * 它是**额外**的: 学生自己的在线训练照常进行。\n\n"
+            "三条边界 (读数必须与它们一起看):\n"
+            "  1. 这是**模仿**: 上限就是所选那一档 AB (L1/L2/L3 一档比一档弱);\n"
+            "  2. 它**不碰 critic** (PPO 的 BC 路径整段不含 critic 前向/反向),\n"
+            "     SAC 独立口径下 q1/q2 逐字节不变;\n"
+            "  3. 跑完**只改内存里的权重** —— 唯一的落盘点是退出程序时。\n\n"
+            "读数: 对局期间每若干次更新会在下面的\"模型自检\"面板里打一行\n"
+            "      (`samples= / updates= / CE=`), 整场结束后面板里有一份完整摘要;\n"
+            "      曲线在\"行为克隆 (BC)\"那个 tab 里, 双击可放大。\n\n"
+            "⚠ 只有场上**至少一侧能做 BC 学生** (PPO 两支 / SAC 三支) 时才选得动;\n"
+            "  两边都是纯搜索 (AB 各档 / MCTS) 时这个下拉框会置灰并把原因写在这里。"));
+        if (rowBc != nullptr) {
+            rowBc->addWidget(lab);
+            rowBc->addWidget(cb);
+            /*
+               ---- [2026-10] 软目标复选框 (用户问题: "不直接使用 onehot 通过 abagent 计算
+                    概率分布再进行行为克隆是否会更好?") ----
+               放在**老师下拉框旁边**: 它改的是"老师给什么" (一只手 vs 一个分布),
+               不是另开一个功能。默认**不勾** —— 实测两个指标方向相反 (可比口径的 KL 更好,
+               而硬口径的 top-1 略低), 只压小 train−留出差 (见文档 §9), 所以是可选档。
+            */
+            QCheckBox *soft = new QCheckBox(QStringLiteral("软目标 (多深度一致)"), this);
+            soft->setObjectName(QStringLiteral("bcSoftCheck"));
+            soft->setChecked(false);
+            soft->setToolTip(QStringLiteral(
+                "行为克隆的**目标**形态 (改的是老师给什么, 不是另开一个功能)\n\n"
+                "不勾 (默认, one-hot): 老师只给最深那一层搜出来的**一手**,\n"
+                "  目标熵 H(t)=0, 损失 = 掩码 NLL (CE 就是 NLL)。\n"
+                "勾上 (软目标): 深度 1..D **各投一票**, 票数/D 当概率 ⇒ 一个分布,\n"
+                "  目标熵 H(t)>0, 损失仍是合法集上的交叉熵 —— 它的**下界变成 H(t)**\n"
+                "  (CE = H(t) + KL(t‖π)), 所以看 CE 时必须与报告里那行 targetH 一起看。\n\n"
+                "为什么是\"多深度一致\"而不是\"根分值 softmax\": AB 的根循环是窗口写法,\n"
+                "非最优孩子返回的是**界**而不是精确分值 ⇒ 拿根分值做 softmax 等于在搜索\n"
+                "裁剪的产物上克隆。多深度投票只用\"各深度的最优手\"这一个稳定的量。\n\n"
+                "实测 (4000 局面 / 深度 3 / 8 epoch / **4 个种子**成对比较, 见文档 §9):\n"
+                "两个指标**方向相反** —— 可比口径 **留出 KL (CE − H(t)) 4/4 都更低**\n"
+                "(2.379→1.866), 而硬口径 **留出 top-1 略低** (38.59%→36.78%, 3/4 个种子,\n"
+                "符号不一致 ⇒ 只能算「没变好」); train−留出 差 4/4 都更小 (0.427→0.280),\n"
+                "代价约 +12~14% 打标签时间 —— 所以它是**可选档**, 默认关。\n\n"
+                "⚠ 老师选\"关\"时它没有任何作用 (没有采样就没有目标)。"));
+            QObject::connect(soft, &QCheckBox::toggled, this, &MainWindow::onBcSoftToggled);
+            rowBc->addWidget(soft);
+            rowBc->addStretch(1);        /* 左对齐 (与其它几行同一做法) */
+            m_bcSoftCheck = soft;
+        } else {
+            ui->matchModeRow->addWidget(lab);
+            ui->matchModeRow->addWidget(cb);
+        }
+        QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                         this, &MainWindow::onBcTeacherChanged);
+        m_bcTeacherCombo = cb;
+    }
 }
 
 /*
- * applyMoeHighlight - "呼吸高亮"的**唯一**一个启停点
+ * humanAiSide - "人机那条路的学生"是哪一支
  *
- * 三件事一起做, 缺一件就会留下"关了但还在动"或"开着但没数据"的半状态:
- *   1. 取数定时器 (开 -> start, 关 -> stop);
- *   2. 控件侧的开关 (它会顺手清掉最后一帧的实时数据, 免得高亮"冻"在面板上);
- *   3. 放大窗口 (如果开着) 同步 —— 两处显示必须同一个口径。
- *
- * 调用点只有两个: 勾选框的 toggled, 以及构造函数末尾那一次对齐
- * (见那里的说明: 勾选框建得比定时器早, 所以不能在建它的地方调用)。
+ * 就是"对战AI"下拉框 (index 0) 选中的那一支 —— 人机对弈里 AI 执黑、玩家执红, 所以
+ * **AI 那一支才是学生** (玩家没有策略头可克隆)。两处需要它: 曲线建线判据、下拉框启用判据;
+ * 各写一遍的话会出现"下拉框亮着但曲线不建线"这种自相矛盾的状态。
  */
+ChessBoard::AgentType MainWindow::humanAiSide() const
+{
+    if (ui->agentComboBox != nullptr && ui->agentComboBox->currentIndex() >= 0) {
+        return static_cast<ChessBoard::AgentType>(
+            ui->agentComboBox->itemData(ui->agentComboBox->currentIndex()).toInt());
+    }
+    return ChessBoard::AGENT_ALPHABETA;      /* 拿不到就当作"没有学生" */
+}
+
+/*
+ * onBcTeacherChanged - "行为克隆训练"下拉框 (0 = 关, 1..4 = AB 深度)
+ *
+ * 只做两件事: 把选择交给棋盘, 然后在面板上留一行"这一次选的是谁"。
+ * **不在这里判断能不能用**: 下拉框在不能用的时候是**置灰**的 (见
+ * updateBcMatchControlsEnabled), 所以"选得动"就等于"可以用"; 而棋盘那一侧还会再判一次
+ * (模式 / 场上有没有学生), 判不通过时它会在面板上说明原因 (见 matchAgents 里那段)。
+ *
+ * [2026-10] 另外: 选完之后**立刻按新选择重新布置曲线**(建线或清线) —— 曲线是"这一场/这一局
+ * 会不会有读数"的预告, 让用户不必等到开局才发现"原来没建线"。
+ */
+void MainWindow::onBcTeacherChanged(int index)
+{
+    if (ui->gameWidget == nullptr || m_bcTeacherCombo == nullptr) {
+        return;
+    }
+    const int depth = (index >= 0) ? m_bcTeacherCombo->itemData(index).toInt() : 0;
+    ui->gameWidget->setBcTeacherDepth(depth);
+    /*
+       重新布置 BC 曲线 (选回"关"就清掉那两条线): 不清的话图上还挂着上一次的线, 而这一场
+       根本没在克隆 —— 那正是"两条空平线被读成保真度 0"的同一类误读 (见 armBcChartSeries)。
+       走的是与开局同一份实现, 所以"选了老师但场上没有学生"这句话在两种情形下一致。
+    */
+    if (!m_matchRunning && !ui->gameWidget->isMatchRunning()) {
+        armBcChartSeries(ChessBoard::bcHasStudent(m_matchTypeA, m_matchTypeB)
+                             || ChessBoard::bcSupported(humanAiSide()),
+                         depth, /*humanMode=*/!ChessBoard::bcHasStudent(m_matchTypeA, m_matchTypeB));
+    }
+    qInfo().noquote() << QStringLiteral("[BC] 对局中行为克隆 = %1")
+                             .arg(depth > 0 ? ChessBoard::bcTeacherName(depth)
+                                            : QStringLiteral("关"));
+    if (ui->selfCheckView != nullptr) {
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+        ui->selfCheckView->insertPlainText(
+            QStringLiteral("[BC] 对局中行为克隆 = %1 (老师 = 下拉框选的 AB, 与对手无关)\n")
+                .arg(depth > 0 ? ChessBoard::bcTeacherName(depth)
+                               : QStringLiteral("关")));
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+    }
+}
+
+/*
+ * onBcSoftToggled - "软目标 (多深度一致)" 复选框 (2026-10)
+ *
+ * 分工与 onBcTeacherChanged 一样: 只把勾选交给棋盘 + 在面板留一行, **不在这里判断
+ * 能不能用** (老师下拉框停在"关"时它就是没作用, 报告里也没有读数 —— 判据在棋盘那侧)。
+ * 面板上的那一行是必要的: 这个勾选不改变任何控件的可见状态, 不留字的话用户没法确认
+ * "到底生效了没有"; 而它与老师档位一起决定**报告里 CE 的可比性** (软目标下 CE 的下界
+ * 是 H(t)), 所以必须写清"生效中的目标形态"。
+ */
+void MainWindow::onBcSoftToggled(bool on)
+{
+    if (ui->gameWidget != nullptr) {
+        ui->gameWidget->setBcSoftTarget(on);
+    }
+    const QString what = on ? QStringLiteral("软目标 (深度 1..D 各投一票, 分布; H(t)>0)")
+                            : QStringLiteral("one-hot (只取最深一层的一手; H(t)=0)");
+    qInfo().noquote() << QStringLiteral("[BC] 目标形态 = %1").arg(what);
+    if (ui->selfCheckView != nullptr) {
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+        ui->selfCheckView->insertPlainText(
+            QStringLiteral("[BC] 目标形态 = %1%2\n")
+                .arg(what,
+                     on ? QStringLiteral(" —— CE 的下界变成 H(t), 与报告里的 targetH 一起看")
+                        : QString()));
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+    }
+}
+
+/*
+ * updateBcMatchControlsEnabled - "那个下拉框此刻该不该亮"的**唯一**实现
+ *
+ * 判据有两层, 缺一层就会出现一种"看起来能用其实没用"的状态:
+ *   1. **场上得有学生**: 至少一侧能做 BC (PPO 两支 / SAC 三支) —— 老师由下拉框给,
+ *      所以"对手是不是 AB"**不参与**判定 (2026-10 口径)。判据用库侧的
+ *      `ChessBoard::bcHasStudent` (界面不重写一遍)。人机那条路的学生是"对战AI"那一支,
+ *      所以它也参与判定 —— 否则"人机想克隆"会被 A/B 的选择连坐置灰。
+ *   2. **时机**: 对局进行中不让改 (改了之后这一场算不算? 没有定义) ——
+ *      与 selfPlayBtn / preTrainCheck 在开赛后置灰同一个口径。
+ *
+ * 置灰时**必须**把原因写进 tooltip: "下拉框是灰的"既可能是"场上没有学生",
+ * 也可能是"正在对弈" —— 两者的下一步动作完全不同。
+ */
+void MainWindow::updateBcMatchControlsEnabled()
+{
+    if (m_bcTeacherCombo == nullptr || ui->matchAComboBox == nullptr
+        || ui->matchBComboBox == nullptr) {
+        return;
+    }
+    const int ia = ui->matchAComboBox->currentIndex();
+    const int ib = ui->matchBComboBox->currentIndex();
+    if (ia < 0 || ib < 0) {
+        m_bcTeacherCombo->setEnabled(false);
+        return;
+    }
+    const ChessBoard::AgentType a = static_cast<ChessBoard::AgentType>(
+        ui->matchAComboBox->itemData(ia).toInt());
+    const ChessBoard::AgentType b = static_cast<ChessBoard::AgentType>(
+        ui->matchBComboBox->itemData(ib).toInt());
+    /* 人机那条路的学生 = "对战AI" 那一支 */
+    ChessBoard::AgentType aiSide = ChessBoard::AGENT_ALPHABETA;
+    if (ui->agentComboBox != nullptr && ui->agentComboBox->currentIndex() >= 0) {
+        aiSide = static_cast<ChessBoard::AgentType>(
+            ui->agentComboBox->itemData(ui->agentComboBox->currentIndex()).toInt());
+    }
+
+    const bool matchStudent = ChessBoard::bcHasStudent(a, b);
+    const bool humanStudent = ChessBoard::bcSupported(aiSide);
+    const bool anyStudent = matchStudent || humanStudent;
+    const bool running = m_matchRunning || ui->gameWidget->isMatchRunning();
+    m_bcTeacherCombo->setEnabled(anyStudent && !running);
+    /*
+       软目标复选框与下拉框**同进同出** (2026-10): 它是"老师给什么"的一种, 场上一旦
+       没有学生、或者对弈已经开始 (这一场定下来了), 改它同样没有定义。
+       ⚠ 只在**启用**时才跟着走: 对弈结束后 `anyStudent` 仍然为真, 于是用户的勾选
+       会被原样保留 —— 用 setChecked 同步"当前值"会把勾选**清掉**, 那是另一类 bug。
+    */
+    if (m_bcSoftCheck != nullptr) {
+        m_bcSoftCheck->setEnabled(anyStudent && !running);
+    }
+
+    if (!anyStudent) {
+        m_bcTeacherCombo->setToolTip(QStringLiteral(
+            "这一场没有能做行为克隆的**学生**。\n"
+            "老师由本下拉框选 (与对手无关), 但**场上至少要有一支**有策略头的 agent:\n"
+            "PPO+MCTS / PPO+MCTS(MLP专家) / SAC+AZ / SAC+AZ-MoE / SAC+AZ-MoE-MLP 这五支。\n"
+            "现在 A/B 与\"对战AI\"选的都是纯搜索 agent (Alpha-Beta 各档 / MCTS), 它们没有\n"
+            "可克隆的策略头 —— 把其中一处换成那五支里的一支即可。"));
+    } else if (running) {
+        m_bcTeacherCombo->setToolTip(QStringLiteral(
+            "对弈进行中: 这个选择**这一场已经定下来了** (中途改它没有定义),\n"
+            "等这一场结束再切。"));
+    } else {
+        m_bcTeacherCombo->setToolTip(QStringLiteral(
+            "对局中行为克隆 (BC): 选一个 **Alpha-Beta 老师**, 学生的每个局面都由它当标签\n\n"
+            "选好之后 (默认**关**):\n"
+            "  * **与对手是谁无关** —— 对手是 AB 某一档、是别的 agent、还是人机里的\n"
+            "    人类棋手, 都照常克隆;\n"
+            "  * 只在这一场、且只在\"训练对局\"模式下生效;\n"
+            "  * **学生每走一手** => 那个局面 + 老师在该局面搜出来的一手 = 一条样本\n"
+            "     => 立刻更新一次**策略头**;\n"
+            "  * 损失 = 完整合法集上的掩码交叉熵, 与在线训练 / 命令行 train_bc 同一套口径;\n"
+            "  * 它是**额外**的: 学生自己的在线训练照常进行。\n\n"
+            "读数: 对局期间在下面的\"模型自检\"面板里逐次打一行 (samples= / updates= / CE=),\n"
+            "整场结束后面板里有一份完整摘要 (含\"只改了内存里的权重\"那句提醒);\n"
+            "曲线在\"行为克隆 (BC)\"那个 tab 里, 双击可放大。"));
+    }
+}
+
 void MainWindow::applyMoeHighlight(bool on)
 {
     if (m_moeLoadView != nullptr) {
@@ -1178,6 +1518,12 @@ void MainWindow::onAgentSelected(int index)
 
     /* 换了 agent 就换一份自检报告 (不支持的 agent 显示"没有自检项") */
     requestSelfCheckPanelUpdate(false);
+
+    /*
+       BC 的按钮跟着"当前 agent 能不能做"走 (2026-10): 换成纯搜索 agent 时它是灰的,
+       并把**原因**写在提示里 (否则"按钮是灰的"读不出是"这一支不支持"还是"正在忙")。
+    */
+    updateBcMatchControlsEnabled();
 }
 
 /* ================================================================
@@ -1224,6 +1570,11 @@ void MainWindow::onStartMatch()
     m_matchRunning = true;
     m_matchLog.clear();
     ui->selfPlayBtn->setText("停止对弈");
+    /*
+       对弈期间禁用 BC (2026-10): BC 要独占主 agent (整段持有 agent 锁), 而对弈的决策
+       路径正在用它 —— 两者不能同时在跑 (不然 BC 会让对弈停在一半等锁, 看起来像卡死)。
+    */
+    updateBcMatchControlsEnabled();
     ui->matchResultLabel->setToolTip(QString());
     ui->matchResultLabel->setText(
         QString("对弈 %1 vs %2 · 共 %3 局 · 准备中")
@@ -1243,6 +1594,14 @@ void MainWindow::onStartMatch()
             m_matchRunning = false;
             ui->selfPlayBtn->setEnabled(true);
             ui->selfPlayBtn->setText("开始对弈");
+            updateBcMatchControlsEnabled();   /* 对弈结束: 勾选框重新可用 */
+            /*
+               对局结束后刷一次自检面板: 这一场的"对局中行为克隆"摘要就存在 ChessBoard 里
+               (bcReportText), 而面板的刷新时机原来是"选 agent / 每手预训练 / 启动完成"——
+               对局结束时正好是"这一场克隆了多少"最该被看到的一刻, 少了这一次刷新,
+               用户要等下一手棋才看得到 (而这一场可能已经结束了)。
+            */
+            requestSelfCheckPanelUpdate(false);
             ui->matchResultLabel->setText(summary);
             ui->matchResultLabel->setToolTip(detail);
             ui->scoreLabel->setText(QStringLiteral("最终比分: %1").arg(summary));
@@ -1325,6 +1684,35 @@ void MainWindow::setupMetricsPanel()
         */
         ui->lossChart->removeAllSeries();
         ui->rewardChart->removeAllSeries();
+        if (m_bcChart != nullptr) {
+            m_bcChart->removeAllSeries();       /* "清空曲线"也要清掉 BC 那一张 */
+            m_bcLastFidTop1 = -1.0;
+            m_bcLastFidPTeacher = -1.0;
+            m_bcLastFidCe = -1.0;
+            m_bcLastFidWindow = 0;
+        }
+        /*
+           [2026-10 用户报] 价值评估那一张也必须被"清空曲线"清掉 —— 第一版漏了它, 于是
+           "点了清空、别的图空了、它还留着", 用户看到的是"这个按钮对那条曲线没用"。
+           同时把读数行的状态一起复位: 曲线清了而读数行还在报"第 5 局, pairs 138"的话,
+           那个读数就成了**假的**(它描述的是已经被清掉的那批点)。
+           ⚠ 探针本身**不清** (m_valueWinV/Z 那些在 ChessBoard 里, 而且它是"最近 2000 手"
+             的滚动窗口): 这里清的是**画出来的曲线**, 下一个局末的点会接着画 —— 语义与
+             "清空损失曲线"一致 (清的是显示, 不是把已经发生的训练忘掉)。
+        */
+        if (m_valueChart != nullptr) {
+            m_valueChart->removeAllSeries();
+            m_valueChart->addSeries(QStringLiteral("EV (z = 真实胜负 ±1/0; 0 = 常数预测水平)"),
+                                    kSeriesColors[3 % kSeriesColorCount]);
+            m_valueChart->addSeries(QStringLiteral("ρ (z = 引擎口径折扣回报; 0 = 无相关)"),
+                                    kSeriesColors[4 % kSeriesColorCount]);
+        }
+        m_valueCalibErr = 0.0;
+        m_valueSampleCount = 0;
+        m_valueZVar = 0.0;
+        m_valueZVarEng = 0.0;
+        m_valueEvEng = 0.0;
+        m_valueGameNo = 0;
         m_lossSeries.clear();
         m_rewardSeriesA = -1;
         m_rewardSeriesB = -1;
@@ -1353,14 +1741,228 @@ void MainWindow::setupMetricsPanel()
         openLargeChart(ui->rewardChart,
                        QStringLiteral("环境奖励 (每手累计, 局末含 ±1) — 放大"));
     });
+    /*
+       ---- BC 那条曲线的双击放大**不在这里接** ----
+       这一节 (setupMetricsPanel) 跑在 setupChartTabs() **之前**, 此刻 m_bcChart 还是
+       nullptr, 在这里 connect 等于什么都没接 —— 而且它是**静默**的: 没有编译错、
+       没有运行期警告, 现象只是"双击行为曲线没反应"。2026-10 用户报的正是这个。
+       接线放在创建它的地方: setupChartTabs() 末尾。
+    */
+}
+
+/* ============================================================================
+ *  ---- [2026-10] 把"训练损失"与"行为克隆"放进两个 tab (用户口径) ----
+ * ============================================================================
+ * 用户口径: "在 loss 曲线窗口增加一个 tab 显示"。
+ *
+ * 三件事:
+ *   1. 把 .ui 里的 lossChart + lossValueLabel **搬**进第一个 tab 页 (从原布局里
+ *      removeWidget, 再 addTab —— Qt 的标准做法, 控件本身还是原来那两个, 于是
+ *      导出/放大/画点这些接线一行都不用改);
+ *   2. 新建第二个 tab 页: BC 保真度曲线 + 它自己的读数行;
+ *   3. 把 tab 控件插回**原布局里 lossChart 原来的位置** —— 于是右侧那一列的排布
+ *      (比分 / MoE / 曲线 / 奖励曲线 / 按钮 / 对局列表) 与改动前完全一致, 只是原来
+ *      "训练损失"占的那一格现在是两个 tab。
+ *
+ * 为什么 BC 曲线是**两条同量纲的线** (一致率% 与 P(老师)%): CurveChart 只有一根纵轴,
+ * 混量纲的线画在一起就是"两个口径混着比大小"(本工程反复记过的坑)。CE 因此不进曲线,
+ * 它进图下的读数行 (与"损失/奖励"那两行读数同一个做法: 曲线给趋势, 读数给确切的数)。
+ */
+void MainWindow::setupChartTabs()
+{
+    if (ui->lossChart == nullptr || ui->lossValueLabel == nullptr || ui->metricsPanel == nullptr) {
+        return;
+    }
+    QBoxLayout *lay = qobject_cast<QBoxLayout *>(ui->metricsPanel->layout());
+    if (lay == nullptr) {
+        return;      /* 布局结构变了: 不搬了 (宁可没有 tab, 也不要把图搬丢) */
+    }
+    const int at = lay->indexOf(ui->lossChart);
+    if (at < 0) {
+        return;
+    }
+
+    QTabWidget *tabs = new QTabWidget(ui->metricsPanel);
+    tabs->setObjectName(QStringLiteral("chartTabs"));
+
+    /* ---- tab 1: 训练损失 (原来那两个控件, 只是换了个父亲) ---- */
+    QWidget *pageLoss = new QWidget(tabs);
+    pageLoss->setObjectName(QStringLiteral("chartTabLoss"));
+    auto *lossLay = new QVBoxLayout(pageLoss);
+    lossLay->setContentsMargins(0, 0, 0, 0);
+    lossLay->setSpacing(2);
+    lay->removeWidget(ui->lossChart);
+    lay->removeWidget(ui->lossValueLabel);
+    lossLay->addWidget(ui->lossChart, 1);
+    lossLay->addWidget(ui->lossValueLabel);
+    /*
+       tab 文字里刻意带一个 ASCII 记号 ((loss) / (BC)): verify_bc_ui.ps1 要在两个 tab
+       之间切换并断言控件可见性, 而那个脚本必须 ASCII-only (无 BOM 的 .ps1 会被按 ANSI
+       解码)。与自检面板里的 "MaxVio / Loss-Free" 同一个做法。
+    */
+    tabs->addTab(pageLoss, QStringLiteral("训练损失 (loss)"));
+
+    /* ---- tab 2: 行为克隆 (新建的曲线 + 读数行) ---- */
+    QWidget *pageBc = new QWidget(tabs);
+    pageBc->setObjectName(QStringLiteral("chartTabBc"));
+    auto *bcLay = new QVBoxLayout(pageBc);
+    bcLay->setContentsMargins(0, 0, 0, 0);
+    bcLay->setSpacing(2);
+    m_bcChart = new CurveChart(pageBc);
+    m_bcChart->setObjectName(QStringLiteral("bcChart"));
+    /*
+       标题把"怎么读这张图"写进去: 这是一条**代理指标**曲线 —— 它上升说明"更像老师",
+       不是"更强" (docs/training_optimization.md §7.10 的负面结果就写在标题里, 免得
+       曲线被单独引用)。
+    */
+    m_bcChart->setTitle(QStringLiteral(
+        "行为克隆保真度 (每 4 次 actor 更新一个点, 最近 64 条样本窗口): "
+        "一致率 = 策略头选中的着法 == AB 老师那一手 · **代理指标, 不是棋力**"));
+    m_bcChart->setValueSuffix(QStringLiteral(" %"));
+    m_bcChart->setWindow(2000);
+    m_bcValueLabel = new QLabel(pageBc);
+    m_bcValueLabel->setObjectName(QStringLiteral("bcValueLabel"));
+    m_bcValueLabel->setWordWrap(true);
+    m_bcValueLabel->setText(QStringLiteral("行为克隆: 未启用 (在 A/B 面板勾选\"行为克隆训练\")"));
+    bcLay->addWidget(m_bcChart, 1);
+    bcLay->addWidget(m_bcValueLabel);
+    tabs->addTab(pageBc, QStringLiteral("行为克隆 (BC)"));
+
+    /* ---- tab 3 [2026-10]: 价值评估 (critic 的 EV / 校准) ----
+       用户口径: "在奖励窗口增加一个 tab 显示价值评估曲线"。
+       为什么它必须与损失曲线分开一张图 (而不是画在同一条损失曲线上): 量纲与含义都不同 ——
+       损失是 critic 的 MSE (而且目标是**自举**的), 这里的 EV 是"比'永远预测均值'好多少",
+       无量纲、可以为负 (<0 = 还不如常数预测, 本工程实测过 −0.0293)。混在一根纵轴上
+       就是本工程反复记过的"两个口径混着比大小"。
+       ⚠ EV 可以**为负**: CurveChart 的纵轴会自动把 0 线包进来 (recomputeRange), 于是
+       "0 = 不如常数预测"这条参考线天然在图里 —— 这正是读这条曲线唯一需要的参照。 */
+    QWidget *pageValue = new QWidget(tabs);
+    pageValue->setObjectName(QStringLiteral("chartTabValue"));
+    auto *valueLay = new QVBoxLayout(pageValue);
+    valueLay->setContentsMargins(0, 0, 0, 0);
+    valueLay->setSpacing(2);
+    m_valueChart = new CurveChart(pageValue);
+    m_valueChart->setObjectName(QStringLiteral("valueChart"));
+    /*
+       标题写清"怎么读": 0 = 与常数预测同水平, 负 = 还不如常数 (符号/尺度错了),
+       而且它是**跨对局滚动窗口**上的量 (量的是"现在准不准", 不是全程平均)。
+    */
+    m_valueChart->setTitle(QStringLiteral(
+        "价值评估: critic 的 V(s) vs 两种 z (每局结束时算一次, 最近 2000 手窗口) · "
+        "线1 = EV(z=真实胜负); 线2 = **ρ**(z=引擎口径折扣回报, 尺度无关) · "
+        "**0 = 没有信息, 1 = 完美, < 0 = 反着**"));
+    m_valueChart->setValueSuffix(QString());
+    m_valueChart->setWindow(2000);
+    /*
+       两条线 (口径写在线名里, 免得事后分不清哪条是什么):
+         0: **EV**(z = 真实胜负 ±1/0) —— "V 能不能预测胜负"。EV 是尺度敏感的, 所以它只在
+            "同一个尺度的 z" 下才有意义 (z=±1 与 V 同尺度是这个口径的**前提**, 不是巧合)。
+         1: **ρ**(z = 引擎口径折扣回报, γ=0.99) —— "V 与'子力+胜负'的走向是否同向"。
+            ρ 是**尺度无关**的, 所以 V 学的是学习口径 (材质×0.1) 而 z 是引擎口径 (×1) 也
+            能读 —— 这正是用户报"与 MCTS 对弈数值 < 0"暴露出来的那个问题的解:
+            (a) 折扣回报必须用**引擎口径**逐手累加 (与对手是谁无关, 不混口径);
+            (b) EV 在跨口径下会被尺度差吃满 (实测 −24.3) ⇒ 曲线上画 ρ, EV_eng 放读数行。
+       两条线都在"0 = 没有信息"这个意义上可读 (EV: 等价常数预测; ρ: 无相关)。
+    */
+    m_valueChart->addSeries(QStringLiteral("EV (z = 真实胜负 ±1/0; 0 = 常数预测水平)"),
+                            kSeriesColors[3 % kSeriesColorCount]);
+    m_valueChart->addSeries(QStringLiteral("ρ (z = 引擎口径折扣回报; 0 = 无相关)"),
+                            kSeriesColors[4 % kSeriesColorCount]);
+    m_valueValueLabel = new QLabel(pageValue);
+    m_valueValueLabel->setObjectName(QStringLiteral("valueValueLabel"));
+    m_valueValueLabel->setWordWrap(true);
+    m_valueValueLabel->setText(QStringLiteral(
+        "价值评估: 还没有读数 (需要走完一局: 每手的 V(s) 要与该局真实胜负对照)"));
+    valueLay->addWidget(m_valueChart, 1);
+    valueLay->addWidget(m_valueValueLabel);
+    tabs->addTab(pageValue, QStringLiteral("价值评估 (value)"));
+
+    /* ---- 插回原位置 ---- */
+    lay->insertWidget(at, tabs);
+
+    /*
+       ---- [2026-10] BC 曲线的"双击放大"接线**必须在这里** ----
+       它原来写在 setupMetricsPanel() 里 (那一节先跑, 那会儿 m_bcChart 还是 nullptr),
+       于是 connect 被 `if (m_bcChart != nullptr)` 静默跳过: 编译过、跑起来没警告,
+       现象只是"双击行为曲线没反应"(用户 2026-10 报的)。凡是在别处创建的控件,
+       接线就放在**创建它的同一个函数**里 —— 这条比"记住调用顺序"可靠。
+       放大窗口与另外两张同一个入口 (openLargeChart 内部按 source 缓存窗口,
+       所以三张图各有一个放大窗, 互不干扰)。
+       extraReadout: 把 CE 一起带过去 —— 它不在曲线上 (百分比 vs 交叉熵, 不同量纲),
+       只在读数行里, 而放大窗口的读数行是**从曲线数据重新格式化**出来的, 不问一句就
+       会少掉 CE。问的是一个回调, 所以窗口开着时 CE 会跟着对局更新。
+    */
+    connect(m_bcChart, &CurveChart::doubleClicked, this, [this]() {
+        openLargeChart(m_bcChart, QStringLiteral("行为克隆保真度 (放大)"),
+                       [this]() { return bcFidelityCeTail(); });
+    });
+    /*
+       [2026-10] 价值评估那条曲线同样能双击放大 (与另外三张同一个入口): 它的读数行里
+       有校准误差/样本数/方差, 那些**不在曲线上**, 所以同样用 extraReadout 回调带过去 ——
+       否则放大窗口一开就少三个数 (这个坑在 BC 那张图上已经踩过一次)。
+    */
+    connect(m_valueChart, &CurveChart::doubleClicked, this, [this]() {
+        openLargeChart(m_valueChart, QStringLiteral("价值评估 (放大)"),
+                       [this]() { return valueDiagTail(); });
+    });
+}
+
+/*
+   "不在曲线上的那一段"读数 (BC 的 CE 与窗口大小) —— 单独抽出来是为了让**源控件那行
+   标签**与**放大窗口里的读数行**用同一份格式化: 两处各写一遍迟早会分叉, 而"放大窗口
+   少一个数"这种分叉在界面上几乎看不出来。没采过样时返回空串 (那时不该出现 CE)。
+*/
+QString MainWindow::bcFidelityCeTail() const
+{
+    if (m_bcLastFidTop1 < 0.0) {
+        return QString();
+    }
+    return QStringLiteral(" | 最近 CE %1 (窗口 %2 条)")
+        .arg(m_bcLastFidCe, 0, 'f', 4)
+        .arg(m_bcLastFidWindow);
+}
+
+/*
+   "不在价值曲线上"的那一段读数 (校准误差 / 样本对数 / Var(z)) —— 与 BC 的 CE 同一个
+   理由: 它们的量纲与 EV 不同 (校准误差 ∈ [0,2], 样本数是计数), 混在同一根纵轴上就是
+   "两个口径混着比大小"。源标签与放大窗口共用这一份, 免得两处各写一遍而分叉。
+   还没出过点时返回空串 (那时它不该出现)。
+*/
+QString MainWindow::valueDiagTail() const
+{
+    /*
+       "不在曲线上的数" —— 而且**必须包含"为什么没有点"**: 读数行是常驻控件, 而面板里
+       那行说明会被对局结束时的整段刷新冲掉 (用户实测"几轮都没有曲线"时, 界面上什么都
+       看不到, 原因就在这)。三种原因写清楚, 下一步动作完全不同:
+         * pairs < 32        -> 再走几局 (只采到有 V 头那一方的着手: PPO 两支)
+         * Var(z_胜负) = 0   -> 被采样的手结果符号全一样 (全和棋 / 一路输) ⇒ EV 无定义
+         * Var(z_引擎回报)=0 -> 连引擎口径折扣回报都一样 (几乎不会发生)
+    */
+    const bool needMore = (m_valueSampleCount < 32);
+    QString t = QStringLiteral(" | EV_eng %1 · 校准误差 %2 · Var(z): 胜负 %3 / 引擎回报 %4"
+                               " · 第 %5 局 · pairs %6%7")
+                    .arg(std::isnan(m_valueEvEng) ? QStringLiteral("n/a")
+                                                  : QString::number(m_valueEvEng, 'f', 3))
+                    .arg(m_valueCalibErr, 0, 'f', 3)
+                    .arg(m_valueZVar, 0, 'f', 3)
+                    .arg(m_valueZVarEng, 0, 'f', 3)
+                    .arg(m_valueGameNo)
+                    .arg(m_valueSampleCount)
+                    .arg(needMore ? QStringLiteral(" (需 >= 32)") : QString());
+    if (m_valueZVar <= 1e-9) {
+        t += QStringLiteral(" · 胜负口径无方差: 被采样的着手结果符号全一样 (全和棋/一路输)");
+    }
+    return t;
 }
 
 /*
    双击曲线 -> 弹一个 900x560 的独立窗口 (可缩放、可拖到别的屏幕), 内容与源控件
    实时同步 (CurveChartDialog::follow 接的是源控件的 dataChanged 信号)。
    同一个源只留一个窗口: 已经开着就抬到前面 (再双击不会开出一堆重复窗口)。
+   extraReadout: 见 CurveChartDialog::follow 的说明 (BC 那张图用它把 CE 带过去)。
 */
-void MainWindow::openLargeChart(CurveChart *source, const QString &title)
+void MainWindow::openLargeChart(CurveChart *source, const QString &title,
+                                const std::function<QString()> &extraReadout)
 {
     const auto it = m_largeCharts.find(source);
     if (it != m_largeCharts.end() && it.value() != nullptr) {
@@ -1370,8 +1972,12 @@ void MainWindow::openLargeChart(CurveChart *source, const QString &title)
         return;
     }
     auto *dlg = new CurveChartDialog(title, this);
-    dlg->chart()->setValueSuffix(source == ui->lossChart ? QString() : QString());
-    dlg->follow(source);
+    /*
+       纵轴单位在 CurveChartDialog::syncFromSource() 里从源控件抄 (follow 会给它),
+       这里不再自己写一份 —— 这里原来那行是 `source == ui->lossChart ? QString() :
+       QString()`, 两个分支一模一样, 等于没设, 于是"保真度"放大之后数字没有 "%"。
+    */
+    dlg->follow(source, extraReadout);
     /* 关掉时把表里的指针清掉 (窗口是 WA_DeleteOnClose, 会自己析构) */
     connect(dlg, &QObject::destroyed, this, [this, source]() {
         m_largeCharts.remove(source);
@@ -1399,6 +2005,39 @@ void MainWindow::updateMetricsLabels()
     */
     ui->rewardValueLabel->setText(
         ui->rewardChart->readoutText(QStringLiteral("奖励(局内累计)")));
+    /*
+       ---- [2026-10] BC 保真度那一条 ----
+       图表只画"一致率 / P(老师)"两条**同量纲**的线, 而 CE 与它们不同量纲 ⇒ 不画, 放在
+       这一行里。三件事一起给 (与"损失/奖励"两行同一个做法): 曲线给趋势, 读数给确切的数。
+       `readoutText` 里已经带了每条线的最新值/均值/样本数, 这里再补 CE 与窗口大小。
+    */
+    if (m_bcChart != nullptr && m_bcValueLabel != nullptr) {
+        /* 曲线上的数走 readoutText, "不在曲线上的数"(CE) 由 bcFidelityCeTail 给 ——
+           放大窗口用的是同一对 (见 setupChartTabs 末尾的接线), 两处不会分叉。 */
+        m_bcValueLabel->setText(
+            m_bcChart->readoutText(QStringLiteral("克隆保真度")) + bcFidelityCeTail());
+    }
+    /*
+       ---- [2026-10] 价值评估那一行 ----
+       与 BC 那一行同一个做法: 曲线给趋势 (EV), 读数行给"不在曲线上的数"(校准误差 /
+       样本对数 / Var(z))。没出过点时给一句解释, 而不是留空 —— 空行会被读成"没这个功能"。
+    */
+    if (m_valueChart != nullptr && m_valueValueLabel != nullptr) {
+        /*
+           读数行**永远**给状态 (曲线可能是空的, 但原因必须看得见):
+             * 已经有局结束过 (m_valueGameNo > 0) -> 曲线读数 + "不在曲线上的数" + 为什么没点;
+             * 一局都还没结束 -> 说明它在等什么。
+        */
+        QString t = m_valueChart->readoutText(QStringLiteral("价值评估 EV"));
+        if (m_valueGameNo > 0) {
+            t += valueDiagTail();
+        } else {
+            t = QStringLiteral("价值评估: 还没有读数 —— 每个点是**一局结束时**算的 "
+                               "(需要: 走完一局 + 该方有 V 头(PPO 两支) + 折扣回报有方差); "
+                               "只采有 V 头那一方的着手, 所以 pairs 约等于它走过的步数");
+        }
+        m_valueValueLabel->setText(t);
+    }
 }
 
 /*
@@ -1542,6 +2181,23 @@ void MainWindow::selfCheckWorkerLoop()
                 text += QString::fromStdString(report);
                 text += QStringLiteral("\n(点\"全部模型自检\"可以把所有 agent 排在一起对比)");
             }
+            /*
+               ---- [2026-10] 最近一次行为克隆 (BC) 的报告 ----
+               为什么贴在**这里** (而不是新建一个文本视图): 见 mainwindow.h 里
+               buildBcControls 上面那三条理由 —— 核心是"这一列没有滚动区, 少一个视图就少
+               一类'看不见'的坑", 而且报告存在 ChessBoard 里, 每次刷新都拼回来, 于是
+               下一手棋的自检刷新不会把 BC 的结果冲掉。
+               报告自带抬头 (=== 行为克隆 (BC) ... / agent : <名字>), 所以即使它属于
+               **另一个** agent, 也不会被误读成"当前 agent 的数据"。
+            */
+            const QString bc = ui->gameWidget->bcReportText();
+            if (!bc.isEmpty()) {
+                text += QStringLiteral("\n\n---------- 最近一次行为克隆 (BC) ----------\n");
+                text += bc;
+                if (text.right(1) != QLatin1String("\n")) {
+                    text += QStringLiteral("\n");
+                }
+            }
         }
 
         {
@@ -1652,6 +2308,164 @@ void MainWindow::resetMetricsForMatch(const QString &agentA, const QString &agen
                                 : QStringLiteral(" [引擎口径]");
     m_rewardSeriesA = ui->rewardChart->addSeries(agentA + suffixA, kSeriesColors[0]);
     m_rewardSeriesB = ui->rewardChart->addSeries(agentB + suffixB, kSeriesColors[1]);
+
+    /*
+       ---- [2026-10] "行为克隆"那张曲线: 每场换一次线 ----
+       建线判据与"清线"都在 armBcChartSeries 里 (人机那条路共用同一份实现 ——
+       否则两条路各写一遍,"人机里曲线一直是空的"这类缺口会再长出来一次)。
+    */
+    armBcChartSeries(ChessBoard::bcHasStudent(m_matchTypeA, m_matchTypeB),
+                     ui->gameWidget->bcTeacherDepth(), false);
+}
+
+/*
+ * ============================================================================
+ *  armBcChartSeries - "行为克隆"那张曲线上该不该有线"的唯一一处实现 (2026-10)
+ * ============================================================================
+ *
+ * 两种模式共用它:
+ *   * **Agent 对 Agent**: 每场开始 (`resetMetricsForMatch` ← `matchStarted`);
+ *   * **人机对弈**: 每局开始 (`humanGameStarted` ← 玩家落下本局第一子)。
+ *
+ * 为什么必须共用: 两条路的触发时机不同, 但"什么时候该有线"是同一条判据 ——
+ *   `老师下拉框 ≠ 关` **且** `场上/对战AI 那一侧能做 BC 学生`。
+ * 两条路各写一遍的代价, 本工程刚刚付过一次: 人机那条路没建线, 而
+ * `CurveChart::addPoint` 在序列不存在时是**静默 return** ⇒ "BC 明明在训练(面板有
+ * samples/updates), 曲线却一直空着"。所以这里不只是"抽个函数", 是把**静默**那一半堵掉。
+ *
+ * `studentAvailable`: 这一场/这一局里有没有学生 (对局: `bcHasStudent(A,B)`;
+ *                     人机: `bcSupported(对战AI)`)。判据在调用方算, 因为它只有调用方知道。
+ * `humanMode`: 只影响"没开"时那句读数的措辞 (两种模式的原因不同, 下一步动作也不同)。
+ *
+ * 清线 (而不是清点) 是刻意的: 横轴是"**这一场/这一局**的第几次 actor 更新", 而人机那条路
+ * 的计数器每局归零 (`bcResetMatchStats`), 所以点数必须跟着从零开始 —— 否则同一张图上会
+ * 出现"上一局的 4,8,12…"与"这一局的 4,8,12…"接在一起, 横轴就不是一个时间轴了。
+ */
+bool MainWindow::armBcChartSeries(bool studentAvailable, int teacherDepth, bool humanMode)
+{
+    if (m_bcChart == nullptr) {
+        return false;
+    }
+    m_bcChart->removeAllSeries();
+    m_bcLastFidTop1 = -1.0;
+    m_bcLastFidPTeacher = -1.0;
+    m_bcLastFidCe = -1.0;
+    m_bcLastFidWindow = 0;
+    /*
+       [2026-10 用户口径] 建线的条件: 老师来自**下拉框** (与对手无关), 所以只要
+       "下拉框不是关" **且** "有一侧能做学生"就建线。
+       旧条件是"一边 AB + 一边可训练 agent" —— 那会让"PPO vs MCTS 并且选了老师"这一场
+       明明在克隆却不画线 (读数与曲线对不上)。
+    */
+    const bool ok = (teacherDepth > 0) && studentAvailable;
+    if (ok) {
+        m_bcChart->addSeries(QStringLiteral("一致率 (策略头 top-1 == 老师那一手)"),
+                             kSeriesColors[0]);
+        m_bcChart->addSeries(QStringLiteral("P(老师着法)"),
+                             kSeriesColors[2 % kSeriesColorCount]);
+    }
+    updateMetricsLabels();
+    if (!ok && m_bcValueLabel != nullptr) {
+        /*
+           没开的原因要**分开写**: "老师是关的"与"对手/对战AI 那一支没有策略头"是两件事,
+           用户的下一步动作完全不同 (拧下拉框 vs 换 agent)。与人机那条路的说明一一对应。
+        */
+        m_bcValueLabel->setText(
+            humanMode
+                ? QStringLiteral("行为克隆: 没开 (人机对局里 学生 = \"对战AI\" 那一支, 老师 = "
+                                 "上面那个下拉框; 现在 %1)")
+                      .arg(teacherDepth <= 0
+                               ? QStringLiteral("老师还是\"关\"")
+                               : QStringLiteral("\"对战AI\" 那一支不是 PPO/SAC, 没有策略头可克隆"))
+                : QStringLiteral("行为克隆: 没开 (在 A/B 面板把\"行为克隆训练\"选成某一档 "
+                                 "Alpha-Beta; 场上还需要有一支 PPO/SAC —— 老师与对手无关)"));
+    }
+    /*
+       ---- [2026-10] 面板里留一行机器可读的"曲线准备好了没有" ----
+       为什么必须有它: "曲线是空白的"有**两种完全不同的原因** ——
+         (a) 还没建线 (人机对弈那条路在 2026-10 之前一直如此: 没有 matchStarted, 而
+             `addPoint` 在序列不存在时静默 return ⇒ 读数在动、曲线永远空);
+         (b) 建了线但样本还不够 (保真度要 ≥8 条样本、每 4 次 actor 更新才出第一个点)。
+       两种在图上看起来**一模一样**, 而下一步动作完全不同 (前者是缺陷, 后者是等一会儿)。
+       所以把状态写成一行带 ASCII 记号的读数: verify_bc_ui.ps1 据此断言"人机那条路真的
+       建了线", 用户也能一眼看出卡在哪一步。与自检面板里的 MaxVio / Loss-Free 同一做法。
+    */
+    if (ui->selfCheckView != nullptr) {
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+        ui->selfCheckView->insertPlainText(
+            QStringLiteral("[BC] 曲线%1 (chart-%2): 老师=%3 [teacher-depth=%4] [mode=%5]\n")
+                .arg(ok ? QStringLiteral("已建线") : QStringLiteral("未建线"),
+                     ok ? QStringLiteral("armed") : QStringLiteral("not-armed"),
+                     (teacherDepth > 0) ? ChessBoard::bcTeacherName(teacherDepth)
+                                        : QStringLiteral("关"))
+                .arg(teacherDepth)
+                .arg(humanMode ? QStringLiteral("human") : QStringLiteral("match")));
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+    }
+    return ok;
+}
+
+/*
+ * onBcFidelitySample - "行为克隆"那条曲线的一个点 (2026-10)
+ *
+ * 数据源: `ChessBoard::bcFidelitySample`, 在对弈线程里每 4 次 actor 更新发一次
+ * (口径与命令行 `train_bc` 的 `BC::evaluate` 完全同一份实现)。
+ *
+ * 两条线都是**百分比**, 所以画在同一根纵轴上不会出现"两个口径比大小"的问题:
+ *   * 一致率 top-1 (%) : 策略头单独选中的着法 == AB 老师那一手 的比例
+ *   * P(老师着法) (%)  : 策略头给老师那一手的平均概率
+ * CE 不进曲线 (不同量纲) —— 它进图下的读数行, 与上面两个数一起显示。
+ */
+void MainWindow::onBcFidelitySample(int updateNo, double top1Pct, double pTeacher,
+                                    double ce, int windowN)
+{
+    Q_UNUSED(updateNo);
+    m_bcLastFidTop1 = top1Pct;
+    m_bcLastFidPTeacher = pTeacher;
+    m_bcLastFidCe = ce;
+    m_bcLastFidWindow = windowN;
+    if (m_bcChart != nullptr) {
+        m_bcChart->addPoint(0, top1Pct);
+        m_bcChart->addPoint(1, pTeacher * 100.0);
+    }
+    updateMetricsLabels();
+}
+
+/*
+ * onValueDiagSample - "价值评估"那条曲线的一个点 (2026-10)
+ *
+ * 数据源: `ChessBoard::valueDiagSample`, 在**每局结束时**发一次: 把本局每手记下的
+ * V(s) 与该局的真实结果 (走子方视角的 +1/0/−1) 对照, 在"最近 2000 手"的滚动窗口上算
+ * **解释方差 EV** (以及校准误差)。口径与 `bench_diag` 的 [1b] 完全同一份实现
+ * (`RL::Diag::explainedVariance` / `calibration`), 所以命令行与界面上的两个数可比。
+ *
+ * 为什么曲线上只有一个 EV 而校准误差只在读数行: 量纲不同 (EV ∈ (−∞,1] 无量纲,
+ * 校准误差 ∈ [0,2] 是"概率差"), 画在一根轴上就是两个口径混着比大小。
+ *
+ * ⚠ 这个槽**只在真正有读数时被调用** —— "全是和棋 (Var(z)=0) 导致 EV 无定义"那种情况
+ *   ChessBoard 侧就不发信号了 (它会往自检面板写一行说明), 所以曲线里不会出现
+ *   "假 0"(看起来像"V 和常数预测一样烂")。
+ */
+void MainWindow::onValueDiagSample(int gameNo, double evWin, double rhoEng, double evEng,
+                                   double calibErr, int pairs, double zVarWin, double zVarEng)
+{
+    m_valueCalibErr = std::isnan(calibErr) ? 0.0 : calibErr;
+    m_valueSampleCount = pairs;
+    m_valueZVar = zVarWin;
+    m_valueZVarEng = zVarEng;
+    m_valueEvEng = evEng;
+    m_valueGameNo = gameNo;      /* > 0 = 已经有过至少一局结束 (读数行据此决定说什么) */
+    /*
+       两条线各画各的点。**NaN 不上图** —— CurveChart::addPoint 对非有限值直接丢弃,
+       所以"某一口径无方差"时那条线就是不增长, 而不是掉到 0 (看起来像"critic 很烂")。
+    */
+    if (m_valueChart != nullptr) {
+        /* NaN 不上图 (CurveChart::addPoint 对非有限值直接丢弃) ⇒ 算不出来的那条线不增长,
+           而不是掉到 0 (0 会被读成"没有信息"/"反着")。 */
+        m_valueChart->addPoint(0, evWin);
+        m_valueChart->addPoint(1, rhoEng);
+    }
+    updateMetricsLabels();
 }
 
 /* agent 名 -> 损失曲线下标; 第一次见到这个 agent 时新建一条 */
@@ -1774,6 +2588,30 @@ void MainWindow::exportMetricsCsv()
     out << "\n";
     out << ui->rewardChart->toCsv(
         QStringLiteral("环境奖励 (每手一个点; 值是本局累计, 局末那点含终局 +-1)"));
+    /*
+       ---- [2026-10] 第三段: 行为克隆保真度 ----
+       与上面两段同一个理由 (行号口径不同, 所以分段 + 各自的注释行): 这一段的行号是
+       **actor 更新次数**, 而不是"第几手"或"第几局"。两个量纲 (一致率 % / P(老师) %) 相同,
+       所以能并排; CE 不在这一张图里 (见 setupChartTabs 的说明)。
+    */
+    if (m_bcChart != nullptr && m_bcChart->seriesCount() > 0) {
+        out << "\n";
+        out << m_bcChart->toCsv(QStringLiteral(
+            "行为克隆保真度 (每 4 次 actor 更新一个点, 最近 64 条样本窗口; "
+            "一致率 = 策略头选中的着法 == AB 老师那一手; 代理指标, 不是棋力)"));
+    }
+    /*
+       ---- [2026-10] 第四段: 价值评估 (critic 的 EV) ----
+       行号口径 = **局号** (每个点一局), 与上面三段都不同, 所以同样要单独分段 + 写注释行。
+       为什么值得导出: EV 是需要"跨配置比较"的量 (改了 critic/骨干/塑形之后, 它是唯一能
+       回答"价值有没有变准"的数), 而界面上的曲线只留最近 2000 个点。
+    */
+    if (m_valueChart != nullptr && m_valueChart->seriesCount() > 0) {
+        out << "\n";
+        out << m_valueChart->toCsv(QStringLiteral(
+            "价值评估 (每局一个点, 最近 2000 手滚动窗口; EV = 1 − Var(z−V)/Var(z), "
+            "z = 该局真实结果(走子方视角); 0 = 不如常数预测, 1 = 完美)"));
+    }
     f.close();
     QMessageBox::information(this, QStringLiteral("导出完成"),
                              QStringLiteral("已写出: %1").arg(path));

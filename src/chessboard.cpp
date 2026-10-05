@@ -1,5 +1,7 @@
 #include "chessboard.h"
+#include "bcagent.hpp"      /* 行为克隆的 agent 胶水层 (sampleFrom / update; 2026-10) */
 #include "rl/cpuinfo.hpp"
+#include "rl/diag.h"        /* 价值评估曲线的口径: zFromGameResult / valueDiagOf (2026-10) */
 /*
    [2026-10 用户口径 "对弈期间不更新保存模型权重"] 临时权重路径改走内存的通道。
    放在 chessboard.cpp 顶层: 本文件里"武装/解除 + 三条边界"是它唯一的用法。
@@ -267,20 +269,27 @@ static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
  * "先验前 N 名的均匀分布"。80 次时实测仍有约 48% 的访问落在"每个孩子一次"的
  * 地板里 (bench_ppo_sims 的根节点诊断), 400 次降到约 10%。
  *
- * ---- [2026-10] E/top-k 从 4/1 提到 8/2 之后, 这个预算的**代价变了** (实测) ----
+ * ---- [2026-10] E/top-k 已经来回切过一次, 这个预算的**代价**跟着变 (实测) ----
  * 同一台机器 (bench_ppo_backbone_tb + tools/measure_peak_working_set.ps1):
- *   E=4/top-1: 单网络前向 3.59 ms, 400 模拟 ≈ 3.2 s/步   (旧读数)
- *   E=8/top-2: **20.1 ms/模拟 -> 400 模拟 = 8.0 s/步**; 参数量 76 M -> 207.8 M;
- *              峰值工作集 3,301 MB (actor+critic 各背一套完整 TB 专家, 四份缓冲)
- * 也就是"每步等到 8 秒"。这不是 bug, 是 top-k 直接乘算力的必然结果 —— 所以:
- *   * 想保持"每步 3 秒"的感觉, 就把这个数降到 **~160**; 但要记住 160 已经接近
- *     "分支数 38.7 的 4 倍", 深挖余量比 400 时薄得多 (那正是搜索值钱的地方);
- *   * 想保持搜索深度, 就接受 8 s/步 (界面有沙漏 + 状态条, 不至于像死机);
- *   * 想"又快又深", 换 `PPO+MCTS (MLP专家)` 那一支: 同一份搜索代码、0.22 ms/模拟,
- *     1600 模拟 ≈ 0.35 s/步 —— 它的骨干便宜 ~90 倍 (见 rl/ppo.h 顶部那张表)。
- * 一句话: **top-k 那一半是拿"模拟次数"换"容量"**, 而模拟次数是本工程唯一测出过
- * 棋力的杠杆 (40/64/120 -> 42.2%/50.0%/62.5%), 所以这个数字要不要跟着改, 是个
- * 需要用户决定的取舍, 不该由代码偷偷改掉。
+ *   E=4/top-1 (当前): 参数量 actor+critic **104.3 M**, **11.02 ms/模拟 ->
+ *                     400 模拟 = 4.31 s/步**, 峰值工作集 **1,608 MB**
+ *                     (2026-10 切回 4/1 当天实测; 早期注释里那个 "≈3.2 s" 是另一个
+ *                      量法/另一个版本的旧读数, 以本节这组同工具同日读数为准)
+ *   E=8/top-2 (已回退): 20.1 ms/模拟 -> 400 模拟 = 8.0 s/步; 参数量 207.8 M;
+ *                     峰值工作集 3,301 MB (actor+critic 各背一套完整 TB 专家, 四份缓冲)
+ * **2026-10 第二次用户口径已切回 4/1** (`rl/ppo.h` 的 PPO_MOE_EXPERTS/TOPK), 于是
+ * 那个"每步等到 8 秒"的时代结束了 —— 而 400 这个数**刻意不动**:
+ *   * 用户口径原文是"保持 400, 恢复到历史配对": 4/1 配 400 模拟本来就是 2026-10 之前
+ *     的那一档, 切回去等于**免费把每步从 8.0 s 拿回 4.3 s**, 搜索深度一点没减;
+ *   * "模拟次数 ≫ 分支数 (~38.7)"是 π 目标有没有信息量的分水岭 (见 BG_TRAIN_SIMS 的
+ *     长注释), 而"模拟次数"又是本工程**唯一测出过棋力**的杠杆 (40/64/120 ->
+ *     42.2%/50.0%/62.5%) —— 所以在"省下来的算力怎么花"这件事上, 唯一有证据的答案是
+ *     **别花掉**: 留着它换墙钟。
+ *   * 哪天真想把这省下来的时间再换成搜索, 就把这个数抬到 ~1000 (回到 ~10 s/步) —— 那是
+ *     一个需要用户开口的取舍, 不该由代码偷偷改掉。
+ *   * 想"又快又深"还有第三个出口: 换 `PPO+MCTS (MLP专家)` 那一支, 同一份搜索代码、
+ *     0.22 ms/模拟, 1600 模拟 ≈ 0.35 s/步 —— 它的骨干便宜 ~90 倍 (见 rl/ppo.h 顶部那张表)。
+ * 一句话: **top-k 那一半本来就是拿"模拟次数"换"容量"的**, 切回 4/1 就是把这个交换退掉。
  */
 static constexpr int PPO_SIMS = 400;          /* PPO+MCTS 每次决策的模拟次数 */
 /*
@@ -772,21 +781,19 @@ static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
            而且 π / Q / V **逐位相同** (把独立口径的三个骨干也设成同一份之后)。
            于是"同一套算法、同样的预算"下能跑的模拟次数从 ~19 变成 ~42。
 
-       ⚠ **[2026-10 E=8/top-2] 上面那三行数字是 E=4 时代量的, 现在是两倍量级。**
-           专家数 4 -> 8 之后: 每个 TB 专家 ≈ 7.17 M 参数 => 一张网的专家部分
-           28.8 M -> 57.4 M, 共享口径的唯一参数量 57,586,536 -> **114,969,680**
-           (2.00x, 实测); 峰值工作集 577 MB -> **1,138 MB** (1.97x, 实测, 见下);
-           learnBatch 也随 top-2 翻倍 (那 225.6 ms/批 现在约 **450 ms/批**,
-           32 条 ≈ 3.6 s/手)。
-           结论没变 (共享仍然比独立省一半、快一倍以上), 但**绝对值要按新的看** ——
-           照旧引用 57,586,536 / 225.6 ms 会把这一支的代价低估一半。
-           改这两个常量时**这里也要改**, 见 `sacazmoetbagent.h` 的 MOE_TB_EXPERTS。
-           工作集的量法 (E=8 那个数): 20 局不必跑满, 网络张量才是大头 ——
+       ⚠ **[2026-10 E/top-k 又切回 4/1] 上面那三行数字现在是"当前档"的读数, 因为
+            `MOE_TB_EXPERTS/MOE_TB_TOPK` 已经按用户口径降回 4/1。** 中间那一版
+           (E=8/top-2) 的读数保留在这里做对照 —— 它正是"要不要再提上去"的依据:
+               唯一参数量 57,586,536 (E=4/1) -> **114,969,680** (E=8/2, 2.00x, 实测);
+               峰值工作集 577 MB -> **1,138 MB** (1.97x, 实测);
+               learnBatch 225.6 ms/批 -> 约 **450 ms/批** (32 条 ≈ 3.6 s/手, top-2 翻倍)。
+           工作集的量法 (E=8 那个数; 换成 E=4 只需同命令重跑):
                bench_sacmoetb_train --train-games=2 --train-sims=8 --train-plies=24
                  --learn-every=4 --openings=1 --opening=4 --eval-plies=20 --eval-sims=8
                  --opponent=ab --aux=0.1 --lossfree-bias=1 --lossfree-bias-rate=0.01
-           跑的时候每 0.4 s 采一次 WorkingSet64/PeakWorkingSet64 取最大 =
-           **1,138 MB** (日志 build/gate_moe_out/E8k2_workingset.txt)。
+           跑的时候每 0.4 s 采一次 WorkingSet64/PeakWorkingSet64 取最大
+           (E=8 那次 = **1,138 MB**, 日志 build/gate_moe_out/E8k2_workingset.txt)。
+           改这两个常量时**这里也要改**, 见 `sacazmoetbagent.h` 的 MOE_TB_EXPERTS。
 
        **权重文件必须换前缀** (weights/sacaz_moe_shared_agent): 共享口径写 4 个文件
        (trunk + 三个头), 独立口径写 3 个 (_actor/_q1/_q2), 两者的 `_q1` 语义完全
@@ -1184,7 +1191,8 @@ void ChessBoard::startupLoad()
         }
         m_sfSACAZMoe->loadModel(prefix);
         logLoad("SAC+AZ-MoE 读权重(3 x 146 MB)");
-    }    if (s_weightPaths.count(AGENT_SACAZ_MOE_MLP)) {
+    }
+    if (s_weightPaths.count(AGENT_SACAZ_MOE_MLP)) {
         /*
            [2026-09 独立类] MoE+MLP 那一支的预加载: 与 TB 那一块对称, 只换类/前缀/文件数。
            共享口径写 4 个文件 (trunk + 三个头), 所以拨掉的是 "_actorhead" 后缀
@@ -2794,7 +2802,28 @@ long long ChessBoard::divertedWeightBytes() const
 
 void ChessBoard::setHumanGameInProgress(bool on)
 {
-    m_playDivertHuman.store(on);
+    /*
+       [2026-10] "这一局人机开始了" 的**唯一**时刻: 玩家落下这一局的**第一子**时
+       (`m_playDivertHuman` false -> true)。为什么在这里发信号、而不是新加一个 reset 钩子:
+       * 本函数在**每次**玩家落子时都会被调 (幂等), 所以只有这个跳变能代表"新的一局";
+       * 人机那条路**没有** `matchStarted` 那种"场开始"信号, 而界面需要它来给
+         "行为克隆" 那条曲线建线 —— 不建线的话 `CurveChart::addPoint` 是**静默 return**,
+         表现就是"人机里 BC 明明在训练, 曲线却一直空着"(2026-10 用户报的缺口)。
+       为什么按"玩家第一子"算而不是按"按了开局": 启动后直接走子也是一局棋, 而那时没人
+       按过开局 —— 与上面那条"对弈期间权重不落盘"的起算口径逐字一致。
+    */
+    const bool was = m_playDivertHuman.exchange(on);
+    if (on && !was) {
+        emit humanGameStarted();
+    }
+    /*
+       [2026-10] 人机那一局的 BC 读数在**这一局结束时**(或重开一局时) 收尾:
+       清掉"本局已经归零过"的标志 ⇒ 下一局的第一次采样会重新归零 (见 bcSampleForHumanTurn)。
+       人机没有"场"的概念, 所以"一局"就是读数的单位 —— 与对局那条路每场归零同一个口径。
+    */
+    if (!on) {
+        m_bcHumanSession.store(false);
+    }
     updatePlayWeightDivert();
 }
 
@@ -3473,6 +3502,16 @@ Step ChessBoard::humanTurnAiMoveForTest(int color)
                .arg(color).arg(agentDisplayName(m_agentType)));
     setSideRole(sideRoleForHumanGame());
     const Step step = aiThinkRaw(color);
+    /*
+       ---- [2026-10 用户口径] 人机对战里也要能"顺便克隆" ----
+       用户口径要的就是"与人类棋手对弈时照常做行为克隆" (老师来自下拉框, 与人无关)。
+       时机: **决策之后**、落子之前 —— 此刻 `chess` 还是"AI 要走的那一步"的原局面,
+       正是那条样本的定义 (学生=AI 的局面 + 下拉框那一档 AB 在该局面的着法)。
+       为什么在 humanTurnAiMoveForTest 而不是 aiThinkRaw 里: 这个函数是**两份实现共用**
+       的那一份 (aiThink 与测试钩子都委托给它), 放这里人机路径不会漏、测试也覆盖得到。
+       三个闸门 (老师>0 / 训练模式 / 这一支能做学生) 都在 bcSampleForHumanTurn 里。
+    */
+    bcSampleForHumanTurn(m_agentType, color);
     const double waited = dbgNowMs() - t0;
     dbgWait(QStringLiteral("aiThink 结束 (valid=%1)").arg((int)step.valid), waited);
     return legalStepOrFallback(color, step, agentDisplayName(m_agentType));
@@ -4619,6 +4658,15 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
     rewardA = 0.0;
     rewardB = 0.0;
     /*
+       [2026-10] 价值评估: 本局的 (V, mover) 采样从**空**开始。
+       放在函数头而不是"第一次采样时清": 上一局如果是**被中止**的 (matchAgents 里那条
+       break), 它的残留会被这一局接着用 —— 而那些样本对应的 z 谁也说不清。
+    */
+    m_valueGameV.clear();
+    m_valueGameSampleIdx.clear();
+    m_valueGameStep.clear();
+    m_valueGameStepMover.clear();
+    /*
       红/黑 -> A/B 的换算只写一次 (以前 matchAgents 里又算了一遍, 两处规则必须永远
       一致, 否则"逐局明细里的奖励"和"曲线上的点"会对不上)。被中止时也要同步一次,
       所以包成 lambda, 每个出口都调。
@@ -4736,11 +4784,71 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
             break;
         }
 
+        /*
+           ---- [2026-10 用户口径] 对局中行为克隆: **学生走一手** -> 一条样本 ----
+           判据与上一版不同 (这是本轮的口径改动): 老师不再由对手充当, 而是**下拉框**选的
+           那一档 AB, 所以这里判的是"**走这一手的这一方是不是能做 BC 的学生**" ——
+           对手是谁 (AB / 别的 agent / 人) 完全不参与判定。
+           三个条件缺一不可 (与 bcSampleForHumanTurn 那三个逐条对齐):
+             * 下拉框不是"关" (老师深度 > 0);
+             * 模式是**训练对局** —— 评估/只对弈声称"权重不变", 而 BC 是学习;
+             * 走这一手的 agent 有 BC 路径 (PPO 两支 / SAC 三支)。
+           判定放在棋盘锁**外面** (只读几个 atomic/常量), 位置样本在锁内拷, 干活在锁外 ——
+           锁的顺序因此只有一种 (棋盘 -> agent), 与 getAgentSelfCheck / 下面那段
+           终局值同步 (envLock) 完全一致。
+        */
+        const bool bcOn = (m_bcTeacherDepth.load() > 0) && (m_matchMode.load() == MATCH_TRAIN)
+                          && bcSupported(who);
+        const AgentType bcStudent = who;
+        Chess bcPos;
+        /* 走这一手的是哪一方 (BC 样本的 color 必须是它, 而不能读下面已经被翻过的 turn) */
+        int bcMover = Stone::COLOR_NONE;
+        /*
+           ---- [2026-10] 价值评估: 这一手的 V(s) 探针 ----
+           同一个时序要求 (必须在 moveForward 之前取局面), 但它服务的是另一件事:
+           BC 要的是"学生这一手"当监督样本, 而价值评估要的是"agent 在**这个局面**上
+           把价值估成了多少", 局末再与真实胜负对照 (EV/校准)。
+           只在**走这一手的 agent 有标量 V 头**时采 (PPO 两支); 代价是一次 critic 前向。
+        */
+        const bool valueProbeOn = valueProbeOfSupported(who);
+        Chess vPos;
+        int vMover = Stone::COLOR_NONE;
+        /*
+           本手之前的**引擎口径**累计奖励 —— 用来求"这一手的引擎口径即时奖励"。
+           ⚠ 必须用引擎口径 (engineRed/engineBlack), **不是** rewardRed/rewardBlack:
+           后者是"有学习口径就用学习口径、否则回退引擎口径"的两本账, 与 AB/MCTS 对弈时
+           一局之内会混两种口径 (材质 ×0.1 与 ×1), 于是折扣回报被对手那本账主导, V 与它
+           反着走 ⇒ 曲线上读到负值 (用户报的"与 MCTS 对弈数值小于 0")。
+           引擎口径对每一手都有定义、且与 agent 类型无关 ⇒ 不再混口径。
+        */
+        const double rewBeforeEngRed = engineRed;
+        const double rewBeforeEngBlack = engineBlack;
+        /*
+           这一手的走子方: **必须在棋盘锁之前取** —— 锁内 `turn` 会被翻到下一手
+           (下面那段"sideToMove 必须跟着 turn 走"), 锁后再读就是下一手的走子方了。
+        */
+        const int valueMoverNow = turn;
+
         {
             QMutexLocker locker(&mutex);
             double totalReward = 0;
             /* 走这一步的是 turn 方, moveForward 之前先记下来 */
             const int mover = turn;
+            /*
+               ---- 对局中行为克隆: 把"学生这一手"的原局面拷一份 ----
+               必须在 moveForward **之前**: 此刻棋盘还是这一步的原局面, 而"轮到走棋的
+               就是学生" —— 这正是那条样本的定义 (学生的局面 + 老师在该局面上的着法)。
+               与下面的吃子读数、学习口径即时奖励是同一个时序要求, 三处必须在同一刻取。
+            */
+            if (bcOn) {
+                bcPos = chess;
+                bcMover = turn;
+            }
+            /* 价值探针的局面副本 (同一个"落子之前"的时刻) */
+            if (valueProbeOn) {
+                vPos = chess;
+                vMover = turn;
+            }
             /*
                ================================================================
                [O1, 2026-09] 吃子行为: "该吃的时候吃了吗"
@@ -4834,6 +4942,43 @@ int ChessBoard::playMatchGame(AgentType redType, AgentType blackType, bool aIsRe
             /* sideToMove 必须跟着 turn 走, 否则下一手 getResult 会看错方 */
             turn = (turn == Stone::COLOR_RED) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
             chess.sideToMove = turn;
+        }
+        /*
+           ---- [2026-10 用户口径] 对局中行为克隆: 学生这一手 -> 一条样本 -> 一次 actor 更新 ----
+           放在棋盘锁**外面**、下一手决策**之前**: 那一刻没有别的 agent 在工作, 所以
+           只短暂持 agent 锁; 一次更新在 MLP 骨干上是毫秒级, 相对一步决策 (0.3~8 s)
+           可以忽略。老师那一手由 bcOnStudentMove 在**局面副本**上现场搜 (深度取自下拉框)。
+        */
+        if (bcOn) {
+            bcOnStudentMove(bcStudent, bcPos, bcMover);
+        }
+        /*
+           ---- [2026-10] 价值评估: 采这一手的 V(s) ----
+           与 BC 一样在棋盘锁**外面**做 (只短暂持 agent 锁): 探针会临时换 agent 的棋盘
+           副本再还原, 所以必须在锁内 (m_agentMutex 保护常驻实例的全部读写)。
+           采不到就跳过 —— 不支持的 agent (SAC 是 Q 不是 V) / 实例还没建 / NaN 都不算错。
+
+           ⚠ 即时奖励要**每一手都记** (不只采到 V 的那些): z 是"该手之后的折扣回报",
+             求和要从这一手走到局末, 中间对手那些手一样要计入 (漏掉它们, z 就不是回报)。
+        */
+        {
+            const double stepEngRed = engineRed - rewBeforeEngRed;
+            const double stepEngBlack = engineBlack - rewBeforeEngBlack;
+            m_valueGameStep.push_back((valueMoverNow == Stone::COLOR_RED) ? stepEngRed
+                                                                         : stepEngBlack);
+            m_valueGameStepMover.push_back(valueMoverNow);
+        }
+        if (valueProbeOn) {
+            double v = 0.0;
+            bool got = false;
+            {
+                std::lock_guard<std::mutex> agentLock(m_agentMutex);
+                got = valueProbeOf(who, vPos, vMover, v);
+            }
+            if (got) {
+                m_valueGameV.push_back(v);
+                m_valueGameSampleIdx.push_back((int)m_valueGameStep.size() - 1);
+            }
         }
         /*
             每手报一次"本局累计"奖励进度 (锁外 emit: 信号是队列投递到 GUI 线程的,
@@ -4972,6 +5117,49 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
     */
     m_frozenDecisions.store(0);
     const int bgSkippedBefore = m_bgRoundsSkippedByMode.load();
+
+    /*
+       ---- [2026-10 用户口径] 对局中行为克隆: 每场归零 + 记下这一场的"学生/老师" ----
+       归零的理由与上面那条计数归零相同: 报告里的 samples/updates/CE 必须是**本场**的数,
+       不归零的话"这一场一项都没克隆"会带上上一场的读数 (那是假的读数)。
+       学生/老师只在这里认得出来 (对局循环里只知道"这一手是谁在走"), 所以在这里算好。
+       老师来自**下拉框** (与对手无关), 学生在 A/B 里挑 —— 两侧都能做 BC 时**两边都在
+       克隆**, 报告里如实写出两个人的名字。
+       `bcHasStudent` 与界面上的下拉框启用条件**同一份实现** —— 两边各写一遍的话,
+       "下拉框亮着但场上什么也没发生"迟早会发生。
+    */
+    {
+        const int teacherDepth = m_bcTeacherDepth.load();
+        const bool anyStudent = bcHasStudent(typeA, typeB);
+        const bool bcWillRun = (teacherDepth > 0) && (m_matchMode.load() == MATCH_TRAIN)
+                               && anyStudent;
+        QString studentLabel;
+        if (bcWillRun) {
+            const bool sa = bcSupported(typeA);
+            const bool sb = bcSupported(typeB);
+            if (sa && sb) {
+                studentLabel = QStringLiteral("%1 + %2 (两侧都在克隆)")
+                                   .arg(agentDisplayName(typeA), agentDisplayName(typeB));
+            } else {
+                studentLabel = agentDisplayName(sa ? typeA : typeB);
+            }
+        }
+        bcResetMatchStats(studentLabel, bcWillRun ? bcTeacherName(teacherDepth) : QString());
+        if (teacherDepth > 0 && !bcWillRun) {
+            /*
+               选了老师但没生效, 必须**说清原因** (否则用户只会看到"选了没用"):
+               两种原因是完全不同的两件事 —— 模式不对, 或者这一对选手没有学生。
+            */
+            emit bcProgress(QStringLiteral(
+                "[BC] 本场没有做行为克隆: %1")
+                .arg(m_matchMode.load() == MATCH_TRAIN
+                         ? QStringLiteral("A/B 两边都不是能做 BC 学生的 agent "
+                                          "(只有 PPO+MCTS / PPO+MCTS(MLP专家) / SAC+AZ / "
+                                          "SAC+AZ-MoE / SAC+AZ-MoE-MLP 这五支能做学生)")
+                         : QStringLiteral("对弈模式不是\"训练对局\" (评估/只对弈模式下"
+                                          " 权重必须不变, 而 BC 是学习)")));
+        }
+    }
     {
         const MatchMode m = m_matchMode.load();
         if (m == MATCH_NO_LEARN) {
@@ -5085,8 +5273,26 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         const int gCapChosenB = st.capChosenB - capChosenB0;
         if (res == Chess::RESULT_ONGOING) {
             st.aborted = true;      /* playMatchGame 用 ONGOING 表示"被中止" */
+            /*
+               [2026-10] 被中止的这一局**不折算 z** (没有真实结果), 但本局已经采到的
+               (V, mover) 必须丢掉 —— 留着的话它们会在下一局结束时被当成"有胜负的样本"
+               折进去, 而 z 是拿下一局的结果算的 (那是**跨局错配**, 会让 EV 完全失真)。
+            */
+            m_valueGameV.clear();
+            m_valueGameSampleIdx.clear();
+            m_valueGameStep.clear();
+            m_valueGameStepMover.clear();
             break;
         }
+        /*
+           ---- [2026-10] 价值评估: 本局结束 -> 折算 z -> 更新滚动窗口 -> 可能出点 ----
+           放在这里 (而不是 playMatchGame 里) 的原因: **只有这里知道这一局算不算数**
+           (上面那条 break 就是"不算数"), 而且 st.games 的语义 = 已完成的局数。
+           两种 z 口径都在 valueDiagOnGameEnd 里算: 真实胜负 (±1/0) 与**该手之后的折扣
+           回报** (与 critic 的 γ 同口径, 是"曲线一直空着"那个问题的解 —— 胜负口径在
+           "被采样的手结果符号全一样"时 zVar=0, EV 数学上无定义)。
+        */
+        valueDiagOnGameEnd(res, st.games + 1);
 
         /*
             A/B 视角的本局环境奖励: playMatchGame 已经按 aIsRed 换算好了 (出参),
@@ -5178,6 +5384,14 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
     }
     st.bgRoundsSkippedByMode = m_bgRoundsSkippedByMode.load() - bgSkippedBefore;
     st.frozenDecisions = m_frozenDecisions.load();
+
+    /*
+       ---- [2026-10] 对局中行为克隆的收尾报告 ----
+       放在这里 (而不是每局) 的理由: 与"这条曲线是一整场的"同一口径 —— 用户勾的是一个
+       **开关**, 他要知道的是"这一场克隆了多少、学没学动", 而不是每一局的碎数。
+       它同时写 m_bcReport (自检面板) 与对局明细 (逐局列表里那一行)。
+    */
+    bcFinishMatchReport(st);
 
     m_matchRunning = false;
     m_selfPlaying = false;
@@ -5536,6 +5750,707 @@ void ChessBoard::resumeBackgroundTraining()
         m_bgPaused = false;
     }
     m_bgPauseCv.notify_all();
+}
+
+/* ============================================================================
+ *  ---- 行为克隆 (BC) 的界面入口 (2026-10) ----
+ * ============================================================================
+ * 五件事 (顺序即实现顺序):
+ *   1. bcSupported  : 哪些 agent 有 BC 路径 (PPO 两支 + SAC 三支);
+ *   2. runBcOn      : 一次运行 (四种 agent 类共用; 流程在 src/bcrun.hpp);
+ *   3. behaviorCloningWorker: 后台线程主体 (独占 agent + 暂停后台训练 + 发信号);
+ *   4. startBehaviorCloning / bcReportText: 界面调的那两个入口。
+ *
+ * 为什么这些放在 chessboard.cpp 而不是 mainwindow.cpp: 独占 agent 的两个机制
+ * (`m_agentMutex` 与 `pauseBackgroundTraining`) 都在这一侧。理由与三条行为约定
+ * 见 chessboard.h 里 startBehaviorCloning 上面那一整段。
+ */
+
+bool ChessBoard::bcSupported(AgentType type)
+{
+    switch (type) {
+    case AGENT_PPOMCTS:
+    case AGENT_PPOMCTS_MLP:
+    case AGENT_SACAZ:
+    case AGENT_SACAZ_MOE:
+    case AGENT_SACAZ_MOE_MLP:
+        return true;
+    default:
+        /*
+           剩下的类型各有**明确**的理由, 而不是"还没做"含糊过去:
+             * Alpha-Beta 四档 / MCTS : 没有可训练参数 (没有策略头可克隆);
+             * PG / DQN / DQN+MCTS / DQN+AB / EVAB: 有策略头, 但本轮只把 BC 接到了
+               PPO 与 SAC 两条线 (PG/DQN 已从界面下拉框移除, EVAB/DQN+AB 的 BC 口径
+               需要各自单独定义 —— 见 docs/behavior_cloning_2026_10.md 的"边界");
+             * SAC+AZ-59e5233 两支: 行为还原版, 按本工程惯例不许新机制渗进去。
+        */
+        return false;
+    }
+}
+
+QString ChessBoard::bcReportText() const
+{
+    std::lock_guard<std::mutex> lock(m_bcMutex);
+    return m_bcReport;
+}
+
+/* ============================================================================
+ *  ---- 行为克隆 (BC): 与 AB 对弈时"顺便"克隆 (2026-10) ----
+ * ============================================================================
+ * 用户口径: **"在与 abagent 对弈时可另外勾选行为克隆训练, 不另外单独做行为克隆训练"**。
+ * 接口与三条行为约定的说明在 chessboard.h; 这里只记实现上的四个决定:
+ *
+ *   1. **样本在 moveForward 之前取**: 那一刻棋盘还是"对手将要走的那一步"的**原局面**,
+ *      而 `step` 就是它真正要走出的那一手 —— 两者严格对应同一个局面, 这正是这条样本
+ *      全部准确性的来源 (与 [O1] 的吃子读数、学习口径的即时奖励是同一个时序要求,
+ *      三个都必须在同一处取, 否则它们描述的不是同一手棋)。
+ *      做法: 在棋盘锁里面**拷一份** Chess (几 KB), 出了锁再去做 BC ——
+ *      锁的顺序因此只有一种 (棋盘锁 -> agent 锁), 与 getAgentSelfCheck 一致。
+ *   2. **每一条 AB 着法立刻更新一次**, 而不是攒够 64 条再更新: 一局只有几十手 AB 着法,
+ *      攒批等于这一局白克隆。批 = 缓冲区里最近 `kBcBatch` 条 (不足就用全部)。
+ *   3. **只在"训练对局"模式下生效**: 评估/只对弈声称"权重不变", 而 BC 是学习 ——
+ *      让它在那两种模式下偷偷改权重, 正是 P0-b 修掉的那类静默失效。
+ *   4. **不额外占时间**: 更新发生在"对手走完、下一手决策之前"的空档里, 只短暂持有
+ *      agent 锁; 一次更新在 MLP 骨干上是毫秒级 (TB 骨干几十毫秒), 相对一步决策
+ *      (0.3~8 s) 可以忽略。
+ */
+
+/* 这几个刻度放在文件里 (与其它 BG_* 同一手法), 改它们等于改学习问题 */
+namespace {
+constexpr int    kBcBatch     = 32;      /* 一次更新的批 (缓冲区不足时用全部) */
+constexpr std::size_t kBcBufCap = 512;   /* 样本缓冲上限 (FIFO; 512 x 1710 x 4B ≈ 3.5 MB) */
+constexpr float  kBcLr        = 0.002f;  /* 与命令行工具 train_bc 的默认一致 */
+constexpr int    kBcReportEveryUpdates = 8;   /* 面板上每几次更新打一行 (第一次必打) */
+/*
+ * ---- 保真度采样 (那条"行为克隆"曲线) ----
+ * `kBcFidEvery`: 每几次 actor 更新算一次一致率/CE。
+ * `kBcFidWindow`: 在"最近多少条样本"上算 —— 曲线量的是**当前窗口**的保真度, 不是
+ *   全程平均 (全程平均会把"早期很烂"永久混在里面, 趋势就看不出来了)。
+ * `kBcFidMin`: 窗口至少几条才开始算: 1 条样本上的一致率只有 0% 或 100%, 那是噪声,
+ *   画上去会被读成"一开始就很差/很好"。
+ * 代价: 一次 evaluate = 窗口条数的前向 (≤64 次, MLP 骨干约 10~30 ms), 每 4 次更新一次
+ *   ⇒ 相对一步决策 (0.3~8 s) 可以忽略。
+ */
+constexpr int    kBcFidEvery  = 4;
+constexpr std::size_t kBcFidWindow = 64;
+constexpr std::size_t kBcFidMin    = 8;
+} // namespace
+
+bool ChessBoard::bcHasStudent(AgentType a, AgentType b)
+{
+    /*
+       只看"有没有学生"。老师不再由对手充当 (2026-10 用户口径: 下拉框选 AB, 与对手
+       无关), 所以"对手是不是 AB"这件事**完全不参与**判定 —— 两边都是 AB 时
+       bcSupported 全为假, 照样返回 false (没有学生就没有可克隆的策略头)。
+    */
+    return bcSupported(a) || bcSupported(b);
+}
+
+/*
+ * bcTeacherName - 深度 -> 显示名 (唯一来源)
+ *
+ * 界面下拉框、对局报告、模型自检面板全都用这一份: 三处各写一遍的话, 迟早出现
+ * "下拉框写着 L2 而报告里印着深3"这种**看起来像功能坏了**的不一致。
+ * 名字本身取自 agentDisplayName (与 A/B 下拉框同一份), 所以选老师的下拉框与
+ * 选对手的下拉框用的是同一套叫法。
+ */
+QString ChessBoard::bcTeacherName(int depth)
+{
+    switch (depth) {
+    case AB_L1_DEPTH: return agentDisplayName(AGENT_AB_L1);
+    case AB_L2_DEPTH: return agentDisplayName(AGENT_AB_L2);
+    case AB_L3_DEPTH: return agentDisplayName(AGENT_AB_L3);
+    case AB_DEPTH:    return agentDisplayName(AGENT_ALPHABETA);
+    default:
+        /* 0 = 关; 其它值不该出现 (下拉框只给这四个) —— 但不要静默: 报告里要看得出来 */
+        return QStringLiteral("(未选老师)");
+    }
+}
+
+void ChessBoard::bcResetMatchStats(const QString &agentLabel, const QString &teacherLabel)
+{
+    /*
+       ⚠ 这里**不清 `m_bcHumanSession`**: 那个人机侧的"一局一次"标志的清除点是
+       setHumanGameInProgress(false) (终局 / 重开), 而不是每次归零。混在一起的话,
+       人机那条路会在"第一次采样归零"之后又被谁重置一次标志 ⇒ 每手都归零一次 ⇒
+       读数永远只有 1 条样本 (看起来像"克隆没生效")。
+    */
+    m_bcBuf.clear();
+    m_bcSamples = 0;
+    m_bcUpdates = 0;
+    m_bcMissed = 0;
+    m_bcLastCe = -1.0;
+    m_bcFirstCe = -1.0;
+    m_bcLastTop1 = -1.0;
+    m_bcLastPTeacher = -1.0;
+    m_bcLastFidCe = -1.0;
+    m_bcLastWindow = 0;
+    /* 软目标那条路的累计量也要清 (否则报告里的 targetH 会跨场平均) */
+    m_bcTargetEntropySum = 0.0;
+    m_bcSoftSamples = 0;
+    m_bcMatchAgent = agentLabel;
+    m_bcMatchTeacher = teacherLabel;
+    /* 在线训练那条路的基线 (见 m_bcOnlineBase 的说明): onlineSteps = 当前 - 基线 */
+    m_bcOnlineBase = m_trainSampleNo.load();
+    std::lock_guard<std::mutex> lock(m_bcMutex);
+    m_bcReport.clear();
+}
+
+/*
+ * 一条样本 -> 一次 actor 更新 (学生自己的局面 + 下拉框那一档 AB 的着法当标签)。
+ *
+ * **模板**: 四种 agent 类 (PPO 两支共用 PPOMCTSAgent; SAC 三支各一个类) 的
+ * sampleFrom/update 是不同的重载, 所以由调用方按具体类型分发 (见 bcOnStudentMove)。
+ */
+template <class AgentT>
+void ChessBoard::bcCollectFromStudent(AgentT *ag, const Chess &pos, int color,
+                                      const Step &teacher,
+                                      const std::vector<Step> &softMoves,
+                                      const std::vector<float> &softProbs)
+{
+    /*
+       ⚠ `sampleFrom` 会把 agent 自己的棋盘引用改成它正在编码的局面 (agent 的编码器
+       读的是自己那份 Chess) —— 而那份就是本棋盘的 `env`。跑完要还原: 不还原的话,
+       下一个决策虽然会 `env = chess` 覆盖掉它, 但"BC 顺手换掉了 agent 手里的棋盘"
+       这件事一旦在别的路径上暴露, 表现是"AI 在一个不存在的局面上下棋", 极难查。
+    */
+    Chess boardBefore = ag->chess;
+
+    RL::BCSample s;
+    /* 软目标时用多老师重载 (分布); 否则 one-hot。两条路的合法性闸门是同一份实现。 */
+    const bool ok = softMoves.empty()
+                        ? BC::sampleFrom(*ag, pos, color, teacher, s)
+                        : BC::sampleFrom(*ag, pos, color, softMoves, softProbs, s);
+    ag->chess = boardBefore;
+    if (!ok) {
+        /*
+           没做成样本的两种情形都**不是**崩溃, 但都不能静默: 要么这个局面没有合法
+           着法 (终局), 要么老师的着法不在合法集里 (视角/索引不一致 —— 那是缺陷)。
+           记进 m_bcMissed, 报告里会印出来。
+        */
+        m_bcMissed++;
+        return;
+    }
+
+    if (m_bcBuf.size() >= kBcBufCap) {
+        m_bcBuf.erase(m_bcBuf.begin());
+    }
+    m_bcBuf.push_back(s);
+    m_bcSamples++;
+    /*
+       [2026-10] 软目标那条路上顺手累加**老师侧**的目标熵 H(t) (报告里要用):
+       软目标的 CE 下界是 H(t) (CE = H(t) + KL(t‖π)), 不印 H(t) 的话"CE 变大了"这句话
+       就没法解读 —— 是学生学差了, 还是老师本身就模糊? 这里记的是**样本上**的 H(t)
+       (与 `train_bc` 报告里那个"标签"行同一口径: 同一条样本的同一个量)。
+    */
+    if (!softMoves.empty()) {
+        m_bcTargetEntropySum += BC::targetEntropyOf(s);
+        m_bcSoftSamples++;
+    }
+
+    const std::size_t take = std::min<std::size_t>((std::size_t)kBcBatch, m_bcBuf.size());
+    std::vector<RL::BCSample> batch(m_bcBuf.end() - (long)take, m_bcBuf.end());
+    const BC::UpdateStat u = BC::update(*ag, batch, kBcLr);
+    if (!std::isfinite(u.ce)) {
+        /* 这一批一条都没用上 (目标全落空 / 结构不合格): 只记不计 */
+        return;
+    }
+    if (m_bcFirstCe < 0.0) {
+        m_bcFirstCe = (double)u.ce;
+    }
+    m_bcLastCe = (double)u.ce;
+    m_bcUpdates++;
+
+    /*
+       面板上的实时一行 (每 kBcReportEveryUpdates 次一次, 第一次必打)。
+       刻意留 ASCII 记号 (samples= / updates= / CE= / teacher-depth=): verify_bc_ui.ps1
+       要用 UIA 断言它 —— 脚本必须是 ASCII-only (无 BOM 的 .ps1 会被按 ANSI 解码)。
+       `teacher-depth=` 这一项 (2026-10) 是给"报告里的老师是不是下拉框选的那一档"用的:
+       面板在**对局进行中**只会追加这一行 (整段刷新要等自检刷新时机), 所以老师档位必须
+       出现在这一行里 —— 否则脚本只能等到对局结束才断言得到 (第一版就是这么假失败的)。
+    */
+    if (m_bcUpdates == 1 || (m_bcUpdates % kBcReportEveryUpdates) == 0) {
+        emit bcProgress(QStringLiteral("[BC] 克隆 AB 的着法: samples=%1 updates=%2"
+                                       " 批=%3 CE=%4 (目标落空 %5) [teacher-depth=%6 soft=%7]")
+                            .arg(m_bcSamples).arg(m_bcUpdates).arg((qulonglong)take)
+                            .arg(m_bcLastCe, 0, 'f', 4).arg(m_bcMissed)
+                            .arg(m_bcTeacherDepth.load())
+                            .arg(m_bcSoftTarget.load() ? 1 : 0));
+    }
+    /*
+       ---- 报告正文也刷新一次 (2026-10) ----
+       人机那条路没有"场结束"这个时机, 而面板在别的时机 (选中 agent / 每一手探索后 /
+       每场结束) 会**整段刷新**(setPlainText) —— 只在场末写报告的话, 人机里勾了克隆
+       也读不到任何读数 (用户看到的就是"勾了没用")。正文只有几行字符串拼接, 相对一次
+       actor 更新 (毫秒级) 可以忽略。
+    */
+    {
+        std::lock_guard<std::mutex> lock(m_bcMutex);
+        m_bcReport = bcComposeReport();
+    }
+
+    /*
+       ---- 保真度采样: "克隆得像不像老师" (曲线与图下读数用) ----
+       与上面那行**文本进度**是两件事: 进度行说的是"练到第几次", 这里说的是"练得怎么样"。
+       四个量的口径与命令行 `train_bc` 完全一致 (同一个 `BC::evaluate`):
+         * 一致率 = 策略头单独选中的着法 == 老师那一手 的比例 —— 这是 BC 的**训练目标本身**,
+           也是唯一能回答"克隆到底成不成功"的数 (它上升**不是**棋力证据, 报告里写明了);
+         * P(老师着法) = 策略头给老师那一手的平均概率 (0~1, 画图时 ×100);
+         * CE = 同一个合法集掩码口径下的批平均交叉熵;
+         * 窗口 = 最近 `kBcFidWindow` 条样本 (量的是**当前**水平, 不是全程平均)。
+    */
+    if (m_bcUpdates > 0 && (m_bcUpdates % kBcFidEvery) == 0
+        && m_bcBuf.size() >= kBcFidMin) {
+        const std::size_t w = std::min<std::size_t>(kBcFidWindow, m_bcBuf.size());
+        std::vector<RL::BCSample> window(m_bcBuf.end() - (long)w, m_bcBuf.end());
+        BC::Metrics fm;
+        BC::evaluate(*ag, window, fm);
+        if (fm.n > 0) {
+            m_bcLastTop1 = fm.top1Pct;
+            m_bcLastPTeacher = fm.pTeacher;
+            m_bcLastFidCe = fm.ce;        /* 注意: **不是** m_bcLastCe (那是训练批的口径) */
+            m_bcLastWindow = fm.n;
+            emit bcFidelitySample((int)m_bcUpdates, fm.top1Pct, fm.pTeacher, fm.ce, fm.n);
+        }
+    }
+}
+
+void ChessBoard::bcOnStudentMove(AgentType studentType, const Chess &pos, int color)
+{
+    const int depth = m_bcTeacherDepth.load();
+    if (depth <= 0) {
+        return;
+    }
+    /*
+       ---- 老师那一手: 在**局面副本**上现场搜一次 ----
+       为什么用副本: ABAgent 的搜索会真的 moveForward/moveBack (它会改 `history`,
+       见 aiThinkRaw 里那段 AB 分支的说明) —— 直接拿 `pos` 去搜, 就会把搜索过程写进
+       这条样本的**状态编码**里 (编码要看规则历史), 样本当场被污染, 而且看不出来。
+       所以搜索用另一个副本, `pos` 保持"学生要落子前那一刻"的原样。
+       为什么**不加锁**: 搜索只用这个局部副本、不碰 agent、也不碰共享的 `env`,
+       所以它不属于"棋盘锁 / agent 锁"那一对临界区; 深度 1~4 实测 0~90 ms 一次。
+    */
+    Chess teacherBoard = pos;
+    Step teacher;
+    /*
+       ---- [2026-10] 软目标 (用户问题: "不直接使用 onehot、通过 abagent 计算概率分布
+            再进行行为克隆是否会更好?") ----
+       打开时老师给出的是**多深度一致性的分布** (深度 1..D 各投一票), 而不是一只手。
+       为什么用"多深度一致性"而不是"根分值 Boltzmann": AB 的根循环是窗口写法, 非最优
+       孩子的返回是**界**而不是精确分值 ⇒ 拿它做 softmax 等于在裁剪 artifact 上克隆
+       (理由与实测都在 bcagent.hpp 的 softTargetFromAB 与文档 §9)。
+       实测结论 (4000 局面 / 深度 3 / 8 epoch / **4 个种子**成对比较, 见文档 §9): 两个指标
+       **方向相反** —— 可比口径 **留出 KL (CE − H(t)) 4/4 都更低** (2.379→1.866), 硬口径
+       **留出 top-1 略低** (38.59%→36.78%, 3/4 个种子且符号不一致 ⇒ 只能算"没变好");
+       `train−留出` 差 4/4 都更小 (0.427→0.280) 且策略熵不塌; 代价约 +12~14% 打标签时间。
+       所以它是**可选开关**, 默认关 (与"动态奖励/对手入训"同一口径)。
+    */
+    std::vector<Step> softMoves;
+    std::vector<float> softProbs;
+    if (m_bcSoftTarget.load()) {
+        if (!BC::softTargetFromAB(teacherBoard, color, depth, depth, softMoves, softProbs)) {
+            m_bcMissed++;
+            return;
+        }
+        teacher = softMoves.front();        /* 报告/落空计数仍用最深那一层的主着法 */
+    } else {
+        ABAgent ab(teacherBoard, depth);
+        teacher = ab.getBestMove(color);
+    }
+    if (!teacher.valid) {
+        /* 这个局面没有合法着法 (终局) —— 与"目标落空"合并计数, 报告里会印出来 */
+        m_bcMissed++;
+        return;
+    }
+
+    AgentBase *base = agentInstance(studentType);
+    if (base == nullptr) {
+        /* 学生还没有实例 (懒建): 这一手当作没选老师 —— 建实例是决策路径的职责 */
+        m_bcMissed++;
+        return;
+    }
+    /*
+       只短暂持有 agent 锁: 对弈线程在这一刻没有别的 agent 工作, 而自检 worker
+       可能正好在读同一个 agent 的权重 (它是另一条线程) —— 那一层必须挡住。
+    */
+    std::lock_guard<std::mutex> lock(m_agentMutex);
+    switch (studentType) {
+    case AGENT_PPOMCTS:
+        bcCollectFromStudent(static_cast<PPOMCTSAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
+    case AGENT_PPOMCTS_MLP:
+        bcCollectFromStudent(static_cast<PPOMCTSAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
+    case AGENT_SACAZ:
+        bcCollectFromStudent(static_cast<SACAZAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
+    case AGENT_SACAZ_MOE:
+        bcCollectFromStudent(static_cast<SACAZMoETbAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
+    case AGENT_SACAZ_MOE_MLP:
+        bcCollectFromStudent(static_cast<SACAZMoEMlpAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
+    default:
+        break;      /* bcHasStudent 已经拦过了; 这里只是不让它静默走错路 */
+    }
+}
+
+/*
+ * bcSampleForHumanTurn - 人机那条路上的"学生走一手 -> 一条样本" (2026-10)
+ *
+ * 用户口径要的就是这个: **与人类棋手对弈时照常克隆** (老师来自下拉框, 与人无关)。
+ * 对局循环 (playMatchGame) 里已经有一个"落子前拷好的局面", 人机这条路没有 ——
+ * 所以在这里自己拷一份, 之后与对局那条路**共用同一段** bcOnStudentMove。
+ *
+ * 锁序: 先拿棋盘锁拷完就放, 再进 bcOnStudentMove 里的 agent 锁 —— 与对局循环、
+ * getAgentSelfCheck 一样只有"棋盘 -> agent"这一种顺序。
+ *
+ * 三个闸门 (与对局那条路逐条对齐, 否则"人机能偷偷改权重"就会重演 P0-b 那个洞):
+ *   * 老师深度 > 0 (下拉框不是"关");
+ *   * 模式 = 训练对局;
+ *   * 这一手的 AI 那一支**能做 BC 学生** (纯搜索的 AB/MCTS 没有策略头可克隆)。
+ */
+void ChessBoard::bcSampleForHumanTurn(AgentType studentType, int color)
+{
+    if (m_bcTeacherDepth.load() <= 0) {
+        return;
+    }
+    if (m_matchMode.load() != MATCH_TRAIN) {
+        return;
+    }
+    if (!bcSupported(studentType)) {
+        return;
+    }
+    /*
+       人机没有"场"的概念, 所以读数按**一局**归零: 第一次采样时归零一次
+       (exchange 保证只有第一次为真), 终局/重开时由 setHumanGameInProgress(false) 清标志。
+       不归零的话"这一局一条都没克隆"会带上上一局的读数 (那是假的读数);
+       每手都归零的话读数永远只有 1 条样本 (看起来像"克隆没生效")。
+    */
+    if (!m_bcHumanSession.exchange(true)) {
+        bcResetMatchStats(agentDisplayName(studentType),
+                          bcTeacherName(m_bcTeacherDepth.load()));
+    }
+    Chess pos;
+    {
+        QMutexLocker locker(&mutex);
+        pos = chess;
+    }
+    bcOnStudentMove(studentType, pos, color);
+}
+
+/*
+ * 报告正文 (每做一次 actor 更新就刷新一次 -> 面板随时读得到当前读数)。
+ *
+ * 为什么抽成一个函数 (2026-10): 报告有两个消费时机 —— "对局结束" (对局那条路) 与
+ * "面板每次刷新" (人机那条路**没有场结束**, 只在场末写的话面板一刷新就把读数冲掉,
+ * 用户看到的就是"勾了没用")。正文只写一份, 两个时机都调它, 读数不会分叉。
+ *
+ * 三条读数必须一起给, 缺一个就会被误读:
+ *   * samples/updates: "克隆到底有没有在发生" (全是 0 就说明下拉框还停在"关"上);
+ *   * CE 的变化 (第一条 -> 最后一条): "有没有在学" —— 只看最后一个 CE 没法判断方向;
+ *   * targetMissed: **目标落空**的条数 (视角/索引不一致的信号), 非零必须显眼。
+ */
+QString ChessBoard::bcComposeReport() const
+{
+    if (m_bcMatchAgent.isEmpty() && m_bcSamples == 0 && m_bcMissed == 0) {
+        return QString();       /* 本场没开这个功能: 不写报告 (面板上保留上一次的读数) */
+    }
+    QString text;
+    /*
+       ⚠ 行尾那个 `[teacher-depth=N]` 是**机器记号** (ASCII, 0 = 关): verify_bc_ui.ps1
+       要断言"报告里印的老师就是下拉框选的那一档" —— 而档位的显示名是中文, 那个脚本
+       必须 ASCII-only (无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码, 代码里的
+       中文会把脚本解析坏)。与自检面板里的 "MaxVio / Loss-Free" 同一个做法。
+    */
+    text += QStringLiteral("=== 对局中行为克隆 (BC): 学生=%1, 老师=%2 (下拉框选)"
+                           " [teacher-depth=%3] ===\n")
+                .arg(m_bcMatchAgent.isEmpty() ? QStringLiteral("(未记录)") : m_bcMatchAgent,
+                     m_bcMatchTeacher.isEmpty() ? QStringLiteral("(未记录)") : m_bcMatchTeacher,
+                     QString::number(m_bcTeacherDepth.load()));
+    /*
+       ⚠ 这一行里的 ASCII 记号 (match-summary / samples= / updates= / targetMissed= /
+       onlineSteps=) 是**刻意**的: tools/verify_bc_ui.ps1 用 UIA 读面板文本断言它,
+       而那个脚本必须 ASCII-only (无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码,
+       代码里的中文会把脚本解析坏)。与自检面板里的 "MaxVio / Loss-Free" 同一个做法:
+       机器要读的记号用 ASCII, 其余照旧用中文。
+       [2026-10] `onlineSteps=` = 这一场里**在线训练(探索+预训练)**上报过多少次损失。
+       BC 与它是两个独立开关 (都能开), 所以"都开着"与"只有一个在跑"必须分得开 ——
+       否则用户看到的 CE 趋势到底是谁造成的就没法判断。
+       [2026-10 修] 这条报告原来把上面那句写在 emit 出去的一行里 —— 而面板在**对局结束时
+       会整段刷新**(setPlainText), 那一行当场被冲掉 ⇒ 脚本读不到 "match-summary"。
+       现在它放在**存进 bcReportText 的报告正文**里, 于是每次刷新都跟着回来。
+    */
+    text += QStringLiteral("本场汇总 (match-summary): samples=%1 updates=%2 targetMissed=%3"
+                           " onlineSteps=%4 soft=%5\n")
+                .arg(m_bcSamples).arg(m_bcUpdates).arg(m_bcMissed)
+                .arg(std::max<long long>(0, m_trainSampleNo.load() - m_bcOnlineBase))
+                .arg(m_bcSoftTarget.load() ? 1 : 0);
+    /*
+       ---- [2026-10] 软目标那一行: 老师给的分布有多"软" ----
+       只在真的攒到软样本时印。`targetH` 是**老师侧**的量 (平均目标熵 H(t)):
+         * 软目标下 CE 的下界 = H(t) (CE = H(t) + KL(t‖π)) —— 于是
+           "CE 2.41 (软) vs 2.58 (one-hot)" 这类对比只在同 H(t) 下可比, 必须一起看;
+         * H(t) = 0 只可能来自 one-hot (深度只有一层, 票全压在一手上);
+         * H(t) 越大 = 各深度越不一致 = 这个局面上"老师自己都不确定",
+           此时 CE 高**不代表**学生差 (KL 才是"像不像老师"的那部分)。
+    */
+    if (m_bcSoftSamples > 0) {
+        const double h = m_bcTargetEntropySum / (double)m_bcSoftSamples;
+        text += QStringLiteral("软目标 (soft targets, 多深度一致): 软样本=%1/%2 targetH=%3\n")
+                    .arg(m_bcSoftSamples).arg(m_bcSamples).arg(h, 0, 'f', 4);
+        /*
+           ⚠ **深度 1 时软目标退化成 one-hot** (`softTargetFromAB` 只有一层可投票 ⇒
+           唯一候选 p=1 ⇒ H(t)=0)。这不是缺陷 (它正是"深度 1 与旧口径逐位一致"那条保证),
+           但如果报告里只印一个 `targetH=0`, 用户看到的就是"勾了软目标、读数却是 0" ——
+           分不清"没生效"和"退化了"。所以这里明说原因与下一步动作。
+        */
+        if (h <= 1e-9 && m_bcTeacherDepth.load() <= 1) {
+            text += QStringLiteral("  ⚠ 深度=1 时**只有一票** ⇒ 目标退化成 one-hot (H(t)=0), "
+                                   "软目标此时与默认口径**完全一致**; 想真的用软目标请把老师"
+                                   "选成 L2 或更深\n");
+        }
+    }
+    /*
+       ---- [2026-10] 保真度一行 (与"行为克隆"那条曲线同一口径) ----
+       口径说明写在 `bcCollectFromStudent` 的采样处; 这里只把最后那个窗口的读数写进报告。
+       `fidelity` 这个词刻意保留英文 (机器要读): verify_bc_ui.ps1 断言这一行。
+       ⚠ top-1 是 BC 的**训练目标本身**, 报告末尾那三条边界里写着"它不是棋力证据" ——
+         这一行也不例外 (docs/training_optimization.md §7.10: 一致率涨 9 倍而胜率没动)。
+    */
+    if (m_bcLastTop1 >= 0.0) {
+        text += QStringLiteral("保真度 (fidelity, 最近 %1 条样本): top-1=%2% P(teacher)=%3% CE=%4\n")
+                    .arg(m_bcLastWindow)
+                    .arg(m_bcLastTop1, 0, 'f', 2)
+                    .arg(m_bcLastPTeacher * 100.0, 0, 'f', 2)
+                    .arg(m_bcLastFidCe, 0, 'f', 4);
+    }
+    if (m_bcUpdates > 0) {
+        const double drop = (m_bcFirstCe > 0.0 && m_bcLastCe > 0.0)
+                                ? (m_bcFirstCe / m_bcLastCe) : 0.0;
+        /*
+           ⚠ 这里必须用 Qt 的 %1/%2,**不是** printf 的 %.4f —— 写错的表现是运行期刷
+           "QString::arg: Argument missing" 并且文本里留下一串 "%.4f" (本轮踩过)。
+           命令行那一侧之所以是 %.4f: 那边走 std::snprintf。
+        */
+        text += QStringLiteral("批平均 CE: 第一条 %1 -> 最后一条 %2")
+                    .arg(m_bcFirstCe, 0, 'f', 4).arg(m_bcLastCe, 0, 'f', 4);
+        /*
+           ⚠ 措辞必须**跟着方向走**: 第一条样本时的批只有 1 条 (批 = 缓冲区里最多 32 条),
+           它的 CE 可能恰好很低 —— 那么"最后一条更小"这件事就不成立, 而报告里却写着
+           "(降 0.32x)" 的话, 读起来像"学坏了"。所以 <1 时明说方向未定。
+        */
+        if (drop >= 1.0) {
+            text += QStringLiteral(" (降 %1x)").arg(drop, 0, 'f', 2);
+        } else {
+            text += QStringLiteral(" (最后一条更大: 前几条是 1 条样本的批, 噪声大 —— "
+                                   "一局的样本太少, 方向看多场累计)");
+        }
+        text += QStringLiteral("\n");
+    } else {
+        text += QStringLiteral("**一次 actor 更新都没做** —— 检查: 老师下拉框是不是还停在\"关\" / "
+                               "模式是不是被切成\"评估 / 只对弈\"了 (那两种模式下本功能不生效)\n");
+    }
+    if (m_bcSoftTarget.load()) {
+        text += QStringLiteral("口径: 只更新**策略头** (PPO 的 BC 路径整段不含 critic; "
+                               "SAC 独立口径下 q1/q2 逐字节不变), 损失 = 合法集上的掩码交叉熵; "
+                               "目标是**软分布** (深度 1..D 各投一票) ⇒ 其下界是 H(t), "
+                               "看 CE 时必须与上面那行的 targetH 一起看\n");
+    } else {
+        text += QStringLiteral("口径: 只更新**策略头** (PPO 的 BC 路径整段不含 critic; "
+                               "SAC 独立口径下 q1/q2 逐字节不变), 损失 = 合法集上的掩码交叉熵 "
+                               "(目标是 one-hot ⇒ H(t)=0, CE 就是 NLL)\n");
+    }
+    text += QStringLiteral("[注] 只改了**内存里的权重**: 与既有约定一致, 唯一的落盘点是"
+                           "退出程序时 (或你自己按保存)。\n");
+    return text;
+}
+
+/*
+ * 一场结束时: 把报告正文落进 m_bcReport, 并在对局明细里留一行。
+ *
+ * 另外写明"只改了内存里的权重" —— 否则用户会去 weights/ 找一个不存在的文件。
+ * (正文本身在 bcComposeReport 里; 这里只管"落盘时机"与那一行明细。)
+ */
+void ChessBoard::bcFinishMatchReport(MatchStats &st)
+{
+    const QString text = bcComposeReport();
+    if (text.isEmpty()) {
+        return;         /* 本场没开这个功能: 不动报告 (面板上保留上一次的读数) */
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_bcMutex);
+        m_bcReport = text;
+    }
+    /* 对局明细里也留一行 (用户回看逐局列表时看得到), 同时让面板实时更新一次。
+       刻意带 ASCII 记号 (match-summary / samples= / updates= / targetMissed=):
+       verify_bc_ui.ps1 要用 UIA 断言这一行, 而那个脚本必须是 ASCII-only
+       (无 BOM 的 .ps1 会被 Windows PowerShell 按 ANSI 解码) —— 与自检面板里的
+       "MaxVio / Loss-Free" 是同一个做法: 机器要读的记号用 ASCII。 */
+    const QString oneLine = QStringLiteral("[BC] 本场汇总 (match-summary): samples=%1"
+                                           " updates=%2 targetMissed=%3")
+                                .arg(m_bcSamples).arg(m_bcUpdates).arg(m_bcMissed);
+    st.log += QStringLiteral("  ") + oneLine + QStringLiteral("\n");
+    emit bcProgress(oneLine);
+}
+
+/* ============================================================================
+ *  ---- [2026-10] 价值评估 (EV/校准): 从每手的 V(s) 到一条曲线 ----
+ * ============================================================================
+ *
+ * 用户口径: "在奖励窗口增加一个 tab 显示价值评估曲线"。
+ *
+ * 那条曲线画的是 **解释方差 EV**, 不是损失 —— 因为损失曲线 (critic MSE) 是最弱的一层
+ * 证据: 它的目标是**自举**的 (TD/GAE 用 V(s')), 于是"损失在降"可以与"价值是错的"并存
+ * (一个把 Q 学成常数、或者靠自举把材质当终局的网络, MSE 一样可以很低)。能与真实结果
+ * 对照的两个量在 `rl/diag.h` 里早就有了 (`explainedVariance` / `calibration` /
+ * `calibrationError`) —— `bench_diag` 用它们定位过一次真正的缺陷 (实测 **EV = −0.0293**
+ * = "还不如常数预测", 283 个样本里 281 个落在同一个桶)。缺的只是**界面上的曲线**。
+ *
+ * 三个刻意的决定 (每条都对应一类"曲线会给出假读数"的风险):
+ *
+ *  1. **z 用真实胜负, 不用自举目标**: 每手记 (V, 走子方), 局末按胜负折算 (+1/0/−1,
+ *     走子方视角)。用自举目标算 EV 是循环论证 —— "V 能预测 V 的目标"不含任何信息。
+ *     折算口径抽成纯函数 (`RL::Diag::zFromGameResult`), 由 test_diag 钉住。
+ *  2. **zVar ≈ 0 时不出点**: 全是和棋 (或台架截断判和) 时 EV 按定义无解, 而曲线上的 0
+ *     看起来就是"V 和常数预测一样烂" —— 本工程第一次使用 EV 时踩的就是这个假 0。
+ *  3. **滚动窗口而不是全程平均**: 量的是"现在准不准"。窗口**跨局保留** (与损失曲线一样
+ *     是跨场连续的), 但每手都进窗口, 所以它天然是"最近这些手"。
+ *
+ * 代价: 每手一次 critic 前向 (MLP 骨干 ~0.14 ms, TB 骨干 ~3.6 ms), 相对一步决策
+ * (0.3~8 s) 可以忽略, 而且它是**纯只读探针** (不写任何训练状态)。
+ */
+
+namespace {
+/* 滚动窗口上限 (对数): 一局 ~60 手, 2000 对 ≈ 最近 30 局。 */
+constexpr std::size_t kValueWindowCap = 2000;
+/*
+ * 出一个点至少要多少对样本。**32** (原为 64): 用户实测的典型配置是"PPO 和 AB 打 1~3 局",
+ * 而**只采有 V 头那一方**的着手 ⇒ 一局 ~30 手对手 + ~30 手自己 ≈ 30 对, 两局才刚好 60 对
+ * —— 于是"打开克隆训练后没有价值曲线"(用户报的)里有一半原因就是这个门槛。
+ * 代价是噪声: n=32 时 ρ 的标准误差 ≈ 1/√32 ≈ 0.18, n=64 时 ≈ 0.125 ⇒ 读数行必须**把
+ * pairs 一起写出来**(它已经不画在曲线上), 让人知道这个点有多可信。
+ */
+constexpr int kValueMinPairs = 32;
+/* 折扣因子: 必须与 critic 的价值目标同一个 γ (PPOMCTSAgent 构造里的 0.99)。 */
+constexpr double kValueGamma = 0.99;
+
+/* Chess::RESULT_* -> z 的胜者口径 (0 = 红, 1 = 黑, −1 = 和/未定) */
+int zWinnerOf(int result)
+{
+    if (result == Chess::RESULT_RED_WIN) {
+        return Stone::COLOR_RED;
+    }
+    if (result == Chess::RESULT_BLACK_WIN) {
+        return Stone::COLOR_BLACK;
+    }
+    return -1;
+}
+} // namespace
+
+bool ChessBoard::valueProbeOf(AgentType type, Chess &pos, int color, double &out)
+{
+    AgentBase *base = agentInstance(type);
+    if (base == nullptr) {
+        return false;               /* 实例还没建 (懒建): 这一手不采 */
+    }
+    /*
+       只有 PPO 两支有**标量 V 头** (critic)。SAC 三支的批评家是 Q(s,a) 而不是 V(s),
+       EV/校准在那边要换一套口径 (目标不同), 所以这里明确返回 false —— 让界面保持
+       "没有这条读数的 agent 就说明原因"的语义, 而不是塞一个含义不同的数进去。
+    */
+    switch (type) {
+    case AGENT_PPOMCTS:
+    case AGENT_PPOMCTS_MLP:
+        return static_cast<PPOMCTSAgent *>(base)->valueOfPosition(pos, color, out);
+    default:
+        return false;
+    }
+}
+
+void ChessBoard::valueDiagOnGameEnd(int result, int gameNo)
+{
+    /*
+       两种 z 口径各进一份窗口 (2026-10, 用户实测"完成 4 轮对弈都没有曲线"之后补的):
+         z1 = 真实胜负 (±1/0, 走子方视角) —— "V 能不能预测胜负";
+         z2 = 本局最终学习口径回报 (连续量) —— "V 与 critic 真正在学的那个目标是否一致"。
+       为什么两个都给: z1 只有三个取值, 被采样的那些手**结果符号全一样**时 Var(z1) = 0
+       ⇒ EV 无定义 ⇒ 曲线刻意不出点 (那是对的, 但实测里很常见: 只采到一边的手 (对手不是
+       PPO) 而它一路输 ⇒ 全是 −1 ⇒ 永远空)。z2 是连续量, 几乎总有方差, 于是曲线能用。
+    */
+    std::vector<double> zWin, zEng;
+    /* z 口径 1 的 mover 序列: 从"整局数组"里按采样下标取出 (两个数组一一对应) */
+    std::vector<int> sampledMovers;
+    sampledMovers.reserve(m_valueGameSampleIdx.size());
+    for (std::size_t s = 0; s < m_valueGameSampleIdx.size(); s++) {
+        const int i = m_valueGameSampleIdx[s];
+        if (i >= 0 && (std::size_t)i < m_valueGameStepMover.size()) {
+            sampledMovers.push_back(m_valueGameStepMover[(std::size_t)i]);
+        }
+    }
+    RL::Diag::zFromGameResult(m_valueGameV, sampledMovers, zWinnerOf(result), zWin);
+    /*
+       z 口径 2 = 该手之后的**折扣回报** (引擎口径, 每一手都有定义 ⇒ 与对手是谁无关)。
+       γ 取 0.99 —— 与 `PPOMCTSAgent(env, 64, 0.99f, …)` 里那个 gamma 同一个数。
+       ⚠ 它**不**是 V 的训练口径 (V 学的是学习口径、材质×0.1), 所以两者尺度不同 ⇒
+         对这条 z 用的是**尺度无关**的 ρ (见 rl/diag.h 的 pearson): EV 在跨口径下会被
+         尺度差吃满 (实测读到过 −24.3), 而 ρ 只问"同向吗"。
+    */
+    RL::Diag::zFromDiscountedReturnToGo(m_valueGameStep, m_valueGameStepMover,
+                                        m_valueGameSampleIdx, kValueGamma, zEng);
+    if (!zWin.empty()) {
+        RL::Diag::appendWindow(m_valueWinV, m_valueWinZ, m_valueGameV, zWin,
+                               kValueWindowCap);
+        RL::Diag::appendWindow(m_valueWinV, m_valueWinZEng, m_valueGameV, zEng,
+                               kValueWindowCap);
+        m_valuePairs += (long long)zWin.size();
+        m_valueGames++;
+    }
+    m_valueGameV.clear();
+    m_valueGameSampleIdx.clear();
+    m_valueGameStep.clear();
+    m_valueGameStepMover.clear();
+
+    const RL::Diag::ValueDiag dw = RL::Diag::valueDiagOf(m_valueWinV, m_valueWinZ,
+                                                         kValueMinPairs, 10);
+    /*
+       第二条线用 **ρ(V, 引擎口径折扣回报)** 而不是 EV: 尺度无关, 所以"V 学的是学习口径、
+       z 是引擎口径"这件事不再把读数毁掉 (那是用户实测"与 MCTS 对弈数值 < 0"的根因之一)。
+       同时把 EV_eng 也算出来放进读数行 —— 谁想看尺度敏感的那个版本都有, 但曲线上画 ρ。
+    */
+    const RL::Diag::ValueDiag de = RL::Diag::valueDiagOf(m_valueWinV, m_valueWinZEng,
+                                                         kValueMinPairs, 10);
+    const bool rhoOk = de.enough && de.zHasVariance;
+    const double rhoEng = rhoOk ? RL::Diag::pearson(m_valueWinV, m_valueWinZEng) : 0.0;
+    /*
+       ⚠ **每一局结束都发一次信号**, 哪怕算不出来 (值为 NaN, CurveChart 会丢掉不画点)。
+       为什么: 用户实测"几轮对弈都没有曲线"时, 界面上**必须能看出为什么** —— 而"没采到
+       样本(pairs 不足)"与"采到了但没有方差"是两件事, 下一步动作完全不同。
+       原来把这种情况写成面板里的一行说明, 但**面板在对局结束时会整段刷新**(setPlainText),
+       那一行当场被冲掉 —— 于是用户看到的就是"什么都没有"(实测踩到)。
+       现在状态由**读数行**承载 (常驻控件, 不会被冲掉)。
+    */
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    emit valueDiagSample(gameNo, dw.ok ? dw.ev : nan, rhoOk ? rhoEng : nan,
+                         de.zHasVariance ? de.ev : nan,
+                         dw.zHasVariance ? dw.calibErr : nan,
+                         dw.n, dw.zVar, de.zVar);
+    const QString nf = QStringLiteral("(n/a)");
+    /*
+       ⚠ 面板行**只在真的采到样本时才写** (`dw.n > 0`): 否则一场 AB-vs-EVAB 的百局对局会
+       每局往面板扔一行 "pairs=0", 把面板刷满 —— 那和"每 2 秒刷一条警告"是同一类噪声,
+       刷屏之后就不再有人看它了。曲线/读数行的状态仍然每局更新 (信号照发)。
+    */
+    if (dw.n > 0) {
+        emit bcProgress(QStringLiteral(
+            "[value] 价值评估: EV_win=%1 rho_eng=%2 EV_eng=%3 pairs=%4"
+            " zVar_win=%5 zVar_eng=%6")
+            .arg(dw.ok ? QString::number(dw.ev, 'f', 4) : nf)
+            .arg(rhoOk ? QString::number(rhoEng, 'f', 4) : nf)
+            .arg(de.zHasVariance ? QString::number(de.ev, 'f', 4) : nf)
+            .arg(dw.n)
+            .arg(dw.zVar, 0, 'f', 6).arg(de.zVar, 0, 'f', 6));
+    }
 }
 
 /*

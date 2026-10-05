@@ -21,6 +21,12 @@
 #include <map>
 #include <fstream>
 #include "chess.h"
+/*
+   行为克隆的口径层 (RL::BCSample): 对局中克隆要把样本缓冲起来, 所以这个类型要在
+   头文件里可见。它只依赖 rl/tensor.hpp (本工程本来就到处都在用它), 不引入 Qt、
+   也不引入任何 agent 头 —— 所以放在这里不会把 chessboard.h 变重。
+*/
+#include "rl/bc.h"
 #include "gamedb.h"
 #include "abagent.h"
 #include "mcts.h"
@@ -834,6 +840,66 @@ signals:
     void busyStarted(const QString &title, const QString &message);
     void busyMessage(const QString &message);
     void busyFinished();
+
+    /*
+     * ---- 行为克隆 (BC, 与 AB 对弈时勾选) 的进度行 ----
+     * 在**对弈线程**里 emit —— 与 trainLossSample / aiThinkingStage 同一做法
+     * (auto 连接会按线程自动排队投递到 GUI 线程, 界面里不许直接碰控件)。
+     *   line = 一行**已经排版好**的读数 (形如 "[BC] ... samples=12 updates=12 CE=2.4183"),
+     *          里面刻意留了 ASCII 记号 (samples=/updates=/CE=), 好让 UIA 脚本能断言。
+     * 只有一条信号 (没有"bcFinished"): 对局中克隆没有"开始/结束"这两个时刻 ——
+     * 它的生命周期就是**这一场对局**, 而这一场的收尾由 matchFinished 那条既有路径报告。
+     */
+    void bcProgress(const QString &line);
+    /*
+     * ---- [2026-10] BC 保真度采样 (给"行为克隆"那条曲线) ----
+     *
+     * 为什么要单独一条信号: `bcProgress` 是**文本进度**, 而"克隆得像不像老师"这件事
+     * 需要的是**可画成曲线的数**。四个量都在同一口径下算 (`BC::evaluate`, 与训练同一个
+     * 合法集掩码口径), 于是曲线和命令行 `train_bc` 报的是同一个东西:
+     *   updateNo : 第几次 actor 更新 (横轴)
+     *   top1Pct  : **一致率** —— 策略头单独选中的着法 == 老师那一手 的比例 (%)
+     *   pTeacher : 策略头给老师那一手的平均概率 (界面按 % 画, 与 top1 同一量纲)
+     *   ce       : 这一批的交叉熵 (不上曲线 —— 与上面两个不同量纲, 放进图下的读数行)
+     *   windowN  : 这一批是"最近多少条样本"上算的 (曲线量的是**当前窗口**, 不是全程)
+     *
+     * 发射频率: 每若干次更新一次 (窗口至少 8 条样本才开始, 否则前几个点是 0%/100% 的噪声)。
+     */
+    void bcFidelitySample(int updateNo, double top1Pct, double pTeacher, double ce,
+                          int windowN);
+    /*
+     * ---- [2026-10] "这一局人机开始了" (玩家落下本局第一子) ----
+     *
+     * 存在的理由只有一个: 界面要在这个时刻给"行为克隆"那条曲线**建线**。
+     * 人机那条路没有 `matchStarted`(那是 Agent 对 Agent 才有的"场开始"), 而
+     * `CurveChart::addPoint` 在序列不存在时是**静默 return** —— 于是"人机里 BC 明明在
+     * 训练、曲线却一直空着"(用户报的缺口)。发在 `setHumanGameInProgress` 的
+     * false->true 跳变点上, 也就是**每局一次**, 与"人机 BC 读数按局归零"同一口径。
+     * ⚠ 它是"这一局开始了", **不是** "BC 生效了": 老师下拉框 = 关 / 对战AI 不是
+     *   PPO/SAC 时, 界面收到信号也只是把曲线清空并把原因写在读数行里。
+     */
+    void humanGameStarted();
+    /*
+     * ---- [2026-10] 价值评估 (EV/校准) 的一次读数, 给"价值评估"那条曲线 ----
+     *
+     * 为什么必须有它: 损失曲线画的是 critic 的 **MSE**, 而 MSE 是最弱的那一层证据 ——
+     * 它的目标是**自举**的 (TD/GAE 用 V(s')), 所以"损失在降"可能与"价值是对的"无关,
+     * 也看不见"V 是不是还不如常数预测"。真正能回答"critic 有没有用"的是
+     * `rl/diag.h` 里那一套: **解释方差 EV**(无量纲, 0 = 与"永远预测均值"同水平,
+     * <0 = 还不如常数)与**校准误差**(往哪个方向偏) —— 而它们都要**真实结果 z**,
+     * 所以只能在"一局结束"这个时刻算。
+     *
+     * 口径 (与 bench_diag 的 [1b] 同一套, 见 rl/diag.h 的 zFromGameResult):
+     *   V : 每手记录时是**走子方视角**的 critic 输出;
+     *   z : 同一手折算成**走子方视角**的真实结果 (+1/0/−1);
+     *   窗口: 最近若干手 (跨局滚动, FIFO) —— 量的是"**当前**水平", 不是全程平均。
+     *
+     * ⚠ `hasVar == false` (zVar ≈ 0, 例如全是和棋/台架截断) 时**不发这条信号** ——
+     *   EV 在那一刻是**无定义**而不是 0, 而曲线上的 0 看起来就是"和常数预测一样烂"
+     *   (本工程第一次踩这条时读到的就是这个假的 0)。
+     */
+    void valueDiagSample(int gameNo, double evWin, double rhoEng, double evEng,
+                         double calibErr, int pairs, double zVarWin, double zVarEng);
     /* [2026-10 移除] replayIndexChanged / replayModeExited 两个回放信号已删 */
     /* 启动加载完成 */
     void startupComplete();
@@ -1327,6 +1393,110 @@ public:
 
     /*
      * ================================================================
+     *  ---- 行为克隆 (BC): 对局/人机里"顺便"克隆**下拉框选定的 AB** (2026-10) ----
+     * ================================================================
+     *
+     * 用户口径 (2026-10, 原话): **"行为克隆勾选框改成下拉框选择要克隆的 abagent，
+     * 与将要对弈的对方 agent 或者人类棋手无关，训练的时候参考下拉框选择的 abagent
+     * 的决策进行行为克隆训练"**。
+     *
+     * 于是: **老师由下拉框选**, 与"这一场的对手是谁"彻底解耦 —— 对手是 AB 的某一档、
+     * 是别的 agent、还是**人**, BC 都照常进行。与上一版口径的差别是根本性的:
+     *
+     *   上一版: 老师 = **对面的那个 AB** ⇒ 只有"一边 AB + 一边可训练 agent"时才可用,
+     *           而且一场只能克隆对面那一档 (对手换成 MCTS, 整个功能就不可用了);
+     *   这一版: 老师 = **下拉框里那一档 AB**, 学生的每个局面都由它现场搜一手当标签。
+     *
+     * ---- 样本定义 (这是本机制的全部要点) ----
+     * **学生要走的每一个局面** (= 轮到学生走棋、还没落子的那一刻) 是一条样本:
+     *   * 状态/动作一律用**学生自己**的编码口径 (encodeStateFor + stepToActionIdx,
+     *     两者同一个 color) —— 与 `train_bc` / `bcagent.hpp` 完全同一套, 所以两条路的
+     *     样本定义不可能漂移;
+     *   * 标签 = **下拉框那一档 AB 在这个局面上搜出来的那一手**: 在**局面副本**上现场跑
+     *     `ABAgent(depth)`, 既不碰学生手里的棋盘、也不碰对局棋盘、更不需要额外加锁;
+     *   * 于是"克隆"与"对弈/人机"是同一次运行, 不需要任何单独的 BC 入口。
+     *
+     * ⚠ 与上一版相比,**取样的轮次换了** (必须写清楚, 因为读数会跟着变): 上一版取的是
+     *   "**对手(AB)**走的那一手", 这一版取的是"**学生**走的那一手所在的局面"。理由是
+     *   上面的解耦: 老师不再是场上的人, 就没有"对手那一手"可抄; 而"学生自己的局面"
+     *   本来就是它真要做决策的那个分布 (BC 的标准口径, 也避免在分布之外学)。
+     *
+     * ---- 节奏与口径 ----
+     *   * **学生每走一手** => 一条样本 + **一次** actor 更新: 批 = 缓冲区里最多
+     *     `kBcBatch` 条 (不足就用全部)。不攒够 64 条再更新: 一局只有几十手,
+     *     等攒够就等于这一局白克隆;
+     *   * 缓冲区上限 `kBcBufferCap` (FIFO), 于是"越近的局面权重越大"这件事是显式的;
+     *   * 学习率 `kBcLr` 与命令行工具的默认一致 (0.002), RMSProp 逐张量归一化 ⇒
+     *     "每手一次更新"的位移是有界的 (不是"一局下来权重跑飞");
+     *   * **只在"训练对局"模式下生效**: 评估/只对弈模式声称"权重不变", 而 BC 是学习 ——
+     *     让它在那两种模式下偷偷改权重, 正是 P0-b 修掉的那类静默失效。
+     *
+     * ---- 三条与既有约定对齐的行为 ----
+     *   1. **只改内存里的权重**: 与"对弈期间不落盘"同一条口径, 唯一落盘点是退出。
+     *   2. **不独占 agent**: 更新发生在"已经落子、下一手决策之前"的空档里, 只短暂持有
+     *      `m_agentMutex` —— 不像"单独跑一次 BC"那样要整段占住几分钟。老师的 AB 搜索
+     *      在任何锁之外完成 (只用副本), 见 bcOnStudentMove。
+     *   3. **读数是"这一场/这一局"的累计**: 对局每场归零一次, 人机那条路**每局**归零
+     *      一次 (那里没有"场"这个概念), 都写进自检面板。
+     */
+    /* 这个 agent 类型能不能做 BC 的学生 (PPO 两支 + SAC 三支) */
+    static bool bcSupported(AgentType type);
+    /*
+     * 这个 agent 类型能不能报**标量 V(s)** —— 价值评估曲线 (EV/校准) 的采样前提。
+     * 只有 PPO 两支: 它们的 critic 就是 V(s); SAC 三支的批评家是 Q(s,a) (目标不同),
+     * 拿 Q 冒充 V 会让 EV 的含义变掉, 所以那边明确"没有这条读数"(界面上说明原因)。
+     */
+    static bool valueProbeOfSupported(AgentType type)
+    {
+        return type == AGENT_PPOMCTS || type == AGENT_PPOMCTS_MLP;
+    }
+    /*
+     * 这一对选手**能不能**开"对局中克隆": 只要**至少一侧**是能做 BC 的学生就行 ——
+     * 老师由下拉框选, 与对手是谁无关 (这正是 2026-10 的口径)。两侧都能做学生时
+     * **两边各在自己的局面上克隆**。
+     * 界面据此启用/禁用那个下拉框, 并把原因写在提示里 (与库里同一份判据)。
+     */
+    static bool bcHasStudent(AgentType a, AgentType b);
+    /*
+     * 老师深度 = 下拉框里那一档 Alpha-Beta 的搜索深度; **0 = 关** (默认)。
+     * 1/2/3/4 分别对应界面上的 Alpha-Beta L1/L2/L3/(深度=4) 四档 —— 深度与档位在本
+     * 工程里一一对应 (abDepthOf 是唯一来源), 所以只存一个 int: 少一个"开关与档位
+     * 可能不一致"的状态。
+     */
+    int bcTeacherDepth() const { return m_bcTeacherDepth.load(); }
+    void setBcTeacherDepth(int depth) { m_bcTeacherDepth.store(depth); }
+    /*
+     * ---- [2026-10] 软目标开关 (用户问题: "不直接使用 onehot 通过 abagent 计算概率
+     *      分布再进行行为克隆是否会更好?") ----
+     *
+     * true  => 老师给的是**多深度一致性的分布** (深度 1..D 各投一票, 票数/D 当概率),
+     *         目标熵 H(t) > 0, 损失 = 合法集上的交叉熵 (其下界就是 H(t));
+     * false => 老师只给最深那一层的一手 (one-hot), H(t) = 0, 损失 = 掩码 NLL。
+     * 同样是 atomic 的理由与 `m_bcTeacherDepth` 相同 (GUI 线程写, 对弈/人机线程读)。
+     *
+     * ⚠ 默认 **关**: 实测 (4000 局面 / 深度 3 / 8 epoch / **4 个种子**成对比较, 见
+     *   docs/behavior_cloning_2026_10.md §9) 两个指标**方向相反** —— 可比口径
+     *   **留出 KL (CE − H(t)) 4/4 个种子都更低** (均值 2.379 → 1.866), 而硬口径
+     *   **留出 top-1 略低** (38.59% → 36.78%, 3/4 个种子; 单种子符号不一致 ⇒ 只能算"没变好"),
+     *   `train−留出` 差 4/4 都更小 (0.427 → 0.280), 策略熵不塌, 代价约 +12~14% 打标签时间。
+     *   所以它是"可选开关"而不是新默认 —— 把默认换掉等于**悄悄换掉所有人读数的口径**
+     *   (软目标的 CE 与 one-hot 的 CE 不是同一把尺), 与"动态奖励 / 对手入训"同一个口径。
+     */
+    bool isBcSoftTarget() const { return m_bcSoftTarget.load(); }
+    void setBcSoftTarget(bool on) { m_bcSoftTarget.store(on); }
+    /* 深度 -> 显示名 (唯一来源: 界面下拉框、对局报告、面板全都用这一份) */
+    static QString bcTeacherName(int depth);
+    /*
+     * 最近一次"对局中克隆"的报告 (纯文本, 多行; 没跑过时为空)。
+     * 界面把它拼进"模型自检"面板 —— 那个面板回答的正是"这个模型值不值得继续训",
+     * 而 BC 的读数 (样本数 / 更新次数 / CE / 口径自检) 属于同一类问题。
+     * 拼进面板而不是新加控件还有一个具体的理由: 中间那一列没有滚动区, 少一个视图
+     * 就少一类"看不见"的坑 (见 mainwindow.ui 里那段说明)。
+     */
+    QString bcReportText() const;
+
+    /*
+     * ================================================================
      *  ---- P1: 让对手的棋进入训练数据 (exploreAndTrain 的对手参数) ----
      * ================================================================
      *
@@ -1627,6 +1797,108 @@ private:
 
     /* 后台训练 */
     std::thread m_bgTrainThread;
+
+    /*
+     * ---- 行为克隆 (BC, 下拉框选老师) 的状态 (见上面那段说明) ----
+     *
+     * `m_bcTeacherDepth` 是 atomic: 写在 GUI 线程 (下拉框), 读在**对弈线程 / 人机
+     * worker 线程** (每一手都要读)。其余几个在"干活的那条线程"里串行读写 (样本缓冲、
+     * 统计), 所以不需要同步 —— 唯一对外的出口是 `m_bcReport` (拼好的文本, 用下面那把
+     * 独立的小锁保护)。
+     * `m_bcReport` 用**独立的**一把锁而不是 m_agentMutex: 后者在决策路径里会被整段持有
+     * (一次思考可能几秒), 用它保护报告会让"读最近一次报告"跟着卡住, 而报告正是界面
+     * 每次刷新面板都要读的东西。
+     */
+    std::atomic<int> m_bcTeacherDepth{0};       /* 0 = 关; 1/2/3/4 = AB 深度 (下拉框选) */
+    std::atomic<bool> m_bcSoftTarget{false};    /* [2026-10] 软目标 (多深度一致), 默认关 */
+    std::vector<RL::BCSample> m_bcBuf;      /* 这一场从学生的局面上攒到的样本 (FIFO) */
+    long long m_bcSamples = 0;              /* 本场累计样本数 */
+    long long m_bcUpdates = 0;              /* 本场累计 actor 更新次数 */
+    long long m_bcMissed = 0;               /* 本场"没能做成样本"的条数 (目标落空/无合法集) */
+    double m_bcLastCe = -1.0;               /* 最近一次批平均 CE */
+    double m_bcFirstCe = -1.0;              /* 第一条样本的批平均 CE (用来看"有没有在降") */
+    /* 最近一次"保真度窗口"的读数 (进对局报告; 由 bcCollectFromStudent 填)
+       ⚠ 窗口 CE 与"批平均 CE"(m_bcLastCe) 是**两个口径**: 前者是最近 64 条上的 CE,
+       后者是最近一个训练批上的 CE。混用会把"第一条 -> 最后一条"那个读数变成
+       "第一条批 vs 最后一个窗口", 于是它的方向失去意义 —— 所以分成两个成员。 */
+    double m_bcLastTop1 = -1.0;
+    double m_bcLastPTeacher = -1.0;
+    double m_bcLastFidCe = -1.0;
+    int m_bcLastWindow = 0;
+    /*
+     * [2026-10] 软目标 (多深度一致) 的**老师侧**读数: 目标熵 H(t) 的累计与条数。
+     * 为什么要它: CE 是"学生 vs 老师"的数, 换了软目标之后 CE 的**下界**从 0 变成 H(t)
+     * (CE = H(t) + KL(t‖π)), 于是"CE 2.41 vs 2.58"这种对比**只在同一个 H(t) 下可比**。
+     * 报告里印出 H(t) 才能回答"这个 CE 到底是学得差还是老师本身就模糊"。
+     * 只在软目标那条路上累加 (`m_bcSoftSamples` 同时是"软样本条数"的计数器)。
+     */
+    double m_bcTargetEntropySum = 0.0;
+    long long m_bcSoftSamples = 0;
+    /*
+     * "这一场开始时在线训练上报过多少次损失"的基线 (2026-10)。
+     * 报告里的 `onlineSteps=` = `m_trainSampleNo - m_bcOnlineBase` —— 它回答的是
+     * "**BC 与在线训练(探索+预训练)同时开着的时候, 在线那条路到底有没有真的跑**":
+     * 两个开关互相独立 (都能开), 而"都开着"与"只有一个在跑"在读数上必须分得开,
+     * 否则用户没法判断自己看到的 CE 趋势是哪条路造成的。
+     * (PPO 那一支的在线训练就是探索+预训练这条路, 见 aiThinkRaw 的 PPO 分支。)
+     */
+    long long m_bcOnlineBase = 0;
+    mutable std::mutex m_bcMutex;
+    QString m_bcReport;
+    /* 这一场的"学生 / 老师"名字 (只用于报告: 对局循环里认不出"A 还是 B") */
+    QString m_bcMatchAgent;
+    QString m_bcMatchTeacher;
+    /*
+     * 人机那条路的"一局一次"归零标志 (2026-10): 人机没有"场"的概念, 而读数必须是
+     * **这一局**的累计 ⇒ 第一次采样时归零 (compare-exchange, 只有第一次为真),
+     * 终局/重开 (setHumanGameInProgress(false)) 时清掉。
+     * atomic: 终局那条路可能从 worker 线程走 (process() -> notifyHumanGameEnd)。
+     */
+    std::atomic<bool> m_bcHumanSession{false};
+    /*
+     * ---- 价值评估 (EV/校准) 的采样 (2026-10) ----
+     *
+     * 与 BC 那套状态同一风格, 但目的不同: BC 量的是"像不像老师", 这里量的是
+     * "**critic 说的价值对不对**"。三段数据:
+     *   m_valueGameV / m_valueGameMover : **本局**攒的每手 (V, 走子方) —— 局末才知道 z;
+     *   m_valueWinV  / m_valueWinZ      : 跨局滚动的 (V, z) 窗口 (FIFO, 上限见常量);
+     *   m_valuePairs / m_valueGames     : 读数用 (对数 / 已计入的局数)。
+     * ⚠ 采样只在**对局那条路** (§playMatchGame) 做: 那里才有"每手都是同一个 agent 自己
+     *   决策"的干净口径; 人机那条路 AI 只走一半的手, 混进来会让"这个 V 是谁的"说不清。
+     */
+    std::vector<double> m_valueGameV;        /* 采到 V 的那些手 */
+    std::vector<int> m_valueGameSampleIdx;   /* 它们在下面两个"整局"数组里的下标 */
+    /*
+     * **整局**每一手的 (即时奖励, 走子方) —— 不只是采样到的那些手。
+     * ⚠ 只记**引擎口径** (材质×1 + 终局 ±1, `engineRed/engineBlack`)!
+     *   (用户实测三次之后定的): 第一版记的是 `rewardRed/rewardBlack`, 那两本账是
+     *   "有学习口径就用学习口径、否则回退引擎口径" ⇒ 与 AB/MCTS 对弈时 **一场之内两种
+     *   口径混在一起** (PPO 那边材质×0.1, 对手那边×1), 于是折扣回报被对手那本账主导,
+     *   V 与它自然"反着走" ⇒ 曲线上读到负值(用户报的"与 MCTS 对弈价值曲线偏低数值小于 0")。
+     *   引擎口径对**每一手**都有定义且与 agent 无关 ⇒ 不再混口径。
+     */
+    std::vector<double> m_valueGameStep;
+    std::vector<int> m_valueGameStepMover;
+    std::vector<double> m_valueWinV;
+    std::vector<double> m_valueWinZ;        /* z 口径 1: 真实胜负 (+1/0/−1, 走子方视角) */
+    std::vector<double> m_valueWinZEng;     /* z 口径 2: 引擎口径的折扣回报 (均匀口径, 不混) */
+    long long m_valuePairs = 0;
+    int m_valueGames = 0;    /* 对局循环 / 人机路径里的钩子 (定义在 .cpp) */
+    void bcResetMatchStats(const QString &agentLabel, const QString &teacherLabel);
+    template <class AgentT>
+    void bcCollectFromStudent(AgentT *ag, const Chess &pos, int color, const Step &teacher,
+                              const std::vector<Step> &softMoves,
+                              const std::vector<float> &softProbs);
+    void bcOnStudentMove(AgentType studentType, const Chess &pos, int color);
+    /* 人机那条路: 自己从 chess 拷一份局面, 然后与对局循环走同一段 bcOnStudentMove */
+    void bcSampleForHumanTurn(AgentType studentType, int color);
+    /* 报告正文 (进行中也调它 —— 人机那条路没有"场结束"这个时机) */
+    QString bcComposeReport() const;
+    /* 每手把"走子方视角的 V(s)"推进本局的采样缓冲 (不支持的 agent 直接返回 false) */
+    bool valueProbeOf(AgentType type, Chess &pos, int color, double &out);
+    /* 局末: 把本局的 (V, mover) 折算成 (V, z) 进滚动窗口, 窗口够大就发一次读数 */
+    void valueDiagOnGameEnd(int result, int gameNo);
+    void bcFinishMatchReport(MatchStats &st);
     /*
        atomic: 置位/清位在 GUI 线程 (start/stop), 而读取在训练线程的循环条件、
        以及暂停闸门的 wait 谓词里 —— 一个普通 bool 被两条线程读写是数据竞争

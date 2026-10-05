@@ -49,10 +49,14 @@ param(
     [int]$Games = 1,
     [switch]$Full,           # wait for the whole match instead of aborting early
     [int]$TimeoutSec = 300,
-    # 等"开始对弈"按钮变 enabled (= startupLoad 完成) 的上限, 秒。默认 30。
+    # 等"开始对弈"按钮变 enabled (= startupLoad 完成) 的上限, 秒。默认 120。
     # 启动耗时取决于 weights/ 里有什么 (大权重越多越慢), 环境慢就调大 —— 见下面
     # 那段注释: 写死 30 s 会把"还没加载完"误报成"加载失败"。
-    [int]$StartupTimeoutSec = 30,
+    # [2026-10] 实测这台机器上冷启动 = 约 40 s (README 记录的同一个数), 其中
+    # "PPO+MCTS: 17.1 s / SAC+AZ-MoE 读权重 11.3 s / DQN+AB 3.6 s" 三块就占了大头
+    # (日志见 -LogFile 的 [weights] 行) —— 30 s 必然超时, 于是**默认路径**每次都在
+    # "start button never became enabled within 30 s" 上假失败。默认值提到 120。
+    [int]$StartupTimeoutSec = 120,
     [int]$AIndex = -1,       # agent index for side A (-1 = leave the default)
     [int]$BIndex = -1,       # agent index for side B
     # "对战AI" 组合框 (0) 选哪个 agent —— 它决定**后台训练的目标**。
@@ -139,6 +143,20 @@ function Get-Desc([string]$name) {
     $e = Find-ByName $name
     if ($null -eq $e) { return "" }
     return [string]$e.Current.HelpText
+}
+
+# 按 Name **前缀**找一个控件元素本身 (不是它的 HelpText)。
+# 为什么需要它 (2026-10): CurveChart 的 accessibleName 现在是 "<标题> · n=<点数>"
+# (把点数放进 Name 是为了让脚本能断言"曲线真的在长" —— Description 在 Qt 的 UIA 桥里
+# 读不到)。于是"精确名字查找"会静默返回 null, 症状却是"双击没打开放大窗口"。
+function Find-ByNamePrefix([string]$prefix) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::IsControlElementProperty, $true)
+    foreach ($t in $script:root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants, $cond)) {
+        if ([string]$t.Current.Name -like "$prefix*") { return $t }
+    }
+    return $null
 }
 
 # 同上, 但按**名字前缀**找 (文案会改: 例 "环境奖励 (每手累计..." 后面挂了口径说明)。
@@ -477,8 +495,15 @@ try {
     if ($lossDesc -ne "") { Write-Output ("loss chart   = " + $lossDesc) }
     if ($rewardDesc -ne "") { Write-Output ("reward chart = " + $rewardDesc) }
 
-    # 每局一行明细 (且行里要有奖励信息)
-    $listOk = ($gameLines.Count -ge 1) -and ($gameLines[0] -like "*奖励*")
+    # 每局一行明细 (且行里要有奖励信息)。
+    # **只有打完的局才会落一行** (chessboard.cpp: emit matchGameFinished(st.games, ...)),
+    # 被中止的那一局不落行 —— 于是默认路径 (开局 3 s 就按"停止对弈") 的场次必然
+    # `共 0 局` + 0 条逐局行。旧的写法把"没有逐局行"直接当失败, 报出来的是
+    # "RESULT: FAIL" 而脚本里**没有任何一条 FAIL 行** —— 2026-10 就是这么被绊住的:
+    # 真正的失败原因不是产品, 而是"中止得太早, 这一场的逐局行还没到该出现的时候"。
+    # 现在先算出原始结果, 等下面从结果标签里解析出 $gamesDone 再决定是否真的判定。
+    $gameLinesOk = ($gameLines.Count -ge 1) -and ($gameLines[0] -like "*奖励*")
+    $listOk = $gameLinesOk
     $scoreOk = ($score -match "\d+\s*:\s*\d+")
     # 奖励曲线每手一个点 (局末再多一个含 ±1 的点) -> 点数至少要赶上总手数。
     # 这是用户那个"对弈时奖励曲线没有更新"的**防回归断言**: 点数≈1 就是 bug 复现。
@@ -489,6 +514,16 @@ try {
     if ($final -match "(\d+)\s*手") { $plies = [int]$Matches[1] }
     $gamesDone = -1
     if ($final -match "共\s*(\d+)\s*局") { $gamesDone = [int]$Matches[1] }
+    # ---- 逐局明细检查的适用性 (见上面 $gameLinesOk 的注释) ----
+    # 只有"这一场真有局打完"时, "列表里该有逐局行"才是产品承诺; 0 局的场次
+    # (默认路径按停止按得太早) 本来就一条都不该有, 这时报 FAIL 是检查自己的错。
+    if ($gamesDone -eq 0 -and $gameLines.Count -eq 0) {
+        Write-Output "   (跳过逐局明细检查: 本场 0 局完成 —— 逐局行只在局末落一条, 走 -Full 才会检查它)"
+        $listOk = $true
+    } elseif ($gamesDone -gt 0 -and (-not $gameLinesOk)) {
+        # 有局打完却没有逐局行 = 真 bug (明细丢失), 这时候必须响。
+        Write-Output ("   逐局明细缺失: 已完成 {0} 局, 但列表里 0 条逐局行" -f $gamesDone)
+    }
     if ($rewardPtsFinal -ge 0 -and $plies -ge 0 -and $gamesDone -ge 0) {
         # 一手一个点, 每局再多一个"局末含 ±1"的点; 被将死那一手不落子所以每局可能少一个,
         # 于是下界取 (手数 - 局数)。
@@ -578,7 +613,8 @@ try {
     Write-Output ("stray list items (dialogs)= {0}" -f $stray.Count)
     foreach ($s in $stray) { Write-Output ("   ? " + $s) }
 
-    Write-Output ("list has per-game lines = {0}" -f $listOk)
+    Write-Output ("list has per-game lines = {0}  (已完成 {1} 局, 逐局行 {2} 条)" -f `
+        $listOk, $gamesDone, $gameLines.Count)
     Write-Output ("score shows a ratio     = {0}" -f $scoreOk)
     Write-Output ("reward chart has points = {0}" -f $rewardOk)
     Write-Output ("loss readout present    = {0}" -f $lossOk)
@@ -601,7 +637,12 @@ try {
 
     $largeOk = $false
     $largeText = ""
-    $chartEl = Find-ByName "训练损失 (每完成一次在线训练一个点)"
+    # [2026-10] 按**前缀**找损失图: CurveChart 的 accessibleName 现在是
+    # "<标题> · n=<点数>"(点数进 Name 是为了让脚本能断言"曲线真的在长" —— Description
+    # 在 Qt 的 UIA 桥里压根读不到, 见 metricsview.cpp 的 updateAccessibility)。
+    # 写死全名的话这里会**找不到控件**, 而症状是"双击没打开放大窗口" ——
+    # 一条与双击毫无关系的假失败。
+    $chartEl = Find-ByNamePrefix "训练损失 (每完成一次在线训练一个点)"
     if ($null -ne $chartEl) {
         $r = $chartEl.Current.BoundingRectangle
         if ($r.Width -gt 4 -and $r.Height -gt 4) {

@@ -42,6 +42,7 @@
 #include <QEventLoop>
 #include <QMouseEvent>
 #include <QObject>
+#include <QRegularExpression>      /* [E] 从 BC 报告里读 samples=/updates= */
 #include <QTimer>
 
 #include <chrono>
@@ -610,6 +611,112 @@ int main(int argc, char **argv)
               "(端到端: 走的是真实点击路径, 不是直接调函数)");
         check(missedAfter == missedBefore,
               "而且没有被同时记成\"没交出\" (两个计数严格互斥)");
+    }
+
+    /* ================================================================
+     *  [E] 人机对战里的行为克隆 (2026-10 用户口径)
+     * ================================================================
+     *
+     * 用户口径 (原话): **"行为克隆勾选框改成下拉框选择要克隆的 abagent，与将要对弈的
+     * 对方 agent 或者人类棋手无关"**。这一节钉的就是后半句里的**人类棋手**那一条:
+     * 人机对战里没有第二个 agent 当老师, 老师只能来自下拉框 —— 于是"跟人下棋时
+     * 到底有没有在克隆"必须有一条端到端的证据。
+     *
+     * 为什么这一节必须在本探针里 (而不是 test_bc / test_match):
+     *   * `test_bc` 是纯 RL 层 (没有棋盘、没有 agent 实例);
+     *   * 人机那条路的 AI 决策只在 `aiThink -> humanTurnAiMoveForTest` 上发生, 而本探针
+     *     是**唯一**驱动它的地方 (它同时是那条路的测试钩子, 见 chessboard.h)。
+     *   ⇒ 断言刻意走**真实点击** (不是直接调函数): "人落了子 -> AI 应手 -> 顺手克隆"
+     *     这条链路里任何一环断了, 这里都会红。
+     *
+     * 观测手段: 棋盘自己的 BC 报告 (`bcReportText()`)。它是给界面面板用的同一份文本,
+     * 里面带 ASCII 记号 (samples= / updates= / teacher-depth=), 所以不需要读中文。
+     */
+    std::printf("\n[E] 人机对战里的行为克隆 (老师来自下拉框, 与人无关)\n");
+    {
+        board.setMatchMode(ChessBoard::MATCH_TRAIN);
+        board.setBcTeacherDepth(1);                  /* 下拉框 = Alpha-Beta L1 (最深 4) */
+        board.setAgentType(ChessBoard::AGENT_PPOMCTS_MLP);   /* 学生: 有策略头的一支 */
+        board.setPreTrainEnabled(false);
+        board.reset();
+        quiesce(board, 400);
+
+        const BlackSnapshot bcBlack0 = snapshotBlack(board);
+        playMove(board, 6, 4, 5, 4);                 /* 人先走一步 (兵七进一) */
+        long long bcAiMs = -1;
+        const bool bcReplied = waitForBlackChange(board, bcBlack0, 120000, &bcAiMs);
+        check(bcReplied, "[BC] AI (学生) 在人机里应手了一次");
+        if (bcReplied) {
+            std::printf("      AI 应手耗时 %.0f ms\n", (double)bcAiMs);
+        }
+        quiesce(board, 800);
+
+        const QString rep = board.bcReportText();
+        std::printf("      ---- 人机这一局的 BC 报告 ----\n");
+        for (const QString &l : rep.split(QLatin1Char('\n'))) {
+            if (!l.trimmed().isEmpty()) {
+                std::printf("      %s\n", l.toUtf8().constData());
+            }
+        }
+        check(!rep.isEmpty(), "[BC] 人机这条路写出了 BC 报告 (不为空 = 采样真的发生了)");
+        /*
+           三个数一起看 (与界面报告同一口径):
+             * samples/updates > 0 —— "克隆到底有没有在发生";
+             * targetMissed == 0 —— 没有"老师着法不在合法集里"这类口径错位。
+        */
+        const QRegularExpression re(
+            QStringLiteral("samples=(\\d+) updates=(\\d+) targetMissed=(\\d+)"));
+        const QRegularExpressionMatch m = re.match(rep);
+        check(m.hasMatch(), "[BC] 报告里有 match-summary 那一行 (samples/updates/targetMissed)");
+        if (m.hasMatch()) {
+            const long long samples = m.captured(1).toLongLong();
+            const long long updates = m.captured(2).toLongLong();
+            const long long missed = m.captured(3).toLongLong();
+            std::printf("      samples=%lld updates=%lld targetMissed=%lld\n",
+                        samples, updates, missed);
+            check(samples >= 1, "[BC] 人机这一局至少采到 1 条样本");
+            check(updates >= 1, "[BC] 至少做过 1 次 actor 更新 (策略头真的被练了)");
+            check(missed == 0, "[BC] 没有目标落空 (老师的着法都在合法集里)");
+        }
+        /*
+           老师必须是**下拉框**选的那一档: 报告头部带 machine-readable 的
+           `[teacher-depth=N]`。人机里没有第二个 agent, 所以这条也顺带证明了
+           "老师不是从对手身上继承来的"。
+        */
+        check(rep.contains(QStringLiteral("[teacher-depth=1]")),
+              "[BC] 报告里的老师 = 下拉框选的那一档 (teacher-depth=1)");
+        /*
+           [2026-10] 软目标开关的**默认**: `soft=0`。这条看起来很小, 但它盯住的是
+           "新开关默认关" —— 默认打开的话, 所有人读到的 CE 都会换口径 (软目标的 CE 下界
+           是 H(t), 见 docs/behavior_cloning_2026_10.md §9), 而界面上没有任何东西会
+           提醒这一点 (复选框不勾也是它)。顺带也证明这个字段真的走到了 GUI 那条路。
+        */
+        check(rep.contains(QStringLiteral("soft=0")),
+              "[BC] 默认是 one-hot (报告里 soft=0); 软目标是可选开关");
+
+        /* ---- 反面对照: 下拉框选"关"之后, 同样的操作**不该**再产生样本 ---- */
+        board.setBcTeacherDepth(0);
+        board.reset();
+        quiesce(board, 400);
+        const long long beforeSamples = [&board]() {
+            const QRegularExpression r2(QStringLiteral("samples=(\\d+)"));
+            const QRegularExpressionMatch m2 = r2.match(board.bcReportText());
+            return m2.hasMatch() ? m2.captured(1).toLongLong() : -1;
+        }();
+        const BlackSnapshot offBlack0 = snapshotBlack(board);
+        playMove(board, 6, 4, 5, 4);
+        long long offAiMs = -1;
+        const bool offReplied = waitForBlackChange(board, offBlack0, 120000, &offAiMs);
+        check(offReplied, "[BC] 关掉老师之后 AI 照常应手 (只是不再克隆)");
+        quiesce(board, 600);
+        const QRegularExpression r3(QStringLiteral("samples=(\\d+)"));
+        const QRegularExpressionMatch m3 = r3.match(board.bcReportText());
+        const long long afterSamples = m3.hasMatch() ? m3.captured(1).toLongLong() : -1;
+        std::printf("      关掉老师: samples %lld -> %lld (期望: 不再增长)\n",
+                    beforeSamples, afterSamples);
+        check(afterSamples <= beforeSamples,
+              "[BC] 下拉框 = 关 时不再产生新样本 (开关真的关掉了, 不是一直开着)");
+        board.setAgentType(ChessBoard::AGENT_ALPHABETA);   /* 收尾: 还原便宜的 agent */
     }
 
     std::printf("\n==== 失败项: %d ====\n", gFailed);

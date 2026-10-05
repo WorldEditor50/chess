@@ -15,13 +15,53 @@ namespace {
 constexpr int kFrameIntervalMs = 33;
 constexpr qreal kTwoPi = 6.283185307179586;
 
-/* 动画尺寸 */
-constexpr qreal kDialCy = 76.0;    /* 动画圆心 y (控件内坐标) */
+/* 动画尺寸 (基准值: 表盘区高度 kDialRegionH 时用原尺寸, 见下面 scaleOf) */
+constexpr qreal kDialCy = 76.0;    /* 动画圆心 y (控件内坐标, 基准布局) */
 constexpr qreal kHaloR = 56.0;     /* 呼吸光晕半径 */
 constexpr qreal kRingR = 43.0;     /* 粒子环半径 */
 constexpr qreal kSandHalfW = 17.0; /* 沙漏半宽 */
 constexpr qreal kSandHalfH = 21.0; /* 沙漏半高 */
 constexpr int kParticleCount = 10;
+
+/*
+ * ================================================================
+ *  ---- [2026-10 用户口径] 控件缩小: 表盘按可用高度**等比缩放** ----
+ * ================================================================
+ * 用户口径: "将中间的沙漏控件缩小尺寸" —— 中间那一列要腾出地方给别的行
+ * (模式/对手入训/…/行为克隆), 而这块卡片原来是**固定 200 px 高**。
+ *
+ * 做法: 不再用固定的像素几何, 而是把"标题 + 底部三行文字"这两块**固定**住
+ * (它们是文字, 缩了就看不清), 剩下的高度全给表盘, 表盘里的每一个半径按
+ * `表盘高 / kDialRegionH` 等比缩放。
+ *
+ * 三条刻意的选择:
+ *   1. **不缩字体**: 耗时那一行是给用户看的读数 (百分秒), agent 名与阶段文字也是
+ *      —— 字号一旦跟着缩, "小"就变成"看不清", 那不是缩小而是变坏;
+ *   2. **基准值 = 原来的观感**: `kDialRegionH = 112` 正好是原来 200 px 卡片里
+ *      留给表盘的高度 ⇒ 把控件还原成 200 px 时, 画出来与改动前**逐像素同款**
+ *      (所以这条改动不会顺手改掉动画的样子);
+ *   3. **留一个下限**: 高度再小也不会把表盘缩到看不见 (`kDialMinH`), 超出的部分
+ *      由布局去压缩文字那一块 (宁可挤文字, 不要画一团糊)。
+ * ================================================================
+ */
+constexpr qreal kTitleH = 22.0;         /* 标题占的高度 */
+constexpr qreal kTextBlockH = 66.0;     /* 底部三行文字占的高度 */
+constexpr qreal kDialRegionH = 112.0;   /* 基准表盘高 (对应的就是原来的 200 px 卡片) */
+constexpr qreal kDialMinH = 40.0;       /* 表盘区最小高度 (再小就只缩不画了) */
+
+/* 表盘中心与缩放因子 (paintEvent 与三个绘制函数共用同一套, 免得对不上) */
+inline qreal dialRegionH(int widgetH)
+{
+    return std::max(kDialMinH, (qreal)widgetH - kTitleH - kTextBlockH);
+}
+inline qreal dialScale(int widgetH)
+{
+    return dialRegionH(widgetH) / kDialRegionH;
+}
+inline QPointF dialCenter(int widgetW, int widgetH)
+{
+    return QPointF(widgetW / 2.0, kTitleH + dialRegionH(widgetH) / 2.0);
+}
 
 /* 配色 (与 appstyle.qss 的 #fef9e3 米色背景协调) */
 const QColor kAccent(47, 127, 214);      /* 思考中: 蓝 */
@@ -58,7 +98,13 @@ QString formatElapsed(long long ms)
 ThinkingIndicator::ThinkingIndicator(QWidget *parent)
     : QWidget(parent)
 {
-    setMinimumSize(170, 186);
+    /*
+       [2026-10 用户口径] 尺寸缩小: 200 -> 136 px 高。
+       为什么是 136: 标题 22 + 表盘最小 40 + 底部三行文字 66 = 128, 再留 8 px 呼吸余量。
+       表盘因此缩到 48 px 高 (原基准 112 的 0.43 倍), 而**文字一个字都没变小**。
+       垂直方向是 Fixed: 布局会照 sizeHint 给高度, 所以这个数就是它实际占的高度。
+    */
+    setMinimumSize(170, 128);
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
     m_timer.setInterval(kFrameIntervalMs);
@@ -67,12 +113,12 @@ ThinkingIndicator::ThinkingIndicator(QWidget *parent)
 
 QSize ThinkingIndicator::sizeHint() const
 {
-    return QSize(200, 200);
+    return QSize(200, 136);
 }
 
 QSize ThinkingIndicator::minimumSizeHint() const
 {
-    return QSize(170, 186);
+    return QSize(170, 128);
 }
 
 void ThinkingIndicator::start(const QString &agentName, const QString &stage)
@@ -167,7 +213,9 @@ void ThinkingIndicator::paintEvent(QPaintEvent *)
 
     const qreal w = width();
     const qreal h = height();
-    const QPointF c(w / 2.0, kDialCy);
+    /* 表盘区随控件高度收缩 (见文件头 kDialRegionH 的说明); 文字那一块固定 */
+    const QPointF c = dialCenter((int)w, (int)h);
+    const qreal s = dialScale((int)h);
 
     /* ---- 卡片底 ---- */
     const QRectF panel = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
@@ -202,10 +250,10 @@ void ThinkingIndicator::paintEvent(QPaintEvent *)
     p.setPen(titleColor);
     p.drawText(QRectF(4.0, 4.0, w - 8.0, 18.0), Qt::AlignCenter, title);
 
-    /* ---- 三种动画: 呼吸灯 / 旋转粒子 / 沙漏 ---- */
-    drawHalo(p, c);
-    drawParticles(p, c);
-    drawHourglass(p, c);
+    /* ---- 三种动画: 呼吸灯 / 旋转粒子 / 沙漏 (都按 s 缩放) ---- */
+    drawHalo(p, c, s);
+    drawParticles(p, c, s);
+    drawHourglass(p, c, s);
 
     /* ---- 实时耗时 ---- */
     QFont timeFont(QStringLiteral("Consolas"));
@@ -241,11 +289,11 @@ void ThinkingIndicator::paintEvent(QPaintEvent *)
     p.drawText(QRectF(4.0, h - 24.0, w - 8.0, 15.0), Qt::AlignCenter, stageText);
 }
 
-/* 呼吸灯: 半径与透明度同相位缓慢起伏 */
-void ThinkingIndicator::drawHalo(QPainter &p, const QPointF &c) const
+/* 呼吸灯: 半径与透明度同相位缓慢起伏 (半径按 s 缩放, 透明度与字号无关) */
+void ThinkingIndicator::drawHalo(QPainter &p, const QPointF &c, qreal s) const
 {
     const qreal wave = 0.5 + 0.5 * std::sin(kTwoPi * m_phase);
-    const qreal radius = kHaloR * (0.94 + 0.10 * wave);
+    const qreal radius = kHaloR * s * (0.94 + 0.10 * wave);
     const int alphaMax = m_running ? static_cast<int>(40 + 70 * wave) : 18;
 
     QRadialGradient halo(c, radius);
@@ -261,12 +309,12 @@ void ThinkingIndicator::drawHalo(QPainter &p, const QPointF &c) const
 }
 
 /* 旋转粒子: 一圈固定位置的粒子, 亮度峰值 (彗头) 随时间绕圈跑 */
-void ThinkingIndicator::drawParticles(QPainter &p, const QPointF &c) const
+void ThinkingIndicator::drawParticles(QPainter &p, const QPointF &c, qreal s) const
 {
     /* 参考圆: 让"环"本身可见, 否则只有亮点在飘 */
     p.setBrush(Qt::NoBrush);
     p.setPen(QPen(QColor(170, 165, 140, m_running ? 90 : 45), 1.0));
-    p.drawEllipse(c, kRingR, kRingR);
+    p.drawEllipse(c, kRingR * s, kRingR * s);
 
     const qreal headIdx = m_phase * kParticleCount;   /* 彗头在"粒子序号"空间的位置 */
     const qreal breathe = 0.5 + 0.5 * std::sin(kTwoPi * m_phase * 2.0);
@@ -281,14 +329,15 @@ void ThinkingIndicator::drawParticles(QPainter &p, const QPointF &c) const
         const qreal head = std::pow(1.0 - d / kParticleCount, 2.0);   /* 1 -> 0 的彗尾 */
 
         const qreal ang = kTwoPi * (i / static_cast<qreal>(kParticleCount));
-        const qreal rr = kRingR + 2.5 * std::sin(kTwoPi * m_phase + i);
+        const qreal rr = (kRingR + 2.5 * std::sin(kTwoPi * m_phase + i)) * s;
         const QPointF pt(c.x() + rr * std::cos(ang), c.y() + rr * std::sin(ang));
 
         const qreal scale = m_running ? 1.0 : 0.3;
         QColor col(kAccent);
         col.setAlphaF(qBound(0.0, (0.12 + 0.78 * head) * scale, 1.0));
         p.setBrush(col);
-        const qreal r = (1.7 + 2.7 * head) * (0.85 + 0.15 * breathe);
+        /* 粒子的半径也跟着缩, 但留一个 0.6 的下限: 缩到看不见就等于动画没了 */
+        const qreal r = (1.7 + 2.7 * head) * (0.85 + 0.15 * breathe) * std::max(0.6, s);
         p.drawEllipse(pt, r, r);
     }
 }
@@ -315,10 +364,10 @@ void ThinkingIndicator::drawParticles(QPainter &p, const QPointF &c) const
    现在上下两腔都用同一套 `u = hh·√f` 的换算, 上半部剩 `f = 1−drained`,
    下半部积 `f = drained`, 于是"漏下去的"和"堆起来的"在任何相位都面积相等。
 */
-void ThinkingIndicator::drawHourglass(QPainter &p, const QPointF &c) const
+void ThinkingIndicator::drawHourglass(QPainter &p, const QPointF &c, qreal s) const
 {
-    const qreal hw = kSandHalfW;
-    const qreal hh = kSandHalfH;
+    const qreal hw = kSandHalfW * s;
+    const qreal hh = kSandHalfH * s;
     const QPointF top(c.x(), c.y() - hh);
     const QPointF mid(c.x(), c.y());
     const QPointF bot(c.x(), c.y() + hh);

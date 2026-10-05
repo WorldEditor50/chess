@@ -6,6 +6,7 @@
 #include <QString>
 #include <QVector>
 #include <QWidget>
+#include <functional>      /* CurveChartDialog::follow 的 extraReadout 回调 */
 
 class QLabel;
 
@@ -82,6 +83,14 @@ public:
     /* 标题 + 坐标轴文字 (纵轴只写单位/含义, 不画刻度文字) */
     void setTitle(const QString &title);
     void setValueSuffix(const QString &suffix);   /* 例如 " loss" / " 分" */
+    /*
+       读回当前的纵轴单位 (2026-10)。
+       为什么要有这个 getter: 放大窗口 (CurveChartDialog) 是**另一个** CurveChart 实例,
+       它的 suffix 不会自动跟着源控件走 —— 于是"保真度"那张图 (% 为单位) 放大之后
+       数字全都不带 "%", 看起来像换了一个口径。放大窗口开窗时按源控件抄一份就对了
+       (源控件自己那份 suffix 是谁设的、设成什么, 这里不需要知道)。
+    */
+    QString valueSuffix() const { return m_suffix; }
 
     /* 加一条曲线, 返回它的下标 (从 0 开始) */
     int addSeries(const QString &name, const QColor &color);
@@ -182,8 +191,16 @@ public:
     /*
      * 跟随某个源控件: 立刻同步一次, 之后源控件每变一次就同步一次。
      * 传 nullptr 表示解除跟随。
+     *
+     * extraReadout (2026-10): 追加在**读数行末尾**的一段文字。存在的理由:
+     * 读数行 = "曲线上的数" + "不在曲线上的数", 而后者只有源控件知道 —— 例如
+     * "行为克隆"那张图把 CE 放在读数行里 (CE 与百分比不同量纲, 不进曲线),
+     * 放大窗口要显示得**和源控件一模一样**就得能问到它。
+     * 它是**回调**而不是一次性快照: 每次同步都重新问一遍, 于是窗口开着的时候
+     * CE 会跟着对局一起更新 (传一个返回固定字符串的 lambda 也可以)。
      */
-    void follow(CurveChart *source);
+    void follow(CurveChart *source,
+                const std::function<QString()> &extraReadout = std::function<QString()>());
 
 private slots:
     void syncFromSource();
@@ -192,6 +209,7 @@ private:
     CurveChart *m_chart = nullptr;
     QLabel *m_readout = nullptr;
     CurveChart *m_source = nullptr;
+    std::function<QString()> m_extra;
 };
 
 #endif // METRICSVIEW_H

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <functional>       /* openLargeChart 的 extraReadout 回调 */
 #include "gamedb.h"
 #include "chessboard.h"
 #include "metricsview.h"
@@ -68,6 +69,57 @@ private slots:
 
 private:
     void populateAgentComboBox();
+
+    /*
+     * ================================================================
+     *  ---- 行为克隆 (BC): 下拉框选老师 (2026-10) ----
+     * ================================================================
+     * 用户口径 (原话): **"行为克隆勾选框改成下拉框选择要克隆的 abagent，与将要对弈的
+     * 对方 agent 或者人类棋手无关，训练的时候参考下拉框选择的 abagent 的决策进行行为
+     * 克隆训练"**。所以界面上是一个下拉框 (`bcTeacherCombo`, 插在 matchModeRow 之后的
+     * 那一组里): 第一项 = 关, 后面四项 = Alpha-Beta L1/L2/L3/(深度=4), itemData 存深度。
+     * 没有"跑一次 BC"的按钮与旋钮 —— 要单独跑用命令行 `train_bc` (它不占界面)。
+     *
+     * 下拉框的**启用条件**: 场上**至少有一支能做 BC 学生** (A/B 之一, 或者人机那条路的
+     * "对战AI")。判据本身在 `ChessBoard::bcHasStudent` (库侧), 界面**不重新实现一遍**
+     * —— 两边各写一份的话,"下拉框亮着但场上什么也没发生"迟早发生。
+     * ⚠ 旧的"必须一边是 AB"那条门槛**没有了**: 老师由下拉框给, 与对手无关。
+     */
+    void onBcTeacherChanged(int index);
+    /*
+     * "软目标 (多深度一致)" 复选框 (2026-10)。
+     * 只做一件事: 把勾选交给棋盘 (`ChessBoard::setBcSoftTarget`) 并在面板留一行 ——
+     * 与 `onBcTeacherChanged` 同一个分工 (能不能用由"老师下拉框 ≠ 关"与置灰逻辑决定)。
+     * ⚠ 勾了但老师还是"关"时**不要**去动下拉框: 用户的顺序可能是先勾再选老师,
+     *   替他改选择会让"我只是勾了一下"变成"顺便开了克隆训练"。
+     */
+    void onBcSoftToggled(bool on);
+    /*
+     * "行为克隆"那张曲线上**该不该有线**的唯一实现, 两种模式共用:
+     *   * Agent 对 Agent: 每场开始 (`matchStarted` -> `resetMetricsForMatch`);
+     *   * 人机对弈: 每局开始 (`humanGameStarted` -> 玩家落下本局第一子)。
+     * 为什么必须共用: 触发时机不同, 但判据是同一条 (`老师下拉框 ≠ 关` 且 `有学生`);
+     * 两条路各写一遍的代价本工程刚付过 —— 人机那条路没建线, 而 `CurveChart::addPoint`
+     * 在序列不存在时是**静默 return**, 于是"BC 在训练但曲线空着"。
+     * `humanMode` 只影响"没开"时那句读数的措辞 (两种模式的原因与下一步动作不同)。
+     * 返回 true = 这一次真的建出了两条线。
+     */
+    bool armBcChartSeries(bool studentAvailable, int teacherDepth, bool humanMode);
+    /* "人机那条路的学生" = "对战AI" 那一支 (两条路径都用它, 免得各写一遍) */
+    ChessBoard::AgentType humanAiSide() const;
+    /*
+     * "那个下拉框此刻该不该亮"的**唯一**一处实现。
+     * 触发点: 换 A / 换 B / 换"对战AI" / 对弈开始与结束 / 启动完成 (启动前实例还没建)。
+     * 每处各写一遍必然漏掉某一种组合 (本工程在"SAC 掩码只改了一半"上吃过同一个亏),
+     * 所以只有这一个函数, 并且它自己把**原因**写进 tooltip。
+     */
+    void updateBcMatchControlsEnabled();
+
+    /* 下拉框 (代码里建 -> 只能自己记着) */
+    class QComboBox *m_bcTeacherCombo = nullptr;
+    /* 软目标复选框 (同上; 只用来同步启用状态与 tooltip) */
+    class QCheckBox *m_bcSoftCheck = nullptr;
+
     /*
      * 权重**静默**存到标准路径 (不弹任何窗口): 放在**常驻后台线程**里做。
      * 两个调用方: Agent 对弈结束 (onStartMatch 那条路) 与人机对局终局
@@ -97,6 +149,68 @@ private:
     /* 把曲线的"最新值/均值/样本数"写进图下面的标签 (见 .cpp 的注释) */
     void updateMetricsLabels();
     /*
+     * ================================================================
+     *  ---- [2026-10] "训练损失 / 行为克隆" 两个 tab (用户要求) ----
+     * ================================================================
+     * 用户口径: *"在 loss 曲线窗口增加一个 tab 显示"* —— 于是"训练损失"那张图不再
+     * 单独占一块, 而是与 **"行为克隆"** 并排放在一个 QTabWidget 的两个 tab 里
+     * (一次只看一张, 所以中间/右侧那一列**不多占一个像素**)。
+     *
+     * 为什么用代码插 (而不是改 mainwindow.ui): 与 MoeLoadView、以及 matchModeRow 后面
+     * 那几行同一条理由 —— `insertWidget` 的落点稳定, 而把 .ui 里那张图搬进一个 tab
+     * 需要手改 XML 并重新验证整列的布局 (本工程为"改 .ui 引发布局回归"付过账)。
+     * 做法就是 Qt 的标准动作: 从原布局里 `removeWidget` 出来, 再 `addTab` 进 tab 页。
+     *
+     * 两条曲线的分工 (刻意不混):
+     *   * "训练损失" = 每个 agent 一条, 值是 critic 的 MSE (在线训练的上报口径);
+     *   * "行为克隆" = 每场两条 (**一致率 top-1 %** 与 **P(老师着法) %**), 同一个
+     *     量纲 (都是百分比) 所以能画在一张图上; **CE 不进曲线**, 它放在图下的读数行里
+     *     (CE 与百分比不同量纲, 混在一张图上会被读成"CE 很小所以克隆很好")。
+     */
+    void setupChartTabs();
+    /* BC 保真度采样 -> 曲线 + 图下读数 (从 ChessBoard::bcFidelitySample 来) */
+    void onBcFidelitySample(int updateNo, double top1Pct, double pTeacher, double ce,
+                            int windowN);
+    /*
+     * "不在曲线上的那一段" BC 读数 = " | 最近 CE x (窗口 N 条)" (没采过样时返回空串)。
+     * 抽成一个函数是因为它有两个消费方: 图下那行标签 (updateMetricsLabels) 与
+     * **放大窗口里的读数行** (放大窗口的读数是按曲线数据重新格式化出来的, 不问一句
+     * 就会少掉 CE)。两处各写一份格式迟早分叉, 而"放大窗口少一个数"几乎看不出来。
+     */
+    QString bcFidelityCeTail() const;
+    /*
+     * "不在价值曲线上"的那一段读数 (校准误差 / 样本对数 / Var(z))。
+     * 与 bcFidelityCeTail 同一个理由: 曲线上只有一个 EV (量纲一致), 其余数进读数行;
+     * 源标签与放大窗口共用这一份, 免得两处各写一遍而分叉。
+     */
+    QString valueDiagTail() const;
+    /* 价值评估采样 -> 曲线 + 读数 (从 ChessBoard::valueDiagSample 来, 每局一次) */
+    void onValueDiagSample(int gameNo, double evWin, double rhoEng, double evEng,
+                           double calibErr, int pairs, double zVarWin, double zVarEng);
+
+    /* "价值评估"那张曲线控件与它下面的读数行 (代码里建 -> 只能自己记着) */
+    class CurveChart *m_valueChart = nullptr;
+    class QLabel *m_valueValueLabel = nullptr;
+    /*
+     * 最近一次价值评估读数 (读数行里"不在曲线上"的三个数)。`m_valueSampleCount == 0`
+     * = 还没出过点 (那时读数行给一句解释, 而不是留空)。
+     */
+    double m_valueCalibErr = 0.0;
+    int m_valueSampleCount = 0;
+    double m_valueZVar = 0.0;        /* z = 真实胜负 的方差 */
+    double m_valueZVarEng = 0.0;     /* z = 引擎口径折扣回报 的方差 */
+    double m_valueEvEng = 0.0;       /* z = 引擎口径折扣回报 的 EV (尺度敏感, 只进读数行) */
+    int m_valueGameNo = 0;
+
+    /* "行为克隆"那张曲线控件与它下面的读数行 (代码里建 -> 只能自己记着) */
+    class CurveChart *m_bcChart = nullptr;
+    class QLabel *m_bcValueLabel = nullptr;
+    /* 最近一次保真度采样 (图下读数: 一致率 / P(老师) / CE 一起给, 因为 CE 不在图上) */
+    double m_bcLastFidTop1 = -1.0;
+    double m_bcLastFidPTeacher = -1.0;
+    double m_bcLastFidCe = -1.0;
+    int m_bcLastFidWindow = 0;
+    /*
      * ---- 模型自检面板 (异步) ----
      * 数据源 ChessBoard::getAgentSelfCheck() -> AgentBase::selfCheckReport()。
      * 为什么需要它 (损失与自对弈胜率都答不了"值不值得继续训") 见 .cpp 里的长注释。
@@ -121,8 +235,10 @@ private:
     /*
      * 双击曲线 -> 弹一个放大的独立窗口 (见 metricsview.h 的 CurveChartDialog)。
      * 同一个源控件只保留一个窗口: 已经开着就抬到前面, 不再新开一个。
+     * extraReadout: 追加在放大窗口读数行末尾的一段文字 (BC 那张图用它带 CE 过去)。
      */
-    void openLargeChart(CurveChart *source, const QString &title);
+    void openLargeChart(CurveChart *source, const QString &title,
+                        const std::function<QString()> &extraReadout = std::function<QString()>());
 
     Ui::MainWindow *ui;
 
