@@ -1203,9 +1203,38 @@ private:
     /* 每层 LN1 的输入序列 (= 进入本层时的残差流) —— 反向要它算 LN 的解析梯度 */
     std::vector<std::vector<float> > curIn;
 
+    /*
+       [2026-10 P6] 注意力**矩阵化**用的"每头"工作缓冲 (T×dk / T×T)。
+       原来是四个手写标量多重循环 (占 forward 的 39%, 见方案 §1.5), 现在改成
+       "每头连续 (T×dk) + `MM::` 四个内核"。`MM::` 只吃 `Tensor`, 所以这些缓冲是
+       Tensor 形态; 一次分配、每层每头复用 ⇒ 内存不随层数增长, 计时区里零分配。
+       (布局: 只把 Q/K/V/dOut 从交错 (t×tokDim + h×dk + c) 收成连续 (t×dk + c);
+        P 本来就是按头连续的 (H×T×T) ⇒ 不用搬。)
+    */
+    struct AttnScratch {
+        Tensor Qh, Kh, Vh;          /* (T × dk) 收集后的 Q/K/V */
+        Tensor S, P, Oh;            /* S:(T×T) 分数, P:(T×T) 归一化概率, Oh:(T×dk) 输出 */
+        Tensor dOh, dPh, dSh;       /* 反向: 输出梯度 / dP / dS */
+        Tensor dQh, dKh, dVh;       /* 反向: 各头的梯度 */
+        Tensor Pm;                  /* mask⊙P (只在 dropout 打开时用; 默认空) */
+        bool ready;
+        AttnScratch() : ready(false) {}
+        void init(int T, int dk_)
+        {
+            Qh = Tensor(T, dk_); Kh = Tensor(T, dk_); Vh = Tensor(T, dk_);
+            S = Tensor(T, T);    P  = Tensor(T, T);   Oh = Tensor(T, dk_);
+            dOh = Tensor(T, dk_); dPh = Tensor(T, T); dSh = Tensor(T, T);
+            dQh = Tensor(T, dk_); dKh = Tensor(T, dk_); dVh = Tensor(T, dk_);
+            Pm = Tensor(T, T);
+            ready = true;
+        }
+    };
+    AttnScratch attnScr;
+
     void allocBuffers()
     {
         const std::size_t nT = (std::size_t)(SeqLen * tokDim);
+        attnScr.init(SeqLen, dk);
         for (int b = 0; b < blocks; b++) {
             BlockCache &c = blk[(std::size_t)b];
             c.h1.assign(nT, 0.0f); c.q.assign(nT, 0.0f); c.k.assign(nT, 0.0f);
@@ -1361,108 +1390,138 @@ private:
        前向/反向/优化器/范数/往返都只剩一行循环。
     */
 
-    /* ---- 多头注意力: scores = Q Kᵀ / √d_k, **按行** softmax, O = P V ---- */
+    /*
+       ---- 多头注意力: scores = Q Kᵀ / √d_k, **按行** softmax, O = P V ----
+
+       [2026-10 P6] **矩阵化**: 原来这里是手写标量多重循环 (方案 §1.5 实测:
+       注意力 8 次单头 = 6.303 ms = forward 的 39%), 现在每头把 (T×dk) 的 Q/K/V 收集成
+       连续缓冲交给 `MM::`:
+           S = Qh·Khᵀ (`ikjk`) → 逐行 softmax → P → Oh = P·Vh (`ikkj`)
+       实测 (`probe_attn_matrix`, P6-前哨: 同机同轮配对、9 轮中位数、三跑复现)
+       **forward 2.22× / backward 1.73× / fwd+bwd 1.89×** (B1 = 含 gather/scatter,
+       就是本实现的形式); 数值差只有 float 累加顺序的量级 (`Out` max|Δ| 4.5e-08)。
+       ⚠ `MM::*` 四内核**一律累加** (Part 0 的硬约束) ⇒ 每次调用前 `zero()`
+         —— 探针第一版忘了 zero, Out 的最大差直接飙到 1.4e-1;
+       ⚠ 本函数**不逐位等于**改动前 (求和顺序变了): 方案 Part 4 里 P6 是**唯一**
+         允许不做逐位等价的一项, 验收看 `test_transformer [2][6]` 的 FD/RoPE 断言
+         与 `test_grad` 的 FD 读数。
+    */
     void attnFwd(const std::vector<float> &Q, const std::vector<float> &K,
                  const std::vector<float> &V, std::vector<float> &P,
-                 std::vector<float> &Out) const
+                 std::vector<float> &Out)
     {
         const float scale = 1.0f / std::sqrt((float)dk);
         for (int h = 0; h < heads; h++) {
+            /* gather: 交错 (t×tokDim + h×dk + c) → 连续 (t×dk + c) */
+            for (int t = 0; t < SeqLen; t++) {
+                for (int c = 0; c < dk; c++) {
+                    const std::size_t src = (std::size_t)(t * tokDim + h * dk + c);
+                    const std::size_t dst = (std::size_t)(t * dk + c);
+                    attnScr.Qh[dst] = Q[src];
+                    attnScr.Kh[dst] = K[src];
+                    attnScr.Vh[dst] = V[src];
+                }
+            }
+            attnScr.S.zero();                       /* MM:: 累加 ⇒ 先清零 */
+            Tensor::MM::ikjk(attnScr.S, attnScr.Qh, attnScr.Kh);
             float *Ph = &P[(std::size_t)(h * SeqLen * SeqLen)];
             for (int i = 0; i < SeqLen; i++) {
-                /* scores 一行 */
                 float mx = -1e30f;
                 for (int j = 0; j < SeqLen; j++) {
-                    float s = 0;
-                    for (int c = 0; c < dk; c++) {
-                        s += Q[(std::size_t)(i * tokDim + h * dk + c)]
-                           * K[(std::size_t)(j * tokDim + h * dk + c)];
-                    }
-                    s *= scale;
-                    Ph[(std::size_t)(i * SeqLen + j)] = s;
+                    const std::size_t k = (std::size_t)(i * SeqLen + j);
+                    const float s = attnScr.S[k] * scale;
+                    attnScr.S[k] = s;
                     if (s > mx) { mx = s; }
                 }
                 float sum = 0;
                 for (int j = 0; j < SeqLen; j++) {
-                    const float e = std::exp(Ph[(std::size_t)(i * SeqLen + j)] - mx);
-                    Ph[(std::size_t)(i * SeqLen + j)] = e;
+                    const std::size_t k = (std::size_t)(i * SeqLen + j);
+                    const float e = std::exp(attnScr.S[k] - mx);
+                    attnScr.P[k] = e;
                     sum += e;
                 }
                 const float inv = 1.0f / (sum + 1e-30f);
-                for (int j = 0; j < SeqLen; j++) { Ph[(std::size_t)(i * SeqLen + j)] *= inv; }
+                for (int j = 0; j < SeqLen; j++) {
+                    const std::size_t k = (std::size_t)(i * SeqLen + j);
+                    attnScr.P[k] *= inv;            /* 归一化后的 P (P·V 与反向都要它) */
+                    Ph[k] = attnScr.P[k];           /* 写回缓存: 反向必须看到**未丢弃**的 P */
+                }
             }
-            for (int i = 0; i < SeqLen; i++) {
+            attnScr.Oh.zero();
+            Tensor::MM::ikkj(attnScr.Oh, attnScr.P, attnScr.Vh);
+            for (int t = 0; t < SeqLen; t++) {
                 for (int c = 0; c < dk; c++) {
-                    float acc = 0;
-                    for (int j = 0; j < SeqLen; j++) {
-                        acc += Ph[(std::size_t)(i * SeqLen + j)] * V[(std::size_t)(j * tokDim + h * dk + c)];
-                    }
-                    Out[(std::size_t)(i * tokDim + h * dk + c)] = acc;
+                    Out[(std::size_t)(t * tokDim + h * dk + c)] = attnScr.Oh[(std::size_t)(t * dk + c)];
                 }
             }
         }
     }
+    /* 反向 (矩阵化, 见 attnFwd 的说明):
+           dPh = dOh·Vhᵀ (`ikjk`) → softmax 雅可比 → dSh
+           dVh = Pᵀ·dOh (`kikj`, P 用**乘过 mask 的**那一份)
+           dQh = dSh·Kh (`ikkj`) / dKh = dShᵀ·Qh (`kikj`)   (后两者再乘 scale) */
     void attnBwd(const std::vector<float> &Q, const std::vector<float> &K,
                  const std::vector<float> &V, const std::vector<float> &P,
                  const std::vector<float> &dOut, std::vector<float> &dQ,
                  std::vector<float> &dK, std::vector<float> &dV,
-                 const std::vector<float> *maskP = nullptr) const
+                 const std::vector<float> *maskP = nullptr)
     {
         const float scale = 1.0f / std::sqrt((float)dk);
         dQ.assign((std::size_t)(SeqLen * tokDim), 0.0f);
         dK.assign(dQ.size(), 0.0f);
         dV.assign(dQ.size(), 0.0f);
-        std::vector<float> dS((std::size_t)(SeqLen * SeqLen), 0.0f);
         for (int h = 0; h < heads; h++) {
-            const float *Ph = &P[(std::size_t)(h * SeqLen * SeqLen)];
-            for (int i = 0; i < SeqLen; i++) {
-                /* dP_ij = Σ_c dOut_ic · V_jc   (再做 dropout 的 mask: P 的那一层已经乘过) */
-                for (int j = 0; j < SeqLen; j++) {
-                    float acc = 0;
-                    for (int c = 0; c < dk; c++) {
-                        acc += dOut[(std::size_t)(i * tokDim + h * dk + c)]
-                             * V[(std::size_t)(j * tokDim + h * dk + c)];
-                    }
-                    if (maskP != nullptr) { acc *= (*maskP)[(std::size_t)(h * SeqLen * SeqLen + i * SeqLen + j)]; }
-                    dS[(std::size_t)(i * SeqLen + j)] = acc;
+            /* gather: Q/K/V 与 dOut 都从交错布局收成 (T×dk) */
+            for (int t = 0; t < SeqLen; t++) {
+                for (int c = 0; c < dk; c++) {
+                    const std::size_t src = (std::size_t)(t * tokDim + h * dk + c);
+                    const std::size_t dst = (std::size_t)(t * dk + c);
+                    attnScr.Qh[dst] = Q[src];
+                    attnScr.Kh[dst] = K[src];
+                    attnScr.Vh[dst] = V[src];
+                    attnScr.dOh[dst] = dOut[src];
                 }
-                /* 按行 softmax 的雅可比: dS_ij = P_ij (dP_ij − Σ_l P_il dP_il) */
+            }
+            const float *Ph = &P[(std::size_t)(h * SeqLen * SeqLen)];
+            const float *Mh = (maskP != nullptr) ? &(*maskP)[(std::size_t)(h * SeqLen * SeqLen)] : nullptr;
+            for (int k = 0; k < SeqLen * SeqLen; k++) {
+                attnScr.P[(std::size_t)k] = Ph[k];
+                if (Mh != nullptr) { attnScr.Pm[(std::size_t)k] = Ph[k] * Mh[k]; }
+            }
+            /* dP_ij = Σ_c dOh_ic · V_jc  (再做 dropout ① 的 mask: P 的那一层已经乘过) */
+            attnScr.dPh.zero();
+            Tensor::MM::ikjk(attnScr.dPh, attnScr.dOh, attnScr.Vh);
+            if (Mh != nullptr) {
+                for (int k = 0; k < SeqLen * SeqLen; k++) { attnScr.dPh[(std::size_t)k] *= Mh[k]; }
+            }
+            /* 按行 softmax 的雅可比: dS_ij = P_ij (dP_ij − Σ_l P_il dP_il) */
+            for (int i = 0; i < SeqLen; i++) {
                 float dot = 0;
                 for (int j = 0; j < SeqLen; j++) {
-                    dot += Ph[(std::size_t)(i * SeqLen + j)] * dS[(std::size_t)(i * SeqLen + j)];
+                    const std::size_t k = (std::size_t)(i * SeqLen + j);
+                    dot += attnScr.P[k] * attnScr.dPh[k];
                 }
                 for (int j = 0; j < SeqLen; j++) {
-                    dS[(std::size_t)(i * SeqLen + j)] =
-                        Ph[(std::size_t)(i * SeqLen + j)]
-                        * (dS[(std::size_t)(i * SeqLen + j)] - dot);
+                    const std::size_t k = (std::size_t)(i * SeqLen + j);
+                    attnScr.dSh[k] = attnScr.P[k] * (attnScr.dPh[k] - dot);
                 }
             }
-            /* dV_jc += Σ_i P_ij dOut_ic ; dQ_ic += Σ_j dS_ij K_jc / √d_k ; dK_jc += Σ_i dS_ij Q_ic / √d_k
-               ⚠ dV 用的是**乘过 mask 的** P (前向的 PV 用的是 mask⊙P) —— 只给 dP 乘 mask
-                 而给 dV 用未丢弃的 P 是错的 (dropout 的第一版就是这样, 冻住 mask 的
-                 有限差分当场把它抓了出来: wq 的梯度偏大 15.6%、embed 偏大 24.6%). */
-            for (int j = 0; j < SeqLen; j++) {
+            /* ⚠ dV 用的是**乘过 mask 的** P (前向的 PV 用的是 mask⊙P) —— 只给 dP 乘 mask
+               而给 dV 用未丢弃的 P 是错的 (dropout 第一版就是这样, 冻住 mask 的有限差分
+               当场把它抓了出来: wq 的梯度偏大 15.6%、embed 偏大 24.6%)。 */
+            attnScr.dVh.zero();
+            Tensor::MM::kikj(attnScr.dVh, (Mh != nullptr) ? attnScr.Pm : attnScr.P, attnScr.dOh);
+            attnScr.dQh.zero();
+            Tensor::MM::ikkj(attnScr.dQh, attnScr.dSh, attnScr.Kh);
+            attnScr.dKh.zero();
+            Tensor::MM::kikj(attnScr.dKh, attnScr.dSh, attnScr.Qh);
+            for (int t = 0; t < SeqLen; t++) {
                 for (int c = 0; c < dk; c++) {
-                    float accV = 0, accK = 0;
-                    for (int i = 0; i < SeqLen; i++) {
-                        float pij = Ph[(std::size_t)(i * SeqLen + j)];
-                        if (maskP != nullptr) {
-                            pij *= (*maskP)[(std::size_t)(h * SeqLen * SeqLen + i * SeqLen + j)];
-                        }
-                        accV += pij * dOut[(std::size_t)(i * tokDim + h * dk + c)];
-                        accK += dS[(std::size_t)(i * SeqLen + j)] * Q[(std::size_t)(i * tokDim + h * dk + c)];
-                    }
-                    dV[(std::size_t)(j * tokDim + h * dk + c)] += accV;
-                    dK[(std::size_t)(j * tokDim + h * dk + c)] += accK * scale;
-                }
-            }
-            for (int i = 0; i < SeqLen; i++) {
-                for (int c = 0; c < dk; c++) {
-                    float acc = 0;
-                    for (int j = 0; j < SeqLen; j++) {
-                        acc += dS[(std::size_t)(i * SeqLen + j)] * K[(std::size_t)(j * tokDim + h * dk + c)];
-                    }
-                    dQ[(std::size_t)(i * tokDim + h * dk + c)] += acc * scale;
+                    const std::size_t dst = (std::size_t)(t * tokDim + h * dk + c);
+                    const std::size_t src = (std::size_t)(t * dk + c);
+                    dQ[dst] += attnScr.dQh[src] * scale;
+                    dK[dst] += attnScr.dKh[src] * scale;
+                    dV[dst] += attnScr.dVh[src];
                 }
             }
         }
