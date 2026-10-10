@@ -460,6 +460,30 @@ inline UpdateStat update(PPOMCTSAgent &ag, const std::vector<RL::BCSample> &batc
         }
     }
     st.targetMiss = (int)(ag.ppo.bcTargetMisses - missBefore);
+    /*
+       ============================================================
+       [2026-10] 批边界必须走一次 `finalizeMoeBatch()` —— 与在线路径对齐
+       ============================================================
+       为什么以前没有它 (以及为什么那是个缺口):
+         * 在线路径的三条学习路径 (trainStep / learnFromReplay / learnSelfPlay) 都在
+           `applyGradients` 之前调 `finalizeMoeBatch()`, 它做两件事:
+             ① `accumulateTrainBatch()`: 把本批的 `usageBatch` 记进"训练侧"计数,
+                于是 `moeUsageSplit()` 的"训练侧 / 推理侧"归因才是对的;
+             ② `applyMoeBiasUpdate()`: 无辅助损失偏置均衡的控制回路
+                (`biasGate[i] += rate·sign(mean_load − load_i)`)。
+         * BC 走的是另一条 (`bcApplyGradients`), 上面两步**一步都没做** ⇒
+           (a) BC 期间的门控**完全没有均衡回路** —— docs/behavior_cloning_2026_10.md §7
+               自己把这条列成"已知缺口: BC 期间 MoE 路由可能偏斜, 本轮没量";
+           (b) BC 的 actor 前向被算在"推理侧", 所以 BC 期间读 `moeUsageSplit()` 会得到
+               一个归因错位的训练侧负载。
+       顺序要求 (与在线路径同一份约定): **必须在 `addAuxGradient` 之前** —— 后者读同一批
+       统计、并在末尾把它们清零; 也必须在 RMSProp 之前 (`biasGate` 只影响 top-k 选择,
+       所以它不改本步的梯度, 但下一步的路由要用它)。
+       代价与默认行为: `moeLossFreeBias=false` (PPO 的库默认) 时这里除了
+       `accumulateTrainBatch()` 的计数之外**什么都不做**; GUI 默认开着它
+       (`chessboard.cpp` 的 PPO_MOE_LOSSFREE), 所以界面那条 BC 从这一版起才真正开始均衡。
+    */
+    ag.ppo.finalizeMoeBatch();
     if (ag.ppo.bcSampleCount > 0) {
         ag.ppo.bcApplyGradients(lr);
         st.ce = (float)ag.ppo.lastActorLoss;

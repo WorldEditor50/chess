@@ -12,6 +12,9 @@
  * 支持四种 agent (都走同一套 BC 口径, 见 src/bcagent.hpp):
  *   --agent=ppo           PPO+MCTS (TB 专家骨干, 界面现役; 建网/内存都很贵)
  *   --agent=ppo-mlp       PPO+MCTS (MLP 专家骨干; 便宜 ~25x, 冒烟与小实验用它)
+ *   --agent=ppo-layer     PPO+MCTS (廉价专家骨干: Layer<Gelu>, **无 MHA**; 2026-10)
+ *   --agent=ppo-seq       PPO+MCTS (**真正的**序列 Transformer 专家: 按格 token 化 +
+ *                          逐行 softmax 注意力 + 位置嵌入 + Pre-LN 残差; 2026-10)
  *   --agent=sac           SAC+AZ (纯 MLP, 界面 AGENT_SACAZ)
  *   --agent=sac-moe-mlp   SAC+AZ-MoE-MLP
  *   --agent=sac-moe       SAC+AZ-MoE (TB 专家; 建网数秒)
@@ -56,6 +59,19 @@
  *   <build>/train_bc --agent=sac --positions=4000 --depth=3 --epochs=8
  *   <build>/train_bc --agent=ppo --load=weights/ppomcts_agent --save=weights/ppomcts_bc
  *   <build>/train_bc --agent=ppo-mlp --masked=0 ...      :: 全量 8100 口径对照臂
+ *
+ *   ---- [2026-10] 骨干对照 (同一份数据/老师/seed/lr/batch, 只换专家类型) ----
+ *   <build>/train_bc --agent=ppo-mlp   --positions=1000 --depth=4 --soft=1 --soft-depths=4 ^
+ *                    --epochs=8 --batch=64 --lr=0.002 --seed=20240901 --holdout=5
+ *   <build>/train_bc --agent=ppo       <同上>      :: 现役 TB 专家 (52.4 M 参数)
+ *   <build>/train_bc --agent=ppo-layer <同上>      :: 无 MHA 廉价专家 (11.7 M 参数)
+ *   实测 (2026-10, 本机): 三臂的 CE 轨迹同量级 (训练 3.65 -> 2.05, 留出 3.65 -> 2.69),
+ *   而**每次更新的代价** 10.2 s / 254.1 s / ~15 s —— 见
+ *   docs/tb_expert_training_2026_10.md §4。
+ *
+ *   ---- [2026-10] 梯度裁剪口径对照 (PPO 这条线) ----
+ *   <build>/train_bc --agent=ppo --grad-clip=legacy|global|none [--grad-clip-norm=1.0]
+ *   `legacy` = 老行为 (逐张量单位范数归一, 逐位不变); `global` = 全网范数裁剪。
  */
 #include <chrono>
 #include <cmath>
@@ -90,6 +106,21 @@ struct Cfg {
     bool masked = true;
     /* SAC: 共享骨干口径 (一个骨干 + 三个头) —— 界面的 SAC+AZ-MoE 那一支用它 */
     bool sharedTrunk = false;
+    /*
+       [2026-10] 梯度裁剪口径 (只对 PPO 这条线生效; 见 rl/optimize.h 的 GradClipMode)。
+       默认 = 老行为 (逐张量单位范数归一), 所以不给参数时读数与改动前逐位相同。
+       `ppoClip` 是命令行字符串, 建 agent 时解析 (解析失败直接报错退出, 不静默降级)。
+    */
+    std::string gradClip = "legacy";
+    float gradClipNorm = 1.0f;
+    /*
+       [2026-10] 序列专家的两个旋钮 (默认 = 老行为):
+         posKey   : "1d"(可学 90 个位置向量) / "2d"(可学 10 行 + 9 列) / "rope"(无参数旋转);
+         dropoutP : 0 = 关闭 (不消耗随机数)。
+       只对 `--agent=ppo-seq` 有效; 其它骨干会**响亮失败** (见 main 里的检查)。
+    */
+    std::string posKey = "1d";
+    float dropoutP = 0.0f;
     std::string loadPrefix;
     std::string savePrefix;
 };
@@ -138,6 +169,26 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--soft-depths") { g_cfg.bc.softDepths = std::atoi(v.c_str()); }
         else if (k == "--soft-linear") { g_cfg.bc.softLinearWeight = (std::atoi(v.c_str()) != 0); }
         else if (k == "--shared")  { g_cfg.sharedTrunk = (std::atoi(v.c_str()) != 0); }
+        /*
+           [2026-10] 梯度裁剪口径 (PPO 这条线; 见 rl/optimize.h 的 GradClipMode):
+             --grad-clip=legacy|global|none   (默认 legacy = 老行为, 逐位不变)
+             --grad-clip-norm=1.0             (只对 global 生效: 全网梯度范数上限)
+           为什么要它: `clipGrad` 的真实语义是"逐张量梯度归一化到单位长度", 它抹掉梯度
+           大小的信息 (实测: 尺度 1 与 1e6 的梯度, 一步之后的 |Δw| 完全相同)。不把它做成
+           一个可切换的口径, 就没有办法做"关掉裁剪"的对照实验。
+        */
+        else if (k == "--grad-clip") { g_cfg.gradClip = v; }
+        else if (k == "--grad-clip-norm") { g_cfg.gradClipNorm = (float)atof(v.c_str()); }
+        /*
+           [2026-10] 两个"专家级旋钮" (补的未做结构项):
+             --pos=1d|2d|rope   序列专家的位置编码 (默认 1d = 老行为, 逐位不变);
+                                2d = 可学 (10 行 + 9 列), rope = 无参数旋转 (相对位置)。
+             --dropout=p        dropout 概率 (默认 0 = 关闭, 不消耗随机数)。
+           只对 `--agent=ppo-seq` 有效: 其它骨干的转发接口返回 false, 这里**响亮失败**
+           (不静默忽略 —— 本工程被"设了却没生效"咬过多次)。
+        */
+        else if (k == "--pos")     { g_cfg.posKey = v; }
+        else if (k == "--dropout") { g_cfg.dropoutP = (float)atof(v.c_str()); }
         else if (k == "--load")    { g_cfg.loadPrefix = v; }
         else if (k == "--save")    { g_cfg.savePrefix = v; }
         else if (k == "--max-positions") { g_cfg.bc.maxPositions = std::atoi(v.c_str()); }
@@ -231,16 +282,71 @@ int main(int argc, char *argv[])
     };
 
     /* ---- 造 agent (与界面 / 既有 bench 同一套形状参数) ---- */
-    if (g_cfg.agent == "ppo" || g_cfg.agent == "ppo-mlp") {
-        const bool tb = (g_cfg.agent == "ppo");
+    if (g_cfg.agent == "ppo" || g_cfg.agent == "ppo-mlp" || g_cfg.agent == "ppo-layer"
+        || g_cfg.agent == "ppo-seq") {
+        RL::PPO::Backbone bb = RL::PPO::Backbone::MlpExperts;
+        const char *label = "PPO+MCTS (MLP 专家)";
+        if (g_cfg.agent == "ppo") {
+            bb = RL::PPO::Backbone::TbExperts;
+            label = "PPO+MCTS (TB 专家)";
+        } else if (g_cfg.agent == "ppo-layer") {
+            /* [2026-10] 无 MHA 的廉价专家: 与 TB 那一支的**唯一**差别是专家类型 */
+            bb = RL::PPO::Backbone::LayerExperts;
+            label = "PPO+MCTS (廉价专家,无MHA)";
+        } else if (g_cfg.agent == "ppo-seq") {
+            /* [2026-10] 真正的序列 Transformer 专家 (token 化 + 逐行 softmax + 位置嵌入) */
+            bb = RL::PPO::Backbone::SeqExperts;
+            label = "PPO+MCTS (序列Transformer专家)";
+        }
         PPOMCTSAgent agent(env, g_cfg.hidden, 0.99f, 0.001f, 1.414f,
-                           g_cfg.expert, 0.1f, true,
-                           tb ? RL::PPO::Backbone::TbExperts
-                              : RL::PPO::Backbone::MlpExperts);
+                           g_cfg.expert, 0.1f, true, bb);
         agent.ppo.maskedTrainHead = g_cfg.masked;
+        /* 梯度裁剪口径 (默认 legacy = 老行为; 解析失败直接退出, 不静默降级) */
+        {
+            int mode = RL::GRAD_CLIP_PER_TENSOR_UNIT_NORM;
+            if (!RL::parseGradClipMode(g_cfg.gradClip.c_str(), mode)) {
+                std::fprintf(stderr, "未知 --grad-clip: %s (可选 legacy / global / none)\n",
+                             g_cfg.gradClip.c_str());
+                return 2;
+            }
+            agent.setGradClip(mode, g_cfg.gradClipNorm);
+            agent.setTrackGradNorm(true);   /* 报告里要打梯度范数 (只读一遍, 只在本工具里开) */
+            std::printf("[clip] %s", RL::gradClipModeName(mode));
+            if (mode == RL::GRAD_CLIP_GLOBAL_NORM) {
+                std::printf(" (上限 %.3g)", (double)g_cfg.gradClipNorm);
+            }
+            std::printf("\n");
+        }
+        /*
+           [2026-10] 位置编码模式 / dropout: 只对 seq 骨干有效 (转发接口返回 false)。
+           响亮的失败方式: 非 seq 骨干 + 显式要求了非默认值时直接退出, 而不是"设了没生效"。
+        */
+        {
+            const bool wantPos = (g_cfg.posKey != "1d");
+            const bool wantDrop = (g_cfg.dropoutP > 0.0f);
+            if (wantPos || wantDrop) {
+                if (wantPos) {
+                    if (!agent.setExpertPosMode(g_cfg.posKey)) {
+                        std::fprintf(stderr,
+                                     "[--pos=%s] 骨干 %s 不支持位置编码模式 (只有 --agent=ppo-seq 支持)\n",
+                                     g_cfg.posKey.c_str(), RL::PPO::backboneName(bb));
+                        return 2;
+                    }
+                }
+                if (wantDrop) {
+                    if (!agent.setExpertDropout(g_cfg.dropoutP)) {
+                        std::fprintf(stderr,
+                                     "[--dropout=%.3f] 骨干 %s 不支持专家 dropout (只有 --agent=ppo-seq 支持)\n",
+                                     (double)g_cfg.dropoutP, RL::PPO::backboneName(bb));
+                        return 2;
+                    }
+                }
+                std::printf("[seq] 位置编码 %s, dropout %.3f\n",
+                            agent.posModeInUse().c_str(), (double)agent.expertDropoutInUse());
+            }
+        }
         if (!loadOrFail(agent)) { return 2; }
-        return runBc(agent, tb ? "PPO+MCTS" : "PPO+MCTS (MLP 专家)",
-                     RL::PPO::backboneName(agent.getBackbone()));
+        return runBc(agent, label, RL::PPO::backboneName(agent.getBackbone()));
     }
     if (g_cfg.agent == "sac") {
         SACAZAgent agent(env, g_cfg.hidden, 0.99f, 0.001f, 1.5f,
@@ -264,7 +370,7 @@ int main(int argc, char *argv[])
         return runBc(agent, "SAC+AZ-MoE (TB 专家)", agent.backboneName());
     }
 
-    std::fprintf(stderr, "未知 agent: %s (可选 ppo / ppo-mlp / sac / sac-moe-mlp / sac-moe)\n",
-                 g_cfg.agent.c_str());
+    std::fprintf(stderr, "未知 agent: %s (可选 ppo / ppo-mlp / ppo-layer / sac / "
+                         "sac-moe-mlp / sac-moe)\n", g_cfg.agent.c_str());
     return 2;
 }

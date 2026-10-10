@@ -328,8 +328,17 @@ inline Tensor lowTriangle(int rows, int cols)
     return x;
 }
 
-/* exponential moving average */
-inline void lerp(Tensor &x, const Tensor xi, float r)
+/*
+   exponential moving average
+
+   ⚠ [2026-10] 第二个参数原来是 `const Tensor xi` —— **按值传** ⇒ 每次调用把源张量
+   整块深拷贝一遍。它是 `softUpdateTo` 的唯一实现路径 (Polyak 软更新), 调用点密集:
+   `layer.h:254,256`、`attention.hpp:338-340,579-581,975`、`concat.hpp`、`transformer.hpp:442-445`、
+   `moe.hpp:340-341`。按 SACAZ MoE TB 的 MHA 尺寸 (一个投影 1263² = 6.38 MB, 四个投影)
+   算, 一层每次软更新白拷 ≈25.5 MB、4 个专家 ≈102 MB【推理·算式, 未做 A/B】。
+   改成 `const Tensor &` 是**零语义变化**的一行改动。
+*/
+inline void lerp(Tensor &x, const Tensor &xi, float r)
 {
     for (std::size_t i = 0; i < x.size(); i++) {
         x[i] = (1 - r) * x[i] + r * xi[i];

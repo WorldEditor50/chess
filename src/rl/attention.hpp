@@ -28,6 +28,7 @@ public:
 
     Tensor& forward(const Tensor& x, bool inference=false) override
     {
+        requireWired("PositionalEncoder");     /* 死代码守卫: 见 ilayer.h */
         float d = float(x.totalSize);
         for (std::size_t i = 0; i < x.totalSize; i++) {
             if (i%2 == 0) {
@@ -286,6 +287,18 @@ public:
         return;
     }
 
+    /* 梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数) */
+    double gradNorm2() const override
+    {
+        return gradNorm2Of(g.wq) + gradNorm2Of(g.wk) + gradNorm2Of(g.wv);
+    }
+    void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g.wq, s);
+        scaleTensorGrad(g.wk, s);
+        scaleTensorGrad(g.wv, s);
+    }
+
      void Adam(float lr, float alpha, float beta,
                float alpha_, float beta_,
                float decay, bool clipGrad) override
@@ -421,6 +434,7 @@ public:
     }
     Tensor& forward(const RL::Tensor &x, bool inference=false) override
     {
+        requireWired("Attention<N>");     /* 死代码守卫: 见 ilayer.h */
         for (int i = 0; i < N; i++) {
             Tensor &out = dotProduct[i].forward(x, inference);
             a.embedding({i*unitDim, 0}, out);
@@ -893,6 +907,23 @@ public:
         }
         g.zero();
         return;
+    }
+
+    /* 梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数) */
+    double gradNorm2() const override
+    {
+        double s = gradNorm2Of(g.wo);
+        for (int i = 0; i < numHeads; i++) {
+            s += heads[(std::size_t)i].gradNorm2();
+        }
+        return s;
+    }
+    void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g.wo, s);
+        for (int i = 0; i < numHeads; i++) {
+            heads[(std::size_t)i].scaleGrad(s);
+        }
     }
 
     void Adam(float lr, float alpha, float beta,

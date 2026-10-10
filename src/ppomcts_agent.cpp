@@ -173,6 +173,12 @@ std::string PPOMCTSAgent::getName() const
     if (backbone == Backbone::MlpExperts) {
         return "PPO+MCTS (AlphaZero, MLP专家)";
     }
+    if (backbone == Backbone::LayerExperts) {
+        return "PPO+MCTS (AlphaZero, 廉价专家/无MHA)";
+    }
+    if (backbone == Backbone::SeqExperts) {
+        return "PPO+MCTS (AlphaZero, 序列Transformer专家)";
+    }
     return "PPO+MCTS (AlphaZero)";
 }
 
@@ -903,12 +909,97 @@ std::string PPOMCTSAgent::selfCheckReport() const
     std::snprintf(buf, sizeof(buf), "骨干: %s | 专家 %d 个, topK=%d | 隐层 %d\n",
                   backboneName(backbone), moeExpertCount(), moeTopK(), expertHidden);
     out += buf;
-    if (backbone == Backbone::MlpExperts) {
-        out += "  界面 agent 类型 PPO+MCTS-MLP (AGENT_PPOMCTS_MLP): MlpExpert 便宜 ~25x "
-               "(前向 0.139 ms vs TB 3.59 ms), 容量小 ~18x (2.15 M vs 38.0 M 参数)\n";
-    } else {
-        out += "  界面 agent 类型 PPO+MCTS (AGENT_PPOMCTS): TransformerBlock<16,360> 专家"
+    /*
+       ⚠ 这里原来是 `if (MlpExperts) ... else ...` 两分支 —— 加第三/第四种骨干之后它会把
+       新骨干错报成 TB 专家 (读数张冠李戴是本工程记过很多次的事), 所以按枚举逐个写清, 不留兜底。
+    */
+    switch (backbone) {
+    case Backbone::MlpExperts:
+        out += "  界面 agent 类型 PPO+MCTS-MLP (AGENT_PPOMCTS_MLP): MlpExpert "
+               "(2 层 tanh MLP, 隐层 64) 便宜 ~25x, 容量小 ~21x (2.45 M vs 52.4 M 参数)\n";
+        break;
+    case Backbone::LayerExperts:
+        out += "  实验骨干 (未接界面): Layer<Gelu> 专家 —— **无 MHA**, 每个专家 d²+d 参数\n";
+        break;
+    case Backbone::SeqExperts: {
+        /*
+           [2026-10] 真正的序列 Transformer: 读数与前三支**不可比**, 所以口径要写全 ——
+           "token 数 / token 宽度 / 头数 / 层数 / 注意力矩阵规模" 缺一个都会被误读。
+        */
+        const int dkSeq = expertHidden / (RL::PPO::SEQ_HEADS > 0 ? RL::PPO::SEQ_HEADS : 1);
+        std::snprintf(buf, sizeof(buf),
+                      "  实验骨干 (未接界面): **真正的序列 Transformer** —— %d 个 token "
+                      "(每格一个), token 宽 %d, %d 头 (d_k=%d), %d 层, 注意力矩阵 %d x %d\n",
+                      RL::PPO::SEQ_LEN, expertHidden, RL::PPO::SEQ_HEADS, dkSeq,
+                      RL::PPO::SEQ_BLOCKS, RL::PPO::SEQ_LEN, RL::PPO::SEQ_LEN);
+        out += buf;
+        out += "    按 key 轴**逐行** softmax + 可学位置嵌入 + Pre-LN 残差 "
+               "(与 TB 专家的单向量外积 + 全局 softmax 是两种东西, 见文档 §10)\n";
+        break;
+    }
+    case Backbone::TbExperts:
+    default:
+        out += "  界面 agent 类型 PPO+MCTS (AGENT_PPOMCTS): TransformerBlock 专家"
                " (E=4 top-1), 现役骨干\n";
+        break;
+    }
+    /*
+       ---- [2026-10] TB 专家的结构读数 (头口径 / 参数构成) ----
+       "请求 16 头、实用 15 头"这件事在修正前**任何读数都不变** (只是慢一点、容量少一点),
+       所以这三个数必须打在面板上: 它比读模板参数可靠, 也是 test_ppo_backbone 的断言对象。
+    */
+    {
+        const int hReq = tbHeadsRequested();
+        const int hUse = tbHeadsUsed();
+        const int hDim = tbHeadDim();
+        if (hReq > 0) {
+            std::snprintf(buf, sizeof(buf),
+                          "  注意力头: 请求 %d / 实用 %d / d_k %d / 注意力元素 %lld\n",
+                          hReq, hUse, hDim, tbAttnElements());
+            out += buf;
+            if (hReq != hUse) {
+                std::snprintf(buf, sizeof(buf),
+                              "  **警告: 请求 %d 头但只跑了 %d 头 (d_model=%d 不被 %d 整除 ⇒ "
+                              "静默降级)** —— 见 rl/ppo.h 顶部的头数口径修正\n",
+                              hReq, hUse, STATE_DIM, hReq);
+                out += buf;
+            }
+        }
+        long long pa = 0, pf = 0, pl = 0;
+        tbExpertParamBreakdown(pa, pf, pl);
+        if (pa + pf + pl > 0) {
+            const double tot = (double)(pa + pf + pl);
+            std::snprintf(buf, sizeof(buf),
+                          "  专家参数构成: 注意力 %lld (%.1f%%) / FFN %lld (%.1f%%) / "
+                          "LN %lld (%.2f%%)\n",
+                          pa, 100.0 * (double)pa / tot, pf, 100.0 * (double)pf / tot,
+                          pl, 100.0 * (double)pl / tot);
+            out += buf;
+        }
+    }
+    /*
+       ---- [2026-10] 优化器的裁剪口径 + 梯度范数 ----
+       `clipGrad` 的真实语义是"逐张量梯度归一化到单位长度" (不是裁剪), 而 RMSProp 的逐坐标
+       归一又会把整张量的等比缩放抵消掉 ⇒ 换裁剪口径**不是**训练问题的解药 (实测见
+       docs/tb_expert_training_2026_10.md §3)。梯度范数默认不采集, 这里宁可说"未采集"
+       也不打一个恒为 0 的假数。
+    */
+    {
+        std::snprintf(buf, sizeof(buf), "梯度裁剪: %s",
+                      RL::gradClipModeName(gradClipModeValue()));
+        out += buf;
+        if (gradClipModeValue() == RL::GRAD_CLIP_GLOBAL_NORM) {
+            std::snprintf(buf, sizeof(buf), " (上限 %.3g)", (double)gradClipNormValue());
+            out += buf;
+        }
+        if (trackGradNormEnabled()) {
+            std::snprintf(buf, sizeof(buf), " | 最近一次梯度范数: actor %.4g / critic %.4g\n",
+                          actorGradNorm(), criticGradNorm());
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          " | 梯度范数: 未采集 (trackGradNorm=off, 见 rl/ppo.h 的说明)\n");
+        }
+        out += buf;
     }
     std::snprintf(buf, sizeof(buf),
                   "表示: 状态 %d 维 = %d 平面 x %d 格\n", STATE_DIM, PLANES, CELLS);

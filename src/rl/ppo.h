@@ -16,6 +16,7 @@
 #include "annealing.hpp"
 #include "expert.hpp"          /* 专家类型 / ExpertFactory / scaleExpertInit */
 #include "transformer.hpp"
+#include "seq_transformer.hpp" /* [2026-10] 真正的序列 Transformer 专家 (SeqExperts 骨干) */
 
 namespace RL {
 
@@ -33,16 +34,37 @@ class MoERouteProbe;
  * 结构参数必须编译期确定 (模板参数), 所以放在 namespace 作用域而不是类成员。
  *
  *  TB 专家的结构:
- *    PPO_MOE_TB_HEADS = 16 -> 1440/16 = 90 维/头 (与 SACAZAgent 的
- *                              MOE_TB_HEADS=15 @1260 同一个"每头 ~90 维"的口径)
- *    PPO_MOE_TB_DFF   = 360 -> = d_model/4 (压住 TB 专家里 FFN 的开销;
- *                              注意力那 4·d_model² 才是大头, FFN 只占 1/8)
+ *    PPO_MOE_TB_HEADS = 15 -> **1710/15 = 114 维/头, 且整除** (见下面的头数口径修正)
+ *    PPO_MOE_TB_DFF   = 360 -> 约 d_model/4.75 (压住 TB 专家里 FFN 的开销;
+ *                              注意力那 4·d_model² 才是大头 —— 实测它占一个专家
+ *                              **90.4% 的参数**与 96.5% 的 FLOPs, FFN 只占 9.5% / 3.5%)
  *
- *  换专家只改 `PPOExpert` 这一行 (两种专家都在 ExpertFactory 里注册过):
- *    using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;  // 现役
- *    using PPOExpert = MlpExpert;                                          // 旧配置 (专家数要配 8/2)
+ *  换专家只改 `PPOExpert` 这一行 (几种专家都在 ExpertFactory 里注册过):
+ *    using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF, true>;  // 现役
+ *    using PPOExpert = MlpExpert;                       // MLP 专家 (专家数配 8/2)
+ *    using PPOExpert = Layer<Gelu>;                     // 无 MHA 的廉价专家 (见 LayerExperts)
+ *
+ *  ------------------------------------------------------------------
+ *  [2026-10] 头数口径修正: 请求 16 头 -> 实用 15 头, 且显式 HonorHeads = true
+ *  ------------------------------------------------------------------
+ *  实测 (本机 `probe_tb_init`, d_model = PPOMCTSAgent::STATE_DIM = 1710):
+ *    * 原口径写 `PPO_MOE_TB_HEADS = 16`, 注释还写"1440/16 = 90 维/头" ——
+ *      而 1440 是 `DQNABAgent::STATE_DIM`, 根本不是这个 agent 的 d_model;
+ *    * `TransformerBlock<16,360>` 的第三个模板参数 `HonorHeads` **默认 false**,
+ *      于是走"头数必须整除 d_model"的老规则: `1710 = 2·3²·5·19`, 16 ∤ 1710 ⇒
+ *      **静默降到 15 头**、d_k = 114。即"请求 16, 实用 15", 而没有任何读数会变 ——
+ *      这正是 `dev_sacmoetb_2026_09.md` 记过的同类缺陷 (那次是请求 15 / 实用 3)。
+ *  修法 = "把请求写成真实值" + "让降级没有发生的空间":
+ *    * `PPO_MOE_TB_HEADS = 15`: 1710 = 15 × 114, **整除、覆盖满** (`uncoveredCoords()==0`);
+ *    * 第三个模板参数显式写 `true`: 以后即使有人把 d_model 换成不整除的维数,
+ *      "请求的头数"与"实用的头数"也永远相等 (自检面板把两者都打出来, 见 §自检)。
+ *  **兼容性**: 15 头 × d_k=114 与原口径**完全同构** ⇒ `paramCount()` 不变
+ *  (actor 仍是 52,388,888), 存量 `weights/ppomcts_agent.dat_*` **仍可载入, 且同一份
+ *  权重的前向输出逐位不变**。唯一差别是"从随机初始化重训"时的初始化随机数流
+ *  (原口径构造 16 个 head 再丢掉 1 个, 现在构造 15 个) ⇒ 新初始化的权重与旧的不同。
+ *  记录: `docs/tb_expert_training_2026_10.md`。
  */
-constexpr int PPO_MOE_TB_HEADS = 16;
+constexpr int PPO_MOE_TB_HEADS = 15;
 constexpr int PPO_MOE_TB_DFF   = 360;
 /*
  * ---- [2026-10 第二次口径] 用户口径: "将 sac agent 与 ppo agent 的 TB 专家数量降为 4,
@@ -94,7 +116,13 @@ constexpr int PPO_MOE_TB_DFF   = 360;
 constexpr int PPO_MOE_EXPERTS  = 4;
 constexpr int PPO_MOE_TOPK     = 1;
 
-using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
+/*
+ * 现役 TB 专家: 第三个模板参数 `HonorHeads` **必须显式给 true**。
+ * 见上面那段"头数口径修正": 不给它就会走"头数必须整除 d_model"的老规则,
+ * 而"请求的头数 != 实用的头数"这种偏差在本工程里只会表现为"慢"和"容量少",
+ * 不报错、不改任何读数 (dev_sacmoetb_2026_09.md §1 的教训)。
+ */
+using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF, true>;
 
 /*
  * ================================================================
@@ -102,22 +130,84 @@ using PPOExpert = TransformerBlock<PPO_MOE_TB_HEADS, PPO_MOE_TB_DFF>;
  * ================================================================
  * 上面那套 TB 专家是现役骨干, 而 E=8 / top-2 的 **MlpExpert** 配置并没有被删掉 ——
  * 它现在由**另一个 agent** 使用 (界面上的 "PPO+MCTS (AlphaZero, MLP专家)",
- * ChessBoard::AGENT_PPOMCTS_MLP), 于是可以在同一个算法下直接对弈比较两种骨干:
+ * ChessBoard::AGENT_PPOMCTS_MLP), 于是可以在同一个算法下直接对弈比较几种骨干。
+ *
+ * ⚠ 下面这张历史表的**维数是 d=1440** (复现脚本 `.r1build/bench_ppo_expert.cpp`
+ *   里写死了 `D = 1440`), 而生产路径的 d_model = STATE_DIM = **1710** ——
+ *   所以"38.0 M"不是现役 TB actor 的参数量, 现役是 **52,388,888** (见文件顶部那段)。
+ *   本表留着只当"不同专家类型的相对单价"用:
  *
  *   配置                        参数量     前向       前向+反向
  *   MlpExpert        E=8 top-2   2.15 M   0.139 ms    1.94 ms
- *   TB<16,360>       E=4 top-1  38.0  M   3.59  ms   32.1  ms   <- 现役 (2026-10 第二次口径)
- *   TB<16,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms   (2026-10 第一次口径, 已回退)
+ *   TB<15,360>       E=4 top-1  (38.0 M @1440 / 52.4 M @1710)  3.59 ms  32.1 ms
+ *   TB<15,360>       E=8 top-2  75.3  M   6.24  ms   41.0  ms   (2026-10 第一次口径, 已回退)
  *
- * (数字来自 ppo.h 上面那张实测表; MLP 专家便宜 ~25×、容量小 ~18×。)
  * 选择方式见 `PPO::Backbone` —— 运行时参数。**默认是 TB 专家 (E=4/top-1)**, 所以
  * 现役 agent 与测试跟着编译期常量走; 想比"便宜骨干"就在另一个 agent 那一支上看。
- * ⚠ MLP 专家那一档**不动** (它本来就是 E=8/top-2, 而且算力便宜 ~25x): 本次回退只改了
- *   文件顶部的 `PPO_MOE_EXPERTS / PPO_MOE_TOPK` 这一对 (TB 专家), 这正是"两个骨干各有
- *   一套常量"的意义 —— 改一支不会连坐另一支。
+ * ⚠ MLP 专家那一档**不动** (它本来就是 E=8/top-2, 而且算力便宜 ~25x): 这正是
+ *   "几个骨干各有一套常量"的意义 —— 改一支不会连坐另一支。
  */
 constexpr int PPO_MOE_MLP_EXPERTS = 8;
 constexpr int PPO_MOE_MLP_TOPK    = 2;
+
+/*
+ * ================================================================
+ *  [2026-10] 第三种骨干: 无 MHA 的廉价专家 `LayerExperts`
+ * ================================================================
+ * 为什么加它 (全部是实测, 见 `docs/tb_expert_training_2026_10.md`):
+ *
+ *   * 实测 (probe, d_model=1710): 一个 TB 专家的 **90.4% 参数是注意力**, 而这条支路
+ *     在初始化时**功能上是死的** —— `softmax(z)` 是**全局**归一 (`util.hpp:465` 对整张
+ *     `d_k×d_k` 张量求和), 于是 `Σ_ij z_ij = 1` ⇒ 每行只有 `1/d_k` 的质量 ⇒
+ *     单头输出 ∝ `|v|/d_k`。实测量级: `|x|=11.53, |attn_out|=0.017, |ffn_out|=8.16`,
+ *     **注意力只占块输出方差的 1.45e-06**, 而且换局面时它几乎不变 (近似常数偏置)。
+ *   * 也就是说 "52.4 M 参数的 Transformer 专家" 实际是
+ *     **恒等残差 + 一个 360 宽的 GELU FFN (~1.2 M 有效参数) + 一个常数**。
+ *   * 代价却全是它付的: 一个 BC 更新 TB **1.374 s** vs MLP **0.050 s** (27.5×,
+ *     batch=32/lr=0.002 实测), 而**学到的 CE 曲线两者同量级** —— 见
+ *     `train_bc --agent=ppo|ppo-mlp` 的受控 A/B (训练 CE 3.649->2.046 vs 3.662->2.068)。
+ *
+ * 所以这一支 = "把那条死支路删掉, 只留一个廉价非线性":
+ *   `Layer<Gelu>` 专家 (d -> d 单层 FC + GELU, 复用 `ExpertFactory<Layer<Fn>>`,
+ *   **不需要**新写专家类), 每个专家 `d²+d = 2,925,811` 参数, E=4/top-1 ⇒ MoE 11.7 M
+ *   (vs TB 的 51.75 M, **4.4× 小**), 每专家前向 FLOPs 2.92 M (vs TB 35.3 M, **12× 小**)。
+ * 为什么不是"直接换掉 TB 专家": 本工程的约定是"加一支不一定连坐另一支" ——
+ * TB 那一支的存量权重、界面条目、所有实测读数都还在, 这一支**只多了一个枚举值**,
+ * 走同一条 `makeMoeLayer` 工厂 (ppo.cpp), 所以两者的搜索/训练/存盘/诊断代码逐行相同。
+ * 它目前**只接到库与工具**(`train_bc --agent=ppo-layer` / `train_ppo --backbone=layer` /
+ * `bench_agent_arena --backbone-ppo=layer`), 界面条目等有了读数再决定 (加界面 agent 要动
+ * 十几个构造点, 不该和"验证结构假设"混在一轮里)。
+ */
+constexpr int PPO_MOE_LAYER_EXPERTS = 4;
+constexpr int PPO_MOE_LAYER_TOPK    = 1;
+using PPOLayerExpert = Layer<Gelu>;
+
+/*
+ * ================================================================
+ *  [2026-10] 第四种骨干: **真正的序列 Transformer** (`SeqExperts`)
+ * ================================================================
+ * 前三支的专家都是"向量进 / 向量出"的层, 其中 `TransformerBlock` 那条(TB 专家)在
+ * 结构上**不是 attention** (单向量 ⇒ 没有 token 轴; `softmax` 还是全局归一 ⇒ 输出被
+ * 压掉 1/d_k)。本支用 `RL::SeqTransformerExpert` 换成标准 Pre-LN Transformer 编码器:
+ *   * 状态按**格子**切 token (1710 = 90 格 × 19 平面 ⇒ T=90, featDim=19);
+ *   * 可学的位置嵌入 (没有它棋盘就是无序的格子袋);
+ *   * `scores = Q Kᵀ/√d_k` 是 (T×T), **按 key 轴逐行 softmax**, `O = P V`;
+ *   * `Blocks` 层 Pre-LN + 残差 + GELU FFN;
+ *   * 逐格输出投影回 19 维 → 散回 1710 (满足 MoE"输入输出同维"的契约)。
+ * 实现与验证细节见 `src/rl/seq_transformer.hpp` 顶部; 实测读数见
+ * `docs/tb_expert_training_2026_10.md` §10。
+ *
+ * **为什么 dIn 必须能被 PPO_SEQ_LEN 整除**: 这个 token 化是按格子的, 而本工程的编码是
+ * "平面优先" (`state[plane*CELLS + cell]`) ⇒ dIn = 平面数 × 90。PPO 的 STATE_DIM = 1710
+ * 正好是 19×90 ✓。SAC/DQN 那条 1263 = 17×90+3 的编码**不满足** (3 个规则上下文是额外
+ * 追加的标量), 所以这一支目前只接 PPO —— 构造时会对不整除的维数**响亮失败**, 不静默降级。
+ */
+constexpr int PPO_SEQ_LEN    = 90;   /* = ChessState::CELLS: 每格一个 token */
+constexpr int PPO_SEQ_HEADS  = 4;
+constexpr int PPO_SEQ_BLOCKS = 2;
+constexpr int PPO_MOE_SEQ_EXPERTS = 4;
+constexpr int PPO_MOE_SEQ_TOPK    = 1;
+using PPOSeqExpert = SeqTransformerExpert<PPO_SEQ_LEN, PPO_SEQ_HEADS, PPO_SEQ_BLOCKS>;
 
 /*
  * Simplified PPO for AlphaZero-style Chinese Chess.
@@ -197,25 +287,40 @@ public:
     /* MLP 专家那一套的别名 (E=8 / top-2) */
     static constexpr int MOE_MLP_EXPERTS = PPO_MOE_MLP_EXPERTS;
     static constexpr int MOE_MLP_TOPK    = PPO_MOE_MLP_TOPK;
+    /* 廉价专家那一套的别名 (Layer<Gelu>, E=4 / top-1) */
+    static constexpr int MOE_LAYER_EXPERTS = PPO_MOE_LAYER_EXPERTS;
+    static constexpr int MOE_LAYER_TOPK    = PPO_MOE_LAYER_TOPK;
+    /* 序列 Transformer 那一套的别名 (E=4 / top-1; token 宽度 = expertHidden) */
+    static constexpr int MOE_SEQ_EXPERTS = PPO_MOE_SEQ_EXPERTS;
+    static constexpr int MOE_SEQ_TOPK    = PPO_MOE_SEQ_TOPK;
+    static constexpr int SEQ_LEN         = PPO_SEQ_LEN;
+    static constexpr int SEQ_HEADS       = PPO_SEQ_HEADS;
+    static constexpr int SEQ_BLOCKS      = PPO_SEQ_BLOCKS;
 
     /*
-     * ---- 骨干选择 (本工程的扩展, 2026-09) ----
+     * ---- 骨干选择 (本工程的扩展, 2026-09; 第三支 2026-10) ----
      * 上游 snakeAI 只有一种编译期骨干 (PPOExpert), 而"MLP 专家"这条配置在本工程里
      * 已经被 SACAZAgent 用作对照骨干 (见它的 Backbone::SparseMoeMlp)。把它做成
-     * **构造参数**之后, 同一个 PPO 实现 (搜索、训练、存盘、诊断全部共用) 就能带两种
+     * **构造参数**之后, 同一个 PPO 实现 (搜索、训练、存盘、诊断全部共用) 就能带几种
      * 专家, 而不必复制一份 rl/ppo.cpp —— 复制才是真正的风险 (三份拷贝迟早漂移,
      * 见 expert.hpp 顶部的教训)。
      *
-     * 两种骨干的**结构差异只有 MoE 层里的专家类型与 (E, top-k)**; 其余层
+     * 几种骨干的**结构差异只有 MoE 层里的专家类型与 (E, top-k)**; 其余层
      * (Tanh(h) / Softmax / Linear 头)、损失、优化器、权重格式全部相同。
-     * 权重文件带结构指纹 (张量元素总数 == paramCount()), 所以两种骨干的检查点
+     * 权重文件带结构指纹 (张量元素总数 == paramCount()), 所以不同骨干的检查点
      * **互相拒绝载入**而不是静默串权重。
      */
     enum class Backbone {
-        TbExperts = 0,   /* TransformerBlock<16,360> 专家, E=4 top-1 (现役) */
-        MlpExperts       /* MlpExpert 专家, E=8 top-2 (便宜 ~25x, 容量小 ~18x) */
+        TbExperts = 0,   /* TransformerBlock<15,360,HonorHeads> 专家, E=4 top-1 (现役) */
+        MlpExperts,      /* MlpExpert 专家, E=8 top-2 (便宜 ~25x, 容量小 ~21x) */
+        LayerExperts,    /* Layer<Gelu> 专家 (无 MHA), E=4 top-1 —— 见文件顶部那一节 */
+        SeqExperts       /* SeqTransformerExpert: **真正的**序列 Transformer, E=4 top-1 */
     };
     static const char *backboneName(Backbone b);
+    /* 骨干名 (供工具/测试做参数与文件名用; 与界面显示名分开) */
+    static const char *backboneKey(Backbone b);
+    /* 解析 `tb` / `mlp` / `layer` (大小写不敏感); 失败返回 false 且不改 out */
+    static bool parseBackbone(const char *s, Backbone &out);
 
     PPO(){}
     explicit PPO(int stateDim, int hiddenDim, int actionDim,
@@ -592,6 +697,14 @@ public:
     int moeLayerCount() const;
     int moeExpertCount() const;
     int moeTopK() const;
+    /*
+       [2026-10] 两个"专家级旋钮": 位置编码模式 (1d/2d/rope) 与 dropout 概率。
+       走 `SparseMoE` → 每个专家的虚函数转发 (**只有 SeqExperts 骨干响应**);
+       返回 false = 这个骨干不支持该旋钮 (TB/MLP/Layer 三个骨干都返回 false)。
+       约定: 构造网之后、开始训练之前调用一次 (位置编码会重新分配该模式的参数)。
+    */
+    bool setExpertPosMode(const std::string &key);
+    bool setExpertDropout(float p);
     /* 参数量 (只读诊断) */
     long long actorParamCount() const { return actorP.paramCount(); }
     long long criticParamCount() const { return critic.paramCount(); }
@@ -616,6 +729,26 @@ public:
        取的是 **actor (策略网)** 那一层 —— 理由见 ppo.cpp 里的说明。
     */
     const MoERouteProbe *moeRouteProbe() const;
+
+    /* ----------------------------------------------------------------
+     *  [2026-10] TB 专家的"结构自检"读数 (只读)
+     * ----------------------------------------------------------------
+     * 为什么必须有它: "请求 16 个头 / 实用 15 个头"这件事在改动前**一个读数都不变**
+     * (慢一点、容量少一点, 别的一模一样) —— 见 ppo.h 顶部的头数口径修正。
+     * 把这三个数打到自检面板上, 下次同类偏差当场可见, 不用靠人去读模板参数。
+     * 非 TransformerBlock 骨干返回 -1 / 0 (与 iLayer 的约定一致)。
+     */
+    int tbHeadsRequested() const;    /* 模板参数里请求的头数 */
+    int tbHeadsUsed() const;         /* 真正参与前向的头数 */
+    int tbHeadDim() const;           /* 每个头的 d_k */
+    long long tbAttnElements() const;/* numHeads * d_k^2 (TB 专家的单价来源) */
+    /*
+       一个 TB 专家里"注意力 vs FFN vs LayerNorm"的参数拆解 (只读诊断)。
+       实测 (d_model=1710): 注意力 90.4% / FFN 9.5% / LN 0.05% —— 而注意力那条支路
+       在初始化时只贡献 1.45e-06 的输出方差 (见文件顶部那一节)。三个数都是 0 表示
+       当前骨干不是 TransformerBlock 专家。
+    */
+    void tbExpertParamBreakdown(long long &attn, long long &ffn, long long &ln) const;
 
 public:
     int stateDim;
@@ -655,6 +788,42 @@ public:
     */
     bool  moeLossFreeBias = false;
     float moeLossFreeBiasRate = 0.01f;
+
+    /*
+       ================================================================
+       [2026-10] 梯度裁剪口径 —— "clipGrad" 这个名字骗了所有人 (但换掉它也修不了训练)
+       ================================================================
+       `Optimize::RMSProp(..., clipGrad=true)` 做的是 `dw /= dw.norm2() + 1e-8` ——
+       **不是裁剪, 是把每个权重张量的梯度归一化到单位长度** (实测: 尺度 1 与 1e6 的
+       同一份梯度, 一步之后的 |Δw| 完全相同)。
+
+       但**不要**因此以为"换成真正的裁剪就能让 TB 好训" —— RMSProp 自己逐坐标归一
+       (`v[i]=ρv+(1−ρ)dw²`, `Δw=−lr·dw/(sqrt(v)+ε)`), 任何整张量的等比缩放都会被它抵消,
+       所以三种模式在实用梯度尺度上是**同一条轨迹** (实测相对差 < 1e-6; 唯一差别在
+       |g| ∈ [1e-16, 3e-9] 这条极窄的带里, 见 rl/optimize.h 顶部那一节)。
+       TB 真正的机制是: **RMSProp 让每个坐标都按 ±lr 走**, 于是占 90.4% 参数、对输出方差
+       只贡献 1.45e-06 的注意力, 与承载全部信号的 FFN 拿到同样的步长。修它要么改结构
+       (删掉那条死支路 / 让它真的参与函数), 要么改优化器族, 不是改这个开关。
+
+       那这三个模式存在的意义: 把语义写清楚 + 让对照实验能只靠命令行跑 + 配
+       `actorGradNorm` 读出"这一步真实的信号有多大" (这个数以前没有)。
+       `PerTensorUnitNorm` 是**默认**, 逐位不变 —— 换默认值等于让所有既有读数不可复现。
+    */
+    int   gradClipMode = RL::GRAD_CLIP_PER_TENSOR_UNIT_NORM;
+    float gradClipNorm = 1.0f;
+    /*
+       最近一次优化器调用**之前**的梯度范数 (只读诊断): 这是"这次更新到底有多大的
+       信号"的唯一读数 —— 关掉裁剪之后它就是判断"学习率要不要跟"的依据。
+       `gradNormTotal()` 取 actor+critic; `bcApplyGradients` 只更新 actor。
+
+       ⚠ 它**默认不算** (`trackGradNorm=false`): 算一次要把 52 M 参数的梯度全部读一遍,
+       而 TB 骨干下一步 trainStep 的优化器本来就占 ~91% —— 在训练主路径上白加一遍读
+       不划算。需要它的地方 (自检面板 / train_bc / train_ppo / `GlobalNorm` 裁剪)
+       显式打开; 非 legacy 的裁剪口径下**必须**算 (那是裁剪本身要用的)。
+    */
+    bool   trackGradNorm = false;
+    double actorGradNorm = 0.0;
+    double criticGradNorm = 0.0;
 
     /*
        ================================================================

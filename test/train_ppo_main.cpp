@@ -113,6 +113,18 @@ struct Cfg {
     float lossFreeBiasRate = -1.0f;
     bool  auxCoefGiven = false;
     float auxCoef = -1.0f;
+    /*
+       ---- [2026-10] 骨干与梯度裁剪口径 ----
+       `backbone`: "tb" (默认, 界面现役) / "mlp" / "layer" (无 MHA 的廉价专家)。
+         三支走同一个 `makeMoeLayer` 工厂, 所以除了专家类型之外逐行相同。
+       `gradClip`: "legacy" (默认 = 老行为) / "global" / "none"。见 rl/optimize.h。
+         为什么必须做成开关: 老口径 `clipGrad` 的真实语义是"逐张量梯度归一化到单位长度",
+         它把梯度大小的信息完全抹掉 (实测: 尺度 1 与 1e6 的梯度, 一步之后 |Δw| 相同) ——
+         不做成一个可切换的口径, "关掉裁剪"的对照就只能靠改源码重编。
+    */
+    std::string backbone = "tb";
+    std::string gradClip = "legacy";
+    float gradClipNorm = 1.0f;
 };
 
 Cfg g_cfg;
@@ -158,6 +170,14 @@ bool parseArgs(int argc, char **argv)
             g_cfg.lossFreeBiasRate = (float)std::atof(v.c_str());
         }
         else if (k == "--aux-coef") { g_cfg.auxCoef = (float)std::atof(v.c_str()); g_cfg.auxCoefGiven = true; }
+        /*
+           [2026-10] 骨干与梯度裁剪口径 (见 rl/ppo.h 顶部 / rl/optimize.h 的 GradClipMode)。
+           `--backbone=layer` 是新加的无 MHA 廉价专家那一支 —— 与 TB 那一支的**唯一**差别
+           就是专家类型 (同一个工厂 makeMoeLayer), 所以直接可做受控对照。
+        */
+        else if (k == "--backbone") { g_cfg.backbone = v; }
+        else if (k == "--grad-clip") { g_cfg.gradClip = v; }
+        else if (k == "--grad-clip-norm") { g_cfg.gradClipNorm = (float)std::atof(v.c_str()); }
         else if (k == "--quiet") { g_cfg.verbose = false; }
         else if (k == "--help" || k == "-h") {
             std::printf(
@@ -171,7 +191,10 @@ bool parseArgs(int argc, char **argv)
                 "                 [--clamp=F] [--clip-eps=F] [--entropy=F]\n"
                 "                 [--aux-coef=F]          MoE 辅助损失系数 (默认 0.1)\n"
                 "                 [--lossfree-bias=0|1]   无辅助损失偏置均衡 (默认 0 = 关)\n"
-                "                 [--lossfree-bias-rate=F] 它的步长 (默认 0.01; 见 Cfg 的刻度坑)\n");
+                "                 [--lossfree-bias-rate=F] 它的步长 (默认 0.01; 见 Cfg 的刻度坑)\n"
+                "                 [--backbone=tb|mlp|layer|seq] 专家骨干 (默认 tb = 界面现役;\n"
+                "                                          seq = 真正的序列 Transformer, 见 rl/seq_transformer.hpp)\n"
+                "                 [--grad-clip=legacy|global|none] [--grad-clip-norm=F]\n");
             return false;
         } else {
             std::printf("[警告] 未知参数: %s (--help 看用法)\n", argv[i]);
@@ -215,7 +238,31 @@ int main(int argc, char **argv)
     RL::Random::setSeed(g_cfg.seed);
 
     Chess board;
-    PPOMCTSAgent ag(board, g_cfg.hidden, 0.99f, 0.001f, 1.414f, g_cfg.expert);
+    /*
+       ---- [2026-10] 骨干由 --backbone 决定 (默认 tb = 界面现役) ----
+       解析失败**直接退出**, 不静默退回 tb —— "以为在跑 mlp 其实跑的是 tb" 这种错
+       在本工程里只会表现为"读数不对但没什么异常", 属于最贵的一类错。
+    */
+    RL::PPO::Backbone bb = RL::PPO::Backbone::TbExperts;
+    if (!RL::PPO::parseBackbone(g_cfg.backbone.c_str(), bb)) {
+        std::printf("[错误] 未知 --backbone: %s (可选 tb / mlp / layer)\n", g_cfg.backbone.c_str());
+        return 2;
+    }
+    PPOMCTSAgent ag(board, g_cfg.hidden, 0.99f, 0.001f, 1.414f, g_cfg.expert, 0.1f, true, bb);
+    {
+        int mode = RL::GRAD_CLIP_PER_TENSOR_UNIT_NORM;
+        if (!RL::parseGradClipMode(g_cfg.gradClip.c_str(), mode)) {
+            std::printf("[错误] 未知 --grad-clip: %s (可选 legacy / global / none)\n",
+                        g_cfg.gradClip.c_str());
+            return 2;
+        }
+        ag.setGradClip(mode, g_cfg.gradClipNorm);
+        if (g_cfg.verbose) {
+            std::printf("[骨干] %s | [裁剪] %s%s\n", RL::PPO::backboneName(bb),
+                        RL::gradClipModeName(mode),
+                        mode == RL::GRAD_CLIP_GLOBAL_NORM ? " (见 --grad-clip-norm)" : "");
+        }
+    }
 
     /* ---- 配置: 全部走成员, 不动 trainSelfPlay 的签名 ---- */
     ag.potentialShaping = g_cfg.potentialShaping;

@@ -449,15 +449,27 @@ inline std::string formatReport(const Config &cfg, const Result &r,
  * ============================================================ */
 inline std::string caliperFor(PPOMCTSAgent &ag, const Result &r)
 {
-    char buf[1024];
+    char buf[1200];
     std::snprintf(buf, sizeof(buf),
                   "\n[5] 口径自检 (PPO): BC 样本 %lld, 其中走合法列口径 %lld, actor 更新 %lld 次\n"
                   "    参与更新的样本 %lld 条; **目标落空 (不在合法集里) 被丢弃 %lld 条**%s\n"
                   "    critic 是否被 BC 动过: 否 (BC 路径整段不含 critic 前向/反向, 见 rl/ppo.cpp)\n"
-                  "    lastLoss (critic 的 MSE) 是否被 BC 写过: 否 (BC 只写 lastActorLoss = 批平均 CE)\n",
+                  "    lastLoss (critic 的 MSE) 是否被 BC 写过: 否 (BC 只写 lastActorLoss = 批平均 CE)\n"
+                  /*
+                     [2026-10] 两条新读数:
+                       * 梯度裁剪口径 —— 老口径 `clipGrad` 的真实语义是"逐张量梯度归一化到
+                         单位长度"(不是裁剪), 而 RMSProp 的逐坐标归一会把任何整张量的等比
+                         缩放抵消掉 ⇒ 三种模式在实用尺度上是同一条轨迹 (见 rl/optimize.h);
+                       * 最近一批的 actor 梯度范数 —— 以前没有这个数, 而"关掉裁剪之后学习率
+                         要不要跟"只能靠它判断。
+                  */
+                  "    梯度裁剪: %s | 最近一批 actor 梯度范数: %.6g\n"
+                  "    MoE 批边界: finalizeMoeBatch() 已在每个批之前调用 "
+                  "(BC 期间也走无辅助损失偏置回路; 见 src/bcagent.hpp)\n",
                   ag.ppo.bcSamples, ag.ppo.bcSparseSteps, ag.ppo.bcSteps,
                   r.samplesUsed, r.targetMissed,
-                  (r.targetMissed > 0) ? "  <-- 造样本那一层的视角/索引算错了" : "");
+                  (r.targetMissed > 0) ? "  <-- 造样本那一层的视角/索引算错了" : "",
+                  RL::gradClipModeName(ag.ppo.gradClipMode), ag.ppo.actorGradNorm);
     return std::string(buf);
 }
 

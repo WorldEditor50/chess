@@ -176,6 +176,9 @@ public:
        面板上不写清骨干就会张冠李戴 (与 SACAZAgent 的 backbone 同理)。
     */
     RL::PPO::Backbone backbone = RL::PPO::Backbone::TbExperts;
+    /* [2026-10] 两个专家级旋钮的"当前值" (只读诊断 + clone 时要带过去) */
+    std::string seqPosKeyUsed = "1d";
+    float expertDropoutUsed = 0.0f;
 
     /* Training statistics */
     int totalEpisodes;
@@ -798,6 +801,76 @@ public:
     void resetMoeUsage() { ppo.resetMoeUsage(); }
     /* [2026-10] 实时路由探针 (界面呼吸灯; 见 rl/sparse_moe.hpp 的 MoERouteProbe) */
     const RL::MoERouteProbe *moeRouteProbe() const { return ppo.moeRouteProbe(); }
+
+    /*
+       ----------------------------------------------------------------
+       [2026-10] 梯度裁剪口径 (见 rl/optimize.h 的 GradClipMode)
+       ----------------------------------------------------------------
+       默认是 `GRAD_CLIP_PER_TENSOR_UNIT_NORM` (= 老行为, 逐位不变), 所以不调它
+       就什么都不变。`GRAD_CLIP_GLOBAL_NORM` 时 `norm` 是全网范数上限。
+       为什么做成 agent 上的 setter: 界面/工具需要在**建网之后、训练之前**统一切换
+       (与 `setLossFreeBias` / `enableMlpGate` 同一种接线方式)。
+    */
+    void setGradClip(int mode, float norm = 1.0f)
+    {
+        ppo.gradClipMode = mode;
+        if (norm > 0.0f) { ppo.gradClipNorm = norm; }
+        /* 非 legacy 口径下梯度范数是裁剪本身要用的, 必须打开 */
+        if (mode != RL::GRAD_CLIP_PER_TENSOR_UNIT_NORM) { ppo.trackGradNorm = true; }
+    }
+    /* 打开/关闭"每步读一次梯度范数" (诊断用; 默认关, 见 rl/ppo.h 的说明) */
+    void setTrackGradNorm(bool on) { ppo.trackGradNorm = on; }
+    bool trackGradNormEnabled() const { return ppo.trackGradNorm; }
+    int   gradClipModeValue() const { return ppo.gradClipMode; }
+    float gradClipNormValue() const { return ppo.gradClipNorm; }
+    /* 最近一次优化器调用**之前**的梯度范数 (只读诊断; 关掉裁剪后判断 lr 的依据) */
+    double actorGradNorm() const { return ppo.actorGradNorm; }
+    double criticGradNorm() const { return ppo.criticGradNorm; }
+    /*
+       批边界的"结算": 训练侧计数 + 无辅助损失偏置的控制回路, 必须排在
+       `addAuxGradient`/优化器之前。在线三条学习路径各自内部已调;
+       **BC 那条路 (`BC::update`) 也从 2026-10 起调它** —— 见 src/bcagent.hpp。
+    */
+    void finalizeMoeBatch() { ppo.finalizeMoeBatch(); }
+
+    /*
+       [2026-10] 两个"专家级旋钮" (位置编码模式 / dropout)。
+       与 `setGradClip` 同一种接线方式: 建网之后、训练之前调一次。
+         * `posKey`: "1d"(默认) / "2d"(10 行 + 9 列可学) / "rope"(无参数, 相对位置);
+         * `dropoutP`: 0 表示关闭 (默认)。
+       两者都返回 bool: **false = 这个骨干不支持** (只有 SeqExperts 支持),
+       所以调用方 (train_bc / train_ppo / 界面) 必须检查返回值并响亮报错,
+       而不是"设了却没生效" (本工程被静默不生效咬过多次)。
+    */
+    bool setExpertPosMode(const std::string &posKey)
+    {
+        const bool ok = ppo.setExpertPosMode(posKey);
+        if (ok) { seqPosKeyUsed = posKey; }
+        return ok;
+    }
+    bool setExpertDropout(float p)
+    {
+        const bool ok = ppo.setExpertDropout(p);
+        if (ok) { expertDropoutUsed = p; }
+        return ok;
+    }
+    std::string posModeInUse() const { return seqPosKeyUsed; }
+    float expertDropoutInUse() const { return expertDropoutUsed; }
+
+    /*
+       [2026-10] TB 专家的结构读数 (只读; 非 TB 骨干返回 -1 / 0)。
+       面板上打它们是为了让"请求的头数 != 实用的头数"这种偏差**当场可见** ——
+       这类偏差在本工程里只会表现为"慢 + 容量少", 不报错、不改任何既有读数
+       (见 rl/ppo.h 顶部的头数口径修正)。
+    */
+    int tbHeadsRequested() const { return ppo.tbHeadsRequested(); }
+    int tbHeadsUsed() const { return ppo.tbHeadsUsed(); }
+    int tbHeadDim() const { return ppo.tbHeadDim(); }
+    long long tbAttnElements() const { return ppo.tbAttnElements(); }
+    void tbExpertParamBreakdown(long long &attn, long long &ffn, long long &ln) const
+    {
+        ppo.tbExpertParamBreakdown(attn, ffn, ln);
+    }
 
     /* Online training (human-vs-AI) */
     void beginOnline();

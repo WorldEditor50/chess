@@ -143,6 +143,18 @@ public:
         l3.RMSProp(lr, rho, decay, clipGrad);
     }
 
+    /* 梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数) */
+    double gradNorm2() const override
+    {
+        return l1.gradNorm2() + l2.gradNorm2() + l3.gradNorm2();
+    }
+    void scaleGrad(float s) override
+    {
+        l1.scaleGrad(s);
+        l2.scaleGrad(s);
+        l3.scaleGrad(s);
+    }
+
     void Adam(float lr, float alpha, float beta, float alpha_, float beta_,
               float decay, bool clipGrad) override
     {

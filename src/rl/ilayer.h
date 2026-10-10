@@ -2,8 +2,65 @@
 #define ILAYER_H
 #include "tensor.hpp"
 #include <memory>
+#include <cstdio>
+#include <cstdlib>
 
 namespace RL {
+
+/*
+   ============================================================
+    未接线层 (死代码) 的守卫 —— 2026-10
+   ============================================================
+   仓库里有三个**从未被任何生产路径实例化**的层:
+     * `PositionalEncoder` (attention.hpp)  —— 最早的"位置编码"尝试
+     * `Attention<N>`      (attention.hpp)  —— "单向量 + 外积伪注意力", 见 tb 文档 §9
+     * `Dropout<Fn>`       (layer.h)        —— 而且它的 mask 语义本身是错的, 见那里的注
+   它们与上游 snakeAI 同源 (`docs/rl_sync.md`), 所以**保留不删**; 但"静默不生效的代码"
+   在本工程被咬过多次 (旧 TB 的头数降级、`pe` 未分配越界写)。所以这里给一个**响亮失败**的守卫:
+
+     * 默认**禁止**被调用 —— 一旦有人把它们接进 Net, 立刻 abort 并打印"要走 Transformer
+       请用 seq_transformer.hpp";
+     * 要研究这些层本身 (例如跑断言测试) 时, 显式 `setAllowUnwiredLayers(true)` (可 grep 的 opt-in)。
+
+   判据见 `test_transformer [8]`: 默认禁止, 打开之后这些层**本身**仍然要用有限差分验证过。
+*/
+inline bool &unwiredLayersAllowed()
+{
+    static bool allowed = false;
+    return allowed;
+}
+inline void setAllowUnwiredLayers(bool on) { unwiredLayersAllowed() = on; }
+
+inline void requireWired(const char *who)
+{
+    if (unwiredLayersAllowed()) { return; }
+    std::fprintf(stderr,
+                 "[%s] 这个层**从未接线** (死代码), 而且历史上出过越界写/静默不生效的坑。\n"
+                 "  => 不要把它接进 Net。要走 Transformer 请用 `src/rl/seq_transformer.hpp`\n"
+                 "     的 `SeqTransformerExpert` (按格子 token 化 + 按 key 轴逐行 softmax)。\n"
+                 "  => 确实要研究这个层本身, 先显式调用 `RL::setAllowUnwiredLayers(true)`。\n",
+                 who);
+    std::fflush(stderr);
+    std::abort();
+}
+
+/*
+   编译期探测"这个层有没有某个可选接口" (C++17 void_t)。
+   用途: `SparseMoE` 要把"专家级旋钮"转发给每个专家, 但只有序列 Transformer 专家
+   实现了它们; 用 if constexpr + 这两个 traits, MlpExpert / TransformerBlock /
+   Layer<> 那些骨干一个字节都不动 (也不需要给它们补空实现)。
+*/
+template<typename T, typename = void>
+struct HasPosModeByKey : std::false_type {};
+template<typename T>
+struct HasPosModeByKey<T, std::void_t<decltype(std::declval<T &>().setPosModeByKey(std::string()))> >
+    : std::true_type {};
+
+template<typename T, typename = void>
+struct HasExpertDropout : std::false_type {};
+template<typename T>
+struct HasExpertDropout<T, std::void_t<decltype(std::declval<T &>().setExpertDropout(0.0f))> >
+    : std::true_type {};
 
 class iLayer
 {
@@ -22,7 +79,13 @@ public:
         LAYER_TRANSFORMERBLOCK,
         LAYER_MOE,
         LAYER_SSM,
-        LAYER_MAMBA
+        LAYER_MAMBA,
+        /*
+           [2026-10] 真正的序列 Transformer 专家 (src/rl/seq_transformer.hpp)。
+           与 LAYER_TRANSFORMERBLOCK 分开: 那个是"单向量 + 外积伪注意力"的旧实现,
+           两者并不是同一种层 —— 混在一个 type 里会让诊断读数张冠李戴。
+        */
+        LAYER_SEQTRANSFORMER
     };
     using sptr = std::shared_ptr<iLayer>;
 public:
@@ -123,7 +186,68 @@ public:
     */
     virtual void write(std::ostream &file){}
     virtual void read(std::istream &file){}
+
+    /*
+       ============================================================
+       [2026-10] 梯度范数 / 梯度缩放 (全局裁剪与"这次更新有多大信号"的读数)
+       ============================================================
+       为什么放在 iLayer 上: 全局范数裁剪要求**跨层**先把范数算出来、再统一等比缩小,
+       而各层的梯度张量在各自的成员里 (iFcLayer 的 g.w/g.b、ScaledDotProduct 的
+       g.wq/wk/wv、TransformerBlock 的 LN 与子层…)。没有这两个虚函数, 上层就只能
+       dynamic_cast 到每一个具体模板 —— 那正是"新增一层就要记得改一圈"的形状。
+
+       默认实现是**安全的"不报"**: `gradNorm2()` 返回 0, `scaleGrad()` 什么都不做。
+       含义是"这一层没有梯度缓冲, 或者还没实现" —— 于是 `GRAD_CLIP_GLOBAL_NORM`
+       的范数是"已实现层的范数之和", 而不是错的数。PPO 的 actor/critic 全是
+       SparseMoE + iFcLayer, 覆盖是完整的 (见 ppo.h 的 gradClipMode 说明)。
+    */
+    virtual double gradNorm2() const { return 0.0; }
+    virtual void scaleGrad(float s) { (void)s; }
+    /*
+       [2026-10] 专家级的两个可选旋钮 (只有序列 Transformer 专家实现)。
+       为什么放在 iLayer 上而不是 dynamic_cast: 建网走的是 `makeMoeLayer` 工厂,
+       返回的是 `iLayer::sptr`, 而专家藏在 `SparseMoE` 内部 —— 用虚函数转发一层
+       (SparseMoE 覆写成"转发给每个专家") 就不必在每个调用点 dynamic_cast。
+       默认实现是**空操作 + 返回 false** ⇒ 其它骨干 (TB/MLP/Layer) 完全不受影响。
+    */
+    virtual bool setPosModeByKey(const std::string &key) { (void)key; return false; }
+    virtual bool setExpertDropout(float p) { (void)p; return false; }
+
+    /*
+       ============================================================
+       [2026-10] 参数构成 (只读诊断): 注意力 / 非注意力 / 归一化 三块
+       ============================================================
+       默认实现把所有参数都算进 `ffn` (非注意力): 对 MLP / Layer<Gelu> 这些"整体就是一个
+       前馈"的专家, 这就是准确的口径。`TransformerBlock` 覆盖它, 给出真正的三分法 ——
+       实测 d_model=1710 时是 注意力 90.4% / FFN 9.5% / LN 0.05%, 而注意力那条支路
+       在初始化时只贡献 1.45e-06 的输出方差 (见 rl/ppo.h 顶部那一节)。
+       存在的理由与 gradNorm2 一样: 上层 (PPO / 自检面板) 不该 dynamic_cast 到每种专家。
+    */
+    virtual void paramBreakdown(long long &attn, long long &nonAttn, long long &norm) const
+    {
+        attn = 0;
+        nonAttn = paramCount();
+        norm = 0;
+    }
 };
+
+/* 两个小工具: 给"实现了梯度缓冲"的层用, 免得每层各抄一遍循环 */
+inline double gradNorm2Of(const Tensor &t)
+{
+    double s = 0.0;
+    for (std::size_t i = 0; i < t.totalSize; i++) {
+        const double v = t[i];
+        s += v * v;
+    }
+    return s;
+}
+
+inline void scaleTensorGrad(Tensor &t, float s)
+{
+    for (std::size_t i = 0; i < t.totalSize; i++) {
+        t[i] *= s;
+    }
+}
 
 }
 #endif // ILAYER_H

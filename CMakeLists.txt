@@ -1653,6 +1653,53 @@ if(CHESS_BUILD_TESTS)
     set_tests_properties(test_bc PROPERTIES TIMEOUT 900
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir_bc}")
 
+    # ------------------- PPO 骨干结构 + 裁剪口径的断言测试 (进 ctest; 秒级)
+    # [2026-10] 为什么单独一个目标: 它**不建 agent、不跑 MCTS、不碰棋盘**, 所以只依赖
+    # rl 层 (ppo.cpp / bc.cpp / util.cpp) 且是秒级 —— 而"改一行头数常量"这种事不该排在
+    # `test_ppomcts` (~20 分钟, TB 骨干) 的队尾。盯四件会静默错的事:
+    #   [1] 骨干枚举解析 (失败必须报错, 不能静默退回默认)
+    #   [2] TB 专家的头数口径: 请求 == 实用 (改动前是"请求 16 / 实用 15", 而任何读数都不变)
+    #   [3] 参数构成 (注意力/FFN/LN) 与 actor 参数量 52,388,888 (口径修正不改结构 ⇒ 存量权重可载)
+    #   [4] `clipGrad` 的真实语义: 它是"逐张量单位范数归一"; 而 RMSProp 的逐坐标归一会把
+    #       整张量的等比缩放**抵消掉** ⇒ 三种裁剪模式在实用梯度尺度上给出同一条轨迹
+    #       (这条必须钉住, 否则会有人以为"换个裁剪就能修 TB 的训练")
+    add_executable(test_ppo_backbone
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_ppo_backbone_main.cpp)
+    target_include_directories(test_ppo_backbone PRIVATE ${SRC_DIR})
+    target_link_libraries(test_ppo_backbone PRIVATE
+        RL_CORE)
+    target_compile_options(test_ppo_backbone PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_ppo_backbone PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(test_ppo_backbone)
+    add_test(NAME test_ppo_backbone COMMAND test_ppo_backbone)
+    set_tests_properties(test_ppo_backbone PROPERTIES TIMEOUT 300)
+
+    # ------------------- Transformer 这条线的断言测试 (进 ctest; 秒级)
+    # [2026-10] 盯四类事 (每一类都对应审计出来的一个真问题):
+    #   [1] 真 Transformer 专家 (SeqTransformerExpert) 的解析梯度 == 有限差分 (逐参数组);
+    #   [2] 注意力语义不变量: 关位置嵌入 ⇒ 置换等变 / 常量 token ⇒ 输出 token 相同 /
+    #       开位置嵌入 ⇒ 置换**不**等变 (正对照);
+    #   [3] 权重往返 write→read 逐位一致;
+    #   [4] 旧 MultiHeadAttention 的反向 (仓库此前**没有**任何覆盖) —— 用 double 参考前向
+    #       + 中心差分验证: 生产初始化下它的梯度只有 1e-7, 低于 float32 差分的噪声地板,
+    #       只能用参考实现查。结论: 反向公式正确, 问题在结构 (见文档 §9)。
+    add_executable(test_transformer
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_transformer_main.cpp)
+    target_include_directories(test_transformer PRIVATE ${SRC_DIR})
+    target_link_libraries(test_transformer PRIVATE
+        RL_CORE)
+    target_compile_options(test_transformer PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_transformer PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(test_transformer)
+    add_test(NAME test_transformer COMMAND test_transformer)
+    set_tests_properties(test_transformer PROPERTIES TIMEOUT 300)
+
     # ------------------- PG "lastLoss 变非有限值且不复位" 的定位探针 (不进 ctest)
     # test_match [2.7b] 曾经时真时假 (一次绿一次红), 根因就是 dpg.lastLoss 会变成
     # NaN/Inf 而曲线控件丢弃非有限值 ⇒ 损失曲线静默停止上报。这个探针把"哪一手开始坏"
@@ -1822,6 +1869,28 @@ if(CHESS_BUILD_TESTS)
         AUTOUIC OFF
         AUTORCC OFF)
     chess_add_header_deps(probe_dqnmcts_aliasing)
+
+    # ------------------- 序列专家的**代价分解**探针 (计时探针, 不进 ctest)
+    # [2026-10] 为什么单开一个目标: 这台机器上同一个二进制、同一份输入的耗时能漂 5~6 倍
+    #   (test_transformer 实测 0.60 s -> 3.38 s), 所以"X 比 Y 快 N 倍"必须**同一进程、
+    #   同一轮**成对量出来, 并且每一轮带一条对照通道 (它的跨度就是这次读数的可信度)。
+    #   本探针就是把这套口径固化成可复现的东西:
+    #     [B] 专家 forward / forward+backward   [C] forward 的分量配对分解
+    #     [D] backward 的分量配对分解           [E] 同一形状 fcFwd vs fcBwd
+    #     [F] 容器与内核 (LN vector/Tensor/裸指针, FC 逐 token vs MM::ikjk vs 手写)
+    #   运行: cmake --build <build> --target probe_seq_cost && <build>\probe_seq_cost.exe
+    #   注意: 读数随机器状态变, 只比**同一轮里的比值**, 不要跨次比较绝对值。
+    add_executable(probe_seq_cost
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_seq_cost_main.cpp)
+    target_include_directories(probe_seq_cost PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_seq_cost PRIVATE RL_CORE)
+    target_compile_options(probe_seq_cost PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_seq_cost PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(probe_seq_cost)
 
     # 想用 AddressSanitizer 查这类问题 (arena 里"agent 返回非法走法"/堆损坏),
     # 必须**整个构建**都带 /fsanitize=address —— 只给一个目标加会在链接时报

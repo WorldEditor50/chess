@@ -3546,3 +3546,44 @@ RESULT: PASS
 
 ---
 
+## 零之二点四十、`Tensor::MM` 的**常驻**形状契约一开，`test_pretrain` 当场抓到一条跑了很久的静默 bug（2026-10）
+
+**现象**：给 `MM::kikj` 加上"Release 也生效"的形状契约检查之后（见
+[`docs/tensor_optimization_plan.md`](tensor_optimization_plan.md) 的 P1 / A4），
+`test_pretrain` 立刻 abort：
+
+```
+[Tensor::MM] 形状契约失守: kikj 需要 z(k,c) = x1(r,k)^T * x2(r,c)
+  ⇒ 实际形状: z[64,1] (缓冲 64) x1[64,90] (缓冲 5760) x2[64,1] (缓冲 64)
+```
+
+**根因**：`src/rl/layer.h` 的 `LayerNorm<Fn, LN::Pre>::backward` 把 `kikj` 的 sink
+`dL` 按 `outputDim` 分配（应为 `inputDim`）：
+
+```cpp
+Tensor dL(outputDim, 1);                              // 错：应为 inputDim
+Tensor::MM::kikj(dL, w, dy);                          // z = wᵀ·dy ⇒ 必须是 (inputDim, 1)
+for (i < ei.totalSize) ei[i] = gamma * (dL[i] - u);   // 按 inputDim 读 dL ⇒ 越界读
+```
+
+两个后果都**不报错**：① 输入梯度的后 `inputDim − outputDim` 个坐标**从未被写**；
+② 紧接着那个循环按 `ei.totalSize = inputDim` 读 `dL` ⇒ **越界读**（读缓冲区外的字节写进 `ei`）。
+顺带一处口径错：z-score 的"减均值"本就该在**输入向量**（长度 inputDim）上做。
+
+**触发点**：`dpg.cpp:43` 的 `LayerNorm<Sigmoid, LN::Pre>::_(stateDim=90, hiddenDim=64, …)`
+—— 只有 `inputDim != outputDim` 的用法才会踩到；`ddpg.cpp:11/15` 的 `(hidden, hidden)` 用法不受影响。
+（前一轮曾按日志把责任记到 DQN 头上 —— 那是**跨 stdout/stderr 两个通道配对**造成的误判，
+与 §8.4 那条口径教训同源；真正的判据是"w=(64,90) 的 FC 类" + `TanhNorm::backward` 的入口打印从未出现。）
+
+**为什么一直没被发现**：那三条形状断言按 R1.5 的口径留在 `#ifndef NDEBUG` 里，Release 下一个字节都不剩
+⇒ 断言关掉之后就是静默截断 + 越界读。**这条是"契约检查全在 NDEBUG"这个口径的代价实例**，
+与 `src/rl/sac.h:99-104`（critic 只读了前 stateDim 个元素）同一形状。
+
+**修复**：`Tensor dL(inputDim, 1);` —— 一个词，同时消掉截断与越界读；对 `inputDim == outputDim`
+的既有用法**逐位不变**。`layer.h` 内已写下完整证据链。
+
+**状态**：代码已修；`test_pretrain` 复跑与全量 `ctest` 按用户口径暂停，下一轮补
+（见 `docs/tensor_optimization_plan.md` Part 6 台账的 `P1-附` 行）。
+
+---
+

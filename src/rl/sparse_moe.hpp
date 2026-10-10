@@ -391,6 +391,18 @@ public:
     virtual int topK() const = 0;
 
     /*
+       [2026-10] 第 0 个专家的 `iLayer*` (结构自检用)。
+       为什么需要它: "TB 专家请求了几个头 / 用了几个 / 每个多宽 / 参数怎么拆"这些读数
+       全都长在**专家类型**上 (TransformerBlock), 而上层 (RL::PPO / 面板) 只通过
+       `ISparseMoE` 接口看这个层 —— 于是要么在这里开一个口子, 要么上层 dynamic_cast
+       到每一种专家模板 (那正是"新增一种专家就要记得改一圈"的形状, 见 expert.hpp 顶部)。
+       `nullptr` = 这个实现没有专家层 (安全默认, 与 routeProbe 同一约定)。
+       注意返回的是**第 0 个**专家: E 个专家在结构上是同构的, 读数取一个就够。
+    */
+    virtual iLayer *firstExpertLayer() { return nullptr; }
+    virtual const iLayer *firstExpertLayer() const { return nullptr; }
+
+    /*
        [2026-10] "此刻哪个专家在工作"的**无锁**探针 (界面呼吸灯的数据源)。
        返回 nullptr = 这个实现没有探针 (默认实现, 其它 iLayer 不受影响)。
 
@@ -651,6 +663,9 @@ public:
 
     int expertCount() const override { return NumExperts; }
     int topK() const override { return (TopK < NumExperts) ? TopK : NumExperts; }
+    /* 结构自检: 第 0 个专家 (见 ISparseMoE::firstExpertLayer 的说明) */
+    iLayer *firstExpertLayer() override { return &experts[0]; }
+    const iLayer *firstExpertLayer() const override { return &experts[0]; }
     const MoERouteProbe *routeProbe() const override { return &liveProbe; }
 
     Tensor& forward(const Tensor& x, bool inference=false) override
@@ -1024,6 +1039,40 @@ public:
         g_bg.zero();
     }
 
+    /*
+       梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数)。
+       ⚠ 这里数的是**所有**专家的梯度张量 —— 未被 top-k 选中的专家梯度恒为 0
+       (稀疏路由的定义), 所以"范数被稀释"这件事在这条骨干上是真实存在的:
+       E=4 / top-1 时一条样本只让 1 个专家有梯度, 另外 3 个贡献 0。
+       全局裁剪用的是**总和**而不是均值, 所以这个 0 不会把范数算错。
+    */
+    double gradNorm2() const override
+    {
+        double s = gradNorm2Of(g_wg) + gradNorm2Of(g_bg);
+        if (gateStruct == GateStructure::Mlp) {
+            s += gradNorm2Of(g_wg1) + gradNorm2Of(g_bg1)
+               + gradNorm2Of(g_wg2) + gradNorm2Of(g_bg2);
+        }
+        for (int i = 0; i < NumExperts; i++) {
+            s += experts[i].gradNorm2();
+        }
+        return s;
+    }
+    void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g_wg, s);
+        scaleTensorGrad(g_bg, s);
+        if (gateStruct == GateStructure::Mlp) {
+            scaleTensorGrad(g_wg1, s);
+            scaleTensorGrad(g_bg1, s);
+            scaleTensorGrad(g_wg2, s);
+            scaleTensorGrad(g_bg2, s);
+        }
+        for (int i = 0; i < NumExperts; i++) {
+            experts[i].scaleGrad(s);
+        }
+    }
+
     void Adam(float lr, float alpha, float beta, float alpha_, float beta_,
               float decay, bool clipGrad) override
     {
@@ -1041,6 +1090,35 @@ public:
         }
         g_wg.zero();
         g_bg.zero();
+    }
+
+    /*
+       [2026-10] 专家级旋钮的**转发** (见 ilayer.h 里那两个虚函数的说明): 用
+       `if constexpr` 只在专家类型真的实现了该接口时才转发 ⇒ MlpExpert /
+       TransformerBlock / Layer<> 这些骨干一位都不动 (默认虚函数返回 false)。
+       全部专家都成功才算成功, 调用方据此判断"这个骨干支不支持这个旋钮"。
+    */
+    bool setPosModeByKey(const std::string &key) override
+    {
+        if constexpr (HasPosModeByKey<Expert>::value) {
+            bool ok = true;
+            for (int i = 0; i < NumExperts; i++) { ok = experts[i].setPosModeByKey(key) && ok; }
+            return ok;
+        } else {
+            (void)key;
+            return false;
+        }
+    }
+    bool setExpertDropout(float p) override
+    {
+        if constexpr (HasExpertDropout<Expert>::value) {
+            bool ok = true;
+            for (int i = 0; i < NumExperts; i++) { ok = experts[i].setExpertDropout(p) && ok; }
+            return ok;
+        } else {
+            (void)p;
+            return false;
+        }
     }
 
     void clamp(float c0, float cn) override

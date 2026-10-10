@@ -8,8 +8,44 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <climits>     /* [2026-10] INT_MAX: posOf 的 32 位乘加契约 */
+#include <cstdio>      /* [2026-10] 结构守卫的"响亮失败"输出 */
 #include <assert.h>
+#include "alignallocator.hpp"   /* [2026-10] 对齐分配器: Tensor 的存储默认 32 B 对齐 */
 #include "simd_ops.hpp"
+
+/*
+   ============================================================
+    [2026-10] 张量的存储从 `std::allocator`（16 B 保证）换成 `AlignAllocator32`（32 B 保证）
+   ============================================================
+   动机有两条, 一条是正确性、一条是性能（性能那条**还没被实测证实**, 见下）:
+
+   1. **正确性**: `simd/avx2func.hpp` 的转置内核用了 `_mm256_store_ps`（**要求 32 B**）与
+      `_mm_load_ps`（要求 16 B）。之前 Tensor 的缓冲只有 16 B 保证 ⇒ 一旦真拿矩阵去调它
+      就是 #GP（"碰运气"能跑不等于对）。现在 `val.data()` 有 32 B 保证，这条契约成立。
+   2. **性能**: 32 B 对齐的 32 B 访问**永不跨 64 B cache line**。⚠ 但本仓库所有**在用**的
+      SIMD 内核走的都是 `loadu/storeu`（非对齐指令，跨线才有一点代价），所以"对齐更快"是
+      **待实测**的假设，不是已知事实（对照: `MM::ikjk` 的循环写法改动值 12~25×，而"整批
+      GEMM"只有 1.00~1.13×）。
+
+   代价与收益（**实测**，`probe_align`，同进程/同轮交替/9 轮中位数/固定单核；同一块 32 B 对齐
+   缓冲 vs 把它**错开 16 B**，5760 float = 23 KB 的缓冲，在用内核走 `loadu/storeu`）:
+
+     | 内核 | 32 B 对齐 | 错开 16 B | 比值（三次） |
+     |---|---:|---:|---|
+     | `fill`（纯写） | 1.58~1.88 µs | 3.22~4.40 µs | **2.39 / 2.03 / 2.04** ⇒ 稳定，**流式写慢 ~2×** |
+     | `dot`（读为主） | 6.70~7.71 µs | 6.50~14.09 µs | 1.83 / 0.97 / 0.91 ⇒ **没有可测差别** |
+     | `mul`（读+写） | 3.96~8.63 µs | 4.53~14.03 µs | 1.63 / 1.14 / 1.03 ⇒ 弱、不稳 |
+
+   结论要按**最保守**的那条读: 错开 16 B 会让**每一次 32 B 访问都跨 cache line**, 而
+   Alder Lake 对**跨界写**的惩罚大（~2×）、对**跨界读**基本免疫 ⇒ 对齐的稳定收益在"写密集"
+   的路径上（`fill`/清零/拷贝/逐元素写），不在只读归约上。⚠ 第一次那组 `dot/mul` 报
+   1.6~1.8× 是**机器噪声**（那一轮对照通道跨度 315%，见 docs/seq_transformer_design.md §8.4）
+   —— 同一个二进制复测两次就回到 0.91~1.14。教训与 §8.4 一致: 比值必须同轮成对量、并印出
+   对照通道跨度，否则会把噪声当成结论。
+
+   分配代价: 小张量构造 0.93~1.12×（≈没有差别；Tensor 的构造成本本来就被 shape/sizes 主导）。
+*/
 
 /*
    别名提示 (给编译器, 不影响语义): 只用在"逐元素的两条独立内存"这类循环上 ——
@@ -26,7 +62,7 @@
 
 namespace RL {
 
-template<typename T, template<typename Ti> class Alloc=std::allocator>
+template<typename T, template<typename Ti> class Alloc=AlignAllocator32>
 class Tensor_
 {
 public:
@@ -242,6 +278,48 @@ public:
 public:
     /* default construct */
     Tensor_():totalSize(0){}
+
+    /*
+       ============================================================
+        [2026-10] 两条**常驻**(Release 也生效)的结构守卫
+       ============================================================
+       为什么这两条不能像 MM 的形状断言那样只活在 Debug (那条纪律见 `requireShape2d`
+       与 `docs/issues_review.md` R1.5 —— "Release 一个字节都不变"):
+         * `posOf()` 的乘加是**32 位**的 (`int` 步长 × `int` 下标), 它成立的前提是
+           "每个下标与步长的乘积都落在 int 范围内"(`tensor.hpp:655-659` 只用注释声明,
+           代码里**没有任何拦截**)。一次静默截断在这里等于**错位下标** —— 读到别人的数、
+           写到别人的位置, 而且是"看起来合理"的数字。
+         * `totalSize` 与 `val.size()` 是**两套长度源**: `reshape`/`view` 只改前者,
+           于是"按 totalSize 的循环"与"按 val.size() 的循环"永久分叉
+           (`flatten()` 的历史越界 bug 就是这一类, `rl_sync.md:314-316`)。
+       两条都是**每次构造/每次 reshape 一次整数比较**, 不是每元素; 失败按仓库纪律
+       **响亮失败** (结构/契约错误 abort, 资源错误才抛异常 —— 与 `AlignedAllocator`
+       的 `bad_alloc` 同一条分界线)。
+    */
+    static void requireIndexable(std::size_t total, const char *where)
+    {
+        if (total > (std::size_t)INT_MAX) {
+            std::fprintf(stderr,
+                         "[Tensor] %s: 元素总数 %llu 超出 32 位下标契约\n"
+                         "  ⇒ `posOf` 用 int 步长 × int 下标累加 (见 tensor.hpp:655-659), 超过 2^31 会静默错位。\n"
+                         "     要么把张量切小, 要么按那里的说明把 Shape/Size 一起改成 64 位 (那是一次带实测代价的改动)。\n",
+                         where, (unsigned long long)total);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    static void requireSameLength(const Tensor_ &t, std::size_t expect, const char *where)
+    {
+        if (t.val.size() != expect) {
+            std::fprintf(stderr,
+                         "[Tensor] %s: 形状乘积 %llu 与缓冲长度 %llu 不一致\n"
+                         "  ⇒ 这个类有两套长度 (`totalSize` / `val.size()`); 不拦住的话, 按 totalSize 的循环\n"
+                         "     与按 val.size() 的循环会永久分叉 (越界读/写, 或只填了一半)。\n",
+                         where, (unsigned long long)expect, (unsigned long long)t.val.size());
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
     static std::vector<int> sizesOf(const std::vector<int> &shape)
     {
         std::vector<int> sizes(shape.size(), 1);
@@ -264,6 +342,9 @@ public:
                  sizes[i] *= shape[j];
             }
         }
+        /* [2026-10] 常驻守卫: `posOf` 的 32 位乘加契约 (见 requireIndexable 的说明)。
+           放在这里 ⇒ 7 个调用点 (四个构造 + reshape + view + 静态 posOf) 全覆盖。 */
+        requireIndexable(totalsize, "initParams (形状乘积)");
         return;
     }
     /* contruct with shape */
@@ -289,6 +370,16 @@ public:
         initParams(shape, sizes, totalSize);
     }
 
+    /*
+       ⚠ [2026-10 审计] 这个构造**是坏的、而且从来没被实例化过**: `x[0].totalsize`
+       拼错了成员名 (成员是 `totalSize`), `sizes.push_back(x[0].sizes)` 也把
+       `std::vector<int>` 往 `std::vector<int>` 里推了一个 vector —— 两处都过不了编译。
+       模板成员只在实例化时检查, 所以它一直静静躺在那里。
+       正确的"把 N 个子张量摞起来"的实现在 `fromVector()` (它有一整段注释写清楚了
+       旧版本 `std::copy` 越界写 `shape` 的那个 bug)。这里**不删也不改**: 它属于
+       上游 snakeAI 的同源代码, 删除/修复该走 `docs/rl_sync.md` 那条线, 不该混在
+       "Tensor 下标类型"这一轮里。
+    */
     explicit Tensor_(const std::vector<Tensor_> &x)
     {
         totalSize = x.size()*x[0].totalsize;
@@ -318,22 +409,39 @@ public:
     Tensor_(const Tensor_ &r)
         :totalSize(r.totalSize),shape(r.shape),sizes(r.sizes),val(r.val){}
 
-    /* move construct */
-    Tensor_(Tensor_ &&r):totalSize(r.totalSize)
+    /*
+       move construct —— **[2026-10] 必须标 `noexcept`**。
+       为什么: `std::vector<Tensor>` 增长时用 `move_if_noexcept`, 而这个类**可拷贝**
+       ⇒ 不标 noexcept 就会**退化成深拷贝**。实测 (`probe_move`,
+       证据 `.r1build/probe_move_run1.txt`): 256 个 (1710,1) 张量, 无 reserve 的
+       `push_back` **11.04 ms** vs 同样载荷的 `std::vector<float>`(它的 move 是 noexcept)
+       **3.59 ms** = **3.08x**; 单看"增长"那一段 7.27 ms vs 0.45 ms = **16x**。
+       三个 `swap` 都不会抛 (`std::vector::swap` 在 `is_always_equal` 分配器下是 noexcept),
+       所以整条 move 可以承诺 noexcept —— 这正是 vector 需要的那个承诺。
+       (顺带删掉原来那句冗余的 `totalSize = r.totalSize;`: 初始化列表里已经有了。)
+    */
+    Tensor_(Tensor_ &&r) noexcept:totalSize(r.totalSize)
     {
-        totalSize = r.totalSize;
         shape.swap(r.shape);
         sizes.swap(r.sizes);
         val.swap(r.val);
         r.totalSize = 0;
     }
 
-    inline operator T* () noexcept
+    /*
+       [2026-10] 两个转换算子改成 `explicit`。
+       原来 `Tensor → T*` (裸指针退化) 与 `Tensor → std::vector<T>`(**整块深拷贝**)
+       都是**隐式**的: 任何 `float*` 形参、任何 `const std::vector<float>&` 形参都能
+       静默接收, 后者一次拷走整张量。全仓 grep 找不到显式调用点, 但"隐式"意味着它
+       可能正在别处发生 —— 改成 explicit 之后由**编译器**回答这个问题 (构建失败 = 有人在用)。
+       `explicit operator T*` 仍然允许 `static_cast<T*>(t)`, 只是不再允许隐式退化。
+    */
+    explicit inline operator T* () noexcept
     {
         return val.data();
     }
 
-    inline operator Vector ()
+    explicit inline operator Vector ()
     {
         return val;
     }
@@ -357,8 +465,31 @@ public:
         }
         return flag;
     }
+    /*
+       [2026-10] `data()` 是"从 Tensor 拿裸缓冲"的**正名**入口。
+       为什么要加: 仓库里 `.val.data()` 有 68 处 (其中 55 处在 tensor.hpp 之外),
+       而 `ptr()` 在 `src/` 里 **0 处** (只有测试 3 处) —— 大家想要的名字是 `data()`。
+       `ptr()` 保留为别名 (不删, 有测试在用), 新代码一律用 `data()`。
+    */
+    inline T* data() noexcept { return val.data(); }
+    inline const T* data() const noexcept { return val.data(); }
     inline T* ptr() noexcept { return val.data(); }
     inline const T* ptr() const noexcept { return val.data(); }
+    /* [2026-10] 对齐自检: 这块存储是否 `a` 字节对齐 (默认 32 = AVX2 向量宽度)。
+       为什么要有这个读数: 对齐是"看不见的契约" —— 要求对齐的内核拿到不对齐的指针是 UB
+       (不是"慢一点"), 所以它必须能被印出来/被断言 (见 test_transformer [9])。 */
+    inline bool alignedTo(std::size_t a = RL_ALIGN_DEFAULT) const
+    {
+        return RL::isAlignedTo(val.data(), a);
+    }
+    inline std::size_t dataAlignment() const
+    {
+        /* 从 1 往上找第一个"置位"的地址位: 那一位就是这块地址的自然对齐 (上限 256) */
+        const std::size_t p = reinterpret_cast<std::size_t>(val.data());
+        std::size_t a = 1;
+        while (a < 256 && (p & a) == 0) { a <<= 1; }
+        return a;
+    }
     inline bool empty() const {return totalSize == 0;}
     /* iterator */
     inline iterator begin() noexcept { return val.begin();}
@@ -387,8 +518,26 @@ public:
     */
     void zero(){simdops::fill(val.data(), T(0), val.size());}
     void fill(T value){simdops::fill(val.data(), value, val.size());}
-    inline T &operator[](int i) {return val[i];}
-    inline T operator[](int i) const {return val[i];}
+    /*
+       ============================================================
+       [2026-10] 下标类型: `int` -> `std::size_t`
+       ============================================================
+       原来这两个是 `operator[](int)`, 而本仓库里**几乎每一处逐元素循环**都写成
+
+           for (std::size_t i = 0; i < t.totalSize; i++) { t[i] = ...; }
+
+       (totalSize / val.size() 都是 `std::size_t`) —— 于是每次访问都要
+       `size_t -> int -> size_t` 绕一圈: 先截断 (mov), 进 `val[i]` 时再零扩展。
+       编译器不能总是证明"截断无害"(i 可能 > INT_MAX), 所以这个来回通常留在代码里。
+
+       改成 `std::size_t` 之后:
+         * 传 `int` 的调用方**仍然合法** —— int -> size_t 是**加宽**转换, 不会丢值;
+         * "用 size_t 循环"这条主路径上不再有任何转换 (与 `val[]` 的类型一致)。
+       ⚠ 不保留 `operator[](int)` 重载: 两个重载会让 `t[0u]` / `t[someEnum]` 这类调用
+         变成二义 (unsigned int 到两者都要一次转换), 而 `size_t` 一个版本就覆盖了它们。
+    */
+    inline T &operator[](std::size_t i) {return val[i];}
+    inline T operator[](std::size_t i) const {return val[i];}
 
     /* assign operator */
     inline Tensor_& operator=(const Tensor_ &r)
@@ -414,8 +563,8 @@ public:
         return *this;
     }
 
-    /* move */
-    Tensor_ &operator=(Tensor_ &&r)
+    /* move —— 同样必须 `noexcept` (理由见 move 构造上方的注释) */
+    Tensor_ &operator=(Tensor_ &&r) noexcept
     {
         if (this == &r) {
             return *this;
@@ -426,6 +575,16 @@ public:
         val.swap(r.val);
         r.totalSize = 0;
         return *this;
+    }
+    /* [2026-10] 显式 swap: 三个容器都是 noexcept swap ⇒ 整条 noexcept */
+    void swap(Tensor_ &r) noexcept
+    {
+        const std::size_t t = totalSize;
+        totalSize = r.totalSize;
+        r.totalSize = t;
+        shape.swap(r.shape);
+        sizes.swap(r.sizes);
+        val.swap(r.val);
     }
     /* init */
     static Tensor_ zeros(Shape &shape)
@@ -555,11 +714,37 @@ public:
     template<typename ...Index>
     inline std::size_t posOf(Index ...index) const
     {
-        int indexs[] = {index...};
+        /*
+           ============================================================
+           [2026-10] 这里做过一次"把下标全提到 size_t"的改动, **被实测否决了**
+           ============================================================
+           背景: 原来是 `int indexs[] = {index...};`, 传 `std::size_t` 下标时是**收缩转换**
+           —— 就是每次构建都报的那条 `C4838: 从 "size_t" 转换到 "int" 需要收缩转换`。
+
+           第一版把它们全部提到 64 位 (数组 `std::size_t[]` + `(std::size_t)sizes[i]*
+           indexs[i]`)。实测 (`bench_tensor_index`, 256×256 与 1710×1710 两种规模、
+           交替 A/B、取中位数) 在"`operator()` 密集"的二维循环上**慢了 34%**
+           (5.25 -> 3.48 GB/s), 而 `operator[]` 那两条路径在噪声内 (±1~4%, 对照的 SIMD
+           fill 也在 ±8% 漂)。原因: 这个点积在 N=2 时是"两次 32 位乘加", 提到 64 位之后
+           每次都要先把 `int` 步长符号扩展到 64 位再做 64 位乘, 而且数组元素从 4 字节变 8 字节
+           —— 换来的"空间"在这份代码里根本用不上 (所有下标都远小于 2^31)。
+
+           所以保留 32 位数组与 32 位乘法, 只把**隐式**窄化写成**显式** `static_cast<int>`:
+             * 语义与改动前**逐位相同** (同一个截断, 只是不再依赖隐式转换规则);
+             * `C4838` 消失 (实测: 改完之后 RL_CORE 全量构建不再有这条警告);
+             * 与 `sizes`(=`std::vector<int>`) 的类型一致, 没有跨类型乘法。
+
+           隐含前提 (与改动前一致, 不是新引入的): **每个下标与步长的乘积都落在 int 范围内**。
+           本工程的最大张量是 1710×1710 ≈ 2.9 M 元素、最长的 1-D 张量 2.9 M、步长最大 1710,
+           乘积上界 ~5e9 —— 单看 `sizes[0]*index0` 这一项是 `1710 * 1709 ≈ 2.9e6`,
+           安全; 也就是说这个前提在本工程的形状下成立。真要支持 >2^31 的张量,
+           得把 `Shape`/`Size` 一起改成 `std::size_t`(公共类型, 牵动一大片), 那不是本轮的范围。
+        */
+        const int indexs[] = {static_cast<int>(index)...};
         std::size_t pos = 0;
-        std::size_t N = sizeof... (Index);
+        const std::size_t N = sizeof... (Index);
         for (std::size_t i = 0; i < N; i++) {
-            pos += sizes[i]*indexs[i];
+            pos += static_cast<std::size_t>(sizes[i] * indexs[i]);
         }
         return pos;
     }
@@ -567,8 +752,9 @@ public:
     inline std::size_t posOf(const std::vector<int> &indexs) const
     {
         std::size_t pos = 0;
+        /* 与上面同一个理由: 32 位乘加 + 显式扩宽 (原实现是 int*int 隐式转 size_t) */
         for (std::size_t i = 0; i < sizes.size(); i++) {
-            pos += sizes[i]*indexs[i];
+            pos += static_cast<std::size_t>(sizes[i] * indexs[i]);
         }
         return pos;
     }
@@ -578,11 +764,17 @@ public:
         std::vector<int> sizes = sizesOf(shape);
         std::size_t pos = 0;
         for (std::size_t i = 0; i < sizes.size(); i++) {
-            pos += sizes[i]*indexs[i];
+            pos += static_cast<std::size_t>(sizes[i] * indexs[i]);
         }
         return pos;
     }
-    inline void indexOf(int pos, std::vector<int> &indexs) const
+    /*
+       [2026-10] `pos` 由 `int` 改成 `std::size_t`: 调用点传的是循环下标
+       (`y.indexOf(i, indexs)` 里的 i 是 `std::size_t`), 原签名每次都在做 size_t -> int。
+       这里是**唯一**一处 64 位确实更合适的地方: `pos` 是"扁平下标", 它的上界是 totalSize
+       (size_t), 而 `int pos_` 在累加过程中没有理由被限制在 32 位。
+    */
+    inline void indexOf(std::size_t pos, std::vector<int> &indexs) const
     {
         /*
             shape: (2, 3, 4, 5)
@@ -596,15 +788,16 @@ public:
             i2 = (pos - i0*60 - i1*20)/5
             i3 = pos - i0*60 - i1*20 - i2*5
         */
-        int pos_ = 0;
+        std::size_t pos_ = 0;
         for (std::size_t i = 0; i < sizes.size(); i++) {
-            indexs[i] = (pos - pos_)/sizes[i];
-            pos_ += indexs[i]*sizes[i];
+            const int stride = sizes[i];
+            indexs[i] = static_cast<int>((pos - pos_) / static_cast<std::size_t>(stride));
+            pos_ += static_cast<std::size_t>(indexs[i] * stride);
         }
         return;
     }
 
-    inline std::vector<int> indexOf(int pos) const
+    inline std::vector<int> indexOf(std::size_t pos) const
     {
         std::vector<int> indexes(shape.size(), 0);
         indexOf(pos, indexes);
@@ -621,11 +814,20 @@ public:
 
     inline T operator()(const Shape &indexs) const { return val[posOf(indexs)]; }
 
+    /*
+       [2026-10] `reshape` 现在**校验元素总数守恒**。
+       原来它只做 `shape = {…}; initParams(...)`, 于是 `t.reshape(1000,1)` 作用在
+       4 个元素的张量上会得到 `totalSize==1000` 而缓冲只有 4 个 —— 之后
+       `zero()/fill()` 按 `val.size()` 填、`operator[]`/`MM::` 按 `totalSize` 读,
+       两套长度源永久分叉。这不是理论风险: `flatten()` 的同类 bug 在历史上真的越界过
+       (`rl_sync.md:314-316`)。改名不改元素个数的用法 (attention.hpp:191/194) 不受影响。
+    */
     template<typename ...Index>
     Tensor_& reshape(Index ...index)
     {
         shape = {index...};
         initParams(shape, sizes, totalSize);
+        requireSameLength(*this, totalSize, "reshape");
         return *this;
     }
 
@@ -835,6 +1037,25 @@ public:
     }
 
     /* statistics */
+    /*
+       [2026-10] 退化输入守卫。
+       改动前: 空张量上 `argmax/argmin/normalize/max/min` 直接读 `val[0]`(**越界读**),
+       `mean()` 是 `0/0`(NaN), `normalize()` 在常量张量上是 `0/0` —— 全是**静默**产出
+       NaN 或越界值。按仓库纪律, 这是**契约**错误(调用方给了没有意义的输入),
+       所以**响亮失败**, 而不是返回一个"看起来能用"的数。
+       ⚠ 只拦"元素数为 0"和"跨度为 0"; 正常的 1 元素张量不受影响。
+    */
+    void requireNonEmpty(const char *where) const
+    {
+        if (val.empty()) {
+            std::fprintf(stderr,
+                         "[Tensor] %s: 张量是空的 (totalSize=%llu) —— 这个统计量没有定义\n"
+                         "  ⇒ 空张量上取 max/argmax/mean/方差 会越界读或得到 NaN, 所以这里直接停。\n",
+                         where, (unsigned long long)totalSize);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
     T sum() const
     {
         return simdops::sum(val.data(), totalSize);
@@ -842,28 +1063,32 @@ public:
 
     T mean() const
     {
+        if (totalSize == 0) { requireNonEmpty("mean"); }
         T s = sum();
         return s/T(totalSize);
     }
 
     T variance(T u) const
     {
-        T s = 0;
+        requireNonEmpty("variance");
         return simdops::variance(val.data(), u, val.size());
     }
 
     T max() const
     {
+        requireNonEmpty("max");
         return simdops::maxValue(val.data(), val.size());
     }
 
     T min() const
     {
+        requireNonEmpty("min");
         return simdops::minValue(val.data(), val.size());
     }
 
     std::size_t argmax() const
     {
+        requireNonEmpty("argmax");
         T value = val[0];
         std::size_t index = 0;
         for (std::size_t i = 0; i < val.size(); i++) {
@@ -877,6 +1102,7 @@ public:
 
     std::size_t argmin() const
     {
+        requireNonEmpty("argmin");
         T value = val[0];
         std::size_t index = 0;
         for (std::size_t i = 0; i < val.size(); i++) {
@@ -891,6 +1117,7 @@ public:
     /* initialize */
     void normalize()
     {
+        requireNonEmpty("normalize (min-max)");
         double minValue = val[0];
         double maxValue = val[0];
         for (std::size_t i = 0; i < val.size(); i++) {
@@ -900,6 +1127,14 @@ public:
             if (maxValue < val[i]) {
                 maxValue = val[i];
             }
+        }
+        if (!(maxValue > minValue)) {
+            std::fprintf(stderr,
+                         "[Tensor] normalize (min-max): 张量的跨度是 0 (min=max=%g) —— 会得到 0/0 = NaN\n"
+                         "  ⇒ 常量张量没有 min-max 归一化可言, 这里直接停而不是静默产出 NaN。\n",
+                         maxValue);
+            std::fflush(stderr);
+            std::abort();
         }
         for (std::size_t i = 0; i < val.size(); i++) {
             val[i] = (val[i] - minValue)/(maxValue - minValue);
@@ -981,7 +1216,7 @@ public:
 
         /*
            ============================================================
-            形状契约检查 (R1.5, 2026-09) —— 只在 Debug / ASAN 构建里生效
+            形状契约检查 (R1.5, 2026-09) —— Debug 断言 + [2026-10] **两条常驻**
            ============================================================
            下面四个内核的一切都从 z/x1/x2 的 shape 推导: z 的形状决定输出, x1 行主序
            [r,k]、x2 行主序 [k,c]。形状不匹配时既不是编译错误也不会运行时报错 ——
@@ -989,15 +1224,123 @@ public:
            写微基准时用错维度直接崩 (issues_review 的附注)。
            所以把每条内核的形状关系写成断言; **Release (NDEBUG) 下整块被编译掉,
            一个字节都不变**, 想验证就在编译那一个 TU 时加 /UNDEBUG 跑一遍。
+
+           **[2026-10] 在 Debug 断言之外, 再加两条常驻 (Release 也生效) 的检查。**
+           理由是一次**真实事故**: `src/rl/sac.h:99-104` —— critic 的第一层是按
+           stateDim 建的, 却喂了 stateDim+actionDim 的拼接输入; Release 下断言被关掉
+           ⇒ `MM::ikkj` **静默只读了前 stateDim 个元素**, 拼进去的策略概率被整块丢掉
+           (Debug 构建里则会当场断言失败)。这正是"契约检查全在 NDEBUG"的代价。
+           常驻的两条:
+             * 每个入参的**缓冲装得下它自己的形状** (越界写的直接拦截点);
+             * 内核的**形状关系** (k 维必须对得上) —— sac.h 那次漏掉的就是这一条。
+           代价: **每次内核调用 ≈18 ns** (实测 `probe_checks`, 同轮配对: 小内核 (64,64)·(64,1)
+           占它 0.88%、(360,1710)·(1710,1) 占 0.0036%、(90,360)·(360,90) 占 0.0017%;
+           按 seq 骨干一次 forward 的 1080 次 FC 调用折算 ≈0.12% 的 forward —— 这是"把一次
+           已经发生过的静默数据丢失换成 0.1% 的确定性"的价钱)。
+           `RL_TENSOR_CHECKS` 打开时, 再把下面这批 Debug 断言也带进 Release (供"全程查"的构建)。
+           失败一律**响亮 abort** —— 形状错不是"慢一点", 是越界读写。
         */
+        static void contractFail(const char *what)
+        {
+            std::fprintf(stderr,
+                         "[Tensor::MM] 形状契约失守: %s\n"
+                         "  ⇒ 这不是'慢一点', 是越界读/写 (Release 下曾静默丢数据: src/rl/sac.h:99-104)。\n"
+                         "     请检查这一层的输入/输出维度是否与权重形状一致。\n",
+                         what);
+            std::fflush(stderr);
+            std::abort();
+        }
+        /*
+           [2026-10] 把三个操作数的形状一起印出来 —— 这是被 `test_pretrain` 咬过一次之后的改进:
+           只有内核名时, "谁和谁对不上" 还得自己回去数调用点; 有形状就能一眼定位
+           (`kikj` 第一次触发时报的只有名字, 定位花了额外一轮)。
+        */
+        static void shapeToStr(const Tensor_ &t, char *buf, std::size_t n)
+        {
+            std::size_t off = 0;
+            off += (std::size_t)std::snprintf(buf + off, n - off, "[");
+            for (std::size_t i = 0; i < t.shape.size() && off + 16 < n; i++) {
+                off += (std::size_t)std::snprintf(buf + off, n - off, "%s%d",
+                                                  (i == 0) ? "" : ",", t.shape[i]);
+            }
+            std::snprintf(buf + off, n - off, "]");
+        }
+        static void contractFailMm(const char *what, const Tensor_ &z,
+                                   const Tensor_ &x1, const Tensor_ &x2)
+        {
+            char sz[64], s1[64], s2[64];
+            shapeToStr(z, sz, sizeof(sz));
+            shapeToStr(x1, s1, sizeof(s1));
+            shapeToStr(x2, s2, sizeof(s2));
+            std::fprintf(stderr,
+                         "[Tensor::MM] 形状契约失守: %s\n"
+                         "  ⇒ 实际形状: z%s (缓冲 %llu) x1%s (缓冲 %llu) x2%s (缓冲 %llu)\n"
+                         "     这不是'慢一点', 是越界读/写 (Release 下曾静默丢数据: src/rl/sac.h:99-104)。\n"
+                         "     请检查这一层的输入/输出维度是否与权重形状一致。\n",
+                         what, sz, (unsigned long long)z.val.size(),
+                         s1, (unsigned long long)x1.val.size(),
+                         s2, (unsigned long long)x2.val.size());
+            std::fflush(stderr);
+            std::abort();
+        }
         static void requireShape2d(const Tensor_ &t)
         {
             (void)t;
-#ifndef NDEBUG
-            assert(t.shape.size() == 2);
-            assert(t.sizes.size() == t.shape.size());
+#ifdef RL_TENSOR_NO_CONTRACT
+            return;   /* 测量/逃生门 —— 见下方说明, 默认**不定义** */
+#endif
+            /* 常驻 (Release 也生效): 2 维 + 形状元数据自洽 + 缓冲装得下形状 */
+            if (t.shape.size() != 2) { contractFail("张量不是 2 维 (MM 只支持 2 维)"); }
+            if (t.sizes.size() != t.shape.size()) { contractFail("sizes 与 shape 长度不一致"); }
+            if (t.val.size() < (std::size_t)t.shape[0] * (std::size_t)t.shape[1]) {
+                contractFail("缓冲长度小于 shape[0] x shape[1]");
+            }
+#if defined(RL_TENSOR_CHECKS) || !defined(NDEBUG)
             assert(t.val.size() >= t.totalSize);
 #endif
+        }
+        /*
+           ⚠ `RL_TENSOR_NO_CONTRACT` 是**测量/逃生门**, 默认**不定义** (= 检查生效)。
+           它只用来量"这些检查值多少" (同一台机同一轮两个二进制的 A/B), 或给极端在意
+           最后 0.1% 的场景留一条路。**不要在正常构建里打开** —— 关掉之后
+           `src/rl/sac.h:99-104` 那类静默数据丢失就回来了。
+        */
+        /* 四条内核的形状关系 —— 常驻 (Release 也生效), 与各内核的 Debug 断言同源 */
+        static void contractIkkj(const Tensor_ &z, const Tensor_ &x1, const Tensor_ &x2)
+        {
+#ifdef RL_TENSOR_NO_CONTRACT
+            (void)z; (void)x1; (void)x2; return;
+#endif
+            if (z.shape[0] != x1.shape[0] || x1.shape[1] != x2.shape[0] || z.shape[1] != x2.shape[1]) {
+                contractFailMm("ikkj 需要 z(r,c) = x1(r,k) * x2(k,c)", z, x1, x2);
+            }
+        }
+        static void contractKikj(const Tensor_ &z, const Tensor_ &x1, const Tensor_ &x2)
+        {
+#ifdef RL_TENSOR_NO_CONTRACT
+            (void)z; (void)x1; (void)x2; return;
+#endif
+            if (x1.shape[0] != x2.shape[0] || z.shape[0] != x1.shape[1] || z.shape[1] != x2.shape[1]) {
+                contractFailMm("kikj 需要 z(k,c) = x1(r,k)^T * x2(r,c)", z, x1, x2);
+            }
+        }
+        static void contractIkjk(const Tensor_ &z, const Tensor_ &x1, const Tensor_ &x2)
+        {
+#ifdef RL_TENSOR_NO_CONTRACT
+            (void)z; (void)x1; (void)x2; return;
+#endif
+            if (x1.shape[1] != x2.shape[1] || z.shape[0] != x1.shape[0] || z.shape[1] != x2.shape[0]) {
+                contractFailMm("ikjk 需要 z(r,c) = x1(r,k) * x2(c,k)^T", z, x1, x2);
+            }
+        }
+        static void contractKijk(const Tensor_ &z, const Tensor_ &x1, const Tensor_ &x2)
+        {
+#ifdef RL_TENSOR_NO_CONTRACT
+            (void)z; (void)x1; (void)x2; return;
+#endif
+            if (x1.shape[0] != x2.shape[1] || z.shape[0] != x1.shape[1] || z.shape[1] != x2.shape[0]) {
+                contractFailMm("kijk 需要 z(k,c) = x1(r,k)^T * x2(c,r)^T", z, x1, x2);
+            }
         }
 
         /*
@@ -1014,8 +1357,10 @@ public:
 
         inline static void ikkj(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
-#ifndef NDEBUG
+            /* [2026-10] 常驻检查移出 `#ifndef NDEBUG` —— 这就是 sac.h:99-104 那次事故的拦截点 */
             requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            contractIkkj(x, x1, x2);
+#ifndef NDEBUG
             assert(x.shape[0] == x1.shape[0]);
             assert(x1.shape[1] == x2.shape[0]);
             assert(x.shape[1] == x2.shape[1]);
@@ -1104,8 +1449,10 @@ public:
 
         inline static void kikj(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
-#ifndef NDEBUG
+            /* [2026-10] 常驻检查移出 `#ifndef NDEBUG` (理由见 requireShape2d 的说明) */
             requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            contractKikj(x, x1, x2);
+#ifndef NDEBUG
             assert(x1.shape[0] == x2.shape[0]);
             assert(x.shape[0] == x1.shape[1]);
             assert(x.shape[1] == x2.shape[1]);
@@ -1232,8 +1579,10 @@ public:
 
         inline static void ikjk(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
-#ifndef NDEBUG
+            /* [2026-10] 常驻检查移出 `#ifndef NDEBUG` (理由见 requireShape2d 的说明) */
             requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            contractIkjk(x, x1, x2);
+#ifndef NDEBUG
             assert(x1.shape[1] == x2.shape[1]);
             assert(x.shape[0] == x1.shape[0]);
             assert(x.shape[1] == x2.shape[0]);
@@ -1249,16 +1598,61 @@ public:
                 }
             }
             /* transpose x2 */
-            const T *x1d = x1.val.data();
-            const T *x2d = x2.val.data();
-            T *xd = x.val.data();
+            /*
+               [2026-10] 三个指针加 `RL_RESTRICT`: 与 SIMD 内核 (`simd/*.hpp` 的
+               `ikjk(z __restrict, x __restrict, y __restrict)`) 同一约定 —— 调用方本来
+               就要求输出与输入不是同一块内存 (MM 的语义, 见本文件顶部)。不加的话编译器
+               必须假设 `xrow[j] += …` 可能改写 x1d/x2d, 于是**连 x1 的读都不敢提到循环外**
+               (实测: 下面标量分支在 kdim=1 时 12~20 ns/MAC, 加 restrict/提读之后 0.5~0.9)。
+            */
+            const T *RL_RESTRICT x1d = x1.val.data();
+            const T *RL_RESTRICT x2d = x2.val.data();
+            T *RL_RESTRICT xd = x.val.data();
             const std::size_t xr  = (std::size_t)x.sizes[0],  xc  = (std::size_t)x.sizes[1];
             const std::size_t x1r = (std::size_t)x1.sizes[0], x1c = (std::size_t)x1.sizes[1];
             const std::size_t x2r = (std::size_t)x2.sizes[0], x2c = (std::size_t)x2.sizes[1];
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[1];
             const std::size_t cols = (std::size_t)x.shape[1];
-            if (xc == 1 && x1c == 1 && x2c == 1) {
+            if (xc == 1 && x1c == 1 && x2c == 1 && kdim == 1) {
+                /*
+                   ============================================================
+                     kdim == 1: 单样本的**外积** `z(i,j) += x1(i)·x2(j)`
+                   ============================================================
+                   batch=1 的训练里**所有** FC 反向都是这一形态
+                   (`iFcLayer::backward` 的 `MM::ikjk(g.w, e, x)`), 而它偏偏走不到 SIMD:
+                   `mmShapeOk` 要求每个维度 >= 一个向量宽 (AVX2 是 8), x1Col=x2Col=1
+                   ⇒ 必然落到标量分支。
+
+                   通用分支在 j 循环里**逐轮重读 `x1row[k]`**(kdim=1 时就是 x1[i]),
+                   而那个读在 j 循环里是常量 —— 编译器在"xd 可能别名 x1d"的前提下既不能
+                   把它提出来、也不能把这个循环向量化。实测 (probe_seq_cost [H],
+                   同轮成对): (64x64) 12.1~15.8 -> 0.55~0.64 ns/MAC (22~25x);
+                   (360x1710) 12.1~20.6 -> 0.94~1.65 ns/MAC (12~13x);
+                   而两者在同一个零初值上的差 = **0.000e+00** (逐位相同)。
+
+                   注意这与"累加"语义无关: 每个 (i,j) 只加一项, 顺序不可能变。
+                   (唯一理论差别是 `-0.0`: 通用分支先算 `(0+0)+(0+0)` 再 `+p`, 把 `-0.0`
+                   的积变成 `+0.0`; 这里直接加 `p`。累积缓冲从 +0.0 起、且加不出 -0.0,
+                   所以本工程内不可达 —— 上面那次逐位比对也证实了。)
+                */
+                for (std::size_t i = 0; i < rows; i++) {
+                    const T a = x1d[i * x1r];
+                    T *xrow = xd + i * xr;
+                    if (x2r == 1) {
+                        /* 列向量 x2 (训练里的常态: `(cols,1)` 的 sizes[0] 恒为 1):
+                           内层是单位步长 —— 必须写成 `x2d[j]`; 带上 `j*x2r` 这个
+                           **运行时步长**乘子 MSVC 就不向量化了 (实测 2.8 -> 0.4 ns/MAC)。 */
+                        for (std::size_t j = 0; j < cols; j++) {
+                            xrow[j] += a * x2d[j];
+                        }
+                    } else {
+                        for (std::size_t j = 0; j < cols; j++) {
+                            xrow[j] += a * x2d[j * x2r];
+                        }
+                    }
+                }
+            } else if (xc == 1 && x1c == 1 && x2c == 1) {
                 /* x1(i, .) and x2(j, .) are contiguous in k, so the sum over k is
                  * a dot product of two contiguous rows.  The loop nest is j,k
                  * inner here (the old i,k,j nest read x2(j, k) at stride
@@ -1311,8 +1705,10 @@ public:
 
         inline static void kijk(Tensor_ &x, const Tensor_ &x1, const Tensor_ &x2)
         {
-#ifndef NDEBUG
+            /* [2026-10] 常驻检查移出 `#ifndef NDEBUG` (理由见 requireShape2d 的说明) */
             requireShape2d(x); requireShape2d(x1); requireShape2d(x2);
+            contractKijk(x, x1, x2);
+#ifndef NDEBUG
             assert(x1.shape[0] == x2.shape[1]);
             assert(x.shape[0] == x1.shape[1]);
             assert(x.shape[1] == x2.shape[0]);

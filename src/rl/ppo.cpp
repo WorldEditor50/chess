@@ -69,6 +69,24 @@ std::shared_ptr<RL::iLayer> makeMoeLayer(int stateDim, bool withGrad, int expert
                                               RL::PPO_MOE_MLP_TOPK> >(
             stateDim, withGrad, expertHidden);
     }
+    if (backbone == RL::PPO::Backbone::LayerExperts) {
+        /* [2026-10] 无 MHA 的廉价专家 (d -> d 单层 FC + GELU)。
+           `expertHidden` 对它无意义 (ExpertFactory<Layer<Fn>> 会忽略它), 与 TB 专家同。 */
+        return std::make_shared<RL::SparseMoE<RL::PPOLayerExpert,
+                                              RL::PPO_MOE_LAYER_EXPERTS,
+                                              RL::PPO_MOE_LAYER_TOPK> >(
+            stateDim, withGrad, expertHidden);
+    }
+    if (backbone == RL::PPO::Backbone::SeqExperts) {
+        /* [2026-10] 真正的序列 Transformer 专家。**这里 expertHidden 是 token 宽度**
+           (与 MlpExpert 用 hidden 的口径一致) —— 默认 64。
+           注意 stateDim 必须能被 PPO_SEQ_LEN 整除 (1710 = 19 × 90 ✓); 不整除时
+           专家构造函数会响亮失败 (见 seq_transformer.hpp 顶部)。 */
+        return std::make_shared<RL::SparseMoE<RL::PPOSeqExpert,
+                                              RL::PPO_MOE_SEQ_EXPERTS,
+                                              RL::PPO_MOE_SEQ_TOPK> >(
+            stateDim, withGrad, expertHidden);
+    }
     return std::make_shared<RL::SparseMoE<RL::PPOExpert,
                                           RL::PPO_MOE_EXPERTS,
                                           RL::PPO_MOE_TOPK> >(
@@ -80,10 +98,42 @@ std::shared_ptr<RL::iLayer> makeMoeLayer(int stateDim, bool withGrad, int expert
 const char *RL::PPO::backboneName(Backbone b)
 {
     switch (b) {
-    case Backbone::TbExperts:  return "稀疏MoE(TB专家)";
-    case Backbone::MlpExperts: return "稀疏MoE(MLP专家)";
+    case Backbone::TbExperts:    return "稀疏MoE(TB专家)";
+    case Backbone::MlpExperts:   return "稀疏MoE(MLP专家)";
+    case Backbone::LayerExperts: return "稀疏MoE(廉价专家,无MHA)";
+    case Backbone::SeqExperts:   return "稀疏MoE(序列Transformer专家)";
     }
     return "?";
+}
+
+/* 工具/测试用的稳定短名 (与界面显示名分开: 前者进命令行与文件名, 后者进面板) */
+const char *RL::PPO::backboneKey(Backbone b)
+{
+    switch (b) {
+    case Backbone::TbExperts:    return "tb";
+    case Backbone::MlpExperts:   return "mlp";
+    case Backbone::LayerExperts: return "layer";
+    case Backbone::SeqExperts:   return "seq";
+    }
+    return "?";
+}
+
+bool RL::PPO::parseBackbone(const char *s, Backbone &out)
+{
+    if (s == nullptr) { return false; }
+    std::string v(s);
+    for (std::size_t i = 0; i < v.size(); i++) {
+        v[i] = (char)std::tolower((unsigned char)v[i]);
+    }
+    if (v == "tb" || v == "tb-experts" || v == "transformer") { out = Backbone::TbExperts; return true; }
+    if (v == "mlp" || v == "mlp-experts")                     { out = Backbone::MlpExperts; return true; }
+    if (v == "layer" || v == "layer-experts" || v == "cheap" || v == "ffn") {
+        out = Backbone::LayerExperts; return true;
+    }
+    if (v == "seq" || v == "seq-transformer" || v == "real-transformer" || v == "seqtr") {
+        out = Backbone::SeqExperts; return true;
+    }
+    return false;
 }
 
 RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
@@ -410,8 +460,19 @@ void RL::PPO::applyGradients(float lr)
         }
     }
 
-    actorP.RMSProp(lr, 0.9f, 0.001f);
-    critic.RMSProp(lr, 0.9f, 0.001f);
+    /*
+       ---- 梯度裁剪口径 (2026-10) ----
+       默认 `GRAD_CLIP_PER_TENSOR_UNIT_NORM` = 老行为 (逐张量单位范数归一), **逐位不变**。
+       梯度范数只在"要它"的时候算 (`trackGradNorm` / 非 legacy 的裁剪口径) —— 算一次要把
+       全部梯度读一遍, 而在 TB 骨干上优化器本来就占一步的 ~91%, 主路径上不该白加。
+    */
+    const bool needNorm = trackGradNorm || (gradClipMode != GRAD_CLIP_PER_TENSOR_UNIT_NORM);
+    if (needNorm) {
+        actorGradNorm = actorP.gradNorm();
+        criticGradNorm = critic.gradNorm();
+    }
+    actorP.RMSPropMode(lr, 0.9f, 0.001f, gradClipMode, gradClipNorm);
+    critic.RMSPropMode(lr, 0.9f, 0.001f, gradClipMode, gradClipNorm);
     learningSteps++;
 
     if (batchLossCount > 0) {
@@ -920,8 +981,11 @@ void RL::PPO::bcApplyGradients(float lr)
         }
     }
 
-    /* 优化器只调 actor 的 (与在线路径同一个 rho/decay) */
-    actorP.RMSProp(lr, 0.9f, 0.001f);
+    /* 优化器只调 actor 的 (与在线路径同一个 rho/decay/裁剪口径) */
+    if (trackGradNorm || gradClipMode != GRAD_CLIP_PER_TENSOR_UNIT_NORM) {
+        actorGradNorm = actorP.gradNorm();
+    }
+    actorP.RMSPropMode(lr, 0.9f, 0.001f, gradClipMode, gradClipNorm);
     bcSteps++;
 
     /*
@@ -1119,6 +1183,33 @@ int RL::PPO::moeLayerCount() const
     return (int)(moeLayersOf(actorP).size() + moeLayersOf(critic).size());
 }
 
+/*
+   [2026-10] 两个"专家级旋钮"的入口 (位置编码模式 / dropout)。
+   走到 MoE 层上, 用 iLayer 的虚函数让它**转发给每个专家** (只有 SeqExperts 骨干会
+   响应, 其它骨干的默认实现返回 false) ⇒ 返回 false 表示"这个骨干不支持".
+   为什么放在 PPO 这一层: `train_bc --pos=2d` / `train_ppo --backbone=seq --pos=rope`
+   与界面上的开关都要用同一入口, 而两边都拿不到 `SparseMoE` 的具体模板类型。
+*/
+bool RL::PPO::setExpertPosMode(const std::string &key)
+{
+    bool ok = false;
+    std::vector<ISparseMoE*> ms = moeLayersOf(actorP);
+    for (std::size_t i = 0; i < ms.size(); i++) { ok = ms[i]->setPosModeByKey(key) || ok; }
+    ms = moeLayersOf(critic);
+    for (std::size_t i = 0; i < ms.size(); i++) { ok = ms[i]->setPosModeByKey(key) || ok; }
+    return ok;
+}
+
+bool RL::PPO::setExpertDropout(float p)
+{
+    bool ok = false;
+    std::vector<ISparseMoE*> ms = moeLayersOf(actorP);
+    for (std::size_t i = 0; i < ms.size(); i++) { ok = ms[i]->setExpertDropout(p) || ok; }
+    ms = moeLayersOf(critic);
+    for (std::size_t i = 0; i < ms.size(); i++) { ok = ms[i]->setExpertDropout(p) || ok; }
+    return ok;
+}
+
 int RL::PPO::moeExpertCount() const
 {
     std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
@@ -1142,6 +1233,61 @@ const RL::MoERouteProbe *RL::PPO::moeRouteProbe() const
 {
     std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
     return layers.empty() ? nullptr : layers[0]->routeProbe();
+}
+
+/*
+ * [2026-10] TB 专家的结构自检读数 —— 走 `iLayer` 的通用读数接口
+ * (attnHeadsRequested / attnHeadsUsed / attnHeadDim / attnElements), 所以这里
+ * **不需要**知道 MoE 里装的是哪一种专家: 非 TransformerBlock 骨干返回 -1 / 0,
+ * 上层照原样打印即可。骨架用 actor 的第 0 层 (MoE 层)。
+ */
+int RL::PPO::tbHeadsRequested() const
+{
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) { return -1; }
+    iLayer *ex = layers[0]->firstExpertLayer();
+    return (ex == nullptr) ? -1 : ex->attnHeadsRequested();
+}
+int RL::PPO::tbHeadsUsed() const
+{
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) { return -1; }
+    iLayer *ex = layers[0]->firstExpertLayer();
+    return (ex == nullptr) ? -1 : ex->attnHeadsUsed();
+}
+int RL::PPO::tbHeadDim() const
+{
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) { return -1; }
+    iLayer *ex = layers[0]->firstExpertLayer();
+    return (ex == nullptr) ? -1 : ex->attnHeadDim();
+}
+long long RL::PPO::tbAttnElements() const
+{
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) { return 0; }
+    iLayer *ex = layers[0]->firstExpertLayer();
+    if (ex == nullptr) { return 0; }
+    const long long n = ex->attnElements();
+    return (n > 0) ? n : 0;
+}
+
+/*
+ * 一个 TB 专家的参数拆解。**故意只用 iLayer 的通用读数**: 容器层 (TransformerBlock)
+ * 把它自己的三块 (注意力 / FFN / LN) 报出来, 免得这里 dynamic_cast 到模板。
+      注意力 = 4·d_model²   (3 份 qkv + 1 份 wo, 与头数无关 —— 头数只影响 d_k 的切分)
+      FFN    = 2·d_model·d_ff + d_ff + d_model
+      LN     = 4·d_model
+ * 非 TB 专家返回全 0 (调用方据此判断"这一档没有注意力支路")。
+ */
+void RL::PPO::tbExpertParamBreakdown(long long &attn, long long &ffn, long long &ln) const
+{
+    attn = 0; ffn = 0; ln = 0;
+    std::vector<ISparseMoE*> layers = moeLayersOf(actorP);
+    if (layers.empty()) { return; }
+    iLayer *ex = layers[0]->firstExpertLayer();
+    if (ex == nullptr || ex->attnElements() <= 0) { return; }
+    ex->paramBreakdown(attn, ffn, ln);
 }
 
 void RL::PPO::moeUsage(std::vector<long long> &out) const

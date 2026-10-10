@@ -35,6 +35,14 @@
  *                         --plies=120 --opening=4 --seed=20240901 --save-prefix=weights/arena
  *   bench_agent_arena.exe --mode=match --a=sac --b=mcts --games=60 --sims=200
  *                         --load-a=<prefix> --load-b=<prefix> --csv=out.csv
+ *
+ *   ---- [2026-10] "只换骨干"的等模拟对照 (这才是能回答"哪个骨干更强"的口径) ----
+ *   bench_agent_arena.exe --mode=match --a=ppo --b=ppo ^
+ *                         --backbone-ppo-a=tb --backbone-ppo-b=mlp --games=100 --sims=400
+ *   要点: ① A/B 的骨干**各自**由 --backbone-ppo-a / -b 指定 (同一场里一边一个);
+ *         ② `--sims` 本来就是 A/B 共用, 所以这一场是**等搜索预算**的;
+ *         ③ 界面口径下两支 PPO 的模拟预算不同 (400 vs 1600), 那样比的是搜索预算
+ *            而不是骨干 —— 而模拟次数是本工程唯一测出过棋力的杠杆。
  */
 #include <algorithm>
 #include <chrono>
@@ -111,6 +119,20 @@ struct Cfg {
     int openingPlies = 4;               /* 随机开局步数 */
     int abDepth = 2;                    /* --b=ab 时的搜索深度 */
     std::string backboneSac = "mlp";    /* mlp | moe-mlp | tb | dense-tb */
+    /*
+       [2026-10] PPO 的骨干 (tb | mlp | layer), **A 与 B 各一份**。
+       为什么必须分开两份: `buildAgent` 对 A/B 是同一段代码, 用一份配置就只能让两边
+       用同一种骨干 —— 而"TB 专家 vs MLP 专家谁更强"这个问题恰恰需要**一边一个**:
+         bench_agent_arena --mode=match --a=ppo --b=ppo ^
+                           --backbone-ppo-a=tb --backbone-ppo-b=mlp --games=100 --sims=400
+       默认两边都是 mlp = 与改动前逐位相同 (这一支此前写死 MlpExperts)。
+       加它的目的就是让"只换骨干"的对照能在**同一模拟预算**下跑 —— 界面上的两支 PPO
+       用的是不同的模拟预算 (400 vs 1600, chessboard.cpp 的 PPO_SIMS / PPO_MLP_SIMS),
+       那是"用便宜的算力换更多模拟"的设计选择, 但它让"骨干谁强"在界面口径下无法回答,
+       而模拟次数是本工程唯一测出过棋力的杠杆 (40/64/120 -> 42.2%/50.0%/62.5%)。
+    */
+    std::string backbonePpoA = "mlp";
+    std::string backbonePpoB = "mlp";
     int sacHidden = 64;
     float sacCpuct = 1.5f;
     float sacValueScale = 1.0f;   /* 只影响搜索期叶子估值 (默认 1 = 原行为) */
@@ -589,7 +611,7 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
 /* ============================================================
  *  Agent 构造
  * ============================================================ */
-static void buildAgent(Agent &ag, Kind kind, Chess &c)
+static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbonePpo)
 {
     ag.kind = kind;
     switch (kind) {
@@ -628,10 +650,20 @@ static void buildAgent(Agent &ag, Kind kind, Chess &c)
         break;
     }
     case Kind::PPO: {
-        /* 与 GUI 的新 agent 同一档: MLP 专家 (E=8/top-2) + MLP 骨干 + 同 lr/c_puct */
-        ag.ppo.reset(new PPOMCTSAgent(c, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true,
-                                      RL::PPO::Backbone::MlpExperts));
-        ag.backboneName = RL::PPO::backboneName(RL::PPO::Backbone::MlpExperts);
+        /*
+           与 GUI 的新 agent 同一档: 默认 MLP 专家 (E=8/top-2) + MLP 骨干 + 同 lr/c_puct。
+           [2026-10] 骨干改由 `--backbone-ppo-a` / `--backbone-ppo-b` 决定
+           (tb | mlp | layer), 默认两边都是 mlp —— 不传参数时行为与改动前**逐位相同**。
+           解析失败直接退出, 不静默退回 mlp。
+        */
+        RL::PPO::Backbone bb = RL::PPO::Backbone::MlpExperts;
+        if (!RL::PPO::parseBackbone(backbonePpo.c_str(), bb)) {
+            std::printf("[错误] 未知 PPO 骨干: %s (可选 tb / mlp / layer)\n",
+                        backbonePpo.c_str());
+            std::exit(1);
+        }
+        ag.ppo.reset(new PPOMCTSAgent(c, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, bb));
+        ag.backboneName = RL::PPO::backboneName(bb);
         ag.label = std::string("PPO+MCTS/") + ag.backboneName;
         break;
     }
@@ -685,6 +717,8 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--opening")){ g_cfg.openingPlies = std::atoi(v); }
         else if (const char *v = val("--depth"))  { g_cfg.abDepth = std::atoi(v); }
         else if (const char *v = val("--backbone-sac")) { g_cfg.backboneSac = v; }
+        else if (const char *v = val("--backbone-ppo-a")) { g_cfg.backbonePpoA = v; }
+        else if (const char *v = val("--backbone-ppo-b")) { g_cfg.backbonePpoB = v; }
         else if (const char *v = val("--sac-hidden"))   { g_cfg.sacHidden = std::atoi(v); }
         else if (const char *v = val("--sac-cpuct"))    { g_cfg.sacCpuct = (float)std::atof(v); }
         else if (const char *v = val("--sac-value-scale")) { g_cfg.sacValueScale = (float)std::atof(v); }
@@ -760,8 +794,8 @@ int main(int argc, char **argv)
 
     const double tBuild0 = nowMs();
     Agent A, B;
-    buildAgent(A, ka, board);
-    buildAgent(B, kb, board);
+    buildAgent(A, ka, board, g_cfg.backbonePpoA);
+    buildAgent(B, kb, board, g_cfg.backbonePpoB);
     const double tBuild1 = nowMs();
 
     if (!g_cfg.quiet) {

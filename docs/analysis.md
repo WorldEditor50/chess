@@ -344,16 +344,24 @@ SELECT * FROM moves WHERE game_id = 1 ORDER BY move_number;
 
 ### 当前真正仍未做的（按优先级，详见 `issues_review.md` §五）
 
-4. **`Tensor::MM::ikjk/kijk` 的 SIMD 内核是赋值、标量是累加**（语义不一致）。
-   当前调用点 kdim=1 走标量，所以梯度是对的（`test_grad` 实测确认）；但只要改成
-   多样本批量（kdim ≥ 8）就会命中 SIMD 内核，**静默只保留最后一次的贡献**。
-   修法一行：内核改 `z[...] += dot(...)`。
-5. **反向 GEMV 没有 SIMD 内核**：`ei = wᵀ·e` 实测 0.991 ns/MAC，而前向 `o = w·x`
-   是 0.102 —— **9.7×**。SIMD 只加速了前向那一半，训练步现在卡在反向。
-   修法：补与 `gemv_ikkj` 对称的 `gemv_kikj`。
+4. ~~**`Tensor::MM::ikjk/kijk` 的 SIMD 内核是赋值、标量是累加**（语义不一致）。~~
+   **【2026-10 更正：已做】** 四个内核已统一为累加（`z[...] += dot(...)`），并将"一律累加"
+   写进 `Tensor::MM` 的契约注释；回归在 `test_grad` C 节（含 kdim=1 与 kdim=32 两组形状）。
+   本条与第 5 条的状态以 `docs/issues_review.md` R1.5（"已做（R1.5，2026-09）"）为准 ——
+   本文件此前没有跟着更新，属于文档欠账。
+5. ~~**反向 GEMV 没有 SIMD 内核**：`ei = wᵀ·e` 实测 0.991 ns/MAC，而前向 `o = w·x`
+   是 0.102 —— **9.7×**。~~
+   **【2026-10 更正：已做】** 已补与 `gemv_ikkj` 对称的 `gemv_kikj`（`issues_review.md` R1.5
+   第 ② 条），顺带发现 `lstm.cpp:143-148` 五处误用 `kijk`、形状契约不成立。
 6. **训练数据管线（理论层面的取舍）**：见 `agents_design.md` §10。要点是
    DQN 系"每步一次更新"破坏回放缓冲的 i.i.d. 假设（建议改成只写回放、攒批更新），
    PPO 系在稀疏终局奖励下需要显式自举，否则优势几乎全 0、梯度等于噪声。
+7. **[2026-10 新增]** **`Tensor` 类的设计债与 seq 骨干的非 GEMM 开销**：
+   契约检查全在 `NDEBUG`（`sac.h:99-104` 已出过一次 Release 静默读错）、
+   `shape/sizes/totalSize` 三份冗余、`SubTensor` 是静默别名、
+   以及 seq 骨干 forward 有 **76% 不在 GEMM 上**（注意力 39% + 逐 token 搬运 37%）。
+   可执行方案见 [`docs/tensor_optimization_plan.md`](tensor_optimization_plan.md)。
+
 7. **SQLite 跨线程使用 + 写库接口未接线**（`recordMove/startGame/endGame` 全仓零调用），
    需要设计决定。
 8. `DQN` 的 Q 头是 `Layer<Sigmoid>`（值域 `(0,1)`）而奖励含负值 → 结构上无法表示负 Q。

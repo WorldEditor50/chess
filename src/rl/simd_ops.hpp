@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cmath>
 #include <type_traits>
+#include "alignallocator.hpp"   /* [2026-10] 对齐分配器: RL::isAlignedTo / AlignAllocator32 */
 #include "simd/sse2func.hpp"
 #include "simd/avx2func.hpp"
 
@@ -85,10 +86,23 @@ inline bool ok(std::size_t n)
     return step<T>() > 0 && n >= step<T>();
 }
 
+/*
+   [2026-10] 对齐相关的两个读数/判据 (配合 `alignallocator.hpp`)。
+
+   背景: 这一层的**在用**内核全部走 `loadu/storeu`（非对齐指令），所以"对齐"对它们
+   不是正确性要求; 但有两个用途:
+     * `aligned32()`: 判据。`simd/avx2func.hpp` 的转置内核用 `_mm256_store_ps`(32 B) /
+       `_mm_load_ps`(16 B) —— 那条路径必须**确认**对齐再进 (那条内核现在加了守卫, 见它自己的注释);
+     * 自检/报告: `Tensor` 的存储由 `AlignAllocator32` 保证 32 B, 这件事要能被印出来
+       (test_transformer [9] 断言它), 而不是"相信它是对的"。
+*/
+inline bool aligned32(const void *p) { return RL::isAlignedTo(p, 32); }
+inline bool aligned16(const void *p) { return RL::isAlignedTo(p, 16); }
+constexpr std::size_t defaultAlignment() { return RL_ALIGN_DEFAULT; }
+
 /* 编译期是否有可用的内核 (T 受支持且本 TU 启用了指令集) */
 template<typename T>
-constexpr bool hasKernel()
-{
+constexpr bool hasKernel(){
 #if RL_SIMD_HAVE_INSTRUCT
     return IsSimdType<T>::value;
 #else

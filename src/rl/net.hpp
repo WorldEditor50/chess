@@ -12,6 +12,7 @@
 #include "tensor.hpp"
 #include "ilayer.h"
 #include "weightio.hpp"
+#include "optimize.h"   /* GradClipMode (Net::RMSPropMode; 见 rl/optimize.h 顶部) */
 
 namespace RL {
 
@@ -232,13 +233,17 @@ public:
                 Tensor e(preLayer->o.totalSize, 1);
                 layer->backward(preLayer->o, e);
                 preLayer->cacheError(e);
-            } else if ((preLayer->type == iLayer::LAYER_ATTENTION ||
-                      preLayer->type == iLayer::LAYER_MHA ||
-                      preLayer->type == iLayer::LAYER_SCALEDCONCAT ||
-                      preLayer->type == iLayer::LAYER_MOE) &&
-                      layer->type == iLayer::LAYER_FC) {
-                layer->backward(preLayer->o, preLayer->e);
-            } else {
+            }
+            /*
+               [2026-10] 这里原来还有一条
+                 `(type == LAYER_ATTENTION || LAYER_MHA || LAYER_SCALEDCONCAT || LAYER_MOE)
+                  && layer->type == LAYER_FC`
+               的分支 —— 但它的函数体与下面的 `else` **一字不差**, 是"看起来有特殊处理、
+               实际什么都没做"的死分支 (看代码的人会以为这几层走了别的路, 而 LAYER_ATTENTION
+               那条线本身是死代码, 见 ilayer.h 的 `requireWired` 与
+               docs/tb_expert_training_2026_10.md §9.3)。删掉它不改变任何行为。
+            */
+            else {
                 layer->backward(preLayer->o, preLayer->e);
             }
         }
@@ -277,6 +282,73 @@ public:
             layers[i]->RMSProp(lr, rho, decay, clipGrad);
         }
         return;
+    }
+
+    /*
+       ============================================================
+        [2026-10] 按"裁剪口径"跑一次 RMSProp (见 rl/optimize.h 的 GradClipMode)
+       ============================================================
+       三种模式的语义差别、以及"为什么它对 RMSProp 几乎是空操作"都在 `GradClipMode`
+       的注释里; 这里只说实现:
+         * `PerTensorUnitNorm` → 直接走上面那个老函数 (逐位不变, 不额外遍历);
+         * `GlobalNorm`        → 先 `gradNorm2()` 求和, 超限时 `scaleGrad(m/n)` **就地**
+                                 缩小每层梯度, 再走 `clipGrad=false` 的 RMSProp;
+         * `None`              → 直接 `clipGrad=false`。
+       为什么"缩放就地把梯度改掉"可以接受: 梯度缓冲本来就是**每一步用完即清**
+       (各层的 RMSProp 末尾都 `g.zero()`), 所以缩放不会污染下一步; 而且它省掉了
+       "再开一批全尺寸临时张量"的内存 (TB 骨干下这是 GB 级的差别)。
+       `maxNorm <= 0` 视为不裁剪, 免得调用方误传 0 把梯度清成 0。
+    */
+    void RMSPropMode(float lr, float rho, float decay, int mode, float maxNorm)
+    {
+        if (mode == GRAD_CLIP_PER_TENSOR_UNIT_NORM) {
+            RMSProp(lr, rho, decay, true);
+            return;
+        }
+        if (mode == GRAD_CLIP_GLOBAL_NORM && maxNorm > 0.0f) {
+            const double n2 = gradNorm2();
+            if (n2 > 0.0) {
+                const double n = std::sqrt(n2);
+                if (n > (double)maxNorm) {
+                    scaleGrad((float)((double)maxNorm / n));
+                }
+            }
+        }
+        RMSProp(lr, rho, decay, false);
+    }
+
+    /*
+       全网梯度范数² (只统计实现了 `gradNorm2()` 的层; 见 ilayer.h 的说明)。
+       用途: ① `GlobalNorm` 裁剪; ② 面板/报告里的"这一步的信号有多大"读数 ——
+       本工程此前**没有**这个数, 于是"学习率要不要跟"只能靠试。
+    */
+    double gradNorm2() const
+    {
+        double s = 0.0;
+        for (std::size_t i = 0; i < layers.size(); i++) {
+            s += layers[i]->gradNorm2();
+        }
+        return s;
+    }
+    double gradNorm() const { return std::sqrt(gradNorm2()); }
+
+    /* 把全网所有层的梯度张量乘 s (全局裁剪用; 未实现的层原样不动) */
+    void scaleGrad(float s)
+    {
+        for (std::size_t i = 0; i < layers.size(); i++) {
+            layers[i]->scaleGrad(s);
+        }
+    }
+
+    /* 逐层梯度范数 (只读诊断): 输出 "层号:范数" 的文本, 给报告/面板用 */
+    std::string gradNormReport() const
+    {
+        std::ostringstream os;
+        for (std::size_t i = 0; i < layers.size(); i++) {
+            const double n2 = layers[i]->gradNorm2();
+            os << (i == 0 ? "" : " ") << i << ":" << std::sqrt(n2);
+        }
+        return os.str();
     }
 
     void Adam(float lr, float alpha=0.99, float beta=0.9, float decay=0)

@@ -1558,6 +1558,27 @@ struct AVX2 {
     inline static void transpose(float* __restrict y, std::size_t yRow, std::size_t yCol,
                                  const float* __restrict x, std::size_t xRow, std::size_t xCol)
     {
+        /*
+           [2026-10] 本内核是本文件里**唯一**用对齐指令的地方: 16 处 `_mm_load_ps`（要求
+           16 B 对齐）+ 8 处 `_mm256_store_ps`（要求 32 B 对齐）。`Tensor` 的存储现在由
+           `RL::AlignAllocator32` 保证 32 B，所以从 `Tensor::val` 进来的指针是安全的;
+           但它是 public 的、谁都能拿**普通指针**来调 —— 不对齐就是 #GP（不是"慢一点"）。
+
+           所以这里加**守卫**: 不对齐就直接响亮失败，而不是赌运气。为什么不是"回退到标量
+           转置": 这个内核的 y/x 布局约定是它自己的（8×8 分块 + 自己的行步长约定），
+           在**没有人调用它**之前先猜一个可能错的标量回退，比崩掉更危险（本工程最恨的是
+           "静默给错值"）。真要支持任意指针, 就照它的约定写回退并补一条断言测试。
+        */
+        if ((reinterpret_cast<std::size_t>(y) & 31u) != 0 ||
+            (reinterpret_cast<std::size_t>(x) & 15u) != 0) {
+            std::fprintf(stderr,
+                         "[simd::transpose] 输入指针未对齐 (y=%p 需 32 B, x=%p 需 16 B) —— "
+                         "这条内核要求对齐 (用了 _mm256_store_ps/_mm_load_ps)。\n"
+                         "  用 `RL::Tensor_<float, RL::AlignAllocator32>` 的缓冲, 或先对齐再调用。\n",
+                         (const void *)y, (const void *)x);
+            std::fflush(stderr);
+            std::abort();
+        }
 
         const float *x_ = x;
         float *y_ = y;

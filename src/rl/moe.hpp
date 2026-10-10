@@ -276,6 +276,24 @@ public:
         return;
     }
 
+    /* 梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数) */
+    double gradNorm2() const override
+    {
+        double s = gradNorm2Of(g.wg) + gradNorm2Of(g.b);
+        for (int i = 0; i < NumExperts; i++) {
+            s += experts[i].gradNorm2();
+        }
+        return s;
+    }
+    void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g.wg, s);
+        scaleTensorGrad(g.b, s);
+        for (int i = 0; i < NumExperts; i++) {
+            experts[i].scaleGrad(s);
+        }
+    }
+
     void Adam(float lr, float alpha, float beta,
               float alpha_, float beta_,
               float decay, bool clipGrad) override

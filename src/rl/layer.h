@@ -203,6 +203,19 @@ public:
         return;
     }
 
+    /* 梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数) */
+    virtual double gradNorm2() const override
+    {
+        double s = gradNorm2Of(g.w);
+        if (bias) { s += gradNorm2Of(g.b); }
+        return s;
+    }
+    virtual void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g.w, s);
+        if (bias) { scaleTensorGrad(g.b, s); }
+    }
+
     virtual void Adam(float lr, float alpha, float beta,
                       float alpha_, float beta_,
                       float decay, bool clipGrad) override
@@ -546,6 +559,19 @@ public:
     }
     Tensor& forward(const Tensor &x, bool inference=false) override
     {
+        /*
+           ⚠ 死代码守卫 (2026-10, 见 ilayer.h 的 `requireWired`): 这一层**从未被任何
+           生产路径实例化** (`Dropout<` 全仓只出现在它自己的定义处)。而且它自己有两处
+           语义问题, 谁要用先修:
+             1. `mask[i] = bernoulli(p)/(1−p)`: `std::bernoulli_distribution(p)` 以概率 p
+                为真 ⇒ 这里其实是"**保留概率 p**", 却按"丢弃概率 p"的 1/(1−p) 去缩放
+                (倒置式 dropout 应当是"保留 1−p、乘 1/(1−p)") ⇒ p 越接近 1 越离谱;
+             2. 开关用的是 `withGrad` 而不是 `inference` ⇒ 带梯度的网在**推理**时照样丢。
+           序列专家里的 dropout 是另写的 (见 `seq_transformer.hpp` 的 `setDropout`),
+           三条纪律都对齐了: 默认 0 (不消耗随机数) / 只认 `inference` / mask 存缓存供
+           反向复用 (前后向同一张, 由冻 mask 的有限差分钉住)。
+        */
+        requireWired("Dropout");
         Layer<Fn>::forward(x);
         if (withGrad == true) {
             std::bernoulli_distribution bernoulli(p);
@@ -698,8 +724,22 @@ public:
         for (std::size_t i = 0; i < e.totalSize; i++) {
             dy[i] = Fn::df(o[i]) * e[i];           // dy = Fn'(o)·e
         }
-        /* Propagate through w: dL/dx_ = w^T · dy */
-        Tensor dL(outputDim, 1);
+        /* Propagate through w: dL/dx_ = w^T · dy
+           ⚠ [2026-10-10 修] 这里原来是 `Tensor dL(outputDim, 1);` —— **错的两处**:
+             * `MM::kikj(z, w, dy)` 的 z 必须是 **(inputDim, 1)** (z = wᵀ·dy, w 是
+               (outputDim, inputDim)); 按 outputDim 分配 ⇒ 输入梯度**只写了前
+               outputDim 个坐标**, 剩下的留在旧值/零上 (梯度被静默截断)。
+             * 下面那句 `for (i < ei.totalSize)` 按 **inputDim** 读 `dL[i]` ⇒ 当
+               inputDim > outputDim 时是**越界读** (读到的"dL"是缓冲区外的字节),
+               再写进 ei —— 整个 DPG agent 的输入梯度都是这么算出来的。
+             而且均值那一步本来就应该在**输入向量**上做 (x_ 是 z-score 之后的输入,
+             长度 = inputDim), 按 outputDim 取均值连数学口径都是错的。
+           这条被 `Tensor::MM` 的常驻形状契约检查抓到 (2026-10 的 P1 改动):
+             实际形状 z[64,1] x1[64,90] x2[64,1] (DPG: stateDim=90 -> hiddenDim=64,
+             见 dpg.cpp:43)。Release 下 `NDEBUG` 把断言关掉, 所以它**静默跑了很久**:
+             证据 = `test_pretrain` 在加守卫后当场 abort。
+           对 inputDim == outputDim 的既有用法 (ddpg.cpp:11/15) 这是一次**逐位不变**的改动。 */
+        Tensor dL(inputDim, 1);
         Tensor::MM::kikj(dL, w, dy);
         /* Propagate through zscore: dL/dx = gamma · (I - 1/n·1·1^T) · dq */
         float u = dL.mean();

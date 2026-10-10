@@ -151,6 +151,22 @@ public:
              + ffn_up.paramCount() + ffn_down.paramCount();
     }
 
+    /*
+       参数三分法 (见 ilayer.h 的 paramBreakdown)。实测 d_model=1710/d_ff=360:
+         注意力 (3·d² qkv + d² wo) = 11,696,400  → 90.4%
+         FFN    (2·d·d_ff + bias)   =  1,233,270  →  9.5%
+         LN     (4·d)               =      6,840  →  0.05%
+       三个数加起来 == paramCount() (由 test_ppomcts 的断言钉住, 免得以后加层忘了改这里)。
+    */
+    void paramBreakdown(long long &attnOut, long long &ffnOut, long long &lnOut) const override
+    {
+        const long long d = (long long)d_model;
+        attnOut = 4 * d * d;   /* 与头数无关: 无论怎么切 d_k, 3 份 qkv + 1 份 wo 都是 4d² */
+        ffnOut  = ffn_up.paramCount() + ffn_down.paramCount();
+        lnOut   = (long long)gamma1.size() + (long long)beta1.size()
+                + (long long)gamma2.size() + (long long)beta2.size();
+    }
+
     /* iLayer 的通用自检读数: 往下委派给 MHA (见 ilayer.h) */
     int attnHeadsRequested() const override { return attn.attnHeadsRequested(); }
     int attnHeadsUsed() const override { return attn.attnHeadsUsed(); }
@@ -352,6 +368,30 @@ public:
         ffn_down.RMSProp(lr, rho, decay, clipGrad);
         g1.zero(); g2.zero();
         return;
+    }
+
+    /*
+       梯度范数² / 梯度缩放 (全局裁剪; 见 ilayer.h 的同名虚函数)。
+       注意它把**两条相差 3 个数量级**的支路一起报出来 (实测 d_model=1710:
+       `ffn_up≈3.5` vs `wq≈7e-4`) —— 这正是"按范数归一化会把最重要的信息抹掉"
+       那件事的读数来源 (见 rl/optimize.h 的 GradClipMode)。
+    */
+    double gradNorm2() const override
+    {
+        return gradNorm2Of(g1.gamma) + gradNorm2Of(g1.beta)
+             + gradNorm2Of(g2.gamma) + gradNorm2Of(g2.beta)
+             + attn.gradNorm2()
+             + ffn_up.gradNorm2() + ffn_down.gradNorm2();
+    }
+    void scaleGrad(float s) override
+    {
+        scaleTensorGrad(g1.gamma, s);
+        scaleTensorGrad(g1.beta, s);
+        scaleTensorGrad(g2.gamma, s);
+        scaleTensorGrad(g2.beta, s);
+        attn.scaleGrad(s);
+        ffn_up.scaleGrad(s);
+        ffn_down.scaleGrad(s);
     }
 
     void Adam(float lr, float alpha, float beta,

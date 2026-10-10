@@ -18,10 +18,14 @@
 | 保持 chess 版本，未覆盖 | 2 | `rl/ppo.h`、`rl/ppo.cpp` |
 | chess 独有、snakeAI 没有 | 2 | `rl/qlstm.h`、`rl/qlstm.cpp` |
 | 按 chess 侧需要改回/修补后与上游不同 | 5 | `rl/dqn.cpp`、`rl/dqn.h`、`rl/dpg.h`、`rl/layer.h`、`rl/convdqn.cpp` |
+| **同步之后又分叉的（2026-10，见 §1.4）** | 1 | `rl/tensor.hpp`（+ 新增 `rl/alignallocator.hpp`） |
 
 > 同步基线是 snakeAI 的 `5d3246e`（"Fix reward plot after agent switch; audit fixes
 > in rl/ and tests"）。同步过程中发现 snakeAI **工作区**在同步之后又被改过两处
 > （`rl/conv2d.hpp`、`rl/convdqn.cpp`，均为未提交改动），处理方式见 §1.3。
+> **`rl/tensor.hpp` 在同步之后又按 chess 侧需要改了若干处**，逐条记在 §1.4 ——
+> 下次同步前先读那一节（上游若在这些位置有不同版本，按 §1.3 的办法重新跑同步并逐条复核，
+> 不要直接覆盖）。
 
 ### 1.1 为什么 `ppo.h` / `ppo.cpp` 不能覆盖
 
@@ -88,6 +92,24 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 
 如果上游这两处后续提交了不同的最终版本，重新跑一次同步即可。
 
+### 1.4 同步**之后** `rl/tensor.hpp` 又分叉的六处（2026-10）
+
+这一节是 2026-10 补的账：`tensor.hpp` 原本属于"与上游字节级一致"的那 43 个文件，
+在此之后按 chess 侧需要改了六处。**下次同步前先读这里**，逐条判断是保留 chess 版
+还是拉上游（`rl_sync.md` 的规矩：分歧要记账 + 在文件内注释标明）。
+
+| # | 分叉点 | chess 侧的版本 | 为什么 |
+|---|---|---|---|
+| 1 | **存储分配器** | `Tensor_` 的第二个模板参数默认值 = `RL::AlignAllocator32`（新增文件 `src/rl/alignallocator.hpp`，从 N-spirits 的 `basic/alignallocator.hpp` 迁移并修掉 POSIX 分支的 UB） | 上游是 `std::allocator`（MSVC x64 只保证 16 B），而 `simd/avx2func.hpp` 的 `transpose` 用了要求 32 B 的 `_mm256_store_ps` ⇒ 把"碰运气"变成"有保证"。见 `tensor.hpp:15-46` 的文件头 |
+| 2 | **`operator[]` 的形参类型** | `std::size_t`（上游是 `int`），并**刻意不保留** `int` 重载 | 逐元素循环里的 `int↔size_t` 往返转换；两个重载会让 `t[0u]` 二义。见 `tensor.hpp:449-466` |
+| 3 | **`posOf` 的窄化写法** | 显式 `static_cast<int>`（语义与上游的隐式窄化逐位相同，只是不再依赖隐式转换规则） | 消掉 `C4838`。⚠ **不是**"把下标提到 64 位"——那个改法被实测否决（index-dense 二维循环慢 34%） |
+| 4 | **`MM::ikjk` 的标量回退** | `RL_RESTRICT` + `kdim==1` 特判 + `x2r==1` 单位步长内层循环（逐位等价，实测 12~25×） | 见 `docs/seq_transformer_design.md` §9.2.1 / `docs/tb_expert_training_2026_10.md` §10.8 |
+| 5 | **对齐自检入口** | 新增 `alignedTo(a=RL_ALIGN_DEFAULT)` / `dataAlignment()` | 对齐是"看不见的契约"，必须能被印出来/被断言（`test_transformer [9]`） |
+| 6 | **`MM` 的契约注释** | 写明"四个内核**一律累加**"（与 `issues_review.md` R1.5 一致） | 历史上 `ikjk/kijk` 的 SIMD 内核是赋值、标量是累加 |
+
+> 未做完的账：本节只列**已确认**的分叉点。`src/rl/` 其余文件是否在同步后也被改过，
+> 见 `docs/tensor_optimization_plan.md` 的 P0 与 Part 6 执行台账。
+
 ---
 
 ## 二、同步进来的主要修复（按主题）
@@ -133,7 +155,14 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 RL 库的语义（几十个文件，且差异会**编译通过但行为不同**）。而 `tensorsi.hpp` 里真正
 带来加速的是它调用的那些指令集内核，把它们接到现有 `Tensor_` 上，收益一样、API 不变。
 另外实测确认：AVX2 内核用的是 `_mm256_loadu_ps`/`_mm256_storeu_ps`（非对齐），
-只有没被使用的 `transpose` 需要对齐 —— 所以**不需要**替换存储分配器。
+唯一要求对齐的是没被使用的 `transpose`（**当时**的结论因此是"不需要替换存储分配器"）。
+
+> **[2026-10 更正]** 上面那句只对"性能"成立，对"正确性"不成立：`transpose` 是 public
+> API，只要有人对真矩阵调一次，16 B 对齐的缓冲就会 **#GP**（不是慢，是崩）。
+> 所以 `Tensor` 的默认分配器已经换成 `AlignAllocator32`（32 B 保证），并给那个内核加了
+> **响亮失败**守卫 —— 逐条见 §1.4 第 1、5 条与 `tensor.hpp:15-46`。
+> 性能那一半的读数不变（对齐不是主要收益来源：`MM::ikjk` 的循环写法值 12~25×，
+> 整批 GEMM 只有 1.00~1.13×）。
 
 实测收益：
 
