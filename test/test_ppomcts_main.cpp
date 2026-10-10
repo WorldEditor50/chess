@@ -2226,7 +2226,7 @@ static bool testMaskedTrainHead()
             RL::iFcLayer *head = dynamic_cast<RL::iFcLayer *>(
                 agent.ppo.actorP[agent.ppo.actorP.size() - 1]);
             if (head == nullptr) { return 0.0; }
-            const std::size_t rs = (std::size_t)head->w.sizes[0];
+            const std::size_t rs = (std::size_t)head->w.strideOf(0);
             std::vector<float> before;
             for (int a = 0; a < A::ACTION_DIM; a++) {
                 const float *row = head->w.val.data() + (std::size_t)a * rs;

@@ -92,10 +92,10 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 
 如果上游这两处后续提交了不同的最终版本，重新跑一次同步即可。
 
-### 1.4 同步**之后** `rl/tensor.hpp` 又分叉的七处（2026-10；第 7 条是 P3/A11 追加的）
+### 1.4 同步**之后** `rl/tensor.hpp` 又分叉的八处（2026-10；第 7~8 条是 P3/A11+A10 追加的）
 
 这一节是 2026-10 补的账：`tensor.hpp` 原本属于"与上游字节级一致"的那 43 个文件，
-在此之后按 chess 侧需要改了七处（第 1~6 条是 P0/P1，第 7 条是 P3/A11）。
+在此之后按 chess 侧需要改了八处（第 1~6 条是 P0/P1，第 7~8 条是 P3 的 A11/A10）。
 **下次同步前先读这里**，逐条判断是保留 chess 版
 还是拉上游（`rl_sync.md` 的规矩：分歧要记账 + 在文件内注释标明）。
 
@@ -108,6 +108,7 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 | 5 | **对齐自检入口** | 新增 `alignedTo(a=RL_ALIGN_DEFAULT)` / `dataAlignment()` | 对齐是"看不见的契约"，必须能被印出来/被断言（`test_transformer [9]`） |
 | 6 | **`MM` 的契约注释** | 写明"四个内核**一律累加**"（与 `issues_review.md` R1.5 一致） | 历史上 `ikjk/kijk` 的 SIMD 内核是赋值、标量是累加 |
 | 7 | **形状/步长的存储类型**（2026-10 P3 / A11 追加） | `Shape` / `Size` 从 `std::vector<int>` 换成 **`SmallShapeVec<RL_SHAPE_INLINE>`**（内联 4 个 `int` 的小容器，秩 > 4 才回退到堆；带 `operator std::vector<int>()` 兼容桥，所以既有用法 `t.shape[i]` / `.size()` / `Tensor(t.shape)` 全都不变） | 每次张量构造原来都要为 shape/sizes **各做一次堆分配**（`probe_alloc` 实测 `Tensor(r,c)` = **3 次**分配 = 8 B + 8 B + 对齐数据）⇒ A11 降到 **1 次**（只剩数据）。**位宽保持 `int`**（§1.6 的纪律：提到 64 位被实测否决）。⚠ 顺带把变参构造 `Tensor_(Dim ...dim)` 用 `enable_if` 限成**整型维度** —— 否则 `Tensor(std::vector<int>)` 会选中模板并在 `int(dim)` 上编译失败（136 条 `C2440`） |
+| 8 | **`sizes` 成员删除**（2026-10 P3 / A10 追加） | `Tensor_` 不再存步长：`t.sizes[i]` → **`t.strideOf(i)`**（按需 O(rank)，返回 `int` 以保持 32 位乘加）；需要整组步长时用 `stridesInto(int out[RL_SHAPE_MAX])`（**栈数组**，不分配） | `shape` 已经完整决定步长（row-major），再存一份就是**两个必须手工同步的事实源**——`reshape`/`view` 这类入口只改一个就会永久分叉（`flatten()` 的历史越界 bug 属这一类）。⚠ **这是接口级分叉**：外部/上游代码里的 `t.sizes[...]` 会**编译失败**（本仓 13 处已改成 `strideOf`，编译器逐条点名）——下次同步时按这一行处理。秩上限 `RL_SHAPE_MAX`=8，超过**响亮失败**而不是静默截断 |
 
 > 未做完的账：本节只列**已确认**的分叉点。`src/rl/` 其余文件是否在同步后也被改过，
 > 见 `docs/tensor_optimization_plan.md` 的 P0 与 Part 6 执行台账。

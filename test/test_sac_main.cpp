@@ -187,7 +187,7 @@ static void testIllegalColumnGradient()
         return;
     }
 
-    const std::size_t rowStride = (std::size_t)head->g.w.sizes[0];
+    const std::size_t rowStride = (std::size_t)head->g.w.strideOf(0);
     double maxIllegal = 0.0;
     double maxLegal = 0.0;
     for (int a = 0; a < A; a++) {

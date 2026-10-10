@@ -125,7 +125,7 @@ public:
         if (x.shape.size() != 2 || x.shape[1] != 1) {
             return false;                       /* 只支持单样本列向量 */
         }
-        if ((std::size_t)x.shape[0] != inputDim || x.sizes[0] != 1) {
+        if ((std::size_t)x.shape[0] != inputDim || x.strideOf(0) != 1) {
             return false;                       /* 输入维数对不上 / 非连续视图 */
         }
         if (w.shape.size() != 2 || (std::size_t)w.shape[1] != inputDim ||
@@ -146,10 +146,11 @@ public:
         const float *xd = x.val.data();
         const float *wd = w.val.data();
         const float *bd = b.val.data();
-        const std::size_t wRowStride = (std::size_t)w.sizes[0];
-        const std::size_t wColStride = (std::size_t)w.sizes[1];
+        const std::size_t wRowStride = (std::size_t)w.strideOf(0);
+        const std::size_t wColStride = (std::size_t)w.strideOf(1);
+        const std::size_t xRowStride = (std::size_t)x.strideOf(0);   /* [2026-10 A10] 提到循环外 */
         const std::size_t kdim = inputDim;
-        const bool denseRow = (wColStride == 1) && (x.sizes[0] == 1);
+        const bool denseRow = (wColStride == 1) && (xRowStride == 1);
         for (std::size_t t = 0; t < idx.size(); t++) {
             const std::size_t a = (std::size_t)idx[t];
             const float *wrow = wd + a * wRowStride;
@@ -160,7 +161,7 @@ public:
                 }
             } else {
                 for (std::size_t k = 0; k < kdim; k++) {
-                    s += wrow[k * wColStride] * xd[k * (std::size_t)x.sizes[0]];
+                    s += wrow[k * wColStride] * xd[k * xRowStride];
                 }
             }
             out[t] = s;

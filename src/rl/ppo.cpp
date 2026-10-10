@@ -626,7 +626,7 @@ void RL::PPO::sparsePolicyBackward(const Tensor &state,
     Tensor &h = actorP[headIndex - 1]->o;
 
     const std::size_t in = head->inputDim;
-    const std::size_t wRow = (std::size_t)head->w.sizes[0];     /* == in (行主序) */
+    const std::size_t wRow = (std::size_t)head->w.strideOf(0);     /* == in (行主序) */
     const float *hd = h.val.data();
     const float *wd = head->w.val.data();
     float *gwd = head->g.w.val.data();

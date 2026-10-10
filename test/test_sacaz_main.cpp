@@ -1008,7 +1008,7 @@ static void testPpoPort()
     if (head == nullptr) {
         return;
     }
-    const std::size_t rowStride = (std::size_t)head->w.sizes[0];
+    const std::size_t rowStride = (std::size_t)head->w.strideOf(0);
 
     std::vector<int> illegal;
     for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
@@ -1091,7 +1091,7 @@ static void testPpoPort()
         RL::iFcLayer *h2 = dynamic_cast<RL::iFcLayer*>(g2.actor[g2.actor.size() - 1]);
         CHECK(h2 != nullptr, "隔离实验: 策略头是 iFcLayer");
         if (h2 != nullptr) {
-            const std::size_t rs2 = (std::size_t)h2->w.sizes[0];
+            const std::size_t rs2 = (std::size_t)h2->w.strideOf(0);
             std::vector<float> b2;
             for (std::size_t i = 0; i < illegal.size(); i++) {
                 const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;

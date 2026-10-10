@@ -420,11 +420,11 @@ static void testDuelingGradient()
 
     /*
        对**某一个权重元素**做中心差分: (L(w+ε) − L(w−ε)) / 2ε 与解析梯度比。
-       k = row * rowStride + col, rowStride = w.sizes[0] (= 输入维); 越界的组合直接跳过。
+       k = row * rowStride + col, rowStride = w.strideOf(0) (= 输入维); 越界的组合直接跳过。
     */
     auto checkElem = [&](RL::iFcLayer *layer, int row, int col) {
-        const std::size_t rowStride = (std::size_t)layer->w.sizes[0];
-        if (row < 0 || (std::size_t)row >= (std::size_t)layer->w.sizes[1]) { return; }
+        const std::size_t rowStride = (std::size_t)layer->w.strideOf(0);
+        if (row < 0 || (std::size_t)row >= (std::size_t)layer->w.strideOf(1)) { return; }
         if (col < 0 || (std::size_t)col >= rowStride) { return; }
         const std::size_t k = (std::size_t)row * rowStride + (std::size_t)col;
         if (k >= layer->w.size() || k >= layer->g.w.size()) { return; }
@@ -465,7 +465,7 @@ static void testDuelingGradient()
        (这是 DQN 那条"未掩码 argmax 取未训练槽位"缺陷的对偶面)。
     */
     {
-        const std::size_t rowStride = (std::size_t)aOut->w.sizes[0];
+        const std::size_t rowStride = (std::size_t)aOut->w.strideOf(0);
         const int illegalAction = (taken + 4001) % DQNABAgent::ACTION_DIM;
         bool isLegalAction = false;
         for (int v : idx) {

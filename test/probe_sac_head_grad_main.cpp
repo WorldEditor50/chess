@@ -123,10 +123,10 @@ int main(int argc, char **argv)
 
         RL::iFcLayer *head = dynamic_cast<RL::iFcLayer*>(agent.actor[agent.actor.size() - 1]);
         if (head == nullptr) { std::printf("(策略头不是 iFcLayer, 退出)\n"); return 1; }
-        const std::size_t rowStride = (std::size_t)head->w.sizes[0];
+        const std::size_t rowStride = (std::size_t)head->w.strideOf(0);
         std::printf("[SAC ] head: w=(%d,%d) rowStride=%zu bias=%d | actor 参数=%lld | "
                     "state=%d action=%d | 合法=%d\n",
-                    (int)head->w.sizes[0], (int)head->w.sizes[1], rowStride,
+                    (int)head->w.strideOf(0), (int)head->w.strideOf(1), rowStride,
                     (int)head->bias, agent.actor.paramCount(),
                     SACAZAgent::STATE_DIM, SACAZAgent::ACTION_DIM, (int)legalIdx.size());
         if (head->w.size() < (std::size_t)SACAZAgent::ACTION_DIM * rowStride) {
@@ -222,7 +222,7 @@ int main(int argc, char **argv)
             SACAZAgent g2(chess, 64, 0.99f, 0.001f, 1.5f);
             RL::iFcLayer *h2 = dynamic_cast<RL::iFcLayer*>(g2.actor[g2.actor.size() - 1]);
             if (h2 != nullptr) {
-                const std::size_t rs2 = (std::size_t)h2->w.sizes[0];
+                const std::size_t rs2 = (std::size_t)h2->w.strideOf(0);
                 std::vector<float> before;
                 for (std::size_t i = 0; i < illegal.size(); i++) {
                     const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;
@@ -300,7 +300,7 @@ int main(int argc, char **argv)
 
     RL::iFcLayer *head = dynamic_cast<RL::iFcLayer*>(ppo.actorP[ppo.actorP.size() - 1]);
     if (head == nullptr) { std::printf("(策略头不是 iFcLayer, 退出)\n"); return 1; }
-    const std::size_t rowStride = (std::size_t)head->w.sizes[0];
+    const std::size_t rowStride = (std::size_t)head->w.strideOf(0);
     auto snap = [&](const std::vector<int> &acts) {
         std::vector<float> buf;
         for (std::size_t i = 0; i < acts.size(); i++) {

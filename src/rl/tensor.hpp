@@ -117,10 +117,11 @@ namespace RL {
    增长时靠它才不退化成深拷贝，实测 3.08×）。所以本容器的 move 构造/赋值/swap
    **必须也是 noexcept** —— 只搬指针与内联数组，不碰堆。
 
-   用法: `using Shape = SmallShapeVec<RL_SHAPE_INLINE>`；因此 `t.shape` / `t.sizes`
-   的**所有既有用法**（`.size()`、`[]`、`.swap()`、`Tensor(t.shape)`、传给
-   `const std::vector<int>&` 形参）都保持可用 —— 这也是为什么它要提供
-   `operator std::vector<int>()` 这条兼容桥。
+   用法: `using Shape = SmallShapeVec<RL_SHAPE_INLINE>`；因此 `t.shape` 的**所有既有用法**
+   （`.size()`、`[]`、`.swap()`、`Tensor(t.shape)`、传给 `const std::vector<int>&` 形参）
+   都保持可用 —— 这也是为什么它要提供 `operator std::vector<int>()` 这条兼容桥。
+   ⚠ `t.sizes`（成员）已在 **A10** 删掉，步长改用 `t.strideOf(i)` / `t.stridesInto(out)`
+   按需算（全仓 13 处 `X.sizes[0/1]` 已随之改成 `X.strideOf(0/1)`）。
 */
 template <std::size_t N>
 class SmallShapeVec
@@ -297,6 +298,13 @@ private:
 #define RL_SHAPE_INLINE 4
 #endif
 
+/* [2026-10 P3 / A10] 栈上步长数组的长度上限（秩的上限）。
+   8 是"够用且留余量"的取值: 本工程实际秩 ≤ 4（conv2d kernel 4 维），
+   超过它就**响亮失败**而不是静默截断 —— 与 §1.6 那条"位宽保持 int + 常驻范围守卫"同一套纪律。 */
+#ifndef RL_SHAPE_MAX
+#define RL_SHAPE_MAX 8
+#endif
+
 template<typename T, template<typename Ti> class Alloc=AlignAllocator32>
 class Tensor_
 {
@@ -307,12 +315,21 @@ public:
        秩 ≤ `RL_SHAPE_INLINE`(4) 时**不再堆分配** —— `probe_alloc` 量到
        `Tensor(r,c)` 的分配次数 3 → 1（只剩数据缓冲那一次）。位宽仍然是 `int`（§1.6 的纪律）。 */
     using Shape = SmallShapeVec<RL_SHAPE_INLINE>;
+    /*
+       [2026-10 P3 / A10] ⚠ `Size`（原来的第二个 `SmallShapeVec` 成员 `sizes`）**已删**。
+       为什么: `shape` 已经完整决定了步长（row-major），再存一份就等于**两个必须手工同步的
+       事实源** —— 方案 §1.4 数过：`sizes` 与 `totalSize` 都要由 20 个函数维护、在拷贝/移动/
+       赋值里各抄一遍，而 `reshape`/`view` 这类入口只改其中一部分就会**永久分叉**
+       （`flatten()` 的历史越界 bug 就是这一类）。
+       现在步长由 `strideOf(i)` / `stridesInto(out)` **按需**从 `shape` 算出来，
+       成员只剩 `totalSize` 与 `val` 两个长度源（A9 再把这两个合并）。
+       `using Size` 保留成别名（公共类型，别的代码可能写着 `Tensor::Size`），但类内已无成员用它。
+    */
     using Size = SmallShapeVec<RL_SHAPE_INLINE>;
     using iterator = typename Vector::iterator;
     using const_iterator = typename Vector::const_iterator;
     std::size_t totalSize;
     Vector val;
-    Size sizes;
     Shape shape;
 public:
     /* default construct */
@@ -369,28 +386,80 @@ public:
         }
         return sizes;
     }
-    static void initParams(const Shape &shape, Size &sizes, std::size_t &totalsize)
+    /*
+       ============================================================
+        [2026-10 P3 / A10] 步长按需算: `strideOf()` / `stridesInto()`
+       ============================================================
+       `sizes` 成员删掉之后, 步长只有一个来源: `shape`。row-major 下
+           stride[i] = Π_{k>i} shape[k]        (stride[rank-1] == 1)
+       ⚠ **刻意保持 32 位 `int`**: 方案 §1.6 记过"把下标/步长提到 64 位"的实测代价
+       ——index-dense 的二维循环慢 **34%**（5.25 → 3.48 GB/s）, 已被否决。这里返回 `int`
+       就是为了让 `posOf` 里的乘加与改动前**逐位相同**（同一个 32 位截断链）。
+       ⚠ 秩的上限: 栈上的步长数组是定长的（`RL_SHAPE_MAX`），秩超过就**响亮失败**
+       （本工程的秩 ≤ 4：conv2d 的 kernel 是 4 维，其余 1~3 维）。
+    */
+    static constexpr std::size_t maxRank() noexcept { return RL_SHAPE_MAX; }
+
+    /* 把 rank 个步长写进调用方的栈数组（不分配、不存成员）。秩超限 ⇒ 响亮失败。 */
+    void stridesInto(int *out) const
+    {
+        const std::size_t r = shape.size();
+        if (r > RL_SHAPE_MAX) {
+            std::fprintf(stderr,
+                         "[Tensor] stridesInto: 秩 %llu 超过 RL_SHAPE_MAX=%d ——\n"
+                         "  ⇒ 栈上的步长数组是定长的; 要更大的秩请先把 RL_SHAPE_MAX 调大\n"
+                         "     (它会同时改变 `posOf` 里那段 32 位乘加的前提, 见 §1.6)。\n",
+                         (unsigned long long)r, (int)RL_SHAPE_MAX);
+            std::fflush(stderr);
+            std::abort();
+        }
+        int s = 1;
+        for (std::size_t i = r; i-- > 0; ) {
+            out[i] = s;
+            s *= shape[i];
+        }
+    }
+
+    /* 单个步长（按需, O(rank)）。返回 `int` 以保持 32 位乘加（见上）。 */
+    inline int strideOf(std::size_t i) const
+    {
+        int s = 1;
+        for (std::size_t k = i + 1; k < shape.size(); k++) {
+            s *= shape[k];
+        }
+        return s;
+    }
+
+    /*
+       秩的常驻守卫: 与 `requireIndexable`（形状乘积）配对 —— 那条管"元素总数别超 int",
+       这条管"秩别超栈上步长数组的长度"。
+    */
+    static void requireRank(std::size_t rank, const char *where)
+    {
+        if (rank > RL_SHAPE_MAX) {
+            std::fprintf(stderr, "[Tensor] %s: 秩 %llu 超过 RL_SHAPE_MAX=%d\n",
+                         where, (unsigned long long)rank, (int)RL_SHAPE_MAX);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    static void initParams(const Shape &shape, std::size_t &totalsize)
     {
         totalsize = 1;
         for (std::size_t i = 0; i < shape.size(); i++) {
             totalsize *= shape[i];
         }
-        sizes.resize(shape.size(), 1);
-        for (std::size_t i = 0; i < shape.size() - 1; i++) {
-            for (std::size_t j = i + 1; j < shape.size(); j++) {
-                 sizes[i] *= shape[j];
-            }
-        }
         /* [2026-10] 常驻守卫: `posOf` 的 32 位乘加契约 (见 requireIndexable 的说明)。
-           放在这里 ⇒ 7 个调用点 (四个构造 + reshape + view + 静态 posOf) 全覆盖。 */
+           放在这里 ⇒ 全部形状入口 (构造 + reshape) 全覆盖。 */
         requireIndexable(totalsize, "initParams (形状乘积)");
+        requireRank(shape.size(), "initParams (秩)");
         return;
     }
     /* contruct with shape */
     explicit Tensor_(const Shape &shape_)
         :totalSize(1),shape(shape_)
     {
-        initParams(shape, sizes, totalSize);
+        initParams(shape, totalSize);
         val = std::vector<T, Alloc<T>>(totalSize, T(0));
     }
 
@@ -412,13 +481,13 @@ public:
              typename = std::enable_if_t<(std::is_integral<Dim>::value && ...)>>
     explicit Tensor_(Dim ...dim):totalSize(1),shape({int(dim)...})
     {
-        initParams(shape, sizes, totalSize);
+        initParams(shape, totalSize);
         val = std::vector<T, Alloc<T> >(totalSize, T(0));
     }
 
     /* copy constructor */
     Tensor_(const Tensor_ &r)
-        :totalSize(r.totalSize),shape(r.shape),sizes(r.sizes),val(r.val){}
+        :totalSize(r.totalSize),shape(r.shape),val(r.val){}
 
     /*
        move construct —— **[2026-10] 必须标 `noexcept`**。
@@ -434,7 +503,6 @@ public:
     Tensor_(Tensor_ &&r) noexcept:totalSize(r.totalSize)
     {
         shape.swap(r.shape);
-        sizes.swap(r.sizes);
         val.swap(r.val);
         r.totalSize = 0;
     }
@@ -512,7 +580,7 @@ public:
     inline std::size_t size(Index ...index) const
     {
         std::size_t N = sizeof ...(Index) - 1;
-        return sizes[N];
+        return strideOf(N);
     }
 
 
@@ -551,7 +619,6 @@ public:
         }
         totalSize = r.totalSize;
         shape = r.shape;
-        sizes = r.sizes;
         val = r.val;
         return *this;
     }
@@ -575,19 +642,17 @@ public:
         }
         totalSize = r.totalSize;
         shape.swap(r.shape);
-        sizes.swap(r.sizes);
         val.swap(r.val);
         r.totalSize = 0;
         return *this;
     }
-    /* [2026-10] 显式 swap: 三个容器都是 noexcept swap ⇒ 整条 noexcept */
+    /* [2026-10] 显式 swap: 两个容器都是 noexcept swap ⇒ 整条 noexcept */
     void swap(Tensor_ &r) noexcept
     {
         const std::size_t t = totalSize;
         totalSize = r.totalSize;
         r.totalSize = t;
         shape.swap(r.shape);
-        sizes.swap(r.sizes);
         val.swap(r.val);
     }
 
@@ -643,19 +708,25 @@ public:
            所以保留 32 位数组与 32 位乘法, 只把**隐式**窄化写成**显式** `static_cast<int>`:
              * 语义与改动前**逐位相同** (同一个截断, 只是不再依赖隐式转换规则);
              * `C4838` 消失 (实测: 改完之后 RL_CORE 全量构建不再有这条警告);
-             * 与 `sizes`(=`std::vector<int>`) 的类型一致, 没有跨类型乘法。
+             * 与步长数组（`stridesInto` 写出的 `int[]`，A10 之前是成员 `sizes`）的类型一致,
+               没有跨类型乘法。
 
            隐含前提 (与改动前一致, 不是新引入的): **每个下标与步长的乘积都落在 int 范围内**。
            本工程的最大张量是 1710×1710 ≈ 2.9 M 元素、最长的 1-D 张量 2.9 M、步长最大 1710,
-           乘积上界 ~5e9 —— 单看 `sizes[0]*index0` 这一项是 `1710 * 1709 ≈ 2.9e6`,
+           乘积上界 ~5e9 —— 单看 `stride[0]*index0` 这一项是 `1710 * 1709 ≈ 2.9e6`,
            安全; 也就是说这个前提在本工程的形状下成立。真要支持 >2^31 的张量,
            得把 `Shape`/`Size` 一起改成 `std::size_t`(公共类型, 牵动一大片), 那不是本轮的范围。
         */
         const int indexs[] = {static_cast<int>(index)...};
         std::size_t pos = 0;
         const std::size_t N = sizeof... (Index);
+        /* [2026-10 P3 / A10] 步长**按需**算进栈数组（原来读成员 `sizes[i]`）。
+           算一次是 O(rank)，和原来"读成员 + 两次乘加"同量级；乘加保持在 `int` 里
+           （见上面那段：提到 64 位实测慢 34%）。 */
+        int strides[RL_SHAPE_MAX];
+        stridesInto(strides);
         for (std::size_t i = 0; i < N; i++) {
-            pos += static_cast<std::size_t>(sizes[i] * indexs[i]);
+            pos += static_cast<std::size_t>(strides[i] * indexs[i]);
         }
         return pos;
     }
@@ -664,8 +735,10 @@ public:
     {
         std::size_t pos = 0;
         /* 与上面同一个理由: 32 位乘加 + 显式扩宽 (原实现是 int*int 隐式转 size_t) */
-        for (std::size_t i = 0; i < sizes.size(); i++) {
-            pos += static_cast<std::size_t>(sizes[i] * indexs[i]);
+        int strides[RL_SHAPE_MAX];
+        stridesInto(strides);
+        for (std::size_t i = 0; i < shape.size(); i++) {
+            pos += static_cast<std::size_t>(strides[i] * indexs[i]);
         }
         return pos;
     }
@@ -700,8 +773,11 @@ public:
             i3 = pos - i0*60 - i1*20 - i2*5
         */
         std::size_t pos_ = 0;
-        for (std::size_t i = 0; i < sizes.size(); i++) {
-            const int stride = sizes[i];
+        /* [2026-10 P3 / A10] 步长按需算（原来读成员 `sizes`） */
+        int strides[RL_SHAPE_MAX];
+        stridesInto(strides);
+        for (std::size_t i = 0; i < shape.size(); i++) {
+            const int stride = strides[i];
             indexs[i] = static_cast<int>((pos - pos_) / static_cast<std::size_t>(stride));
             pos_ += static_cast<std::size_t>(indexs[i] * stride);
         }
@@ -737,7 +813,7 @@ public:
     Tensor_& reshape(Index ...index)
     {
         shape = {index...};
-        initParams(shape, sizes, totalSize);
+        initParams(shape, totalSize);
         requireSameLength(*this, totalSize, "reshape");
         return *this;
     }
@@ -1003,8 +1079,8 @@ public:
         */
         static bool contiguous2d(const Tensor_ &t)
         {
-            return t.shape.size() == 2 && t.sizes.size() == 2 &&
-                   t.sizes[0] == t.shape[1] && t.sizes[1] == 1;
+            return t.shape.size() == 2 &&
+                   t.strideOf(0) == (int)t.shape[1] && t.strideOf(1) == 1;
         }
 
         /*
@@ -1084,7 +1160,9 @@ public:
 #endif
             /* 常驻 (Release 也生效): 2 维 + 形状元数据自洽 + 缓冲装得下形状 */
             if (t.shape.size() != 2) { contractFail("张量不是 2 维 (MM 只支持 2 维)"); }
-            if (t.sizes.size() != t.shape.size()) { contractFail("sizes 与 shape 长度不一致"); }
+            /* [2026-10 P3 / A10] 原来这里还有一条 "`sizes` 与 `shape` 长度不一致" 的守卫。
+               A10 把 `sizes` 成员删了、步长改为**按需**从 `shape` 算 ⇒ 这条不一致在结构上
+               已经不可能出现, 守卫随之删除（"用类型/结构消除状态, 而不是加断言守它"）。 */
             if (t.val.size() < (std::size_t)t.shape[0] * (std::size_t)t.shape[1]) {
                 contractFail("缓冲长度小于 shape[0] x shape[1]");
             }
@@ -1163,9 +1241,9 @@ public:
                rl/simd_ops.hpp 分派)。内核是**累加**到目标里的, 与本函数语义一致 ——
                这里不要像 tensorsi.hpp 那样补一次 zero()。
             */
-            if (x.shape.size() == 2 && x.shape[1] == 1 && x.sizes[0] == 1 &&
-                x1.shape.size() == 2 && x1.sizes[0] == x1.shape[1] && x1.sizes[1] == 1 &&
-                x2.shape.size() == 2 && x2.shape[1] == 1 && x2.sizes[0] == 1 &&
+            if (x.shape.size() == 2 && x.shape[1] == 1 && x.strideOf(0) == 1 &&
+                x1.shape.size() == 2 && x1.strideOf(0) == x1.shape[1] && x1.strideOf(1) == 1 &&
+                x2.shape.size() == 2 && x2.shape[1] == 1 && x2.strideOf(0) == 1 &&
                 x.shape[0] == x1.shape[0] && x1.shape[1] == x2.shape[0]) {
                 if (simdops::gemv_ikkj<T>((T*)x.val.data(), (std::size_t)x.shape[0],
                                           x1.val.data(), (std::size_t)x1.shape[1],
@@ -1185,9 +1263,9 @@ public:
             const T *x1d = x1.val.data();
             const T *x2d = x2.val.data();
             T *xd = x.val.data();
-            const std::size_t xr  = (std::size_t)x.sizes[0],  xc  = (std::size_t)x.sizes[1];
-            const std::size_t x1r = (std::size_t)x1.sizes[0], x1c = (std::size_t)x1.sizes[1];
-            const std::size_t x2r = (std::size_t)x2.sizes[0], x2c = (std::size_t)x2.sizes[1];
+            const std::size_t xr  = (std::size_t)x.strideOf(0),  xc  = (std::size_t)x.strideOf(1);
+            const std::size_t x1r = (std::size_t)x1.strideOf(0), x1c = (std::size_t)x1.strideOf(1);
+            const std::size_t x2r = (std::size_t)x2.strideOf(0), x2c = (std::size_t)x2.strideOf(1);
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[1];
             const std::size_t cols = (std::size_t)x.shape[1];
@@ -1264,9 +1342,9 @@ public:
             const T *x1d = x1.val.data();
             const T *x2d = x2.val.data();
             T *xd = x.val.data();
-            const std::size_t xr  = (std::size_t)x.sizes[0],  xc  = (std::size_t)x.sizes[1];
-            const std::size_t x1r = (std::size_t)x1.sizes[0], x1c = (std::size_t)x1.sizes[1];
-            const std::size_t x2r = (std::size_t)x2.sizes[0], x2c = (std::size_t)x2.sizes[1];
+            const std::size_t xr  = (std::size_t)x.strideOf(0),  xc  = (std::size_t)x.strideOf(1);
+            const std::size_t x1r = (std::size_t)x1.strideOf(0), x1c = (std::size_t)x1.strideOf(1);
+            const std::size_t x2r = (std::size_t)x2.strideOf(0), x2c = (std::size_t)x2.strideOf(1);
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[0];
             const std::size_t cols = (std::size_t)x.shape[1];
@@ -1401,9 +1479,9 @@ public:
             const T *RL_RESTRICT x1d = x1.val.data();
             const T *RL_RESTRICT x2d = x2.val.data();
             T *RL_RESTRICT xd = x.val.data();
-            const std::size_t xr  = (std::size_t)x.sizes[0],  xc  = (std::size_t)x.sizes[1];
-            const std::size_t x1r = (std::size_t)x1.sizes[0], x1c = (std::size_t)x1.sizes[1];
-            const std::size_t x2r = (std::size_t)x2.sizes[0], x2c = (std::size_t)x2.sizes[1];
+            const std::size_t xr  = (std::size_t)x.strideOf(0),  xc  = (std::size_t)x.strideOf(1);
+            const std::size_t x1r = (std::size_t)x1.strideOf(0), x1c = (std::size_t)x1.strideOf(1);
+            const std::size_t x2r = (std::size_t)x2.strideOf(0), x2c = (std::size_t)x2.strideOf(1);
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[1];
             const std::size_t cols = (std::size_t)x.shape[1];
@@ -1520,9 +1598,9 @@ public:
             const T *x1d = x1.val.data();
             const T *x2d = x2.val.data();
             T *xd = x.val.data();
-            const std::size_t xr  = (std::size_t)x.sizes[0],  xc  = (std::size_t)x.sizes[1];
-            const std::size_t x1r = (std::size_t)x1.sizes[0], x1c = (std::size_t)x1.sizes[1];
-            const std::size_t x2r = (std::size_t)x2.sizes[0], x2c = (std::size_t)x2.sizes[1];
+            const std::size_t xr  = (std::size_t)x.strideOf(0),  xc  = (std::size_t)x.strideOf(1);
+            const std::size_t x1r = (std::size_t)x1.strideOf(0), x1c = (std::size_t)x1.strideOf(1);
+            const std::size_t x2r = (std::size_t)x2.strideOf(0), x2c = (std::size_t)x2.strideOf(1);
             const std::size_t rows = (std::size_t)x.shape[0];
             const std::size_t kdim = (std::size_t)x1.shape[0];
             const std::size_t cols = (std::size_t)x.shape[1];
