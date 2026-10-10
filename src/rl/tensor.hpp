@@ -94,14 +94,220 @@
 
 namespace RL {
 
+/*
+   ============================================================
+    [2026-10 P3 / A11] 形状的定长存储 (SSO): `SmallShapeVec<N>`
+   ============================================================
+   问题（有实测读数）: `shape` 与 `sizes` 原来是两个 `std::vector<int>`，于是**每一次
+   张量构造**都要为它们各做一次堆分配。`probe_alloc`（本机、Debug 堆钩子）量到的基线
+   正是方案 §1.2 那句"恰好 3 次"：
+
+       Tensor(19,1)   →  3 次分配 = 8 B (shape) + 8 B (sizes) + 143 B (对齐数据)
+       Tensor(90,64)  →  3 次分配 = 8 B + 8 B + 23087 B
+       move 构造/默认构造 → 0 次；赋值(容量够) → 0 次；reshape(同元素数) → 1 次 (8 B)
+
+   而这 8 个字节装的是**秩**（维度数），实践中几乎总是 1~4（conv2d 的 kernel 是 4 维）。
+   为它做一次 malloc 是纯开销（方案 §1.2: 单次小分配 230~262 ns）。
+
+   做法: 一个**只给"形状/步长"用**的窄容器 —— 内联 `N` 个 int，超出才回退到堆。
+   刻意**不做成通用容器**: 形状这个用途只需要 size/[]/data/swap/赋值这几样，
+   通用容器的迭代器失效规则、异常保证在这里没有收益，而代价是更多要维护的代码。
+
+   ⚠ 与 A1 的耦合: `Tensor_` 的 move 构造/赋值承诺 `noexcept`（`std::vector<Tensor>`
+   增长时靠它才不退化成深拷贝，实测 3.08×）。所以本容器的 move 构造/赋值/swap
+   **必须也是 noexcept** —— 只搬指针与内联数组，不碰堆。
+
+   用法: `using Shape = SmallShapeVec<RL_SHAPE_INLINE>`；因此 `t.shape` / `t.sizes`
+   的**所有既有用法**（`.size()`、`[]`、`.swap()`、`Tensor(t.shape)`、传给
+   `const std::vector<int>&` 形参）都保持可用 —— 这也是为什么它要提供
+   `operator std::vector<int>()` 这条兼容桥。
+*/
+template <std::size_t N>
+class SmallShapeVec
+{
+public:
+    SmallShapeVec() noexcept : m_data(m_inline), m_size(0), m_cap(N) {}
+
+    SmallShapeVec(std::size_t n, int v) : m_data(m_inline), m_size(0), m_cap(N)
+    {
+        resize(n, v);
+    }
+
+    SmallShapeVec(std::initializer_list<int> il) : m_data(m_inline), m_size(0), m_cap(N)
+    {
+        assign(il.begin(), il.size());
+    }
+
+    /* 兼容桥: `std::vector<int>` → 形状（例如 `Tensor(std::vector<int>{90,64})`） */
+    SmallShapeVec(const std::vector<int> &v) : m_data(m_inline), m_size(0), m_cap(N)
+    {
+        assign(v.data(), v.size());
+    }
+
+    SmallShapeVec(const SmallShapeVec &r) : m_data(m_inline), m_size(0), m_cap(N)
+    {
+        assign(r.m_data, r.m_size);
+    }
+
+    /* noexcept: 只搬指针/内联数组 —— `Tensor_` 的 move noexcept 依赖这一条 */
+    SmallShapeVec(SmallShapeVec &&r) noexcept : m_data(m_inline), m_size(r.m_size), m_cap(N)
+    {
+        if (r.isInline()) {
+            for (std::size_t i = 0; i < r.m_size; i++) { m_inline[i] = r.m_inline[i]; }
+            m_cap = N;
+        } else {
+            m_data = r.m_data;
+            m_cap = r.m_cap;
+            r.m_data = r.m_inline;
+            r.m_cap = N;
+        }
+        r.m_size = 0;
+    }
+
+    ~SmallShapeVec() { release(); }
+
+    SmallShapeVec &operator=(const SmallShapeVec &r)
+    {
+        if (this != &r) { assign(r.m_data, r.m_size); }
+        return *this;
+    }
+
+    SmallShapeVec &operator=(SmallShapeVec &&r) noexcept
+    {
+        if (this != &r) {
+            release();
+            if (r.isInline()) {
+                for (std::size_t i = 0; i < r.m_size; i++) { m_inline[i] = r.m_inline[i]; }
+                m_data = m_inline;
+                m_cap = N;
+            } else {
+                m_data = r.m_data;
+                m_cap = r.m_cap;
+                r.m_data = r.m_inline;
+                r.m_cap = N;
+            }
+            m_size = r.m_size;
+            r.m_size = 0;
+        }
+        return *this;
+    }
+
+    SmallShapeVec &operator=(std::initializer_list<int> il)
+    {
+        assign(il.begin(), il.size());
+        return *this;
+    }
+
+    SmallShapeVec &operator=(const std::vector<int> &v)
+    {
+        assign(v.data(), v.size());
+        return *this;
+    }
+
+    /* 兼容桥（显式用也行）: 形状 → `std::vector<int>` */
+    operator std::vector<int>() const { return std::vector<int>(m_data, m_data + m_size); }
+
+    std::size_t size() const noexcept { return m_size; }
+    bool empty() const noexcept { return m_size == 0; }
+    int *data() noexcept { return m_data; }
+    const int *data() const noexcept { return m_data; }
+    int *begin() noexcept { return m_data; }
+    const int *begin() const noexcept { return m_data; }
+    int *end() noexcept { return m_data + m_size; }
+    const int *end() const noexcept { return m_data + m_size; }
+    int &operator[](std::size_t i) noexcept { return m_data[i]; }
+    const int &operator[](std::size_t i) const noexcept { return m_data[i]; }
+
+    void clear() noexcept { m_size = 0; }
+
+    void push_back(int v)
+    {
+        if (m_size == m_cap) { grow(m_size + 1); }
+        m_data[m_size++] = v;
+    }
+
+    void resize(std::size_t n, int v = 0)
+    {
+        if (n > m_cap) { grow(n); }
+        for (std::size_t i = m_size; i < n; i++) { m_data[i] = v; }
+        m_size = n;
+    }
+
+    void reserve(std::size_t n)
+    {
+        if (n > m_cap) { grow(n); }
+    }
+
+    /* noexcept: 只交换指针/内联数组（`Tensor_::swap` 的 noexcept 依赖它） */
+    void swap(SmallShapeVec &r) noexcept
+    {
+        SmallShapeVec tmp(std::move(*this));
+        *this = std::move(r);
+        r = std::move(tmp);
+    }
+
+    bool operator==(const SmallShapeVec &r) const noexcept
+    {
+        if (m_size != r.m_size) { return false; }
+        for (std::size_t i = 0; i < m_size; i++) { if (m_data[i] != r.m_data[i]) { return false; } }
+        return true;
+    }
+    bool operator!=(const SmallShapeVec &r) const noexcept { return !(*this == r); }
+
+    /* 内联容量与"当前存储是否内联"（诊断/探针用） */
+    static constexpr std::size_t inlineCapacity() noexcept { return N; }
+    bool isInline() const noexcept { return m_data == m_inline; }
+
+private:
+    void assign(const int *src, std::size_t n)
+    {
+        if (n > m_cap) { grow(n); }
+        for (std::size_t i = 0; i < n; i++) { m_data[i] = src[i]; }
+        m_size = n;
+    }
+
+    void grow(std::size_t need)
+    {
+        std::size_t cap = m_cap ? m_cap : N;
+        while (cap < need) { cap *= 2; }
+        int *p = new int[cap];
+        for (std::size_t i = 0; i < m_size; i++) { p[i] = m_data[i]; }
+        if (!isInline()) { delete[] m_data; }
+        m_data = p;
+        m_cap = cap;
+    }
+
+    void release() noexcept
+    {
+        if (!isInline()) { delete[] m_data; }
+        m_data = m_inline;
+        m_size = 0;
+        m_cap = N;
+    }
+
+    int         m_inline[N];
+    int        *m_data;
+    std::size_t m_size;
+    std::size_t m_cap;
+};
+
+/* 内联几个 int? 秩在实践中是 1~4（conv2d 的 kernel 是 4 维，seq 是 2~3 维）。
+   4 个 int = 16 B，加上指针/长度 = 40 B/个 —— 仍然比"24 B 头 + 一次 malloc"划算。 */
+#ifndef RL_SHAPE_INLINE
+#define RL_SHAPE_INLINE 4
+#endif
+
 template<typename T, template<typename Ti> class Alloc=AlignAllocator32>
 class Tensor_
 {
 public:
     using ValueType = T;
     using Vector = std::vector<T, Alloc<T> >;
-    using Shape = std::vector<int>;
-    using Size = std::vector<int>;
+    /* [2026-10 P3 / A11] 形状/步长的存储从 `std::vector<int>` 换成**定长(SSO)容器**:
+       秩 ≤ `RL_SHAPE_INLINE`(4) 时**不再堆分配** —— `probe_alloc` 量到
+       `Tensor(r,c)` 的分配次数 3 → 1（只剩数据缓冲那一次）。位宽仍然是 `int`（§1.6 的纪律）。 */
+    using Shape = SmallShapeVec<RL_SHAPE_INLINE>;
+    using Size = SmallShapeVec<RL_SHAPE_INLINE>;
     using iterator = typename Vector::iterator;
     using const_iterator = typename Vector::const_iterator;
     std::size_t totalSize;
@@ -169,7 +375,7 @@ public:
         for (std::size_t i = 0; i < shape.size(); i++) {
             totalsize *= shape[i];
         }
-        sizes = std::vector<int>(shape.size(), 1);
+        sizes.resize(shape.size(), 1);
         for (std::size_t i = 0; i < shape.size() - 1; i++) {
             for (std::size_t j = i + 1; j < shape.size(); j++) {
                  sizes[i] *= shape[j];
@@ -193,7 +399,17 @@ public:
 
 
     /* construct with shape */
-    template<typename ...Dim>
+    /*
+       [2026-10 P3 / A11] ⚠ 这个变参构造**必须限制在整型维度上**（`enable_if`）。
+       为什么: `Shape` 换成 `SmallShapeVec` 之后, `Tensor(std::vector<int>{...})` 需要
+       一次**用户定义转换**才能匹配 `Tensor_(const Shape&)`, 而变参模板是**精确匹配**
+       (`Dim = std::vector<int>`) ⇒ 重载决议会选中模板, 然后在 `int(dim)` 上炸成
+       `error C2440: 无法从 std::vector<int> 转换为 int`（全量构建里 136 条 error 全
+       出自这一处）。限成整型之后, `std::vector<int>` 只能走形状构造 —— 这也顺手堵住了
+       "任何一个类型都能悄悄变成 1 维张量" 这类重载陷阱。
+    */
+    template<typename ...Dim,
+             typename = std::enable_if_t<(std::is_integral<Dim>::value && ...)>>
     explicit Tensor_(Dim ...dim):totalSize(1),shape({int(dim)...})
     {
         initParams(shape, sizes, totalSize);

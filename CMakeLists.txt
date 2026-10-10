@@ -1891,6 +1891,27 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(probe_seq_cost)
 
+    # ------------------- Tensor 构造的**堆分配次数**探针 ([2026-10] P3 验收 1)
+    # 口径: 只数次数, 不数时间 (次数是结构事实, 跨机器可比; 计时口径见方案 §5.1)。
+    # 实现: MSVC 的 `_CrtSetAllocHook` 钩住 CRT 堆 ⇒ `::operator new`(shape/sizes) 与
+    #   `_aligned_malloc`(数据缓冲) 都在数内, **不需要往 src/rl 里塞计数器**。
+    # ⚠ 钩子只在 Debug CRT 里存在 ⇒ 本目标要在 **Debug 构建目录**里跑:
+    #     cmake -S . -B build/p3dbg -G Ninja -DCMAKE_PREFIX_PATH=C:/Qt/6.9.2/msvc2022_64 \
+    #           -DCMAKE_BUILD_TYPE=Debug
+    #     cmake --build build/p3dbg --target probe_alloc && build/p3dbg/probe_alloc.exe
+    #   Release 下本探针会响亮 exit 2 (而不是打印一堆 0)。
+    add_executable(probe_alloc
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_alloc_main.cpp)
+    target_include_directories(probe_alloc PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_alloc PRIVATE RL_CORE)
+    target_compile_options(probe_alloc PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_alloc PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(probe_alloc)
+
     # 想用 AddressSanitizer 查这类问题 (arena 里"agent 返回非法走法"/堆损坏),
     # 必须**整个构建**都带 /fsanitize=address —— 只给一个目标加会在链接时报
     # LNK2038 (annotate_string/annotate_vector 不匹配, RL_CORE 没带 ASan)。
