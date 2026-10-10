@@ -18,7 +18,7 @@
 | 保持 chess 版本，未覆盖 | 2 | `rl/ppo.h`、`rl/ppo.cpp` |
 | chess 独有、snakeAI 没有 | 2 | `rl/qlstm.h`、`rl/qlstm.cpp` |
 | 按 chess 侧需要改回/修补后与上游不同 | 5 | `rl/dqn.cpp`、`rl/dqn.h`、`rl/dpg.h`、`rl/layer.h`、`rl/convdqn.cpp` |
-| **同步之后又分叉的（2026-10，见 §1.4）** | 1 | `rl/tensor.hpp`（+ 新增 `rl/alignallocator.hpp`） |
+| **同步之后又分叉的（2026-10，见 §1.4）** | 1 | `rl/tensor.hpp`（+ 新增 `rl/alignallocator.hpp`、`rl/tensor_codec.hpp`） |
 
 > 同步基线是 snakeAI 的 `5d3246e`（"Fix reward plot after agent switch; audit fixes
 > in rl/ and tests"）。同步过程中发现 snakeAI **工作区**在同步之后又被改过两处
@@ -92,10 +92,11 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 
 如果上游这两处后续提交了不同的最终版本，重新跑一次同步即可。
 
-### 1.4 同步**之后** `rl/tensor.hpp` 又分叉的十处（2026-10；第 7~10 条是 P3 的 A11/A10/A9/C1）
+### 1.4 同步**之后** `rl/tensor.hpp` 又分叉的十一处（2026-10；第 7~10 条是 P3 的 A11/A10/A9/C1，第 11 条是 P4）
 
 这一节是 2026-10 补的账：`tensor.hpp` 原本属于"与上游字节级一致"的那 43 个文件，
-在此之后按 chess 侧需要改了十处（第 1~6 条是 P0/P1，第 7~10 条是 P3 的 A11/A10/A9/C1）。
+在此之后按 chess 侧需要改了十一处（第 1~6 条是 P0/P1，第 7~10 条是 P3 的 A11/A10/A9/C1，
+第 11 条是 P4 把序列化低层件搬去 `tensor_codec.hpp`）。
 **下次同步前先读这里**，逐条判断是保留 chess 版
 还是拉上游（`rl_sync.md` 的规矩：分歧要记账 + 在文件内注释标明）。
 
@@ -111,6 +112,7 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 | 8 | **`sizes` 成员删除**（2026-10 P3 / A10 追加） | `Tensor_` 不再存步长：`t.sizes[i]` → **`t.strideOf(i)`**（按需 O(rank)，返回 `int` 以保持 32 位乘加）；需要整组步长时用 `stridesInto(int out[RL_SHAPE_MAX])`（**栈数组**，不分配） | `shape` 已经完整决定步长（row-major），再存一份就是**两个必须手工同步的事实源**——`reshape`/`view` 这类入口只改一个就会永久分叉（`flatten()` 的历史越界 bug 属这一类）。⚠ **这是接口级分叉**：外部/上游代码里的 `t.sizes[...]` 会**编译失败**（本仓 13 处已改成 `strideOf`，编译器逐条点名）——下次同步时按这一行处理。秩上限 `RL_SHAPE_MAX`=8，超过**响亮失败**而不是静默截断 |
 | 9 | **`totalSize` 成员删除**（2026-10 P3 / A9 追加） | 长度只剩**一个**来源：`size()` **就是** `val.size()`；`totalSize` 成员删掉，形状乘积不再被"存起来"，只在构造/`reshape` 里**当即校验**（`initParams(Shape&)` 改成返回乘积 + `requireSameLength`；`MM::requireShape2d` 里那条"两套长度不一致"的守卫随之删除，因为它已恒真） | 改动前这个类有**两套长度**（`totalSize` 与 `val.size()`），由 20 个函数手工同步、在拷贝/移动/赋值里各抄一遍，而 `reshape` 只改形状那一侧 ⇒ 永久分叉（`flatten()` 的历史越界 bug 属这一类）。⚠ **接口级分叉**：`t.totalSize` 这种写法会**编译失败**（全仓 **142 处**已改成 `t.size()`，语义完全相同 —— `size()` 原来就是返回 `totalSize`）。⚠ 下一轮 C1 会进一步把 `val` 私有化，届时 `t.val` 也会消失 |
 | 10 | **`val` 成员私有化**（2026-10 P3 / C1 追加） | `Vector val` 从 public 变 private，对外只留访问器 `data()/size()/operator[]/begin()/end()/fill()/zero()`，另加两个**语义明确**的写入口：`copyValuesFrom(r)`（原来 `x.val = y.val` 那种"只拷值"的写法：长度必须一致，内部 `memcpy`）与 `shrinkBufferUncheckedForTest(n)`（**只给"故意踩契约"的测试**，见它的注释） | 上游/外部代码里的 `t.val...` 会**编译失败**（本仓 **14 个文件 / 约 52 行**已改成访问器，由编译器逐条点名）。**为什么要私有化**：公开时任何一处代码都能绕过形状契约直接 resize 缓冲 —— `test_transformer [10]` 那条"缓冲长度 < 形状乘积"的守卫用例, 原来就是靠在测试里 `z.val.resize(100)` 手工造出病态张量才写得出来（它自己的注释还写着"`val` 是 public 的 ⇒ 这条路径在仓库里是真能发生的"） |
+| 11 | **序列化的低层件搬去新文件**（2026-10 P4 追加） | 新增 **`src/rl/tensor_codec.hpp`**（`namespace RL::codec`）：`crc32*` 三件套、`base64*` 三件套、形状解析、错误旗标、以及新的 `parseLine`（形状 + `b64:<crc>: ` 头 / v1 元素个数 + 行尾 trim 的**唯一**一份解析）。`tensor.hpp` 里只剩 `toString/fromString/toDebugString/validateEncodedCount` 这些**转发**（2225 → 1947 行） | **字节格式一个字都没变**（`test_weights` 49 断言、`test_transformer [3]` 的 FNV 指纹、`test_bc` 的 12 处 `netDigest` 一起钉着）。上游的序列化是写在 `Tensor_` 类里的 ⇒ 下次同步时 `tensor.hpp` 的这几处**不要**用上游版本覆盖（会带回来 531 行里的形状解析 3 遍 + 头解析 2 遍）；转发入口的名字保持不变，所以 121 处 `toString/fromString` 调用点没有被动过 |
 
 > 未做完的账：本节只列**已确认**的分叉点。`src/rl/` 其余文件是否在同步后也被改过，
 > 见 `docs/tensor_optimization_plan.md` 的 P0 与 Part 6 执行台账。

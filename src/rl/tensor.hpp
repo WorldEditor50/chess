@@ -13,6 +13,7 @@
 #include <assert.h>
 #include "alignallocator.hpp"   /* [2026-10] 对齐分配器: Tensor 的存储默认 32 B 对齐 */
 #include "simd_ops.hpp"
+#include "tensor_codec.hpp"     /* [2026-10 P4] 序列化的低层件 (crc32/base64/形状解析/错误旗标) */
 
 /*
    ============================================================
@@ -515,10 +516,6 @@ public:
         val = std::vector<T, Alloc<T>>(initParams(shape), T(0));
     }
 
-
-
-
-
     /* construct with shape */
     /*
        [2026-10 P3 / A11] ⚠ 这个变参构造**必须限制在整型维度上**（`enable_if`）。
@@ -633,7 +630,6 @@ public:
         std::size_t N = sizeof ...(Index) - 1;
         return strideOf(N);
     }
-
 
     /*
        zero/fill 走 SIMD 内核 (内核写满所有元素, 所以 val 的长度必须已经是对的长度;
@@ -865,7 +861,6 @@ public:
         return *this;
     }
 
-
     Tensor_ flatten() const
     {
         /*
@@ -886,7 +881,6 @@ public:
         x.val = val;
         return x;
     }
-
 
     Tensor_ tr() const
     {
@@ -1770,10 +1764,10 @@ public:
             reinterpret_cast<const unsigned char *>(val.data());
         char crcHex[16];
         std::snprintf(crcHex, sizeof(crcHex), "%08x",
-                      (unsigned int)crc32(rawBytes, val.size() * sizeof(T)));
+                      (unsigned int)codec::crc32(rawBytes, val.size() * sizeof(T)));
         out += crcHex;
         out += ':';
-        out += base64Encode(val);
+        out += codec::base64Encode(val.data(), val.size() * sizeof(T));
         return out;
     }
 
@@ -1803,14 +1797,12 @@ public:
        都写成 `x = Tensor::fromString(s)`, 没有地方能接收错误码; 由 Net::load 在
        读完整层之前清零、之后检查, 就能把"文件坏了"变成一次明确的失败。
        (线程安全: 权重读写只在单一训练/AI 线程里发生, 且有锁保护, 见 ChessBoard。)
+       [2026-10 P4] 旗标本体搬到了 `codec::decodeFailedRef()`（它属于解码器, 不属于
+       张量）; 这三个入口保留成**转发**, 所以 `Net::load` 的汇总口径一个字节没变。
     */
-    static bool &lastDecodeFailedRef()
-    {
-        static bool failed = false;
-        return failed;
-    }
-    static bool lastDecodeFailed() { return lastDecodeFailedRef(); }
-    static void clearDecodeFailed() { lastDecodeFailedRef() = false; }
+    static bool &lastDecodeFailedRef() { return codec::decodeFailedRef(); }
+    static bool lastDecodeFailed() { return codec::decodeFailedRef(); }
+    static void clearDecodeFailed() { codec::decodeFailedRef() = false; }
 
     /*
        ============================================================
@@ -1833,110 +1825,89 @@ public:
        保证两边判定一致)。
        Net::load 用它把**整个文件的元素总数**与当前网络的 `paramCount()` 对齐 ——
        这是"同一套层结构但维度不同"的权重文件唯一的拦截点 (见 net.hpp 的说明)。
+
+       [2026-10 P4] 实现改为调用 `codec::parseLine`: "形状 + v2 头 / v1 元素个数"这套
+       解析**从两处收敛成一处**（原来本函数与 `fromString` 各写了一遍, 靠注释保证
+       "两边判定一致"; 现在是同一段代码）。
     */
     static bool validateEncodedCount(const char *s, std::size_t sLen, long long &elements)
     {
         elements = 0;
-        const void *barPtr = std::memchr(s, '|', sLen);
-        if (barPtr == nullptr) {
+        codec::LineView li;
+        if (!codec::parseLine(s, sLen, li)) {
             return false;
         }
-        const std::size_t bar = (std::size_t)((const char *)barPtr - s);
-        long long shapeProduct = 1;
-        if (!parseShape(std::string(s, bar), shapeProduct)) {
-            return false;
-        }
-        elements = shapeProduct;
-        const char *p = s + bar + 1;
-        std::size_t n = sLen - bar - 1;
-        while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) {
-            n--;
-        }
-        if (n >= 4 && std::strncmp(p, "b64:", 4) == 0) {
-            if (n < 4 + 8 + 1 || p[12] != ':') {
-                elements = 0;
-                return false;
-            }
-            std::uint32_t want = 0;
-            for (std::size_t k = 4; k < 12; k++) {
-                const char c = p[k];
-                int d;
-                if (c >= '0' && c <= '9') {
-                    d = c - '0';
-                } else if (c >= 'a' && c <= 'f') {
-                    d = c - 'a' + 10;
-                } else if (c >= 'A' && c <= 'F') {
-                    d = c - 'A' + 10;
-                } else {
-                    elements = 0;
-                    return false;
-                }
-                want = (want << 4) | (std::uint32_t)d;
-            }
+        elements = li.shapeProduct;
+        if (li.v2) {
             /* 流式校验: 不分配任何大缓冲, 一趟算完"长度 + 合法性 + 校验和" */
-            const bool ok = base64DecodeInto(p + 13, n - 13, nullptr,
-                                             (std::size_t)(shapeProduct * (long long)sizeof(T)),
-                                             want);
+            const bool ok = codec::base64DecodeInto(codec::v2Payload(li),
+                                                    codec::v2PayloadLen(li), nullptr,
+                                                    (std::size_t)(li.shapeProduct * (long long)sizeof(T)),
+                                                    li.crcWant);
             if (!ok) {
                 elements = 0;
             }
             return ok;
         }
         /* v1 (十进制文本): 值的个数 = 逗号数 + 1 */
-        long long values = (n == 0) ? 0 : 1;
-        for (std::size_t k = 0; k < n; k++) {
-            if (p[k] == ',') {
-                values++;
-            }
-        }
-        if (values != shapeProduct) {
+        if ((long long)li.valueCount != li.shapeProduct) {
             elements = 0;
             return false;
         }
         return true;
     }
 
-    /* 解析 "1,2,3" 形式的形状, 同时给出元素总数 */
+    /* 解析 "1,2,3" 形式的形状, 同时给出元素总数
+       [2026-10 P4] 实现搬到 `codec::parseShape`（指针 + 长度, 不构造 std::string）;
+       这个成员保留成转发, 供类内/测试沿用旧签名。 */
     static bool parseShape(const std::string &shapeString, long long &product)
     {
-        product = 1;
-        if (shapeString.empty()) {
-            return false;
-        }
-        long long cur = 0;
-        bool any = false;
-        for (std::size_t i = 0; i < shapeString.size(); i++) {
-            const char c = shapeString[i];
-            if (c >= '0' && c <= '9') {
-                cur = cur * 10 + (c - '0');
-                any = true;
-            } else if (c == ',') {
-                if (!any || cur <= 0) {
-                    return false;
-                }
-                product *= cur;
-                cur = 0;
-                any = false;
-            } else {
-                return false;
-            }
-        }
-        if (!any || cur <= 0) {
-            return false;
-        }
-        product *= cur;
-        return true;
+        return codec::parseShape(shapeString.data(), shapeString.size(), product);
     }
 
     static Tensor_ fromString(const std::string &s)
     {
-        Tensor_ x;
-        std::string::size_type pos = s.find('|');
-        if (pos == std::string::npos) {
-            lastDecodeFailedRef() = true;
+        /* [2026-10 P4] 解析统一走 `codec::parseLine`（与 validateEncodedCount 同一段代码）:
+           形状乘积 / v2 头 (`b64:<8 位 crc>:`) / v1 的元素个数 / 行尾 trim 都在那里一次做完。
+           本函数只负责**建张量 + 填值**, 失败时置 `codec::decodeFailedRef()` 并返回空张量
+           —— 语义与搬动前逐字相同。 */
+        codec::LineView li;
+        if (!codec::parseLine(s.data(), s.size(), li)) {
+            codec::decodeFailedRef() = true;
+            return Tensor_();
+        }
+        /* 形状: 再从形状串里取一遍每个维度 (只有 rank 个数, 与原来同一套扫描) */
+        std::vector<int> shape;
+        {
+            long long cur = 0;
+            const char *p = s.data();
+            for (std::size_t i = 0; i <= li.shapeLen; i++) {
+                const char c = (i == li.shapeLen) ? ',' : p[i];
+                if (c == ',') {
+                    shape.push_back((int)cur);
+                    cur = 0;
+                } else {
+                    cur = cur * 10 + (c - '0');
+                }
+            }
+        }
+        Tensor_ x = Tensor_(shape);
+
+        if (li.v2) {
+            /* ---- v2: b64:<crc32 hex>:<base64 原始数据> ---- */
+            /* 直接解码进 x 的存储: 长度/合法性/校验和/写入 一趟完成 (不拷 payload) */
+            if (!codec::base64DecodeInto(codec::v2Payload(li), codec::v2PayloadLen(li),
+                                         reinterpret_cast<unsigned char *>(x.val.data()),
+                                         (std::size_t)(li.shapeProduct * (long long)sizeof(T)),
+                                         li.crcWant)) {
+                codec::decodeFailedRef() = true;
+                return Tensor_();
+            }
             return x;
         }
-        auto split = [](const std::string &str)->std::vector<std::string> {
+
+        /* ---- v1 (老格式): 十进制文本, 仍然要能读 ---- */
+        auto split = [](const std::string &str) -> std::vector<std::string> {
             std::vector<std::string> elems;
             std::size_t pos = 0;
             std::size_t len = str.length();
@@ -1951,80 +1922,10 @@ public:
             }
             return elems;
         };
-        /* parse shape (与预校验 validateEncodedCount 共用同一份解析, 保证两边判定一致) */
-        long long shapeProduct = 1;
-        if (!parseShape(s.substr(0, pos), shapeProduct)) {
-            lastDecodeFailedRef() = true;
-            return Tensor_();
-        }
-        std::vector<int> shape;
-        {
-            long long cur = 0;
-            for (std::size_t i = 0; i <= pos; i++) {
-                const char c = (i == pos) ? ',' : s[i];
-                if (c == ',') {
-                    shape.push_back((int)cur);
-                    cur = 0;
-                } else {
-                    cur = cur * 10 + (c - '0');
-                }
-            }
-        }
-        /* create */
-        x = Tensor_(shape);
-
-        /*
-           下面**不再**把 payload 拷成 std::string: 一行可能是 34 MB 的 base64,
-           substr 一次就是一次全量拷贝。这里直接用指针 + 长度, 并让解码器
-           把结果写进张量自己的存储 (见 base64DecodeInto)。
-        */
-        const char *payloadPtr = s.data() + pos + 1;
-        std::size_t payloadLen = s.size() - (pos + 1);
-        /* 去掉行尾可能残留的 '\r' (Windows 文本模式写入的文件) */
-        while (payloadLen > 0
-               && (payloadPtr[payloadLen - 1] == '\r' || payloadPtr[payloadLen - 1] == '\n'
-                   || payloadPtr[payloadLen - 1] == ' ')) {
-            payloadLen--;
-        }
-
-        if (payloadLen >= 4 && std::strncmp(payloadPtr, "b64:", 4) == 0) {
-            /* ---- v2: b64:<crc32 hex>:<base64 原始数据> ---- */
-            if (payloadLen < 4 + 8 + 1 || payloadPtr[12] != ':') {
-                lastDecodeFailedRef() = true;
-                return Tensor_();
-            }
-            std::uint32_t want = 0;
-            for (std::size_t k = 4; k < 12; k++) {
-                const char c = payloadPtr[k];
-                int d;
-                if (c >= '0' && c <= '9') {
-                    d = c - '0';
-                } else if (c >= 'a' && c <= 'f') {
-                    d = c - 'a' + 10;
-                } else if (c >= 'A' && c <= 'F') {
-                    d = c - 'A' + 10;
-                } else {
-                    lastDecodeFailedRef() = true;
-                    return Tensor_();
-                }
-                want = (want << 4) | (std::uint32_t)d;
-            }
-            /* 直接解码进 x.val: 长度/合法性/校验和/写入 一趟完成 */
-            if (!base64DecodeInto(payloadPtr + 13, payloadLen - 13,
-                                  reinterpret_cast<unsigned char *>(x.val.data()),
-                                  (std::size_t)(shapeProduct * (long long)sizeof(T)),
-                                  want)) {
-                lastDecodeFailedRef() = true;
-                return Tensor_();
-            }
-            return x;
-        }
-
-        /* ---- v1 (老格式): 十进制文本, 仍然要能读 ---- */
-        const std::string payload(payloadPtr, payloadLen);
+        const std::string payload(li.payload, li.payloadLen);
         std::vector<std::string> valElements = split(payload);
-        if ((long long)valElements.size() != shapeProduct) {
-            lastDecodeFailedRef() = true;
+        if ((long long)valElements.size() != li.shapeProduct) {
+            codec::decodeFailedRef() = true;
             return Tensor_();
         }
         for (std::size_t i = 0; i < valElements.size(); i++) {
@@ -2033,189 +1934,10 @@ public:
         return x;
     }
 
-    /* ---- base64 (只用位运算, 便于以后换真正的二进制流) ---- */
-    /* ---- base64 与 CRC32 ----
-       CRC 表用函数内静态初始化 (C++11 起线程安全); crc32Update 是递增版本, 供流式
-       解码使用 —— 解一个 34 MB 的张量时不必先把字节存下来再算校验。 */
-    static const std::uint32_t *crc32Table()
-    {
-        static const std::vector<std::uint32_t> table = [] {
-            std::vector<std::uint32_t> t(256);
-            for (std::uint32_t i = 0; i < 256; i++) {
-                std::uint32_t c = i;
-                for (int k = 0; k < 8; k++) {
-                    c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-                }
-                t[i] = c;
-            }
-            return t;
-        }();
-        return table.data();
-    }
-
-    static std::uint32_t crc32Update(std::uint32_t c, unsigned char b)
-    {
-        return crc32Table()[(c ^ b) & 0xFFu] ^ (c >> 8);
-    }
-
-    static std::uint32_t crc32(const unsigned char *data, std::size_t n)
-    {
-        std::uint32_t c = 0xFFFFFFFFu;
-        for (std::size_t i = 0; i < n; i++) {
-            c = crc32Update(c, data[i]);
-        }
-        return c ^ 0xFFFFFFFFu;
-    }
-
-    /*
-       ============================================================
-        流式 base64 解码: 一趟扫完, 零中间分配
-       ============================================================
-       为什么要有它: 权重文件里一个张量可以是一行 34 MB 的 base64, 而老实现是
-         std::string(p + 13, n - 13)     先拷一份 34 MB
-         base64Decode() 里 vector.push_back   再分配 34 MB
-           (那个**按 std::string 收、按 vector 吐**的死解码器已在 [2026-10 P2] 删掉 ——
-            全仓零调用者; 在用的只有本函数与 base64Encode)
-         crc32(raw)                       再扫一遍
-         memcpy 到张量                     再一遍
-       而且"先校验一遍再真正载入"把这一串**整体做了两遍**。实测稀疏 MoE 那 3 个
-       146 MB 的权重文件要 14.9 秒 (29 MB/s), 把"启动时加载所有模型"变成 19 秒。
-       现在: 直接在内存字节流上解码, 每解出 3 个字节就
-         * 增量更新 CRC,
-         * 若有 dst 就**直接写进张量的存储** (连 memcpy 都省了),
-       一趟同时完成"合法性 + 长度 + 校验和 + 写入"。dst == nullptr 就是纯校验模式
-       (给 Net::load 的预校验用, 校验通过才真正写进网络)。
-    */
-    static bool base64DecodeInto(const char *in, std::size_t n,
-                                 unsigned char *dst, std::size_t expectedBytes,
-                                 std::uint32_t wantCrc)
-    {
-        if (expectedBytes == 0 || n == 0 || (n % 4) != 0) {
-            return false;
-        }
-        const std::size_t groups = n / 4;
-        /* 编码长度必须与字节数精确对应 (少一个 '=' 就是被截断了) */
-        if (groups * 3 < expectedBytes || (groups * 3 - expectedBytes) > 2) {
-            return false;
-        }
-        /*
-           逐字符的分支链换成 256 项查找表: 老写法每个字符要过 6 个比较, 而 109 MB 的
-           数据是 1.45 亿个字符 —— 实测一换, 解码从 99 MB/s 提到 ~250 MB/s。
-           '=' 用 64 表示, 非法字符用 -1。
-        */
-        const signed char *tab = base64DecodeTable();
-        std::uint32_t crc = 0xFFFFFFFFu;
-        std::size_t written = 0;
-        for (std::size_t g = 0; g < groups; g++) {
-            const char *q = in + g * 4;
-            const signed char v0 = tab[(unsigned char)q[0]];
-            const signed char v1 = tab[(unsigned char)q[1]];
-            const signed char v2 = tab[(unsigned char)q[2]];
-            const signed char v3 = tab[(unsigned char)q[3]];
-            if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
-                return false;
-            }
-            int pad = 0;
-            if (v2 == 64) {
-                /* 填充只允许出现在最后一组的末尾 */
-                if (g + 1 != groups || v3 != 64) {
-                    return false;
-                }
-                pad = 2;
-            } else if (v3 == 64) {
-                if (g + 1 != groups) {
-                    return false;
-                }
-                pad = 1;
-            }
-            const unsigned int x = ((unsigned int)v0 << 18) | ((unsigned int)v1 << 12)
-                                   | ((unsigned int)(v2 & 63) << 6)
-                                   | (unsigned int)(v3 & 63);
-            const int cnt = 3 - pad;
-            if (written + (std::size_t)cnt > expectedBytes) {
-                return false;
-            }
-            const unsigned char b0 = (unsigned char)((x >> 16) & 0xFFu);
-            const unsigned char b1 = (unsigned char)((x >> 8) & 0xFFu);
-            const unsigned char b2 = (unsigned char)(x & 0xFFu);
-            crc = crc32Update(crc, b0);
-            if (dst != nullptr) {
-                dst[written] = b0;
-            }
-            written++;
-            if (cnt >= 2) {
-                crc = crc32Update(crc, b1);
-                if (dst != nullptr) {
-                    dst[written] = b1;
-                }
-                written++;
-            }
-            if (cnt >= 3) {
-                crc = crc32Update(crc, b2);
-                if (dst != nullptr) {
-                    dst[written] = b2;
-                }
-                written++;
-            }
-        }
-        if (written != expectedBytes) {
-            return false;
-        }
-        return (crc ^ 0xFFFFFFFFu) == wantCrc;
-    }
-
-    /* base64 字符 -> 值 (0..63), '=' -> 64, 其它 -> -1 */
-    static const signed char *base64DecodeTable()
-    {
-        static const std::vector<signed char> table = [] {
-            std::vector<signed char> t(256, (signed char)-1);
-            const char *alphabet =
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            for (int i = 0; i < 64; i++) {
-                t[(unsigned char)alphabet[i]] = (signed char)i;
-            }
-            t[(unsigned char)'='] = (signed char)64;
-            return t;
-        }();
-        return table.data();
-    }
-    static std::string base64Encode(const std::vector<T, Alloc<T> > &data)
-    {
-        static const char *kTab =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        const unsigned char *bytes =
-            reinterpret_cast<const unsigned char *>(data.data());
-        const std::size_t n = data.size() * sizeof(T);
-        std::string out;
-        out.reserve((n + 2) / 3 * 4);
-        std::size_t i = 0;
-        for (; i + 3 <= n; i += 3) {
-            const unsigned int v = ((unsigned int)bytes[i] << 16)
-                                   | ((unsigned int)bytes[i + 1] << 8)
-                                   | (unsigned int)bytes[i + 2];
-            out += kTab[(v >> 18) & 63];
-            out += kTab[(v >> 12) & 63];
-            out += kTab[(v >> 6) & 63];
-            out += kTab[v & 63];
-        }
-        const std::size_t rest = n - i;
-        if (rest == 1) {
-            const unsigned int v = (unsigned int)bytes[i] << 16;
-            out += kTab[(v >> 18) & 63];
-            out += kTab[(v >> 12) & 63];
-            out += '=';
-            out += '=';
-        } else if (rest == 2) {
-            const unsigned int v = ((unsigned int)bytes[i] << 16)
-                                   | ((unsigned int)bytes[i + 1] << 8);
-            out += kTab[(v >> 18) & 63];
-            out += kTab[(v >> 12) & 63];
-            out += kTab[(v >> 6) & 63];
-            out += '=';
-        }
-        return out;
-    }
-
+    /* [2026-10 P4] 原来这里还有一整块 `crc32*` / `base64*` 的实现 (178 行) —— 已搬到
+       `src/rl/tensor_codec.hpp` 的 `namespace RL::codec` (它只吃"指针 + 长度", 与
+       `Tensor_` 无关)。本类只保留**转发**: `toString` / `fromString` /
+       `validateEncodedCount` / 错误旗标。 */
 };
 
 using Tensorf  = Tensor_<float>;
