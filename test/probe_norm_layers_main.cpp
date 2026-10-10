@@ -26,7 +26,7 @@ static float frand(float lo, float hi)
 }
 static void fill(Tensor &t, float lo, float hi)
 {
-    for (std::size_t i = 0; i < t.totalSize; i++) t[i] = frand(lo, hi);
+    for (std::size_t i = 0; i < t.size(); i++) t[i] = frand(lo, hi);
 }
 
 /* L(w) = Σ_i c_i·o_i ,  c = dL/do  (与层的 e 契约一致) */
@@ -35,7 +35,7 @@ static double lossOf(L &layer, const Tensor &x, const Tensor &c)
 {
     Tensor &o = layer.forward(x, true);
     double s = 0;
-    for (std::size_t i = 0; i < o.totalSize; i++) s += (double)c[i]*(double)o[i];
+    for (std::size_t i = 0; i < o.size(); i++) s += (double)c[i]*(double)o[i];
     return s;
 }
 
@@ -80,20 +80,20 @@ struct FnSig { static float f(float x){return 1.0f/(1.0f + std::exp(-1.702f*x));
 static double norm2(const Tensor &t)
 {
     double s = 0;
-    for (std::size_t i = 0; i < t.totalSize; i++) s += (double)t[i]*(double)t[i];
+    for (std::size_t i = 0; i < t.size(); i++) s += (double)t[i]*(double)t[i];
     return std::sqrt(s);
 }
 static double maxAbs(const Tensor &a, const Tensor &b)
 {
     double m = 0;
-    for (std::size_t i = 0; i < a.totalSize; i++)
+    for (std::size_t i = 0; i < a.size(); i++)
         m = std::max(m, std::fabs((double)a[i] - (double)b[i]));
     return m;
 }
 static void unit(Tensor &t)
 {
     double n = norm2(t) + 1e-8;
-    for (std::size_t i = 0; i < t.totalSize; i++) t[i] = (float)((double)t[i]/n);
+    for (std::size_t i = 0; i < t.size(); i++) t[i] = (float)((double)t[i]/n);
 }
 
 /* 取解析 g.w: forward + backward, 返回副本 */
@@ -145,8 +145,8 @@ int main()
     {
         Tensor &o = rmsLin->forward(x, true);
         double S = 0;
-        for (std::size_t i = 0; i < rmsLin->op.totalSize; i++) S += (double)rmsLin->op[i]*(double)rmsLin->op[i];
-        double gamma = 1.0/std::sqrt(S/(double)rmsLin->op.totalSize + 1e-9);
+        for (std::size_t i = 0; i < rmsLin->op.size(); i++) S += (double)rmsLin->op[i]*(double)rmsLin->op[i];
+        double gamma = 1.0/std::sqrt(S/(double)rmsLin->op.size() + 1e-9);
         double dot = 0;
         for (std::size_t i = 0; i < D; i++) dot += (double)rmsLin->op[i]*(double)c[i];
         Tensor dOp(D, 1);

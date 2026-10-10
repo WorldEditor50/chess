@@ -54,7 +54,7 @@
    `bmm` 死簇: `bmm` 是这一簇唯一的根 —— 删掉它, `at()` / `sub()` / `operator%` 同时失去
    唯一调用者 (`.at(` / `.sub(` 在全仓只出现在 `bmm` 体内, 各 2 处), 于是整类
    `SubTensor`(195 行) 与 `subTensor` 成员一并删掉: 对外零引用, 而且它自带一串静默出错
-   路径 (绕过 shape/totalSize 同步、`operator=(const Tensor_&)` 按 `x.totalSize` 写父张量)。
+   路径 (绕过 shape/totalSize 同步、`operator=(const Tensor_&)` 按 `x.size()` 写父张量)。
    一并删的零引用项 (证据 = 全仓 grep; 逐项清单见 `docs/tensor_optimization_plan.md` Part 2.2):
      `toVector` / `fromVector` / `slice` / `view` / `permute`(+`permuteIndexs`) /
      `shapeEqual`(实现本身还越界读) / `size(const Shape&)` / `zeros`×2 / `ones`×2 /
@@ -328,12 +328,14 @@ public:
     using Size = SmallShapeVec<RL_SHAPE_INLINE>;
     using iterator = typename Vector::iterator;
     using const_iterator = typename Vector::const_iterator;
-    std::size_t totalSize;
+    /* [2026-10 P3 / A9] `std::size_t totalSize;` 成员**已删** —— 长度只有一个来源:
+       缓冲本身 (`val.size()`, 由 `size()` 暴露)。形状乘积只在构造/`reshape` 里当即校验。
+       ⚠ 想读长度的代码请用 `size()`（全仓 138 处 `t.size()` 已机械改成它）。 */
     Vector val;
     Shape shape;
 public:
     /* default construct */
-    Tensor_():totalSize(0){}
+    Tensor_(){}
 
     /*
        ============================================================
@@ -443,9 +445,26 @@ public:
             std::abort();
         }
     }
-    static void initParams(const Shape &shape, std::size_t &totalsize)
+    /*
+       ============================================================
+        [2026-10 P3 / A9] 单一长度源: **存储的长度就是唯一的长度**
+       ============================================================
+       改动前这个类有**两套长度**: 成员 `totalSize`(形状乘积) 与 `val.size()`(缓冲长度)。
+       两者由 `initParams` 与各处 `totalSize = ...` 手工保持同步, 而 `reshape` 只改形状那一侧
+       —— 方案 §1.4 记的四个"只改一个不改另一个"的入口就是这么来的, 历史上 `flatten()` 的越界
+       bug 也是这一类 (读的一段按 `totalSize`, 写的一段按 `val.size()`)。
+       现在: `size()` **就是** `val.size()`, `totalSize` 成员删掉。
+       形状乘积不再被"存起来", 它只在两处出现, 且都是**当即校验**的:
+         * 构造/`reshape` 时算一次 (给 `val` 分配用 + 过 `requireIndexable` 的守卫);
+         * `reshape` 里与当前缓冲长度比对 (`requireSameLength`) ⇒ 对不上就响亮失败。
+       于是"两套长度永久分叉"在结构上不可能发生 —— 与 A10 删 `sizes` 是同一条思路:
+       **用结构消除状态, 而不是加断言守它**。
+       ⚠ 兼容性: `t.size()` 的所有**读取**点已机械改成 `t.size()`(全仓 138 处),
+       语义完全相同 (`size()` 原来就是返回 `totalSize`)。
+    */
+    static std::size_t initParams(const Shape &shape)
     {
-        totalsize = 1;
+        std::size_t totalsize = 1;
         for (std::size_t i = 0; i < shape.size(); i++) {
             totalsize *= shape[i];
         }
@@ -453,14 +472,13 @@ public:
            放在这里 ⇒ 全部形状入口 (构造 + reshape) 全覆盖。 */
         requireIndexable(totalsize, "initParams (形状乘积)");
         requireRank(shape.size(), "initParams (秩)");
-        return;
+        return totalsize;
     }
     /* contruct with shape */
     explicit Tensor_(const Shape &shape_)
-        :totalSize(1),shape(shape_)
+        :shape(shape_)
     {
-        initParams(shape, totalSize);
-        val = std::vector<T, Alloc<T>>(totalSize, T(0));
+        val = std::vector<T, Alloc<T>>(initParams(shape), T(0));
     }
 
 
@@ -479,15 +497,14 @@ public:
     */
     template<typename ...Dim,
              typename = std::enable_if_t<(std::is_integral<Dim>::value && ...)>>
-    explicit Tensor_(Dim ...dim):totalSize(1),shape({int(dim)...})
+    explicit Tensor_(Dim ...dim):shape({int(dim)...})
     {
-        initParams(shape, totalSize);
-        val = std::vector<T, Alloc<T> >(totalSize, T(0));
+        val = std::vector<T, Alloc<T> >(initParams(shape), T(0));
     }
 
     /* copy constructor */
     Tensor_(const Tensor_ &r)
-        :totalSize(r.totalSize),shape(r.shape),val(r.val){}
+        :shape(r.shape),val(r.val){}
 
     /*
        move construct —— **[2026-10] 必须标 `noexcept`**。
@@ -498,13 +515,12 @@ public:
        **3.59 ms** = **3.08x**; 单看"增长"那一段 7.27 ms vs 0.45 ms = **16x**。
        三个 `swap` 都不会抛 (`std::vector::swap` 在 `is_always_equal` 分配器下是 noexcept),
        所以整条 move 可以承诺 noexcept —— 这正是 vector 需要的那个承诺。
-       (顺带删掉原来那句冗余的 `totalSize = r.totalSize;`: 初始化列表里已经有了。)
+       (顺带删掉原来那句冗余的 `totalSize = r.size();`: 初始化列表里已经有了。)
     */
-    Tensor_(Tensor_ &&r) noexcept:totalSize(r.totalSize)
+    Tensor_(Tensor_ &&r) noexcept
     {
         shape.swap(r.shape);
         val.swap(r.val);
-        r.totalSize = 0;
     }
 
     /*
@@ -567,14 +583,15 @@ public:
        教训: "文本层零引用"只对**非模板成员**是充分证据; 对头文件里的成员函数,
        真正权威的是编译器。
     */
-    inline bool empty() const {return totalSize == 0;}
+    inline bool empty() const {return val.empty();}
     /* iterator */
     inline iterator begin() noexcept { return val.begin();}
     inline const_iterator begin() const noexcept { return val.begin();}
     inline iterator end() noexcept { return val.end();}
     inline const_iterator end() const noexcept { return val.end();}
     /* size */
-    inline std::size_t size() const {return totalSize;}
+    /* [2026-10 P3 / A9] 长度 = 缓冲长度（唯一的长度源） */
+    inline std::size_t size() const {return val.size();}
 
     template<typename ...Index>
     inline std::size_t size(Index ...index) const
@@ -596,7 +613,7 @@ public:
        ============================================================
        原来这两个是 `operator[](int)`, 而本仓库里**几乎每一处逐元素循环**都写成
 
-           for (std::size_t i = 0; i < t.totalSize; i++) { t[i] = ...; }
+           for (std::size_t i = 0; i < t.size(); i++) { t[i] = ...; }
 
        (totalSize / val.size() 都是 `std::size_t`) —— 于是每次访问都要
        `size_t -> int -> size_t` 绕一圈: 先截断 (mov), 进 `val[i]` 时再零扩展。
@@ -617,7 +634,6 @@ public:
         if (this == &r) {
             return *this;
         }
-        totalSize = r.totalSize;
         shape = r.shape;
         val = r.val;
         return *this;
@@ -630,7 +646,7 @@ public:
     }
     inline Tensor_& operator=(T x)
     {
-        val.assign(totalSize, x);
+        val.assign(val.size(), x);
         return *this;
     }
 
@@ -640,18 +656,14 @@ public:
         if (this == &r) {
             return *this;
         }
-        totalSize = r.totalSize;
         shape.swap(r.shape);
         val.swap(r.val);
-        r.totalSize = 0;
         return *this;
     }
-    /* [2026-10] 显式 swap: 两个容器都是 noexcept swap ⇒ 整条 noexcept */
+    /* [2026-10] 显式 swap: 两个容器都是 noexcept swap ⇒ 整条 noexcept
+       （A9 之后长度由 `val` 自己带着, 不需要再单独换 `totalSize`） */
     void swap(Tensor_ &r) noexcept
     {
-        const std::size_t t = totalSize;
-        totalSize = r.totalSize;
-        r.totalSize = t;
         shape.swap(r.shape);
         val.swap(r.val);
     }
@@ -660,7 +672,7 @@ public:
     {
         Tensor_ y(blockShape);
         std::vector<int> indexs(shape.size(), 0);
-        for (std::size_t i = 0; i < y.totalSize; i++) {
+        for (std::size_t i = 0; i < y.size(); i++) {
             /* local offset */
             y.indexOf(i, indexs);
             for (std::size_t j = 0; j < indexs.size(); j++) {
@@ -675,7 +687,7 @@ public:
     void embedding(const std::vector<int> &offset, const Tensor_ &x)
     {
         std::vector<int> indexs(shape.size(), 0);
-        for (std::size_t i = 0; i < x.totalSize; i++) {
+        for (std::size_t i = 0; i < x.size(); i++) {
             x.indexOf(i, indexs);
             for (std::size_t j = 0; j < indexs.size(); j++) {
                 indexs[j] += offset[j];
@@ -813,8 +825,9 @@ public:
     Tensor_& reshape(Index ...index)
     {
         shape = {index...};
-        initParams(shape, totalSize);
-        requireSameLength(*this, totalSize, "reshape");
+        /* [2026-10 P3 / A9] 形状乘积只在这里"当即校验"一次: 与当前缓冲长度比对,
+           对不上就响亮失败 ⇒ 不需要再把它存成第二个长度源。 */
+        requireSameLength(*this, initParams(shape), "reshape");
         return *this;
     }
 
@@ -835,7 +848,7 @@ public:
          * survive because there j is always 0, but the backward pass crashed —
          * which is what ConvPG/ConvDQN hit on the very first training step.
          */
-        Tensor_ x(static_cast<int>(totalSize), 1);
+        Tensor_ x(static_cast<int>(val.size()), 1);
         x.val = val;
         return x;
     }
@@ -938,23 +951,23 @@ public:
     {
         if (val.empty()) {
             std::fprintf(stderr,
-                         "[Tensor] %s: 张量是空的 (totalSize=%llu) —— 这个统计量没有定义\n"
+                         "[Tensor] %s: 张量是空的 (size=0) —— 这个统计量没有定义\n"
                          "  ⇒ 空张量上取 max/argmax/mean/方差 会越界读或得到 NaN, 所以这里直接停。\n",
-                         where, (unsigned long long)totalSize);
+                         where);
             std::fflush(stderr);
             std::abort();
         }
     }
     T sum() const
     {
-        return simdops::sum(val.data(), totalSize);
+        return simdops::sum(val.data(), val.size());
     }
 
     T mean() const
     {
-        if (totalSize == 0) { requireNonEmpty("mean"); }
+        if (val.empty()) { requireNonEmpty("mean"); }
         T s = sum();
-        return s/T(totalSize);
+        return s/T(val.size());
     }
 
     T variance(T u) const
@@ -1013,7 +1026,7 @@ public:
 
     T norm2() const
     {
-        return std::sqrt(simdops::dot(val.data(), val.data(), totalSize));
+        return std::sqrt(simdops::dot(val.data(), val.data(), val.size()));
     }
     struct MM {
         /*
@@ -1166,9 +1179,8 @@ public:
             if (t.val.size() < (std::size_t)t.shape[0] * (std::size_t)t.shape[1]) {
                 contractFail("缓冲长度小于 shape[0] x shape[1]");
             }
-#if defined(RL_TENSOR_CHECKS) || !defined(NDEBUG)
-            assert(t.val.size() >= t.totalSize);
-#endif
+            /* [2026-10 P3 / A9] 原来这里还有一条 `assert(t.val.size() >= t.size())`。
+               A9 把 `totalSize` 删掉之后它就是恒真的 (长度 = 缓冲长度) ⇒ 删除。 */
         }
         /*
            ⚠ `RL_TENSOR_NO_CONTRACT` 是**测量/逃生门**, 默认**不定义** (= 检查生效)。
@@ -1671,7 +1683,7 @@ public:
             const Tensor_ &x_ = xi[i];
             /* set value */
             std::vector<int> indexs(x.shape.size(), 0);
-            for (std::size_t j = 0; j < x_.totalSize; j++) {
+            for (std::size_t j = 0; j < x_.size(); j++) {
                 x_.indexOf(j, indexs);
                 indexs[dim] += offset;
                 x(indexs) = x_[j];
@@ -1684,7 +1696,7 @@ public:
 
     inline static T dot(const Tensor_& x1, const Tensor_& x2)
     {
-        return simdops::dot(x1.val.data(), x2.val.data(), x1.totalSize);
+        return simdops::dot(x1.val.data(), x2.val.data(), x1.size());
     }
 
     /*

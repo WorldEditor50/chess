@@ -58,8 +58,8 @@ static const int D_IN = 1710, TOK = 64;
 
 static void makeState(Tensor &x, std::mt19937 &rng, int nonzero)
 {
-    std::uniform_int_distribution<int> pick(0, (int)x.totalSize - 1);
-    for (std::size_t i = 0; i < x.totalSize; i++) { x[i] = 0.0f; }
+    std::uniform_int_distribution<int> pick(0, (int)x.size() - 1);
+    for (std::size_t i = 0; i < x.size(); i++) { x[i] = 0.0f; }
     for (int k = 0; k < nonzero; k++) {
         x[(std::size_t)pick(rng)] = (rng() % 2u) ? 1.0f : -1.0f;
     }
@@ -132,7 +132,7 @@ int main(int argc, char **argv)
             const int big = 46341;                /* 46341^2 = 2,147,488,281 > INT_MAX */
             RL::Tensor t(big, big);
             std::printf("!! 32 位下标契约失守竟然没停 (totalSize=%llu)\n",
-                        (unsigned long long)t.totalSize);
+                        (unsigned long long)t.size());
             return 0;
         }
         if (early == "--reshape-guard") {
@@ -140,7 +140,7 @@ int main(int argc, char **argv)
             t.zero();
             t.reshape(1000, 1);                   /* 元素总数不守恒 */
             std::printf("!! reshape 元素数不守恒竟然没停 (totalSize=%llu, val=%llu)\n",
-                        (unsigned long long)t.totalSize, (unsigned long long)t.val.size());
+                        (unsigned long long)t.size(), (unsigned long long)t.val.size());
             return 0;
         }
         if (early == "--empty-stat-guard") {
@@ -1070,7 +1070,7 @@ int main(int argc, char **argv)
                "绝对位置对平移敏感"这件事会淹没在噪声里 (第一版就这么放过了 3.9e-2
                这种只差 5 倍的弱对照)。 */
             ex.setPosMode(SeqPosEnc::LEARN_1D);
-            for (std::size_t i = 0; i < ex.pos.emb[0].val.totalSize; i++) { ex.pos.emb[0].val[i] *= 100.0f; }
+            for (std::size_t i = 0; i < ex.pos.emb[0].val.size(); i++) { ex.pos.emb[0].val[i] *= 100.0f; }
             run(ex, xa, oa);
             run(ex, xb, ob);
             double worstAbs = 0;
@@ -1115,7 +1115,7 @@ int main(int argc, char **argv)
             */
             auto argmaxAbs = [](const Tensor &t) {
                 int best = 0;
-                for (std::size_t i = 1; i < t.totalSize; i++) {
+                for (std::size_t i = 1; i < t.size(); i++) {
                     if (std::fabs((double)t[i]) > std::fabs((double)t[(std::size_t)best])) { best = (int)i; }
                 }
                 return best;
@@ -1216,7 +1216,7 @@ int main(int argc, char **argv)
                 bool sameParams = (ex.posGroupCount() == ex2.posGroupCount());
                 if (sameParams) {
                     for (int gg = 0; gg < ex.posGroupCount() && sameParams; gg++) {
-                        if (ex2.pos.emb[(std::size_t)gg].val.totalSize != ex.pos.emb[(std::size_t)gg].val.totalSize) {
+                        if (ex2.pos.emb[(std::size_t)gg].val.size() != ex.pos.emb[(std::size_t)gg].val.size()) {
                             sameParams = false;
                         }
                     }
@@ -1337,7 +1337,7 @@ int main(int argc, char **argv)
             ex.backward(x, ei);
             auto argmaxAbsD = [](const Tensor &t) {
                 int best = 0;
-                for (std::size_t i = 1; i < t.totalSize; i++) {
+                for (std::size_t i = 1; i < t.size(); i++) {
                     if (std::fabs((double)t[i]) > std::fabs((double)t[(std::size_t)best])) { best = (int)i; }
                 }
                 return best;
@@ -1384,12 +1384,12 @@ int main(int argc, char **argv)
             ex.forward(x, false);
             zeroExpertGrads(ex); ex.e = cvec2; ex.backward(x, ei);
             double gNoDrop = 0;
-            for (std::size_t i = 0; i < ex.ffnDown[0].g.w.totalSize; i++) { gNoDrop += std::fabs((double)ex.ffnDown[0].g.w[i]); }
+            for (std::size_t i = 0; i < ex.ffnDown[0].g.w.size(); i++) { gNoDrop += std::fabs((double)ex.ffnDown[0].g.w[i]); }
             ex.setDropout(0.3f); ex.setDropoutFreezeMask(true);
             ex.forward(x, false);
             zeroExpertGrads(ex); ex.e = cvec2; ex.backward(x, ei);
             double gDrop = 0;
-            for (std::size_t i = 0; i < ex.ffnDown[0].g.w.totalSize; i++) { gDrop += std::fabs((double)ex.ffnDown[0].g.w[i]); }
+            for (std::size_t i = 0; i < ex.ffnDown[0].g.w.size(); i++) { gDrop += std::fabs((double)ex.ffnDown[0].g.w[i]); }
             std::printf("    (e) Σ|g(ffnDown[0])|: p=0 → %.4e, p=0.3 → %.4e (倒置式 ⇒ 不保证更小, 只要求非零)\n", gNoDrop, gDrop);
             CHECK(gDrop > 0.0, "(e) dropout 之后 FFN 仍然拿到非零梯度");
             ex.setDropoutFreezeMask(false);
@@ -1474,7 +1474,7 @@ int main(int argc, char **argv)
             for (int i = 0; i < 240; i++) { xa[(std::size_t)i] = (i % 7) * 0.1f; }
             attn.forward(xa, false);
             double finite = 0, mx = 0;
-            for (std::size_t i = 0; i < attn.o.totalSize; i++) {
+            for (std::size_t i = 0; i < attn.o.size(); i++) {
                 if (!std::isfinite((double)attn.o[i])) { finite += 1.0; }
                 mx = std::max(mx, std::fabs((double)attn.o[i]));
             }
@@ -1500,7 +1500,7 @@ int main(int argc, char **argv)
             if (!t.alignedTo(32)) { bad++; }
             minAlign = std::min(minAlign, a);
             std::printf("    (a) Tensor(%4d,%4d): %zu 元素, 对齐 = %d B, alignedTo(32) = %d\n",
-                        shapes[k].r, shapes[k].c, t.totalSize, a, (int)t.alignedTo(32));
+                        shapes[k].r, shapes[k].c, t.size(), a, (int)t.alignedTo(32));
         }
         CHECK(bad == 0, "(9a) 所有形状的 Tensor 存储都 32 B 对齐 (对齐分配器生效)");
         CHECK(minAlign >= 32, "(9a) 最小对齐 >= 32 B");
@@ -1549,17 +1549,17 @@ int main(int argc, char **argv)
         {
             RL::Tensor_<float, RL::AlignAllocator32> a(std::vector<int>{ 90, 64 });
             RL::Tensor_<float, std::allocator> b(std::vector<int>{ 90, 64 });
-            for (std::size_t i = 0; i < a.totalSize; i++) {
+            for (std::size_t i = 0; i < a.size(); i++) {
                 const float v = (float)((int)(i * 37 % 101) - 50) * 0.25f;
                 a[i] = v; b[i] = v;
             }
             double dfill = 0, dpair = 0;
-            for (std::size_t i = 0; i < a.totalSize; i++) {
+            for (std::size_t i = 0; i < a.size(); i++) {
                 dfill = std::max(dfill, (double)std::fabs(a[i] - b[i]));
             }
             /* 逐元素乘 + 归约 (走 SIMD 内核) 也逐位比 */
             a *= a; b *= b;
-            for (std::size_t i = 0; i < a.totalSize; i++) {
+            for (std::size_t i = 0; i < a.size(); i++) {
                 dpair = std::max(dpair, (double)std::fabs(a[i] - b[i]));
             }
             std::printf("    (d) 对齐 vs std 分配: 同值初始化差 %.1f, 逐元素乘之后差 %.1f, "

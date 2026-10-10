@@ -114,7 +114,7 @@ void MambaLayer::reset()
 void MambaLayer::initParams()
 {
     /* Re-init with same scheme as constructor */
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Random::uniform(W_in, -1.0f, 1.0f);
         Random::uniform(b_in, -1.0f, 1.0f);
     }
@@ -161,7 +161,7 @@ MambaLayer::State MambaLayer::feedForward(const Tensor &x, const Tensor &_h)
 
     /* ——— Input projection ——— */
     Tensor x_proj(hiddenDim, 1);
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Tensor::MM::ikkj(x_proj, W_in, x);
         for (std::size_t i = 0; i < hiddenDim; i++) {
             x_proj[i] += b_in[i];
@@ -266,7 +266,7 @@ void MambaLayer::backwardAtTime(int t,
     }
 
     /* ——— 4. Input projection gradient ——— */
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         /* x_proj contributes to h through: h += B̄ ⊙ x_proj
          * dL/dx_proj = delta_h ⊙ B̄
          * dL/dW_in = dL/dx_proj · x^T
@@ -290,7 +290,7 @@ void MambaLayer::backwardAtTime(int t,
     /* B̄ gradient: g_B̄ = δh ⊙ x_proj */
     Tensor dB_bar(hiddenDim, 1);
     Tensor x_proj(hiddenDim, 1);
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Tensor::MM::ikkj(x_proj, W_in, x);
         for (std::size_t i = 0; i < hiddenDim; i++) x_proj[i] += b_in[i];
     } else {
@@ -402,7 +402,7 @@ void MambaLayer::SGD(float lr)
     cacheX.clear();
     cacheE.clear();
 
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Optimize::SGD(W_in, g_W_in, lr);
         Optimize::SGD(b_in, g_b_in, lr);
         g_W_in.zero();
@@ -428,7 +428,7 @@ void MambaLayer::RMSProp(float lr, float rho, float decay, bool clipGrad)
     cacheX.clear();
     cacheE.clear();
 
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Optimize::RMSProp(W_in, v_W_in, g_W_in, lr, rho, decay, clipGrad);
         Optimize::RMSProp(b_in, v_b_in, g_b_in, lr, rho, decay, clipGrad);
         g_W_in.zero(); g_b_in.zero();
@@ -455,7 +455,7 @@ void MambaLayer::Adam(float lr, float alpha, float beta,
     cacheX.clear();
     cacheE.clear();
 
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Optimize::Adam(W_in, v_W_in, s_W_in, g_W_in, alpha_, beta_, lr, alpha, beta, decay, clipGrad);
         Optimize::Adam(b_in, v_b_in, s_b_in, g_b_in, alpha_, beta_, lr, alpha, beta, decay, clipGrad);
         g_W_in.zero(); g_b_in.zero();
@@ -476,7 +476,7 @@ void MambaLayer::Adam(float lr, float alpha, float beta,
 
 void MambaLayer::clamp(float c0, float cn)
 {
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         Optimize::clamp(W_in, c0, cn);
         Optimize::clamp(b_in, c0, cn);
     }
@@ -508,7 +508,7 @@ void MambaLayer::copyTo(iLayer *layer)
 void MambaLayer::softUpdateTo(iLayer *layer, float alpha)
 {
     MambaLayer &dst = *static_cast<MambaLayer*>(layer);
-    if (W_in.totalSize > 0) {
+    if (W_in.size() > 0) {
         lerp(dst.W_in, W_in, alpha);
         lerp(dst.b_in, b_in, alpha);
     }
@@ -524,8 +524,8 @@ void MambaLayer::softUpdateTo(iLayer *layer, float alpha)
 void MambaLayer::write(std::ostream &file)
 {
     /* Input projection */
-    file << (W_in.totalSize > 0 ? W_in.toString() : std::string("0,0")) << std::endl;
-    file << (b_in.totalSize > 0 ? b_in.toString() : std::string("0,0")) << std::endl;
+    file << (W_in.size() > 0 ? W_in.toString() : std::string("0,0")) << std::endl;
+    file << (b_in.size() > 0 ? b_in.toString() : std::string("0,0")) << std::endl;
     /* Core params */
     file << A_diag.toString() << std::endl;
     file << W_B.toString() << std::endl;

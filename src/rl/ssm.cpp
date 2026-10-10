@@ -33,9 +33,9 @@ SSM::SSM(std::size_t inputDim_,
     }
 
     /* Initialize B, C, b with small random values */
-    for (std::size_t i = 0; i < B.totalSize; i++) B[i] = 0.1f * (2.0f * (float)std::rand() / RAND_MAX - 1.0f);
-    for (std::size_t i = 0; i < C.totalSize; i++) C[i] = 0.1f * (2.0f * (float)std::rand() / RAND_MAX - 1.0f);
-    for (std::size_t i = 0; i < b.totalSize; i++) b[i] = 0.0f;
+    for (std::size_t i = 0; i < B.size(); i++) B[i] = 0.1f * (2.0f * (float)std::rand() / RAND_MAX - 1.0f);
+    for (std::size_t i = 0; i < C.size(); i++) C[i] = 0.1f * (2.0f * (float)std::rand() / RAND_MAX - 1.0f);
+    for (std::size_t i = 0; i < b.size(); i++) b[i] = 0.0f;
 
     /* Persistent hidden state */
     h = Tensor(hiddenDim, 1);

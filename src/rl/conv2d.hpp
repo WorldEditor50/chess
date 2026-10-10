@@ -228,7 +228,7 @@ public:
             }
         }
         /* activate */
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Fn::f(op[i]);
         }
         return o;
@@ -244,7 +244,7 @@ public:
            convolution of dz. The previous version used the raw e for ei, which
            silently dropped the tanh' factor from the input gradient. */
         Tensor dy(o.shape);
-        for (std::size_t i = 0; i < dy.totalSize; i++) {
+        for (std::size_t i = 0; i < dy.size(); i++) {
             dy[i] = Fn::df(o[i])*e[i];
         }
         ei.zero();

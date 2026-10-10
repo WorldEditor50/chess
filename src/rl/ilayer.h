@@ -235,7 +235,7 @@ public:
 inline double gradNorm2Of(const Tensor &t)
 {
     double s = 0.0;
-    for (std::size_t i = 0; i < t.totalSize; i++) {
+    for (std::size_t i = 0; i < t.size(); i++) {
         const double v = t[i];
         s += v * v;
     }
@@ -244,7 +244,7 @@ inline double gradNorm2Of(const Tensor &t)
 
 inline void scaleTensorGrad(Tensor &t, float s)
 {
-    for (std::size_t i = 0; i < t.totalSize; i++) {
+    for (std::size_t i = 0; i < t.size(); i++) {
         t[i] *= s;
     }
 }

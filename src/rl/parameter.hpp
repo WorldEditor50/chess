@@ -26,7 +26,7 @@ public:
     }
     void clamp(float c0, float ci, float cn)
     {
-        for (std::size_t i = 0; i < val.totalSize; i++) {
+        for (std::size_t i = 0; i < val.size(); i++) {
             val[i] = val[i] < c0 ? ci : val[i];
             val[i] = val[i] > cn ? ci : val[i];
         }

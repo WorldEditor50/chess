@@ -82,7 +82,7 @@ inline void SGD(Tensor &w, Tensor &dw,
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         w[i] = (1 - gamma)*w[i] - lr*dw[i];
     }
     return;
@@ -95,7 +95,7 @@ inline void SGDM(Tensor &w, Tensor &m, Tensor &dw,
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         m[i] = (1 - gamma)*m[i] - dw[i]*alpha;
         w[i] -= lr * m[i];
     }
@@ -108,7 +108,7 @@ inline void Adagrad(Tensor &w, Tensor &r, Tensor &dw,
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         r[i] += dw[i]*dw[i];
         w[i] = (1 - gamma)*w[i] - lr*dw[i]/(std::sqrt(r[i]) + 1e-9);
     }
@@ -121,7 +121,7 @@ inline void AdaDelta(Tensor &w, Tensor &v, Tensor &delta, Tensor &dwPrime, Tenso
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         v[i] = rho * v[i] + (1 - rho) * dw[i] * dw[i];
         delta[i] = rho*delta[i] + (1 - rho)*dwPrime[i]*dwPrime[i];
         dwPrime[i] = std::sqrt((delta[i] + 1e-9)/(v[i] + 1e-9));
@@ -137,7 +137,7 @@ inline void RMSProp(Tensor &w, Tensor &v, Tensor &dw,
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         v[i] = rho*v[i] + (1 - rho)*dw[i]*dw[i];
         w[i] = (1 - gamma)*w[i] - lr*dw[i]/(std::sqrt(v[i]) + 1e-9);
     }
@@ -152,7 +152,7 @@ inline void Adam(Tensor &w, Tensor &v, Tensor &m, Tensor &dw,
     if (clipGrad) {
         dw /= dw.norm2() + 1e-8;
     }
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         m[i] = alpha*m[i] + (1 - alpha)*dw[i];
         v[i] = beta*v[i] + (1 - beta)*dw[i]*dw[i];
         float m_ = m[i]/(1 - alpha_);
@@ -165,7 +165,7 @@ inline void Adam(Tensor &w, Tensor &v, Tensor &m, Tensor &dw,
 inline void clamp(Tensor &w, float c0, float cn)
 {
     std::uniform_real_distribution<float> uniform(c0, cn);
-    for (std::size_t i = 0; i < w.totalSize; i++) {
+    for (std::size_t i = 0; i < w.size(); i++) {
         if (w[i] > cn || w[i] < c0) {
             w[i] = uniform(RL::Random::engine);
         }

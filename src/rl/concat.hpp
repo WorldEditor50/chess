@@ -620,7 +620,7 @@ public:
         Tensor::MM::ikkj(o, w1, a);
         Tensor::MM::ikkj(o, w2, x);
         o += b;
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Tanh::f(o[i]);
         }
         return o;
@@ -855,7 +855,7 @@ public:
         }
         z1.zero();
         Tensor::MM::ikkj(z1, w0, a);
-        for (std::size_t i = 0; i < z1.totalSize; i++) {
+        for (std::size_t i = 0; i < z1.size(); i++) {
             z1[i] = Tanh::f(z1[i]);
         }
         z2 = Softmax::f(z1);
@@ -863,7 +863,7 @@ public:
         Tensor::MM::ikkj(o, w1, z2);
         Tensor::MM::ikkj(o, w2, x);
         o += b;
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Tanh::f(o[i]);
         }
         return o;
@@ -1076,7 +1076,7 @@ public:
         type = LAYER_CONCAT;
         outputDim = 0;
         for (std::size_t i = 0; i < layers.size(); i++) {
-            outputDim += layers[i]->o.totalSize;
+            outputDim += layers[i]->o.size();
         }
         w1 = Tensor(outputDim, outputDim);
         w2 = Tensor(outputDim, inputDim);
@@ -1111,14 +1111,14 @@ public:
         for (int i = 0; i < layers.size(); i++) {
             Tensor &out = layers[i]->forward(x, inference);
             a.embedding({offset, 0}, out);
-            offset += out.totalSize;
+            offset += out.size();
         }
         softmax(a);
         o.zero();
         Tensor::MM::ikkj(o, w1, a);
         Tensor::MM::ikkj(o, w2, x);
         o += b;
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Tanh::f(o[i]);
         }
         return o;
@@ -1138,7 +1138,7 @@ public:
         Softmax::jacobian_transpose_mul(a, dzSoft, da);
         int offset = 0;
         for (int i = 0; i < layers.size(); i++) {
-            int unitDim = layers[i]->o.totalSize;
+            int unitDim = layers[i]->o.size();
             layers[i]->e = da.block({offset, 0}, {unitDim, 1});
             offset += unitDim;
         }

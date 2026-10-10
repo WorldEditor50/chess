@@ -41,18 +41,18 @@ static float urand(float lo, float hi)
 }
 static void fillU(Tensor &t, float lo, float hi)
 {
-    for (std::size_t i = 0; i < t.totalSize; i++) t[i] = urand(lo, hi);
+    for (std::size_t i = 0; i < t.size(); i++) t[i] = urand(lo, hi);
 }
 static double nrm2(const Tensor &t)
 {
     double s = 0;
-    for (std::size_t i = 0; i < t.totalSize; i++) s += (double)t[i]*(double)t[i];
+    for (std::size_t i = 0; i < t.size(); i++) s += (double)t[i]*(double)t[i];
     return std::sqrt(s);
 }
 static double maxAbsDiff(const Tensor &a, const Tensor &b)
 {
     double m = 0;
-    for (std::size_t i = 0; i < a.totalSize; i++)
+    for (std::size_t i = 0; i < a.size(); i++)
         m = std::max(m, std::fabs((double)a[i] - (double)b[i]));
     return m;
 }
@@ -104,12 +104,12 @@ public:
         if (fused) {
             const float rr = r;
             if (bias) {
-                for (std::size_t i = 0; i < o.totalSize; i++) {
+                for (std::size_t i = 0; i < o.size(); i++) {
                     o2[i] = std::tanh(rr*o1[i]);
                     o[i] = Fn::f(o2[i] + b[i]);
                 }
             } else {
-                for (std::size_t i = 0; i < o.totalSize; i++) {
+                for (std::size_t i = 0; i < o.size(); i++) {
                     o2[i] = std::tanh(rr*o1[i]);
                     o[i] = Fn::f(o2[i]);
                 }
@@ -118,16 +118,16 @@ public:
             o1 *= r;
             o2 = RL::tanh(o1);
             if (bias) {
-                for (std::size_t i = 0; i < o.totalSize; i++) o[i] = Fn::f(o2[i] + b[i]);
+                for (std::size_t i = 0; i < o.size(); i++) o[i] = Fn::f(o2[i] + b[i]);
             } else {
-                for (std::size_t i = 0; i < o.totalSize; i++) o[i] = Fn::f(o2[i]);
+                for (std::size_t i = 0; i < o.size(); i++) o[i] = Fn::f(o2[i]);
             }
         }
         return o;
     }
     void backward(const Tensor &x, Tensor &ei) override
     {
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             float d1 = Fn::df(o[i])*e[i];
             dy[i] = d1;
             dL[i] = r*(1.0f - o2[i]*o2[i])*d1;
@@ -294,7 +294,7 @@ static HStat stats(std::shared_ptr<LayerT> hidden, double wScale, int nState)
     double dx = 0, qmin = 1e30, qmax = -1e30;
     for (int k = 0; k < 16; k++) {
         Tensor &q = net.forward(st[k], true);
-        for (std::size_t a = 0; a < q.totalSize; a++) { qmin = std::min(qmin, (double)q[a]); qmax = std::max(qmax, (double)q[a]); }
+        for (std::size_t a = 0; a < q.size(); a++) { qmin = std::min(qmin, (double)q[a]); qmax = std::max(qmax, (double)q[a]); }
         Tensor onehot(128, 1); onehot.zero(); onehot[(std::size_t)(k*7 % 128)] = 1.0f;
         net.backward(st[k], onehot);
         dx += nrm2(net.inputGrad);

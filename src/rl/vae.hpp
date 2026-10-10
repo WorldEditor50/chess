@@ -70,7 +70,7 @@ public:
             eps ~ N(0, 1)
         */
         Random::normal(eps, 0, 1);
-        for (std::size_t i = 0; i < z.totalSize; i++) {
+        for (std::size_t i = 0; i < z.size(); i++) {
             z[i] = u[i] + std[i]*eps[i];
         }
         /* decode */

@@ -349,8 +349,8 @@ int main(int argc, char **argv)
 
     /* MM 版本的权重 */
     Tensor mX(T, TOK), mY(T, TOK), mW(TOK, TOK), mB(TOK, 1);
-    for (std::size_t i = 0; i < mX.totalSize; i++) { mX[i] = X64[i]; }
-    for (std::size_t i = 0; i < mW.totalSize; i++) { mW[i] = nrm(rng) * 0.1f; }
+    for (std::size_t i = 0; i < mX.size(); i++) { mX[i] = X64[i]; }
+    for (std::size_t i = 0; i < mW.size(); i++) { mW[i] = nrm(rng) * 0.1f; }
     for (int i = 0; i < TOK; i++) { mB[i] = nrm(rng) * 0.1f; }
     std::vector<float> Wn((std::size_t)TOK * TOK), bn((std::size_t)TOK);
     for (std::size_t i = 0; i < Wn.size(); i++) { Wn[i] = nrm(rng) * 0.1f; }
@@ -554,13 +554,13 @@ int main(int argc, char **argv)
         const int Rr = 64, Cc = 64, NH = 500;
         Tensor hz(std::vector<int>{ Rr, Cc });
         Tensor hx1(std::vector<int>{ Rr, 1 }), hx2(std::vector<int>{ Cc, 1 });
-        for (std::size_t i = 0; i < hz.totalSize; i++) { hz[i] = nrm(rng); }
-        for (std::size_t i = 0; i < hx1.totalSize; i++) { hx1[i] = nrm(rng); }
-        for (std::size_t i = 0; i < hx2.totalSize; i++) { hx2[i] = nrm(rng); }
+        for (std::size_t i = 0; i < hz.size(); i++) { hz[i] = nrm(rng); }
+        for (std::size_t i = 0; i < hx1.size(); i++) { hx1[i] = nrm(rng); }
+        for (std::size_t i = 0; i < hx2.size(); i++) { hx2[i] = nrm(rng); }
         std::vector<float> ref((std::size_t)Rr * Cc);
         hz.zero();
         Tensor::MM::ikjk(hz, hx1, hx2);
-        for (std::size_t i = 0; i < hz.totalSize; i++) { ref[i] = hz[i]; }
+        for (std::size_t i = 0; i < hz.size(); i++) { ref[i] = hz[i]; }
 
         double t0 = nowMs();
         for (int r = 0; r < NH; r++) { Tensor::MM::ikjk(hz, hx1, hx2); }
@@ -577,7 +577,7 @@ int main(int argc, char **argv)
         const double hHand = (nowMs() - t0) / NH;
         /* 逐位等价检查: 手写版跑出来的值与真 ikjk 的差应为 0 (同一累加顺序) */
         Tensor hz2(std::vector<int>{ Rr, Cc });
-        for (std::size_t i = 0; i < hz2.totalSize; i++) { hz2[i] = 0.0f; }
+        for (std::size_t i = 0; i < hz2.size(); i++) { hz2[i] = 0.0f; }
         {
             const float *h1 = hx1.ptr(); const float *h2 = hx2.ptr(); float *zd = hz2.ptr();
             for (int i = 0; i < Rr; i++) {
@@ -587,14 +587,14 @@ int main(int argc, char **argv)
             }
         }
         double hDiff = 0, hRel = 0;
-        for (std::size_t i = 0; i < hz.totalSize; i++) {
+        for (std::size_t i = 0; i < hz.size(); i++) {
             hDiff = std::max(hDiff, (double)std::fabs(hz2[i] - ref[i]));
             hRel = std::max(hRel, (double)std::fabs(hz2[i] - ref[i]) / (std::fabs((double)ref[i]) + 1e-30));
         }
         /* 仓库 FC 反向的真实形状量级 */
         Tensor bg(std::vector<int>{ 360, 1710 }), b1(std::vector<int>{ 360, 1 }), b2(std::vector<int>{ 1710, 1 });
-        for (std::size_t i = 0; i < b1.totalSize; i++) { b1[i] = nrm(rng); }
-        for (std::size_t i = 0; i < b2.totalSize; i++) { b2[i] = nrm(rng); }
+        for (std::size_t i = 0; i < b1.size(); i++) { b1[i] = nrm(rng); }
+        for (std::size_t i = 0; i < b2.size(); i++) { b2[i] = nrm(rng); }
         t0 = nowMs(); for (int r = 0; r < 5; r++) { Tensor::MM::ikjk(bg, b1, b2); } const double bigReal = (nowMs() - t0) / 5;
         t0 = nowMs();
         for (int r = 0; r < 5; r++) {

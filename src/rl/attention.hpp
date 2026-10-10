@@ -29,8 +29,8 @@ public:
     Tensor& forward(const Tensor& x, bool inference=false) override
     {
         requireWired("PositionalEncoder");     /* 死代码守卫: 见 ilayer.h */
-        float d = float(x.totalSize);
-        for (std::size_t i = 0; i < x.totalSize; i++) {
+        float d = float(x.size());
+        for (std::size_t i = 0; i < x.size(); i++) {
             if (i%2 == 0) {
                 pe[i] = std::sin(float(pos)/std::pow(10000.0f, float(i)/d));
             } else {
@@ -45,7 +45,7 @@ public:
     void backward(const Tensor& x, Tensor &ei) override
     {
         /* o = x + pe with pe a constant, so dL/dx = dL/do = e */
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             ei[i] += e[i];
         }
         e.zero();
@@ -443,7 +443,7 @@ public:
         Tensor::MM::ikkj(o, w1, a);
         Tensor::MM::ikkj(o, w2, x);
         o += b;
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Tanh::f(o[i]);
         }
         return o;

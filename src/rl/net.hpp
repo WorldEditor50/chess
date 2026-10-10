@@ -215,22 +215,22 @@ public:
                  preLayer->type == iLayer::LAYER_MAXPOOLING ||
                  preLayer->type == iLayer::LAYER_AVGPOOLING)&&
                     layer->type == iLayer::LAYER_FC) {
-                Tensor e(preLayer->e.totalSize, 1);
+                Tensor e(preLayer->e.size(), 1);
                 layer->backward(preLayer->o.flatten(), e);
                 preLayer->e.val = e.val;
             } else if (preLayer->type == iLayer::LAYER_LSTM) {
                 /* LSTM uses BPTT via cacheError/cacheX cache */
-                Tensor e(preLayer->o.totalSize, 1);
+                Tensor e(preLayer->o.size(), 1);
                 layer->backward(preLayer->o, e);
                 preLayer->cacheError(e);
             } else if (preLayer->type == iLayer::LAYER_SSM) {
                 /* SSM uses the same BPTT pattern as LSTM */
-                Tensor e(preLayer->o.totalSize, 1);
+                Tensor e(preLayer->o.size(), 1);
                 layer->backward(preLayer->o, e);
                 preLayer->cacheError(e);
             } else if (preLayer->type == iLayer::LAYER_MAMBA) {
                 /* MambaLayer uses the same BPTT pattern as SSM/LSTM */
-                Tensor e(preLayer->o.totalSize, 1);
+                Tensor e(preLayer->o.size(), 1);
                 layer->backward(preLayer->o, e);
                 preLayer->cacheError(e);
             }

@@ -82,7 +82,7 @@ namespace RL {
    它原来是专家里的一个 private static, 抽类之后两边都要用。 */
 inline void seqLerpTensor(Tensor &dst, const Tensor &src, float alpha)
 {
-    for (std::size_t i = 0; i < dst.totalSize && i < src.totalSize; i++) {
+    for (std::size_t i = 0; i < dst.size() && i < src.size(); i++) {
         dst[i] = (1.0f - alpha) * dst[i] + alpha * src[i];
     }
 }
@@ -149,7 +149,7 @@ public:
         }
     }
 
-    bool hasGrad() const { return gG.totalSize == (std::size_t)dim; }
+    bool hasGrad() const { return gG.size() == (std::size_t)dim; }
     long long paramCount() const { return 2LL * (long long)dim; }
     /* 由缓冲区长度推出 token 数 —— 这一层不需要知道 SeqLen */
     int tokensIn(const std::vector<float> &X) const
@@ -309,8 +309,8 @@ struct SeqParam
             m = Tensor((std::size_t)n, 1);
         }
     }
-    void zeroGrad() { if (g.totalSize > 0) { g.zero(); } }
-    long long count() const { return (long long)val.totalSize; }
+    void zeroGrad() { if (g.size() > 0) { g.zero(); } }
+    long long count() const { return (long long)val.size(); }
 };
 
 /* ============================================================
@@ -407,7 +407,7 @@ public:
     {
         const float s = 1.0f / std::sqrt((tokDimF > 1.0f) ? tokDimF : 1.0f);
         for (std::size_t p = 0; p < emb.size(); p++) {
-            for (std::size_t i = 0; i < emb[p].val.totalSize; i++) { emb[p].val[i] *= s; }
+            for (std::size_t i = 0; i < emb[p].val.size(); i++) { emb[p].val[i] *= s; }
         }
     }
 
@@ -438,7 +438,7 @@ public:
     {
         if (mode == LEARN_1D) {
             const Tensor &p = emb[0].val;
-            for (std::size_t i = 0; i < p.totalSize && i < X.size(); i++) { X[i] += p[i]; }
+            for (std::size_t i = 0; i < p.size() && i < X.size(); i++) { X[i] += p[i]; }
         } else if (mode == LEARN_2D) {
             const Tensor &pr = emb[0].val;   /* 行 (rows × tokDim) */
             const Tensor &pc = emb[1].val;   /* 列 (cols × tokDim) */
@@ -455,7 +455,7 @@ public:
     void backwardAdd(const std::vector<float> &dX)
     {
         if (mode == LEARN_1D) {
-            for (std::size_t i = 0; i < emb[0].g.totalSize && i < dX.size(); i++) { emb[0].g[i] += dX[i]; }
+            for (std::size_t i = 0; i < emb[0].g.size() && i < dX.size(); i++) { emb[0].g[i] += dX[i]; }
         } else if (mode == LEARN_2D) {
             for (int t = 0; t < seqLen; t++) {
                 const int r = t / cols, c = t % cols;
@@ -519,7 +519,7 @@ public:
     void SGD(float lr)
     {
         for (std::size_t p = 0; p < emb.size(); p++) {
-            if (emb[p].g.totalSize == 0) { continue; }
+            if (emb[p].g.size() == 0) { continue; }
             Optimize::SGD(emb[p].val, emb[p].g, lr);
             emb[p].zeroGrad();
         }
@@ -527,7 +527,7 @@ public:
     void RMSProp(float lr, float rho, float decay, bool clipGrad)
     {
         for (std::size_t p = 0; p < emb.size(); p++) {
-            if (emb[p].g.totalSize == 0) { continue; }
+            if (emb[p].g.size() == 0) { continue; }
             Optimize::RMSProp(emb[p].val, emb[p].v, emb[p].g, lr, rho, decay, clipGrad);
             emb[p].zeroGrad();
         }
@@ -535,7 +535,7 @@ public:
     void Adam(float lr, float alpha, float beta, float alpha_, float beta_, float decay, bool clipGrad)
     {
         for (std::size_t p = 0; p < emb.size(); p++) {
-            if (emb[p].g.totalSize == 0) { continue; }
+            if (emb[p].g.size() == 0) { continue; }
             Optimize::Adam(emb[p].val, emb[p].v, emb[p].m, emb[p].g, alpha_, beta_, lr, alpha, beta, decay, clipGrad);
             emb[p].zeroGrad();
         }
@@ -548,14 +548,14 @@ public:
     {
         double s = 0;
         for (std::size_t p = 0; p < emb.size(); p++) {
-            if (emb[p].g.totalSize > 0) { s += gradNorm2Of(emb[p].g); }
+            if (emb[p].g.size() > 0) { s += gradNorm2Of(emb[p].g); }
         }
         return s;
     }
     void scaleGrad(float s)
     {
         for (std::size_t p = 0; p < emb.size(); p++) {
-            if (emb[p].g.totalSize > 0) { scaleTensorGrad(emb[p].g, s); }
+            if (emb[p].g.size() > 0) { scaleTensorGrad(emb[p].g, s); }
         }
     }
     void copyTo(SeqPosEnc *p) const
@@ -1231,7 +1231,7 @@ private:
         scIn[0] = Tensor((std::size_t)featDim, 1);
         scIn[1] = Tensor((std::size_t)tokDim, 1);
         scIn[2] = Tensor((std::size_t)dff, 1);
-        for (int i = 0; i < 3; i++) { scEi[i] = scIn[i]; scE[i] = Tensor(scIn[i].totalSize, 1); }
+        for (int i = 0; i < 3; i++) { scEi[i] = scIn[i]; scE[i] = Tensor(scIn[i].size(), 1); }
     }
     Tensor& scrInFor(int d) { return (d == featDim) ? scIn[0] : ((d == tokDim) ? scIn[1] : scIn[2]); }
     Tensor& scrEiFor(int d) { return (d == featDim) ? scEi[0] : ((d == tokDim) ? scEi[1] : scEi[2]); }

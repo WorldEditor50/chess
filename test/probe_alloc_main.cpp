@@ -257,14 +257,14 @@ int main()
     /* ============================================================
      *  [E] 对象体积: 三个阶段一起看 (A10 把 `sizes` 成员删掉之后**比原始还小**)
      * ============================================================ */
-    std::printf("[E] 对象体积: 形状存储改了两次, 这里把三个阶段并排印出来\n");
+    std::printf("[E] 对象体积: 形状/长度存储改了三轮, 这里把几个阶段并排印出来\n");
     std::printf("    原始 (shape/sizes 都是 std::vector<int>) : 80 B = totalSize 8 + val 24 + sizes 24 + shape 24\n");
     std::printf("    A11 之后 (两者都换成内联 4 个 int)      : 112 B = 8 + 24 + (16+24) + (16+24)\n");
-    std::printf("    A10 之后 (sizes 成员删掉, 步长按需算)   : %zu B = 8 + 24 + (16+24)\n",
+    std::printf("    A10 之后 (sizes 成员删掉, 步长按需算)   :  72 B = 8 + 24 + (16+24)\n");
+    std::printf("    A9  之后 (totalSize 成员也删掉)         : %zu B = 24 + (16+24)  ← 长度由 `val` 自己带着\n",
                 sizeof(RL::Tensor));
-    std::printf("    ⇒ 相对**原始**净变化 = %+d B (A11 的内联成本 +32 B 被 A10 删掉一个容器 −40 B 盖过)\n",
-                (int)sizeof(RL::Tensor) - 80);
-    std::printf("    换来的是「每次构造少 2 次 malloc」(%s) 且步长不再有第二个需要同步的事实源。\n\n",
+    std::printf("    ⇒ 相对**原始**净变化 = %+d B\n", (int)sizeof(RL::Tensor) - 80);
+    std::printf("    换来的是「每次构造少 2 次 malloc」(%s)、步长/长度各自只剩一个来源。\n\n",
                 "§1.2 实测单次小分配 230~262 ns");
 
     std::printf("=== 探针自查: %d 项, 失败 %d 项 ===\n", g_checks, g_failed);

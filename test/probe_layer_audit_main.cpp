@@ -46,18 +46,18 @@ static float urand(float lo, float hi)
 }
 static void fillU(Tensor &t, float lo, float hi)
 {
-    for (std::size_t i = 0; i < t.totalSize; i++) t[i] = urand(lo, hi);
+    for (std::size_t i = 0; i < t.size(); i++) t[i] = urand(lo, hi);
 }
 static double nrm2(const Tensor &t)
 {
     double s = 0;
-    for (std::size_t i = 0; i < t.totalSize; i++) s += (double)t[i]*(double)t[i];
+    for (std::size_t i = 0; i < t.size(); i++) s += (double)t[i]*(double)t[i];
     return std::sqrt(s);
 }
 static double maxAbsDiff(const Tensor &a, const Tensor &b)
 {
     double m = 0;
-    for (std::size_t i = 0; i < a.totalSize; i++)
+    for (std::size_t i = 0; i < a.size(); i++)
         m = std::max(m, std::fabs((double)a[i] - (double)b[i]));
     return m;
 }
@@ -77,7 +77,7 @@ static double lossOf(L &layer, const Tensor &x, const Tensor &c)
 {
     Tensor &o = layer.forward(x, true);
     double s = 0;
-    for (std::size_t i = 0; i < o.totalSize; i++) s += (double)c[i]*(double)o[i];
+    for (std::size_t i = 0; i < o.size(); i++) s += (double)c[i]*(double)o[i];
     return s;
 }
 
@@ -251,7 +251,7 @@ static void p1()
         for (int t = 0; t < 200; t++) {
             Tensor ga = dirs[t];
             Tensor gb = dirs[t];
-            for (std::size_t i = 0; i < gb.totalSize; i++) gb[i] *= 1e-3f;
+            for (std::size_t i = 0; i < gb.size(); i++) gb[i] *= 1e-3f;
             Optimize::RMSProp(wa, va, ga, 0.01f, 0.9f, 0.0f, clip == 1);
             Optimize::RMSProp(wb, vb, gb, 0.01f, 0.9f, 0.0f, clip == 1);
         }
@@ -280,7 +280,7 @@ static void p1()
         for (int t = 0; t < 200; t++) {
             Tensor ga = dirs[t];
             if (t == 50 || t == 100 || t == 150)
-                for (std::size_t i = 0; i < ga.totalSize; i++) ga[i] *= 50.0f;
+                for (std::size_t i = 0; i < ga.size(); i++) ga[i] *= 50.0f;
             Tensor before = wa;
             Optimize::RMSProp(wa, va, ga, 0.01f, 0.9f, 0.0f, clip == 1);
             biggest = std::max(biggest, maxAbsDiff(wa, before));
@@ -356,7 +356,7 @@ static void p2()
             double n = nrm2(net[0]->o);
             hSum += n;
             hMax = std::max(hMax, n);
-            for (std::size_t k = 0; k < q.totalSize; k++) {
+            for (std::size_t k = 0; k < q.size(); k++) {
                 qmin = std::min(qmin, (double)q[k]);
                 qmax = std::max(qmax, (double)q[k]);
             }

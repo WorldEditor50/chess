@@ -113,9 +113,9 @@ struct Softmax {
     }
     inline static Tensor jacobian(const Tensor &y)
     {
-        Tensor J(y.totalSize, y.totalSize);
-        for (std::size_t i = 0; i < y.totalSize; i++) {
-            for (std::size_t j = 0; j < y.totalSize; j++) {
+        Tensor J(y.size(), y.size());
+        for (std::size_t i = 0; i < y.size(); i++) {
+            for (std::size_t j = 0; j < y.size(); j++) {
                 if (i == j) {
                     J(i, j) = y[i]*(1 - y[j]);
                 } else {
@@ -153,11 +153,11 @@ struct Softmax {
     {
         /* dot = Σ_k y[k] · v[k]  (single scalar over all elements) */
         float dot = 0;
-        for (std::size_t k = 0; k < y.totalSize; k++) {
+        for (std::size_t k = 0; k < y.size(); k++) {
             dot += y[k] * v[k];
         }
         /* out[i] = y[i] · (v[i] - dot) */
-        for (std::size_t i = 0; i < y.totalSize; i++) {
+        for (std::size_t i = 0; i < y.size(); i++) {
             out[i] = y[i] * (v[i] - dot);
         }
         return;
@@ -175,7 +175,7 @@ struct Zeta {
         float sigma = x.variance(u);
         gamma = 1.0/std::sqrt(sigma);
         Tensor x_(x.shape);
-        for (std::size_t i = 0; i < x.totalSize; i++) {
+        for (std::size_t i = 0; i < x.size(); i++) {
             x_[i] = (x[i] - u)*gamma;
         }
         return x_;
@@ -183,9 +183,9 @@ struct Zeta {
 
     inline static Tensor jacobian(Tensor &x)
     {
-        Tensor J(x.totalSize, x.totalSize);
-        for (std::size_t i = 0; i < x.totalSize; i++) {
-            for (std::size_t j = 0; j < x.totalSize; j++) {
+        Tensor J(x.size(), x.size());
+        for (std::size_t i = 0; i < x.size(); i++) {
+            for (std::size_t j = 0; j < x.size(); j++) {
                 if (i == j) {
 
                 } else {

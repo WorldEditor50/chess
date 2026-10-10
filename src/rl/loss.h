@@ -11,7 +11,7 @@ namespace Loss {
 struct MSE {
     inline static Tensor f(const Tensor& yo, const Tensor& yt)
     {
-        Tensor loss(yo.totalSize, 1);
+        Tensor loss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
             float d = yo[i] - yt[i];
             loss[i] = d*d;
@@ -21,7 +21,7 @@ struct MSE {
 
     inline static Tensor df(const Tensor& yo, const Tensor& yt)
     {
-        Tensor dLoss(yo.totalSize, 1);
+        Tensor dLoss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
              dLoss[i] = 2*(yo[i] - yt[i]);
         }
@@ -32,7 +32,7 @@ struct MSE {
 struct CrossEntropy {
     inline static Tensor f(const Tensor& yo, const Tensor& yt)
     {
-        Tensor loss(yo.totalSize, 1);
+        Tensor loss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
             loss[i] = -yt[i]*std::log(yo[i]);
         }
@@ -41,7 +41,7 @@ struct CrossEntropy {
 
     inline static Tensor df(const Tensor& yo, const Tensor& yt)
     {
-        Tensor dLoss(yo.totalSize, 1);
+        Tensor dLoss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
              dLoss[i] = -yt[i]/(yo[i]);
         }
@@ -53,7 +53,7 @@ struct CrossEntropy {
 struct BCE {
     inline static Tensor f(const Tensor& yo, const Tensor& yt)
     {
-        Tensor loss(yo.totalSize, 1);
+        Tensor loss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
             loss[i] = -(yt[i]*std::log(yo[i]) + (1 - yt[i])*std::log(1 - yo[i]));
         }
@@ -61,7 +61,7 @@ struct BCE {
     }
     inline static Tensor df(const Tensor& yo, const Tensor& yt)
     {
-        Tensor dLoss(yo.totalSize, 1);
+        Tensor dLoss(yo.size(), 1);
         for (std::size_t i = 0; i < yo.size(); i++) {
              dLoss[i] = -yt[i]/(yo[i]) - (1 - yt[i])/(1 - yo[i]);
         }

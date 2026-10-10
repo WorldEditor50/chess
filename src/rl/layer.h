@@ -308,7 +308,7 @@ public:
         if (bias) {
             o += b;
         }
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Fn::f(o[i]);
         }
         return o;
@@ -316,7 +316,7 @@ public:
 
     void backward(const Tensor& x, Tensor &ei) override
     {
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             e[i] = Fn::df(o[i]) * e[i];
         }
         Tensor::MM::kikj(ei, w, e);
@@ -413,7 +413,7 @@ public:
         if (bias) {
             op += b;
         }
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Gelu::f(op[i]);
         }
         return o;
@@ -421,7 +421,7 @@ public:
 
     void backward(const RL::Tensor &x, Tensor &ei) override
     {
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             e[i] = Gelu::df(op[i]) * e[i];
         }
         Tensor::MM::kikj(ei, w, e);
@@ -462,7 +462,7 @@ public:
         if (bias) {
             op += b;
         }
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Swish::f(op[i]);
         }
         return o;
@@ -470,7 +470,7 @@ public:
 
     void backward(const Tensor& x, Tensor &ei) override
     {
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             e[i] = Swish::df(op[i]) * e[i];
         }
         Tensor::MM::kikj(ei, w, e);
@@ -511,7 +511,7 @@ public:
         if (bias) {
             op += b;
         }
-        for (std::size_t i = 0; i < o.totalSize; i++) {
+        for (std::size_t i = 0; i < o.size(); i++) {
             o[i] = Mish::f(op[i]);
         }
         return o;
@@ -519,7 +519,7 @@ public:
 
     void backward(const Tensor& x, Tensor &ei) override
     {
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             e[i] = Mish::df(op[i]) * e[i];
         }
         Tensor::MM::kikj(ei, w, e);
@@ -650,11 +650,11 @@ public:
            backward: dy = gamma · (I - 1/n·1·1^T) · (Fn'(o) · e)
         */
         Tensor dy(outputDim, 1);
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             dy[i] = Fn::df(o[i]) * e[i];          // activation derivative => dz
         }
         float u = dy.mean();
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             e[i] = gamma * (dy[i] - u);     // LN centering => dL/dop
         }
         Tensor::MM::kikj(ei, w, dy);
@@ -722,7 +722,7 @@ public:
     {
         /* Forward is: x -> zscore -> w·x_ + b -> Fn::f */
         Tensor dy(outputDim, 1);
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             dy[i] = Fn::df(o[i]) * e[i];           // dy = Fn'(o)·e
         }
         /* Propagate through w: dL/dx_ = w^T · dy
@@ -730,7 +730,7 @@ public:
              * `MM::kikj(z, w, dy)` 的 z 必须是 **(inputDim, 1)** (z = wᵀ·dy, w 是
                (outputDim, inputDim)); 按 outputDim 分配 ⇒ 输入梯度**只写了前
                outputDim 个坐标**, 剩下的留在旧值/零上 (梯度被静默截断)。
-             * 下面那句 `for (i < ei.totalSize)` 按 **inputDim** 读 `dL[i]` ⇒ 当
+             * 下面那句 `for (i < ei.size())` 按 **inputDim** 读 `dL[i]` ⇒ 当
                inputDim > outputDim 时是**越界读** (读到的"dL"是缓冲区外的字节),
                再写进 ei —— 整个 DPG agent 的输入梯度都是这么算出来的。
              而且均值那一步本来就应该在**输入向量**上做 (x_ 是 z-score 之后的输入,
@@ -744,7 +744,7 @@ public:
         Tensor::MM::kikj(dL, w, dy);
         /* Propagate through zscore: dL/dx = gamma · (I - 1/n·1·1^T) · dq */
         float u = dL.mean();
-        for (std::size_t i = 0; i < ei.totalSize; i++) {
+        for (std::size_t i = 0; i < ei.size(); i++) {
             ei[i] = gamma * (dL[i] - u);
         }
 
@@ -811,14 +811,14 @@ public:
         /* Forward: o1 = w·x + b → o2 = Fn(o1) → o = gamma·(o2 - u) */
         Tensor dy(outputDim, 1);
         float u = e.mean();
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             dy[i] = gamma * (e[i] - u) * Fn::df(o2[i]);           // activation derivative
         }
         Tensor::MM::kikj(ei, w, dy);                  // linear backward
 
         Tensor::MM::ikjk(g.w, dy, x);
         if (bias) {
-            for (std::size_t i = 0; i < e.totalSize; i++) {
+            for (std::size_t i = 0; i < e.size(); i++) {
                 g.b[i] += Fn::df(o2[i]) * dy[i];      // dL/db = Fn'(o2)·e (pre-LN)
             }
         }
@@ -875,13 +875,13 @@ public:
     {
         /* Forward: o = Fn(gamma·op + b) */
         Tensor dy(outputDim, 1);
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             dy[i] = gamma * Fn::df(o[i]) * e[i];     // dy = gamma · Fn'(o) · e
         }
         Tensor::MM::kikj(ei, w, dy);
 
         if (bias) {
-            for (std::size_t i = 0; i < e.totalSize; i++) {
+            for (std::size_t i = 0; i < e.size(); i++) {
                 g.b[i] += Fn::df(o[i]) * e[i];      // dL/db = Fn'(o)·e (not gamma-scaled)
             }
         }
@@ -927,11 +927,11 @@ public:
         o1 *= r;
         o2 = RL::tanh(o1);
         if (bias) {
-            for (std::size_t i = 0; i < o.totalSize; i++) {
+            for (std::size_t i = 0; i < o.size(); i++) {
                 o[i] = Fn::f(o2[i] + b[i]);
             }
         } else {
-            for (std::size_t i = 0; i < o.totalSize; i++) {
+            for (std::size_t i = 0; i < o.size(); i++) {
                 o[i] = Fn::f(o2[i]);
             }
         }
@@ -952,7 +952,7 @@ public:
         */
         Tensor dL(outputDim, 1);
         Tensor dy(outputDim, 1);
-        for (std::size_t i = 0; i < e.totalSize; i++) {
+        for (std::size_t i = 0; i < e.size(); i++) {
             float d1 = Fn::df(o[i]) * e[i];       // Fn'(o) · e
             float d2 = o2[i];
             dL[i] = r * (1 - d2 * d2) * d1;         // tanh'(o2) · r · d1 = dL/do1
