@@ -70,7 +70,6 @@ set(RL_SOURCES
     ${SRC_DIR}/rl/qlstm.cpp
     ${SRC_DIR}/rl/sac.cpp
     ${SRC_DIR}/rl/ssm.cpp
-    ${SRC_DIR}/rl/trpo.cpp
     ${SRC_DIR}/rl/util.cpp
 )
 add_library(RL_CORE STATIC ${RL_SOURCES})

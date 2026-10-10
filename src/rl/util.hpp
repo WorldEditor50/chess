@@ -252,59 +252,23 @@ inline Tensor& cos(Tensor& x)
     return x;
 }
 
-inline Tensor sqrt(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::sqrt(x[i]);
-    }
-    return y;
-}
+/*
+   ============================================================
+    [2026-10 P2-附] 删掉 6 个**按值返回**版单目函数
+   ============================================================
+   这里原来是 `Tensor sqrt/exp/log/tanh/sin/cos(const Tensor& x)`: 每个都
+   `Tensor y(x.shape)` 再逐元素算 —— 也就是**每次调用整块深拷贝一个张量**
+   (正是 `docs/tensor_optimization_plan.md` §1.2 里"拷贝构造 vs 赋值 11×"那一类成本)。
 
-inline Tensor exp(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::exp(x[i]);
-    }
-    return y;
-}
+   为什么可以删（判据 = `src/` + `test/` 双零命中 + 重载决议）: 全仓只有 2 处
+   `RL::tanh(...)` 调用 —— `src/rl/layer.h:927`(`TanhNorm::forward`) 与
+   `test/probe_tanh_norm_ops_main.cpp:119`，而**两处的实参都是非 const 左值**
+   (`o1`)，所以重载决议选中的一直是**就地版** `Tensor& tanh(Tensor&)`（上面那一组），
+   按值版**一次都没有被调用过**。
 
-inline Tensor log(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::log(x[i]);
-    }
-    return y;
-}
-
-inline Tensor tanh(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::tanh(x[i]);
-    }
-    return y;
-}
-
-inline Tensor sin(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::sin(x[i]);
-    }
-    return y;
-}
-
-inline Tensor cos(const Tensor& x)
-{
-    Tensor y(x.shape);
-    for (std::size_t i = 0; i < x.size(); i++) {
-        y[i] = std::cos(x[i]);
-    }
-    return y;
-}
+   还在用的是上面 6 个**就地版** (`inline Tensor& sqrt(Tensor&)` 等) 与下面的
+   `normalize/zscore/clamp/...`。删除后由编译器确认无遗漏（全量构建 0 error）。
+*/
 
 inline Tensor upTriangle(int rows, int cols)
 {

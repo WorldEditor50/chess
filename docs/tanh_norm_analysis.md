@@ -58,7 +58,7 @@
 | 位置 | 结构 |
 |---|---|
 | `src/rl/dqn.cpp:71-80`（snakeAI 审计默认，chess 侧 `#if 1` 分支在 `:40-48`） | `MOE<8,4>` → `TanhNorm<Sigmoid>(stateDim, hiddenDim)` → `Layer<Linear>(hiddenDim, actionDim)` |
-| `src/rl/bcq.cpp:33-36` / `ddpg.cpp:21-25` / `qlstm.cpp:15-18` / `sac.cpp:24-29` / `trpo.cpp:17-29` | 同类用法（多为 `hiddenDim → hiddenDim`） |
+| `src/rl/bcq.cpp:33-36` / `ddpg.cpp:21-25` / `qlstm.cpp:15-18` / `sac.cpp:24-29` | 同类用法（多为 `hiddenDim → hiddenDim`）。(原表里还有 `trpo.cpp:17-29` —— **该文件已在 2026-10 P2-附 删除**（零调用者），证据见 `docs/tensor_optimization_plan.md` Part 6 的 P2-附 行） |
 | `test/test_grad_main.cpp`（B 段）、`test_sacaz_main.cpp` | 已覆盖 FD 梯度检查（**但只覆盖 TanhNorm，不覆盖 RMSNorm/LayerNorm**） |
 
 * `RMSNorm`（`layer.h:794`）全仓库**只有定义，零调用点**（`src/`、`test/`、`*.hpp` 全查过）。

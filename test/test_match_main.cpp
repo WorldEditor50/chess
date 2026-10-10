@@ -188,6 +188,23 @@ int main(int argc, char *argv[])
     std::printf("=== Agent 对 Agent 对弈 (arena) ===\n");
     std::printf("[build] %s %s\n", __DATE__, __TIME__);
 
+    /*
+       [2026-10 P2-附] 这个测试全程用**相对路径**写权重 (`weights/_temp_match_*.dat`),
+       但它自己**不建这个目录** —— 于是"在一个全新的构建目录里跑"时, 每一次
+       `saveCurrentAgentModel(...)` 都会失败, 后面的 [2.7c]/[2.7j]/[2.7k] 会因为
+       "装回健康权重"这类前置条件失败而**级联假红**(实测: 空目录下一次跑出 12 条失败,
+       而有 weights/ 的目录 / 换机前都只红 1~3 条)。这里把目录补上, 让"红"只反映被测行为。
+
+       为什么不是"让 save 自己去建": 那是 `ChessBoard`/`Net` 的语义 (写权重不该悄悄
+       造目录), 而"测试要用的临时目录由测试准备"才是这条依赖的正确归属。
+    */
+    {
+        std::error_code ec;
+        std::filesystem::create_directories("weights", ec);
+        std::printf("[ok] 临时权重目录 weights/ : %s\n",
+                    std::filesystem::is_directory("weights") ? "就绪" : "**建不起来**");
+    }
+
     ChessBoard board;
     std::printf("[ok] ChessBoard 构造完成\n");
     /* 不探索: 这个测试关心的是对弈统计, 不是探索 (那是 test_pretrain 的事) */

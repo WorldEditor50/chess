@@ -569,33 +569,11 @@ public:
        原来的实现遍历的就是 val.size() 且直接索引 x.val[i] (没有广播语义), 所以
        只要两边长度相等就能安全替换。
     */
-    Tensor_ operator +(const Tensor_ &x) const
-    {
-        Tensor_ y(shape);
-        simdops::add(y.val.data(), val.data(), x.val.data(), val.size());
-        return y;
-    }
-
-    Tensor_ operator -(const Tensor_ &x) const
-    {
-        Tensor_ y(shape);
-        simdops::sub(y.val.data(), val.data(), x.val.data(), val.size());
-        return y;
-    }
-
-    Tensor_ operator *(const Tensor_ &x) const
-    {
-        Tensor_ y(shape);
-        simdops::mul(y.val.data(), val.data(), x.val.data(), val.size());
-        return y;
-    }
-
-    Tensor_ operator /(const Tensor_ &x) const
-    {
-        Tensor_ y(shape);
-        simdops::div(y.val.data(), val.data(), x.val.data(), val.size());
-        return y;
-    }
+    /* [2026-10 P2-附] 4 个 `Tensor ⊗ Tensor` 值语义算子 (`+ - * /(const Tensor_&)`)
+       **已删**。判据(与 D1 同一条): 方案 Part 2.2 末段点名"TRPO 是它们的唯一 live
+       消费者"; 本轮把 TRPO 整个删掉之后**全量构建 0 error**(458 步, test/bench 目标
+       全都编了) ⇒ "零消费者"是**编译器**证的, 不是 grep 推断的。
+       ⚠ 就地版 (`+= -= *= /=`) 与 `Tensor ⊗ T` 那一组**一个都没动**: 它们有生产调用者。 */
 
     Tensor_ &operator +=(const Tensor_ &x)
     {
@@ -622,33 +600,14 @@ public:
         return *this;
     }
 
-    Tensor_ operator +(T x) const
-    {
-        Tensor_ y(shape);
-        simdops::add(y.val.data(), val.data(), x, val.size());
-        return y;
-    }
-
-    Tensor_ operator -(T x) const
-    {
-        Tensor_ y(shape);
-        simdops::sub(y.val.data(), val.data(), x, val.size());
-        return y;
-    }
-
-    Tensor_ operator *(T x) const
-    {
-        Tensor_ y(shape);
-        simdops::mul(y.val.data(), val.data(), x, val.size());
-        return y;
-    }
-
-    Tensor_ operator /(T x) const
-    {
-        Tensor_ y(shape);
-        simdops::div(y.val.data(), val.data(), x, val.size());
-        return y;
-    }
+    /* [2026-10 P2-附] `Tensor ⊗ T` 的 4 个**按值返回**版 (`+ - * /(T)`) **也已删**:
+       与上面那组不同, 这一组**没有被方案点名**, 所以按"先量后删"处理 —— 拿编译器当
+       判据: 封掉它们之后**全量构建 0 error**(458 步, 含全部 test/bench 目标)
+       ⇒ 零消费者成立。它们每次调用都要 `Tensor_ y(shape)`(**整块深拷贝**)再逐元素算,
+       而调用方要的语义用就地版 (`+= -= *= /=`) 或 `simdops::*` 一行就能表达。
+       ⚠ 就地版 (`+= -= *= /=`, 两个重载各有 4 个)**一个都没动**: 它们有生产调用者。
+       (一行一行核对过的消费者: `simdops::add/sub/mul/div` 的其余调用点全部是就地或
+        显式 `y(i,j)` 写法, 见 `MM::*` 与各层的 forward/backward。) */
 
     Tensor_ &operator +=(T x)
     {

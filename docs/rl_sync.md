@@ -123,6 +123,15 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 | 4 | **（被编译器否掉的一条）** `empty()` 曾按 D1 清单删除, 全量构建报 `error C2039: "empty" 不是 RL::Tensor_ 的成员`（`src/rl/bc.h:73`、`src/rl/sac.cpp:175` / `:274`）⇒ **已原样放回** | 这是 P2 验收纪律"以编译结果为准"当场生效的例子: 头文件里的成员函数,"文本层零引用"不是充分证据 |
 | — | **保留**（无生产调用者但是测试抓手，不是死代码） | `ptr()` / `alignedTo()` / `dataAlignment()`（`test_transformer [9]` 对齐自检）、`sum()`、`toDebugString()`（老格式往返）、`MM::kijk`（`test_grad` 语义钉桩）、`normalize()`（`test_transformer [10]` 的"零跨度必须响亮失败"用例）；**`normalize` 是 P1 新增测试 [10] 的抓手，故 D1 清单里那条不执行** |
 
+**P2-附（同一天，第二阶段）又删了 4 类 —— 全部是上游 snakeAI 同源代码，逐条记账**：
+
+| # | 删掉的上游项 | 判据（本仓库证据） |
+|---|---|---|
+| 5 | `src/rl/trpo.h`（45 行）+ `src/rl/trpo.cpp`（467 行）整个 `TRPO` 类，并从 `CMakeLists.txt` 的 `RL_SOURCES` 去掉 `rl/trpo.cpp` | ① `trpo.h` 只被 `trpo.cpp` 自己 `#include`（全仓第二处都没）；② `\bTRPO\b` 在 `src/`、`test/` 里除 `trpo.*` 自身外**零命中**；③ 删掉后全量构建 0 error。⚠ 它是 `Tensor ⊗ Tensor` 值语义算子**唯一**的 live 消费者（见第 8 条） |
+| 6 | `src/rl/mat.hpp`（543 行 / 16 KB，整个 `Mat` 类） | 全仓**零 `#include "mat.hpp"`**，且**不在** `CMakeLists.txt` 的 `RL_SOURCES` 里 ⇒ 它连"被编译的死代码"都不是，是**从未参与构建的死文件**（`Mat` 的 `val` 还是无对齐的 `std::vector<float>`，与 `Tensor` 平行重复） |
+| 7 | `src/rl/util.hpp` 的 6 个**按值返回**版单目函数（`Tensor sqrt/exp/log/tanh/sin/cos(const Tensor&)`） | 全仓只有 **2 处** `RL::tanh(...)` 调用（`src/rl/layer.h:927`、`test/probe_tanh_norm_ops_main.cpp:119`），**两处实参都是非 const 左值** ⇒ 重载决议选中的一直是就地版 `Tensor& tanh(Tensor&)`，按值版零调用；删掉后全量构建 0 error。它们在用时每次都要 `Tensor y(x.shape)` **整块深拷贝** |
+| 8 | `src/rl/tensor.hpp` 的 8 个**按值返回**算子：`Tensor ⊗ Tensor` 的 `+ - * /(const Tensor_&)`（方案 Part 2.2 末段点名的那 4 个）+ `Tensor ⊗ T` 的 `+ - * /(T)`（**方案没点名的 4 个，属本轮"先量后删"的追加**） | 7 个（第 5 条删掉 TRPO 之后）与 8 个一起封掉，**全量构建 0 error（458 步，含全部 test/bench 目标）** ⇒ 零消费者由**编译器**证实。**就地版**（`+= -= *= /=`，两个重载各 4 个）与 `simdops::*` 的其余调用点一个都没动 |
+
 ---
 
 ## 二、同步进来的主要修复（按主题）
@@ -490,6 +499,10 @@ o   = tanh(W1·(g∘h) + W2·x + b)    (+ x, 若 residual 且 OutDim==dIn)
   标准差归一（并说明在 `clipGrad` 归一化下是整形不变式）、`1/π` 加下限。
 - `trpo.cpp`：改用 GAE(λ=0.95)、重新启用 advantage 归一化、KL 分母加下限、
   步长补上 N 修正。
+  ⚠ **【2026-10 P2-附 更正】`trpo.cpp` / `trpo.h` 整个类已被删除**（零调用者：
+  `trpo.h` 只被 `trpo.cpp` 自己 include，全仓没有第二处 `TRPO` 符号引用；见 §1.5 第 5 条）。
+  上面这条"同步进来的修复"因此变成**历史记录**：下次同步时若上游仍在改 `trpo.cpp`，
+  要决定是"放弃该文件"还是"把它整份拉回来"。
 
 ### 其它
 
