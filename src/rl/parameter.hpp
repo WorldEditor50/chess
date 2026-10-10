@@ -16,8 +16,8 @@ public:
     explicit GradValue(int rows, int cols)
         :val(rows, cols),g(rows, cols),v(rows, cols){}
     GradValue(const GradValue &r):val(r.val),g(r.g),v(r.v){}
-    inline float operator[](int index) const {return val.val[index];}
-    inline float& operator[](int index) {return val.val[index];}
+    inline float operator[](int index) const {return val[index];}
+    inline float& operator[](int index) {return val[index];}
     void RMSProp(float lr, float rho, float decay)
     {
         Optimize::RMSProp(val, v, g, lr, rho, decay, true);

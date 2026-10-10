@@ -627,10 +627,10 @@ void RL::PPO::sparsePolicyBackward(const Tensor &state,
 
     const std::size_t in = head->inputDim;
     const std::size_t wRow = (std::size_t)head->w.strideOf(0);     /* == in (行主序) */
-    const float *hd = h.val.data();
-    const float *wd = head->w.val.data();
-    float *gwd = head->g.w.val.data();
-    float *gbd = head->g.b.val.data();
+    const float *hd = h.data();
+    const float *wd = head->w.data();
+    float *gwd = head->g.w.data();
+    float *gbd = head->g.b.data();
     std::vector<float> ei(in, 0.0f);
     for (std::size_t i = 0; i < n; i++) {
         const float d = dlogit[i];

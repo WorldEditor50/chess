@@ -279,8 +279,8 @@ int runSacVsMcts(A &sac, Chess &board, const Cfg &g)
                 if (fc != nullptr) {
                     std::printf("[WF] %s layer%zu w[0..3]= %.9g %.9g %.9g %.9g  (size=%zu)\n",
                                 tag, i,
-                                (double)fc->w.val.data()[0], (double)fc->w.val.data()[1],
-                                (double)fc->w.val.data()[2], (double)fc->w.val.data()[3],
+                                (double)fc->w.data()[0], (double)fc->w.data()[1],
+                                (double)fc->w.data()[2], (double)fc->w.data()[3],
                                 fc->w.size());
                     return;
                 }

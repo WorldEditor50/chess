@@ -428,14 +428,14 @@ static void testDuelingGradient()
         if (col < 0 || (std::size_t)col >= rowStride) { return; }
         const std::size_t k = (std::size_t)row * rowStride + (std::size_t)col;
         if (k >= layer->w.size() || k >= layer->g.w.size()) { return; }
-        const float orig = layer->w.val[k];
-        layer->w.val[k] = orig + (float)eps;
+        const float orig = layer->w[k];
+        layer->w[k] = orig + (float)eps;
         const double lp = loss();
-        layer->w.val[k] = orig - (float)eps;
+        layer->w[k] = orig - (float)eps;
         const double lm = loss();
-        layer->w.val[k] = orig;
+        layer->w[k] = orig;
         const double numeric = (lp - lm) / (2.0 * eps);
-        const double analytic = (double)layer->g.w.val[k];
+        const double analytic = (double)layer->g.w[k];
         const double denom = std::max(1e-6, std::max(std::fabs(numeric), std::fabs(analytic)));
         worstRel = std::max(worstRel, std::fabs(numeric - analytic) / denom);
         worstAbs = std::max(worstAbs, std::fabs(numeric - analytic));
@@ -474,7 +474,7 @@ static void testDuelingGradient()
         if (!isLegalAction) {
             double mx = 0.0;
             for (std::size_t c = 0; c < rowStride; c++) {
-                mx = std::max(mx, std::fabs((double)aOut->g.w.val[(std::size_t)illegalAction * rowStride + c]));
+                mx = std::max(mx, std::fabs((double)aOut->g.w[(std::size_t)illegalAction * rowStride + c]));
             }
             std::printf("  非法动作 %d 那一行的 |dL/dw|max = %.3e\n", illegalAction, mx);
             CHECK(mx == 0.0, "非法列的头权重梯度**恰好**为 0");
@@ -1027,8 +1027,8 @@ static void testHandAnchor()
         RL::iFcLayer *vOut = dynamic_cast<RL::iFcLayer*>(a.m_vHead[a.m_vHead.size() - 1]);
         CHECK(vOut != nullptr, "V 头输出层是 iFcLayer (可以清零做对照)");
         if (vOut != nullptr) {
-            for (std::size_t k = 0; k < vOut->w.val.size(); k++) { vOut->w.val[k] = 0.0f; }
-            for (std::size_t k = 0; k < vOut->b.val.size(); k++) { vOut->b.val[k] = 0.0f; }
+            for (std::size_t k = 0; k < vOut->w.size(); k++) { vOut->w[k] = 0.0f; }
+            for (std::size_t k = 0; k < vOut->b.size(); k++) { vOut->b[k] = 0.0f; }
             const DQNABAgent::HandStats hsZero = a.netHandStats(0);
             std::printf("  常数 V (V 头清零): gap %.4f (看起来还行), corr %.3f (真话)\n",
                         hsZero.gap, hsZero.corr);
@@ -1081,7 +1081,7 @@ static void testHandAnchor()
     auto trunkW = [](DQNABAgent &ag) {
         std::vector<float> v;
         RL::iFcLayer *l0 = dynamic_cast<RL::iFcLayer*>(ag.m_trunk[0]);
-        if (l0 != nullptr) { v.assign(l0->w.val.begin(), l0->w.val.end()); }
+        if (l0 != nullptr) { v.assign(l0->w.begin(), l0->w.end()); }
         return v;
     };
     const std::vector<float> wBefore = trunkW(b);
@@ -1278,10 +1278,10 @@ static void testMarkovAndNegamax()
         auto bake = [](RL::Net &net, bool valueOne) {
             RL::iFcLayer *out = dynamic_cast<RL::iFcLayer*>(net[net.size() - 1]);
             if (out == nullptr) { return false; }
-            for (std::size_t k = 0; k < out->w.val.size(); k++) { out->w.val[k] = 0.0f; }
-            for (std::size_t k = 0; k < out->b.val.size(); k++) {
+            for (std::size_t k = 0; k < out->w.size(); k++) { out->w[k] = 0.0f; }
+            for (std::size_t k = 0; k < out->b.size(); k++) {
                 /* V 头是 Tanh 输出: tanh(20) = 1.0f (float 下精确饱和) ⇒ V ≡ +1 */
-                out->b.val[k] = valueOne ? 20.0f : 0.0f;
+                out->b[k] = valueOne ? 20.0f : 0.0f;
             }
             return true;
         };

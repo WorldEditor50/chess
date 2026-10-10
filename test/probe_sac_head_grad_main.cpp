@@ -141,7 +141,7 @@ int main(int argc, char **argv)
         auto snap = [&](const std::vector<int> &acts) {
             std::vector<float> buf;
             for (std::size_t i = 0; i < acts.size(); i++) {
-                const float *row = head->w.val.data() + (std::size_t)acts[i] * rowStride;
+                const float *row = head->w.data() + (std::size_t)acts[i] * rowStride;
                 for (std::size_t k = 0; k < rowStride; k++) { buf.push_back(row[k]); }
             }
             return buf;
@@ -163,7 +163,7 @@ int main(int argc, char **argv)
         auto gradSum = [&](const std::vector<int> &acts) {
             double s = 0.0;
             for (std::size_t i = 0; i < acts.size(); i++) {
-                const float *grow = head->g.w.val.data() + (std::size_t)acts[i] * rowStride;
+                const float *grow = head->g.w.data() + (std::size_t)acts[i] * rowStride;
                 for (std::size_t k = 0; k < rowStride; k++) {
                     s += std::fabs((double)grow[k]);
                 }
@@ -225,7 +225,7 @@ int main(int argc, char **argv)
                 const std::size_t rs2 = (std::size_t)h2->w.strideOf(0);
                 std::vector<float> before;
                 for (std::size_t i = 0; i < illegal.size(); i++) {
-                    const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;
+                    const float *row = h2->w.data() + (std::size_t)illegal[i] * rs2;
                     for (std::size_t k = 0; k < rs2; k++) { before.push_back(row[k]); }
                 }
                 /* 手工走一遍 learnBatch 的前向/反向, 但**不调用** RMSProp */
@@ -252,7 +252,7 @@ int main(int argc, char **argv)
                 g2.actor.backward(st, dz);
                 std::vector<float> after;
                 for (std::size_t i = 0; i < illegal.size(); i++) {
-                    const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;
+                    const float *row = h2->w.data() + (std::size_t)illegal[i] * rs2;
                     for (std::size_t k = 0; k < rs2; k++) { after.push_back(row[k]); }
                 }
                 std::printf("  隔离实验 (无优化器): 非法行权重改动 %d/%d\n",
@@ -304,7 +304,7 @@ int main(int argc, char **argv)
     auto snap = [&](const std::vector<int> &acts) {
         std::vector<float> buf;
         for (std::size_t i = 0; i < acts.size(); i++) {
-            const float *row = head->w.val.data() + (std::size_t)acts[i] * rowStride;
+            const float *row = head->w.data() + (std::size_t)acts[i] * rowStride;
             for (std::size_t k = 0; k < rowStride; k++) { buf.push_back(row[k]); }
         }
         return buf;

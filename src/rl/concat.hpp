@@ -261,8 +261,8 @@ public:
         for (int i = 0; i < NumExperts; i++) {
             Tensor &eo = experts[i].forward(x, inference);
             Tensor &hi = proj[i].forward(eo, inference);
-            float *dst = feat.val.data() + (std::size_t)UnitDim * i;
-            const float *src = hi.val.data();
+            float *dst = feat.data() + (std::size_t)UnitDim * i;
+            const float *src = hi.data();
             for (int r = 0; r < UnitDim; r++) {
                 dst[r] = src[r];
             }
@@ -344,8 +344,8 @@ public:
 
         /* 专家路径: feat 的每一段 -> proj_i -> expert_i */
         for (int i = 0; i < NumExperts; i++) {
-            float *pe = proj[i].e.val.data();
-            const float *df = dFeat.val.data() + (std::size_t)UnitDim * i;
+            float *pe = proj[i].e.data();
+            const float *df = dFeat.data() + (std::size_t)UnitDim * i;
             for (int r = 0; r < UnitDim; r++) {
                 pe[r] = df[r];
             }

@@ -193,7 +193,7 @@ static void testIllegalColumnGradient()
     for (int a = 0; a < A; a++) {
         double m = 0.0;
         for (std::size_t k = 0; k < (std::size_t)head->inputDim; k++) {
-            m = std::max(m, std::fabs((double)head->g.w.val[(std::size_t)a * rowStride + k]));
+            m = std::max(m, std::fabs((double)head->g.w[(std::size_t)a * rowStride + k]));
         }
         if (mask[(std::size_t)a] > 0.5f) {
             maxLegal = std::max(maxLegal, m);
@@ -209,7 +209,7 @@ static void testIllegalColumnGradient()
     double maxIllegalB = 0.0;
     for (int a = 0; a < A; a++) {
         if (mask[(std::size_t)a] <= 0.5f) {
-            maxIllegalB = std::max(maxIllegalB, std::fabs((double)head->g.b.val[(std::size_t)a]));
+            maxIllegalB = std::max(maxIllegalB, std::fabs((double)head->g.b[(std::size_t)a]));
         }
     }
     CHECK(maxIllegalB == 0.0, "非法行的偏置梯度恰好为 0");
@@ -318,14 +318,14 @@ static void testGradientAccumulationAndEpochs()
         double sum = 0.0;
         if (head == nullptr) { return sum; }
         for (std::size_t k = 0; k < head->g.w.size(); k++) {
-            sum += std::fabs((double)head->g.w.val[k]);
+            sum += std::fabs((double)head->g.w[k]);
         }
         return sum;
     };
     auto headW0 = [](RL::SAC &s) {
         RL::iFcLayer *head =
             dynamic_cast<RL::iFcLayer*>(s.actor[s.actor.size() - 1]);
-        return head != nullptr ? (double)head->w.val[0] : 0.0;
+        return head != nullptr ? (double)head->w[0] : 0.0;
     };
 
     RL::Transition tr(state, action, nextState, 0.3f, false);
@@ -484,7 +484,7 @@ static void testBatchStatsBoundary()
         double sum = 0.0;
         if (m == nullptr) { return sum; }
         for (std::size_t k = 0; k < m->g_wg.size(); k++) {
-            sum += std::fabs((double)m->g_wg.val[k]);
+            sum += std::fabs((double)m->g_wg[k]);
         }
         return sum;
     };
@@ -571,7 +571,7 @@ static void testNextMaskIsUsed()
         double sum = 0.0;
         if (head == nullptr) { return sum; }
         for (std::size_t k = 0; k < head->g.w.size(); k++) {
-            sum += std::fabs((double)head->g.w.val[k]);
+            sum += std::fabs((double)head->g.w[k]);
         }
         return sum;
     };

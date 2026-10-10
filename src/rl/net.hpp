@@ -217,7 +217,11 @@ public:
                     layer->type == iLayer::LAYER_FC) {
                 Tensor e(preLayer->e.size(), 1);
                 layer->backward(preLayer->o.flatten(), e);
-                preLayer->e.val = e.val;
+                /* [2026-10 P3 / C1] 原写法是 `preLayer->e.val = e.val;` —— 直接赋值缓冲
+                   (会把长度也一起换掉)。C1 把 `val` 私有化之后走语义明确的入口:
+                   只拷值、长度必须一致 (`copyValuesFrom` 内部就是 memcpy + 长度校验)。
+                   这里 `e` 是按 `preLayer->e.size()` 建的, 所以长度天然一致。 */
+                preLayer->e.copyValuesFrom(e);
             } else if (preLayer->type == iLayer::LAYER_LSTM) {
                 /* LSTM uses BPTT via cacheError/cacheX cache */
                 Tensor e(preLayer->o.size(), 1);

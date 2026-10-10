@@ -32,9 +32,9 @@ inline void conv2d(Tensor &y, const Tensor &kernels, const Tensor &x, int stride
     const int hi   = x.shape[1];
     const int wi   = x.shape[2];
 
-    const float *xData = x.val.data();
-    const float *kData = kernels.val.data();
-    float *yData = y.val.data();
+    const float *xData = x.data();
+    const float *kData = kernels.data();
+    float *yData = y.data();
 
     const int xStrideC = hi*wi;
     const int xStrideH = wi;

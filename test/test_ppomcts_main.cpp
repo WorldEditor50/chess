@@ -2229,14 +2229,14 @@ static bool testMaskedTrainHead()
             const std::size_t rs = (std::size_t)head->w.strideOf(0);
             std::vector<float> before;
             for (int a = 0; a < A::ACTION_DIM; a++) {
-                const float *row = head->w.val.data() + (std::size_t)a * rs;
+                const float *row = head->w.data() + (std::size_t)a * rs;
                 for (std::size_t k = 0; k < rs; k++) { before.push_back(row[k]); }
             }
             for (int r = 0; r < 5; r++) { agent.ppo.learnFromReplay(64, 1, 0.005f); }
             double moved = 0.0;
             std::size_t p = 0;
             for (int a = 0; a < A::ACTION_DIM; a++) {
-                const float *row = head->w.val.data() + (std::size_t)a * rs;
+                const float *row = head->w.data() + (std::size_t)a * rs;
                 for (std::size_t k = 0; k < rs; k++) {
                     moved += std::fabs((double)before[p++] - (double)row[k]);
                 }

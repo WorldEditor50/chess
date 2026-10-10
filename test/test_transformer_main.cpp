@@ -122,10 +122,10 @@ int main(int argc, char **argv)
                `val` 是 public 的 ⇒ 这条路径在仓库里是真能发生的 (谁 resize 错就有了)。 */
             RL::Tensor z(90, 90), w(90, 90), x(90, 90);
             z.zero(); w.zero(); x.zero();
-            z.val.resize(100);                    /* 100 < 90*90 = 8100 */
+            z.shrinkBufferUncheckedForTest(100);                    /* 100 < 90*90 = 8100 */
             RL::Tensor::MM::ikkj(z, w, x);        /* 常驻检查必须拦下来 */
             std::printf("!! 缓冲长度 < 形状乘积竟然没停 (val=%llu, shape=%d x %d)\n",
-                        (unsigned long long)z.val.size(), z.shape[0], z.shape[1]);
+                        (unsigned long long)z.size(), z.shape[0], z.shape[1]);
             return 0;
         }
         if (early == "--index-range-guard") {
@@ -139,8 +139,10 @@ int main(int argc, char **argv)
             RL::Tensor t(2, 2);
             t.zero();
             t.reshape(1000, 1);                   /* 元素总数不守恒 */
-            std::printf("!! reshape 元素数不守恒竟然没停 (totalSize=%llu, val=%llu)\n",
-                        (unsigned long long)t.size(), (unsigned long long)t.val.size());
+            /* [2026-10 P3 / C1] 消息里原来印 (totalSize, val.size()) 两个数 —— A9 之后
+               长度只有一个来源, 两个数恒等, 所以只印一个。 */
+            std::printf("!! reshape 元素数不守恒竟然没停 (size=%llu)\n",
+                        (unsigned long long)t.size());
             return 0;
         }
         if (early == "--empty-stat-guard") {

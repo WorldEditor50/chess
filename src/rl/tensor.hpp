@@ -328,12 +328,46 @@ public:
     using Size = SmallShapeVec<RL_SHAPE_INLINE>;
     using iterator = typename Vector::iterator;
     using const_iterator = typename Vector::const_iterator;
-    /* [2026-10 P3 / A9] `std::size_t totalSize;` 成员**已删** —— 长度只有一个来源:
-       缓冲本身 (`val.size()`, 由 `size()` 暴露)。形状乘积只在构造/`reshape` 里当即校验。
-       ⚠ 想读长度的代码请用 `size()`（全仓 138 处 `t.size()` 已机械改成它）。 */
-    Vector val;
+    /*
+       ============================================================
+        [2026-10 P3 / C1] **存储私有化**: `val` 从 public 成员变成 private
+       ============================================================
+       为什么: `val` 公开时, 任何一处外部代码都能绕过形状/长度契约直接动缓冲 ——
+       方案 §1.4 记的四个"只改 val 不改形状"的入口里, 有三个就是这么来的; 而
+       `test_transformer [10]` 那条"缓冲长度 < 形状乘积"的守卫用例, 正是靠在测试里
+       `z.val.resize(100)` 手工制造病态张量才写得出来 (它自己的注释都写着
+       "`val` 是 public 的 ⇒ 这条路径在仓库里是真能发生的")。
+       现在对外只有**访问器**: `data()/size()/operator[]/begin()/end()/fill()/zero()`,
+       以及两个语义明确的写入口:
+         * `copyValuesFrom(r)`   —— 原来 `x.val = y.val` 那种"只拷值"的写法 (长度必须一致);
+         * `shrinkBufferUncheckedForTest(n)` —— **只给踩契约的测试**, 见它的注释。
+       `shape` 这一轮**仍然公开** (读点太多, 且 P5 的视图改造会再动它一次)。
+    */
     Shape shape;
+private:
+    Vector val;
+    /*
+       [2026-10 P3 / C1] `x.val = y.val` 的等价体: **只把值拷过来**, 不碰 shape/长度。
+       长度必须一致 —— 对不上就响亮失败 (原写法是 `std::vector::operator=`, 会把长度也换掉,
+       于是形状与缓冲悄悄分叉; 这正是 C1 要堵的那个口子)。
+    */
 public:
+    void copyValuesFrom(const Tensor_ &r)
+    {
+        requireSameLength(r, val.size(), "copyValuesFrom");
+        if (!val.empty()) {
+            std::memcpy(val.data(), r.val.data(), val.size() * sizeof(T));
+        }
+    }
+    /*
+       ⚠⚠ **只给"故意踩契约"的测试用**（`test_transformer [10]` 的 `--mm-buffer-guard`）:
+       把缓冲缩到 n 个元素而**不动 shape**, 制造"缓冲长度 < 形状乘积"的病态张量,
+       用来验证 MM 的常驻契约检查**真的会拦下来**。
+       A9（长度只有一个来源）+ C1（存储私有化）之后, 这个状态**从公共 API 已经不可达**
+       —— 保留这个洞, 只为让那条守卫继续有回归价值。生产代码**不要**用它。
+    */
+    void shrinkBufferUncheckedForTest(std::size_t n) { val.resize(n); }
+
     /* default construct */
     Tensor_(){}
 

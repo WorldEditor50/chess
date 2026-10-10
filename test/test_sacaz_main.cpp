@@ -1024,7 +1024,7 @@ static void testPpoPort()
         std::vector<float> buf;
         buf.reserve(acts.size() * rowStride);
         for (std::size_t i = 0; i < acts.size(); i++) {
-            const float *row = head->w.val.data() + (std::size_t)acts[i] * rowStride;
+            const float *row = head->w.data() + (std::size_t)acts[i] * rowStride;
             for (std::size_t k = 0; k < rowStride; k++) {
                 buf.push_back(row[k]);
             }
@@ -1094,7 +1094,7 @@ static void testPpoPort()
             const std::size_t rs2 = (std::size_t)h2->w.strideOf(0);
             std::vector<float> b2;
             for (std::size_t i = 0; i < illegal.size(); i++) {
-                const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;
+                const float *row = h2->w.data() + (std::size_t)illegal[i] * rs2;
                 for (std::size_t k = 0; k < rs2; k++) { b2.push_back(row[k]); }
             }
             RL::Tensor st2(SACAZAgent::STATE_DIM, 1);
@@ -1122,7 +1122,7 @@ static void testPpoPort()
             int diff2 = 0;
             std::size_t p = 0;
             for (std::size_t i = 0; i < illegal.size(); i++) {
-                const float *row = h2->w.val.data() + (std::size_t)illegal[i] * rs2;
+                const float *row = h2->w.data() + (std::size_t)illegal[i] * rs2;
                 for (std::size_t k = 0; k < rs2; k++) {
                     if (b2[p++] != row[k]) { diff2++; }
                 }

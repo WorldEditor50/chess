@@ -96,7 +96,7 @@ static bool sameBits(const Tensor &a, const Tensor &b)
     if (a.size() != b.size()) {
         return false;
     }
-    return std::memcmp(a.val.data(), b.val.data(), a.size() * sizeof(float)) == 0;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
 
 /* 把网络里所有 iFcLayer 的 w/b 收集起来 (逐比特比较用) */

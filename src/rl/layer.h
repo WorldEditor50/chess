@@ -143,9 +143,9 @@ public:
             return true;
         }
 
-        const float *xd = x.val.data();
-        const float *wd = w.val.data();
-        const float *bd = b.val.data();
+        const float *xd = x.data();
+        const float *wd = w.data();
+        const float *bd = b.data();
         const std::size_t wRowStride = (std::size_t)w.strideOf(0);
         const std::size_t wColStride = (std::size_t)w.strideOf(1);
         const std::size_t xRowStride = (std::size_t)x.strideOf(0);   /* [2026-10 A10] 提到循环外 */
@@ -154,7 +154,7 @@ public:
         for (std::size_t t = 0; t < idx.size(); t++) {
             const std::size_t a = (std::size_t)idx[t];
             const float *wrow = wd + a * wRowStride;
-            float s = (bias && a < b.val.size()) ? bd[a] : 0.0f;
+            float s = (bias && a < b.size()) ? bd[a] : 0.0f;
             if (denseRow) {
                 for (std::size_t k = 0; k < kdim; k++) {
                     s += wrow[k] * xd[k];
