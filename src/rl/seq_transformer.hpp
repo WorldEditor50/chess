@@ -623,6 +623,19 @@ private:
 };
 
 
+/*
+   [2026-10 P5] 白盒探针入口 (只为 `test/probe_seq_cost_main.cpp` 的 [C]/[D] 存在)。
+
+   为什么需要它: 那两节要把"一次 forward/backward 的用量"拆到分量上, 而**分量必须
+   是专家当前用的那份实现**, 否则三项之和会变成"标量注意力 + 逐 token FC"与"真专家"
+   的混合读数 —— P6 落地后 [C] 就一直是这样 (注意力那一项还是标量版), 于是
+   "三项之和 / forward" 从 0.63 涨到 1.19 倍, 已经不是占比了。
+   在探针里再抄一份当前实现是可以的, 但"再写一份"正是本工程反复吃亏的地方
+   (§3.4 第 3 条)。所以这里开**唯一**一个 friend 声明让探针直接调私有成员,
+   不新增任何 public 接口。只有那个文件定义这个偏特化, 其它 TU 不会实例化它。
+*/
+template<class E, class Tag> struct SeqProbeAccess;
+
 template<int SeqLen, int Heads, int Blocks>
 class SeqTransformerExpert : public iLayer
 {
@@ -687,8 +700,16 @@ public:
     std::vector<float> dCUR, dYS, dTMP, dTMP2;
     std::vector<float> dQv, dKv, dVv, dXs;
 
-    /* 逐 token 调 Layer<> 用的临时张量 (按维数取值, 见 scrOf) */
-    Tensor scIn[3], scEi[3], scE[3];
+    /*
+       [2026-10 P5/C5] 原来这里是逐 token 桥接用的九个 1 列临时张量
+       (`scIn[3]/scEi[3]/scE[3]` + `scrInFor/scrEiFor/scrEFor`) —— 批量 GEMM 直接
+       读写 (T×dim) 的平坦缓冲, 它们**全部成了死代码**, 已删除 (见下方 fcFwd/fcBwd)。
+       取而代之的是两块只增不减的复用暂存, 只有 Gelu 反向要用 (见 fcBwd)。
+    */
+    std::vector<float> scrBatchY, scrBatchP;
+
+    /* 白盒探针 (见文件里 `SeqProbeAccess` 的说明): 只有 probe_seq_cost 会特化它 */
+    template<class E, class Tag> friend struct SeqProbeAccess;
 
 public:
     long long paramCount() const override
@@ -1256,15 +1277,11 @@ private:
         dKv.assign(nT, 0.0f);
         dVv.assign(nT, 0.0f);
         dXs.assign((std::size_t)(SeqLen * featDim), 0.0f);
-        /* 逐 token 调用 Layer<> 的临时张量: 三种维数各一套 */
-        scIn[0] = Tensor((std::size_t)featDim, 1);
-        scIn[1] = Tensor((std::size_t)tokDim, 1);
-        scIn[2] = Tensor((std::size_t)dff, 1);
-        for (int i = 0; i < 3; i++) { scEi[i] = scIn[i]; scE[i] = Tensor(scIn[i].size(), 1); }
+        /* [2026-10 P5/C5] 批量 FC 的复用暂存: Gelu 反向重算的前向输出 Y 与 dP。
+           尺寸按最大的那个 outD (dff) 取, 保证任何调用点都不必再分配。 */
+        scrBatchY.assign((std::size_t)(SeqLen * (dff > tokDim ? dff : tokDim)), 0.0f);
+        scrBatchP.assign(scrBatchY.size(), 0.0f);
     }
-    Tensor& scrInFor(int d) { return (d == featDim) ? scIn[0] : ((d == tokDim) ? scIn[1] : scIn[2]); }
-    Tensor& scrEiFor(int d) { return (d == featDim) ? scEi[0] : ((d == tokDim) ? scEi[1] : scEi[2]); }
-    Tensor& scrEFor(int d)  { return (d == featDim) ? scE[0]  : ((d == tokDim) ? scE[1]  : scE[2]); }
     std::vector<float>& curInOf(int b) { return curIn[(std::size_t)b]; }
 
     /* ---- dropout 的三个帮手 (只在 dropP > 0 时被调用) ---- */
@@ -1320,66 +1337,183 @@ private:
         }
     }
 
-    /* ---- 逐 token 的全连接: Y = X·Wᵀ + b (复用经过测试的 Layer<Linear>) ---- */
+    /* ============================================================
+       ---- 批量(矩阵化)全连接: Y(T×outD) = X(T×inD)·Wᵀ + b ----
+       ============================================================
+       [2026-10 P5/C5] 这里原来是逐 token 的桥接, 每个 token 要:
+           X 行 →(拷贝) scrIn → `Layer::forward` (GEMV) → `l.o` →(拷贝) Y 行;
+       反向更贵 —— `Layer<Fn>::backward` 用**它自己缓存的 o** 算激活导数, 而一个
+       Layer 对象被 T 个 token 共用, 于是每个 token 都得**重跑一次 forward** 把缓存刷成
+       自己的 (≈2× 计算), 再加 dY→e、ei→dX 两次拷贝。整段里"逐 token"这层壳本来只为
+       复用 `Layer<>` 的已测实现, 代价是 T× 的搬运与 T× 的调用开销。
+
+       现在整个 X 当作 (T×inD) 矩阵一次乘完, 直接走 MM 用的同一批 SIMD 内核:
+           前向     Y    = X·Wᵀ      → `mm_ikjk` (z(i,j)=Σ_k x1(i,k)·x2(j,k), 免转置)
+           反向     dX   = dP·W      → `mm_ikkj`
+                    g.w += dPᵀ·X     → `mm_kikj` (**收缩维是 batch 那一维**, 见下方 ⚠)
+                    g.b += dP 的列和
+       激活导数也不再"逐 token 查缓存", 而是逐元素 `dP = dY ⊙ f'(Y)` —— Y 就是批量前向
+       的输出 (Gelu 反向重算一次, 一次 GEMM) ⇒ "逐 token 重跑 forward" 整块消失。
+
+       ⚠ **为什么 `g.w += dPᵀ·X` 必须是 `kikj` 而不是 `ikjk`**: 逐 token 时
+       `MM::ikjk(g.w, e, x)` 是对的 —— 那三个张量是 (outD×1)、(inD×1), 收缩维 = 1
+       (样本维), 两个形状的"最后维"都是那个 1, 所以 ikjk 与 kikj 恰好同义。
+       批量之后样本维变成**第一个**维 (T): ikjk 收缩的是两个操作数的**最后**维
+       (inD), 语义完全不对 —— 而 `mmShapeOk` 只看"每一维是否 >= 向量宽", 四个形状
+       恰好都够, 于是**闸门放行、内核按错误的下标读出界** (第一版就是这么炸的:
+       `avx2func.hpp:1751` 越界读 733 KB, 由 `test_transformer [1]` 的 FD 抓出来)。
+       kikj 收缩的才是第一个维: z(j,k) = Σ_t dP(t,j)·X(t,k) ⇒ z = dPᵀ·X ✓
+       (标量兜底那一支本来就是按 kikj 写的, 所以只有走 SIMD 的路径会错)。
+
+       **数值口径**: 批量 GEMM 沿 k 的 SIMD 分组与逐 token GEMV 不同, 所以这一项
+       **不是逐位相同**。这是 P5 的既定验收 (tensor_optimization_plan.md Part 4):
+       P5 只要求 21 组 FD + permutation 断言通过、BC 的 FD/holdout 不回退。
+
+       内核前置条件 (Debug 断言, Release 由调用点的缓冲契约保证): w/b 连续且形状与
+       inD/outD 一致; X/Y/dX 是 (T×行主序) 的平坦缓冲; 输出与输入**不重叠** ——
+       内核按 `__restrict` 读 x1/x2、写 z。 */
+    void fcFwdBatch(const Tensor &w, const Tensor &b, bool bias,
+                    const std::vector<float> &X, int inD, int outD, std::vector<float> &Y)
+    {
+        const std::size_t T = (std::size_t)SeqLen;
+        const std::size_t K = (std::size_t)inD;
+        const std::size_t N = (std::size_t)outD;
+#ifndef NDEBUG
+        assert(w.shape.size() == 2 && (std::size_t)w.shape[0] == N &&
+               (std::size_t)w.shape[1] == K && w.strideOf(1) == 1);
+        assert(X.size() >= T * K && Y.size() >= T * N);
+#endif
+        float *Yd = Y.data();
+        const float *Xd = X.data();
+        const float *Wd = w.data();
+        /*
+           初始化输出: **内核是累加语义**, 所以这里必须把 T×N 写满 —— 有 bias 就直接
+           把 bias 铺进去, 没 bias 才清零。原来写成"memset + 最后再加一遍 bias",
+           那是对同一个 T×N 缓冲的**两次**遍历; 而 `fcFwdBatch` 的每一层权重是
+           48 KB 级 (192×64), 与 4×16 KB(wq/wk/wv/wo) 一起已经接近 L2 —— 多出来的
+           每次遍历会挤掉热权重。probe_seq_cost [C] 的配对列量到的就是这个:
+           旧(逐 token GEMV, 权重流式读一遍) 0.729 ms vs 当前 1.142 ms。
+           (舍入顺序: bias 先入 vs `Layer<Linear>::forward` 的"乘完再加"不同 —— P5
+           本来就不要求逐位相同, 见上方口径; FD/BC 是这条的验收。)
+        */
+        if (bias) {
+            const float *bd = b.data();
+            for (std::size_t t = 0; t < T; t++) {
+                float *yr = Yd + t * N;
+                for (std::size_t j = 0; j < N; j++) { yr[j] = bd[j]; }
+            }
+        } else {
+            std::memset(Yd, 0, T * N * sizeof(float));
+        }
+        if (!simdops::mm_ikjk<float>(Yd, T, N, Xd, T, K, Wd, N, K)) {
+            /* 兜底: 有任一维 < 向量宽 (step) 时内核拒接 —— 与 MM::ikjk 的通用分支同义 */
+            for (std::size_t t = 0; t < T; t++) {
+                const float *xr = Xd + t * K;
+                float *yr = Yd + t * N;
+                for (std::size_t j = 0; j < N; j++) {
+                    const float *wr = Wd + j * K;
+                    float s = 0.0f;
+                    for (std::size_t k = 0; k < K; k++) { s += xr[k] * wr[k]; }
+                    yr[j] += s;
+                }
+            }
+        }
+        return;
+    }
+
+    /*
+       批量反向的公共尾巴: 给定 dP (∂L/∂该层**输出**, 已乘过激活导数), 求 dX 并累加
+       权重/偏置梯度。dX 由调用方先 assign 成全零 (assign 语义与改动前一致)。
+    */
+    void fcBwdBatch(const Tensor &w, Tensor &gw, Tensor &gb, bool bias,
+                    const std::vector<float> &X, int inD, int outD,
+                    const float *dP, std::vector<float> &dX)
+    {
+        const std::size_t T = (std::size_t)SeqLen;
+        const std::size_t K = (std::size_t)inD;
+        const std::size_t N = (std::size_t)outD;
+#ifndef NDEBUG
+        assert(w.shape.size() == 2 && (std::size_t)w.shape[0] == N &&
+               (std::size_t)w.shape[1] == K && w.strideOf(1) == 1);
+        assert(X.size() >= T * K && dX.size() >= T * K);
+        /* withGrad=false 的层不该走到反向 (原来那条路在 Layer::backward 里同样会炸) */
+        assert(gw.size() == N * K && (!bias || gb.size() == N));
+#endif
+        /* 降级判据只在 Release 有意义: 缺梯度缓冲就不累加, 但 Debug 下上面已经响亮断言 */
+        const bool wantW = (gw.size() == N * K);
+        const bool wantB = bias && (gb.size() == N);
+        float *dXd = dX.data();
+        const float *Xd = X.data();
+        const float *Wd = w.data();
+        if (!simdops::mm_ikkj<float>(dXd, T, K, dP, T, N, Wd, N, K)) {
+            for (std::size_t t = 0; t < T; t++) {
+                const float *pr = dP + t * N;
+                float *xr = dXd + t * K;
+                for (std::size_t j = 0; j < N; j++) {
+                    const float p = pr[j];
+                    const float *wr = Wd + j * K;
+                    for (std::size_t k = 0; k < K; k++) { xr[k] += p * wr[k]; }
+                }
+            }
+        }
+        if (wantW && !simdops::mm_kikj<float>(gw.data(), N, K, dP, T, N, Xd, T, K)) {
+            float *gwd = gw.data();
+            for (std::size_t t = 0; t < T; t++) {
+                const float *pr = dP + t * N;
+                const float *xr = Xd + t * K;
+                for (std::size_t j = 0; j < N; j++) {
+                    const float p = pr[j];
+                    float *wr = gwd + j * K;
+                    for (std::size_t k = 0; k < K; k++) { wr[k] += p * xr[k]; }
+                }
+            }
+        }
+        if (wantB) {
+            float *gbd = gb.data();
+            for (std::size_t t = 0; t < T; t++) {
+                const float *pr = dP + t * N;
+                for (std::size_t j = 0; j < N; j++) { gbd[j] += pr[j]; }
+            }
+        }
+        return;
+    }
+
+    /* 桥接的四个入口: 签名与调用点保持不变, 只剩"要不要过激活"的区别 */
     void fcFwd(Layer<Linear> &l, const std::vector<float> &X, int inD, int outD,
                std::vector<float> &Y, bool inference)
     {
-        Tensor &xi = scrInFor(inD);
-        for (int t = 0; t < SeqLen; t++) {
-            for (int j = 0; j < inD; j++) { xi[(std::size_t)j] = X[(std::size_t)(t * inD + j)]; }
-            l.forward(xi, inference);
-            for (int j = 0; j < outD; j++) { Y[(std::size_t)(t * outD + j)] = l.o[(std::size_t)j]; }
-        }
+        (void)inference;                    /* 批量路径不区分推理/训练 (原路径也不区分) */
+        fcFwdBatch(l.w, l.b, l.bias, X, inD, outD, Y);
     }
     void fcFwd(Layer<Gelu> &l, const std::vector<float> &X, int inD, int outD,
                std::vector<float> &Y, bool inference)
     {
-        Tensor &xi = scrInFor(inD);
-        for (int t = 0; t < SeqLen; t++) {
-            for (int j = 0; j < inD; j++) { xi[(std::size_t)j] = X[(std::size_t)(t * inD + j)]; }
-            l.forward(xi, inference);
-            for (int j = 0; j < outD; j++) { Y[(std::size_t)(t * outD + j)] = l.o[(std::size_t)j]; }
-        }
+        (void)inference;
+        fcFwdBatch(l.w, l.b, l.bias, X, inD, outD, Y);
+        const std::size_t n = (std::size_t)(SeqLen * outD);
+        for (std::size_t i = 0; i < n; i++) { Y[i] = Gelu::f(Y[i]); }
     }
-    /*
-       逐 token 的全连反向。**关键细节**: `Layer<Fn>::backward` 用**它自己缓存的 o** 算激活
-       导数, 而一个 Layer 对象被 T 个 token 共用 —— 所以这里在每个 token 反向之前先重跑一次
-       该 token 的 forward (把缓存刷成这个 token 的)。代价是 ~2× 的计算, 换来的是"不必再写
-       一份 FC/激活的反向" —— 而"再写一份"正是本工程反复吃亏的地方。
-    */
     void fcBwd(Layer<Linear> &l, const std::vector<float> &X, int inD, int outD,
                const std::vector<float> &dY, std::vector<float> &dX)
     {
-        Tensor &xi = scrInFor(inD);
-        Tensor &ei = scrEiFor(inD);
-        Tensor &de = scrEFor(outD);
         dX.assign((std::size_t)(SeqLen * inD), 0.0f);
-        for (int t = 0; t < SeqLen; t++) {
-            for (int j = 0; j < inD; j++) { xi[(std::size_t)j] = X[(std::size_t)(t * inD + j)]; }
-            l.forward(xi, true);                       /* 刷新缓存 (Linear 无害, Gelu 必需) */
-            for (int j = 0; j < outD; j++) { de[(std::size_t)j] = dY[(std::size_t)(t * outD + j)]; }
-            l.e = de;
-            ei.zero();
-            l.backward(xi, ei);
-            for (int j = 0; j < inD; j++) { dX[(std::size_t)(t * inD + j)] = ei[(std::size_t)j]; }
-        }
+        fcBwdBatch(l.w, l.g.w, l.g.b, l.bias, X, inD, outD, dY.data(), dX);
     }
     void fcBwd(Layer<Gelu> &l, const std::vector<float> &X, int inD, int outD,
                const std::vector<float> &dY, std::vector<float> &dX)
     {
-        Tensor &xi = scrInFor(inD);
-        Tensor &ei = scrEiFor(inD);
-        Tensor &de = scrEFor(outD);
+        const std::size_t n = (std::size_t)(SeqLen * outD);
+        /*
+           Y = 该层批量前向的输出 (与 fcFwd 逐位相同的一次重算 —— 权重在前向与反向之间
+           不变, 优化器在之后才跑), dP = dY ⊙ f'(Y): 与 `Layer<Gelu>::backward` 的
+           `e[i] = Fn::df(o[i]) * e[i]` 同义。
+        */
+        fcFwdBatch(l.w, l.b, l.bias, X, inD, outD, scrBatchY);
+        const float *Yd = scrBatchY.data();
+        float *Pd = scrBatchP.data();
+        for (std::size_t i = 0; i < n; i++) { Pd[i] = dY[i] * Gelu::df(Yd[i]); }
         dX.assign((std::size_t)(SeqLen * inD), 0.0f);
-        for (int t = 0; t < SeqLen; t++) {
-            for (int j = 0; j < inD; j++) { xi[(std::size_t)j] = X[(std::size_t)(t * inD + j)]; }
-            l.forward(xi, true);
-            for (int j = 0; j < outD; j++) { de[(std::size_t)j] = dY[(std::size_t)(t * outD + j)]; }
-            l.e = de;
-            ei.zero();
-            l.backward(xi, ei);
-            for (int j = 0; j < inD; j++) { dX[(std::size_t)(t * inD + j)] = ei[(std::size_t)j]; }
-        }
+        fcBwdBatch(l.w, l.g.w, l.g.b, l.bias, X, inD, outD, Pd, dX);
     }
 
     /*

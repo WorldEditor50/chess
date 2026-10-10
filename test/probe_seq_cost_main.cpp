@@ -38,6 +38,59 @@
 using RL::Tensor;
 using SeqExp = RL::SeqTransformerExpert<90, 4, 2>;
 
+/*
+   [2026-10 P5] 白盒入口 —— [C]/[D] 的"当前实现"一列直接调专家自己的私有函数。
+
+   §8.4 的口径是"同一进程、同一轮、成对", 所以旧实现 (逐 token FC / 标量注意力) 与
+   当前实现 (整批 FC / 矩阵化注意力) 必须**在同一轮里各量一遍**。当前实现不能在这里
+   再抄一份: 抄一份就会漂, 而漂掉的读数比没有读数更糟 (P6 之后 [C] 就漂了 —— 注意力
+   那一项一直是标量版, 于是"三项之和 / forward" 变成 1.19 倍)。
+   `SeqProbeAccess` 是 seq_transformer.hpp 里**唯一**一个 friend 声明, 不新增 public
+   接口; 只有本文件定义这个偏特化。
+
+   ⚠ FC 那两个入口传的是**本地的** Layer 对象 (w64/wGelu/wUp/wDown/wOut/wEmb), 不是
+   专家的 —— 同一份代码路径, 但累加进的是本地层的 g.w, 不会把专家的梯度越加越大。
+*/
+namespace RL {
+struct P5ProbeTag;
+template<class E>
+struct SeqProbeAccess<E, P5ProbeTag>
+{
+    static void fcFwdLin(E &e, Layer<Linear> &l, const std::vector<float> &X, int inD, int outD,
+                         std::vector<float> &Y)
+    {
+        e.fcFwd(l, X, inD, outD, Y, false);
+    }
+    static void fcFwdGel(E &e, Layer<Gelu> &l, const std::vector<float> &X, int inD, int outD,
+                         std::vector<float> &Y)
+    {
+        e.fcFwd(l, X, inD, outD, Y, false);
+    }
+    static void fcBwdLin(E &e, Layer<Linear> &l, const std::vector<float> &X, int inD, int outD,
+                         const std::vector<float> &dY, std::vector<float> &dX)
+    {
+        e.fcBwd(l, X, inD, outD, dY, dX);
+    }
+    static void fcBwdGel(E &e, Layer<Gelu> &l, const std::vector<float> &X, int inD, int outD,
+                         const std::vector<float> &dY, std::vector<float> &dX)
+    {
+        e.fcBwd(l, X, inD, outD, dY, dX);
+    }
+    static void attnFwd(E &e, std::vector<float> &q, std::vector<float> &k, std::vector<float> &v,
+                        std::vector<float> &p, std::vector<float> &att)
+    {
+        e.attnFwd(q, k, v, p, att);
+    }
+    static void attnBwd(E &e, std::vector<float> &q, std::vector<float> &k, std::vector<float> &v,
+                        std::vector<float> &p, const std::vector<float> &dP,
+                        std::vector<float> &dQ, std::vector<float> &dK, std::vector<float> &dV)
+    {
+        e.attnBwd(q, k, v, p, dP, dQ, dK, dV, nullptr);
+    }
+};
+} /* namespace RL */
+using Probe = RL::SeqProbeAccess<SeqExp, RL::P5ProbeTag>;
+
 static const int T = 90;          /* SeqLen */
 static const int TOK = 64;        /* tokDim */
 static const int DFT = 3 * TOK;   /* dff */
@@ -333,6 +386,7 @@ int main(int argc, char **argv)
                                      RL::Layer<RL::Linear>(TOK, TOK, true, true) };
     RL::Layer<RL::Linear> wUp(TOK, DFT, true, true), wDown(DFT, TOK, true, true);
     RL::Layer<RL::Linear> wOut(TOK, 19, true, true), wEmb(19, TOK, true, true);
+    RL::Layer<RL::Gelu> wGel(TOK, DFT, true, true);      /* [C2] 当前实现的 Gelu 层 (本地的) */
 
     std::vector<float> Q((std::size_t)T * TOK), K((std::size_t)T * TOK), V((std::size_t)T * TOK),
                        P((std::size_t)4 * T * T), O((std::size_t)T * TOK, 0.0f),
@@ -372,6 +426,8 @@ int main(int argc, char **argv)
      * ============================================================ */
     std::vector<double> vFwd, vBoth, vFcFwd, vAttnFwd, vLnFwd;
     std::vector<double> vBwdFc, vBwdAttn, vBwdLn, vSingle[3];
+    /* [C2]/[D2] "当前实现"一列 (P5: 整批 FC + P6: 矩阵化注意力), 与旧实现同轮配对 */
+    std::vector<double> vFcFwdNew, vAttnFwdNew, vBwdFcNew, vBwdAttnNew;
     for (int r = 0; r < ROUNDS; r++) {
         const bool fwdOrder = (r % 2 == 0);
         auto measureComponents = [&]() {
@@ -382,6 +438,9 @@ int main(int argc, char **argv)
                 fcFwdToken(wUp, X64, TOK, DFT, Y192, xi64, true);
                 fcFwdToken(wDown, X192, DFT, TOK, Y64, xi192, true);
             }
+            /* embed + outProj (与真专家的 forward 对齐: 一次 forward 是 14 次 FC) */
+            fcFwdToken(wEmb, X19, 19, TOK, Y64, xi19, true);
+            fcFwdToken(wOut, X64, TOK, 19, Y19, xi64, true);
             vFcFwd.push_back(nowMs() - t0);
             t0 = nowMs();
             for (int i = 0; i < 8; i++) {
@@ -392,6 +451,24 @@ int main(int argc, char **argv)
             t0 = nowMs();
             for (int i = 0; i < 4; i++) { lnFwdVec(LX, LY, Lg, Lb); }
             vLnFwd.push_back(nowMs() - t0);
+        };
+        /*
+           [C2] 当前实现 (P5 的整批 FC + P6 的矩阵化注意力): 直接调专家的私有函数。
+           调用次数/形状与真专家的 forward 一一对应 (14 FC + 2 次 4 头注意力 + 4 LN)。
+        */
+        auto measureCurrentFwd = [&]() {
+            double t0 = nowMs();
+            for (int b = 0; b < 2; b++) {
+                for (int i = 0; i < 4; i++) { Probe::fcFwdLin(ex, w64[i], X64, TOK, TOK, Y64); }
+                Probe::fcFwdGel(ex, wGel, X64, TOK, DFT, Y192);
+                Probe::fcFwdLin(ex, wDown, X192, DFT, TOK, Y64);
+            }
+            Probe::fcFwdLin(ex, wEmb, X19, 19, TOK, Y64);
+            Probe::fcFwdLin(ex, wOut, X64, TOK, 19, Y19);
+            vFcFwdNew.push_back(nowMs() - t0);
+            t0 = nowMs();
+            for (int b = 0; b < 2; b++) { Probe::attnFwd(ex, Q, K, V, P, O); }
+            vAttnFwdNew.push_back(nowMs() - t0);
         };
         auto measureBwd = [&]() {
             double t0;
@@ -411,6 +488,21 @@ int main(int argc, char **argv)
             for (int i = 0; i < 4; i++) { lnBwdIdx(LX, LdY, dLX, Lg); }
             vBwdLn.push_back(nowMs() - t0);
         };
+        /* [D2] 当前实现的反向分量 (与真专家的 backward 同调用次数: 14 fcBwd + 2 次 4 头 attnBwd) */
+        auto measureCurrentBwd = [&]() {
+            double t0 = nowMs();
+            for (int b = 0; b < 2; b++) {
+                for (int i = 0; i < 4; i++) { Probe::fcBwdLin(ex, w64[i], X64, TOK, TOK, Y64, dX64); }
+                Probe::fcBwdGel(ex, wGel, X64, TOK, DFT, Y192, dX64);
+                Probe::fcBwdLin(ex, wDown, X192, DFT, TOK, Y64, dX192);
+            }
+            Probe::fcBwdLin(ex, wOut, X64, TOK, 19, Y19, dX64);
+            Probe::fcBwdLin(ex, wEmb, X19, 19, TOK, Y64, dX19);
+            vBwdFcNew.push_back(nowMs() - t0);
+            t0 = nowMs();
+            for (int b = 0; b < 2; b++) { Probe::attnBwd(ex, Q, K, V, P, Y64, dQ, dK, dV); }
+            vBwdAttnNew.push_back(nowMs() - t0);
+        };
         auto measureSingle = [&]() {
             double t0;
             t0 = nowMs(); for (int i = 0; i < 3; i++) { fcFwdToken(w64[0], X64, TOK, TOK, Y64, xi64, true); } vSingle[0].push_back((nowMs() - t0) / 3);
@@ -420,9 +512,9 @@ int main(int argc, char **argv)
         if (fwdOrder) {
             double t0 = nowMs(); ex.forward(xs, false); vFwd.push_back(nowMs() - t0);
             t0 = nowMs(); ex.forward(xs, false); ex.backward(xs, ei); vBoth.push_back(nowMs() - t0);
-            measureComponents(); measureBwd(); measureSingle();
+            measureComponents(); measureCurrentFwd(); measureBwd(); measureCurrentBwd(); measureSingle();
         } else {
-            measureSingle(); measureBwd(); measureComponents();
+            measureSingle(); measureCurrentBwd(); measureBwd(); measureCurrentFwd(); measureComponents();
             double t0 = nowMs(); ex.forward(xs, false); ex.backward(xs, ei); vBoth.push_back(nowMs() - t0);
             t0 = nowMs(); ex.forward(xs, false); vFwd.push_back(nowMs() - t0);
         }
@@ -434,25 +526,51 @@ int main(int argc, char **argv)
     const Stat sBcB = statOf(vBwdFc), sAtB = statOf(vBwdAttn), sLnB = statOf(vBwdLn);
     const Stat sCtl = statOf(ctlAll);
     const double bwd = sBoth.med - sFwd.med;
+    /* [C2]/[D2] 当前实现的同一批分量 (同轮配对) */
+    const Stat sFcFN = statOf(vFcFwdNew), sAtFN = statOf(vAttnFwdNew);
+    const Stat sBcBN = statOf(vBwdFcNew), sAtBN = statOf(vBwdAttnNew);
 
     std::printf("[B] 真专家 (每轮交替, %d 轮中位数, 区间)\n", ROUNDS);
     std::printf("    forward            %8.3f ms   [%.3f, %.3f]\n", sFwd.med, sFwd.lo, sFwd.hi);
     std::printf("    forward+backward   %8.3f ms   [%.3f, %.3f]\n", sBoth.med, sBoth.lo, sBoth.hi);
     std::printf("    -> backward        %8.3f ms   = forward 的 %.2f 倍\n\n", bwd, bwd / sFwd.med);
 
-    std::printf("[C] forward 的分量 (各分量凑成\"一次 forward 的用量\")\n");
-    std::printf("    FC 12 次           %8.3f ms   = %.0f%% of forward\n", sFcF.med, 100 * sFcF.med / sFwd.med);
-    std::printf("    注意力 8 次单头    %8.3f ms   = %.0f%% of forward\n", sAtF.med, 100 * sAtF.med / sFwd.med);
-    std::printf("    LN 4 次            %8.3f ms   = %.0f%% of forward\n", sLnF.med, 100 * sLnF.med / sFwd.med);
-    std::printf("    三项之和           %8.3f ms   = %.2f x forward (余下部分是逐 token 拷贝/gather/scatter/残差)\n\n",
-                sFcF.med + sAtF.med + sLnF.med, (sFcF.med + sAtF.med + sLnF.med) / sFwd.med);
+    /*
+       [C]/[C2] 一次 forward 的分量。**两列都是本轮现测** (§8.4: 同一进程、同一轮):
+       旧列 = 逐 token GEMV 桥接 + 标量注意力 (P6 之前专家用的那份), 用探针里的
+       局地复现量; 当前列 = 直接调专家自己的 fcFwd/attnFwd (P5 整批 + P6 矩阵化)。
+       两列的调用次数/形状与真专家的 forward 一一对应 (14 FC + 2 次 4 头注意力 + 4 LN),
+       所以"三项之和"可以直接与 [B] 的 forward 比。
+       ⚠ 与 P6 行里的 [C] 读数不可直接比: 那时 FC 只算 12 次 (不含 embed/outProj),
+       注意力那一项还是标量版 —— 这正是本次重做这两节的原因。
+    */
+    const double sumNew = sFcFN.med + sAtFN.med + sLnF.med;
+    std::printf("[C] forward 的分量 (14 FC + 2 次 4 头注意力 + 4 LN = 一次 forward 的用量)\n");
+    std::printf("                      旧实现(逐token/标量)   当前实现(P5/P6)      比\n");
+    std::printf("    FC 14 次           %8.3f ms          %8.3f ms        %.2fx\n",
+                sFcF.med, sFcFN.med, sFcFN.med / sFcF.med);
+    std::printf("    注意力 2 次(4 头)  %8.3f ms          %8.3f ms        %.2fx\n",
+                sAtF.med, sAtFN.med, sAtFN.med / sAtF.med);
+    std::printf("    LN 4 次            %8.3f ms          %8.3f ms        %.2fx (P5/P6 未改这一项)\n",
+                sLnF.med, sLnF.med, 1.0);
+    std::printf("    三项之和           %8.3f ms          %8.3f ms        %.2fx\n",
+                sFcF.med + sAtF.med + sLnF.med, sumNew, sumNew / (sFcF.med + sAtF.med + sLnF.med));
+    std::printf("    / forward (B)      %8.2f x           %8.2f x   <= 余下部分 = gather/scatter/残差/LN 之外的接线\n\n",
+                (sFcF.med + sAtF.med + sLnF.med) / sFwd.med, sumNew / sFwd.med);
 
-    std::printf("[D] backward 的分量\n");
-    std::printf("    fcBwd 14 次        %8.3f ms   = %.0f%% of backward\n", sBcB.med, 100 * sBcB.med / bwd);
-    std::printf("    attnBwd 2 次(4头)  %8.3f ms   = %.0f%% of backward\n", sAtB.med, 100 * sAtB.med / bwd);
-    std::printf("    LN 反向 4 次       %8.3f ms   = %.0f%% of backward\n", sLnB.med, 100 * sLnB.med / bwd);
-    std::printf("    三项之和           %8.3f ms   = %.2f x backward\n\n",
-                sBcB.med + sAtB.med + sLnB.med, (sBcB.med + sAtB.med + sLnB.med) / bwd);
+    std::printf("[D] backward 的分量 (14 fcBwd + 2 次 4 头 attnBwd + 4 LN 反向)\n");
+    std::printf("                      旧实现(逐token/标量)   当前实现(P5/P6)      比\n");
+    std::printf("    fcBwd 14 次        %8.3f ms          %8.3f ms        %.2fx\n",
+                sBcB.med, sBcBN.med, sBcBN.med / sBcB.med);
+    std::printf("    attnBwd 2 次(4头)  %8.3f ms          %8.3f ms        %.2fx\n",
+                sAtB.med, sAtBN.med, sAtBN.med / sAtB.med);
+    std::printf("    LN 反向 4 次       %8.3f ms          %8.3f ms        %.2fx (P5/P6 未改这一项)\n",
+                sLnB.med, sLnB.med, 1.0);
+    std::printf("    三项之和           %8.3f ms          %8.3f ms        %.2fx\n",
+                sBcB.med + sAtB.med + sLnB.med, sBcBN.med + sAtBN.med + sLnB.med,
+                (sBcBN.med + sAtBN.med + sLnB.med) / (sBcB.med + sAtB.med + sLnB.med));
+    std::printf("    / backward (B)     %8.2f x           %8.2f x\n\n",
+                (sBcB.med + sAtB.med + sLnB.med) / bwd, (sBcBN.med + sAtBN.med + sLnB.med) / bwd);
 
     std::printf("[E] 单件: 同一形状的 forward 与 backward (逐 token)\n");
     std::printf("    64->64   fwd %7.4f ms   bwd %7.4f ms   bwd/fwd = %.2f\n",
