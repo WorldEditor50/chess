@@ -110,12 +110,26 @@ chess 的 `ppo.h/cpp` 是**为 AlphaZero 风格改写过的简化 PPO**（`actio
 > 未做完的账：本节只列**已确认**的分叉点。`src/rl/` 其余文件是否在同步后也被改过，
 > 见 `docs/tensor_optimization_plan.md` 的 P0 与 Part 6 执行台账。
 
+### 1.5 P2（2026-10）**删掉**的上游同源代码项
+
+`docs/tensor_optimization_plan.md` 的 P2「删死代码」清单里有一部分**是上游 snakeAI 同源代码**。
+按上面的规矩（分歧要记账 + 文件内注释标明），这里把"删了上游什么"逐条记下来，供下次同步判断：
+
+| # | 删掉的上游项 | 判据（本仓库证据） |
+|---|---|---|
+| 1 | `Tensor_(const std::vector<Tensor_>&)`（`tensor.hpp` 里原注释标为"属于上游同源代码，删除该走 `rl_sync` 那条线"的那一条） | 它**从来实例化不了**：`x[0].totalsize` 拼错成员名，`sizes.push_back(x[0].sizes)` 把 `std::vector<int>` 推进 `std::vector<int>` —— 模板成员只在实例化时检查，所以一直静静躺着。删掉后**全量构建 0 error**，即"零实例化"被编译器证实。同一语义的正确实现在 `fromVector()`，而它对外同样零引用，一并删了 |
+| 2 | `bmm` + `SubTensor` 整类 + `at()` + `Tensor_::sub()` + `Tensor_::operator%` | `.at(` / `.sub(` 在全仓只出现在 `bmm` 体内（各 2 处）⇒ `bmm` 是这一簇唯一的根，删它即整簇失去调用者；`SubTensor` 对外零引用，且自带一串静默出错路径 |
+| 3 | `slice` / `view` / `permute`（+`permuteIndexs`）/ `shapeEqual` / `size(const Shape&)` / `zeros`×2 / `ones`×2 / `min` / `argmin` / `product2D` / `printValue`×2 / `printValue2D` / `printShape` / `validateEncoded` / `base64Decode` / `MM` 的 4 个"2 参返回副本"重载 / `Tensorc`·`Tensoru8`·`Tensori`·`Tensord` / `operator=(const std::vector<T>&)` / `Tensor_(Shape,Vector)` / `Tensor_(init_list,init_list)` / `Tensor_(T)` | 逐项 `src/` + `test/` 双零命中 grep（清单见 `docs/tensor_optimization_plan.md` Part 2.2 D1），**再以编译器为准** —— 模板代码的"零引用"只是文本层证据 |
+| 4 | **（被编译器否掉的一条）** `empty()` 曾按 D1 清单删除, 全量构建报 `error C2039: "empty" 不是 RL::Tensor_ 的成员`（`src/rl/bc.h:73`、`src/rl/sac.cpp:175` / `:274`）⇒ **已原样放回** | 这是 P2 验收纪律"以编译结果为准"当场生效的例子: 头文件里的成员函数,"文本层零引用"不是充分证据 |
+| — | **保留**（无生产调用者但是测试抓手，不是死代码） | `ptr()` / `alignedTo()` / `dataAlignment()`（`test_transformer [9]` 对齐自检）、`sum()`、`toDebugString()`（老格式往返）、`MM::kijk`（`test_grad` 语义钉桩）、`normalize()`（`test_transformer [10]` 的"零跨度必须响亮失败"用例）；**`normalize` 是 P1 新增测试 [10] 的抓手，故 D1 清单里那条不执行** |
+
 ---
 
 ## 二、同步进来的主要修复（按主题）
 
 ### `Tensor::MM`：训练慢的根因（0.11 → 37 GFLOP/s）
-`struct MM` 的所有内核（`ikkj`/`kikj`/`ikjk`/`kijk` 及其返回副本的版本）原来每次
+`struct MM` 的所有内核（`ikkj`/`kikj`/`ikjk`/`kijk` 及其返回副本的版本 —— 后 4 个
+"2 参返回副本"的重载在 **P2 已删**，见 §1.5）原来每次
 乘加都要调两次 `operator()` → `posOf()`，而 `posOf()` 会在栈上重建索引数组、
 循环读取 `std::vector sizes`，编译器完全无法向量化。实测 **18.2 ns/MAC**。
 

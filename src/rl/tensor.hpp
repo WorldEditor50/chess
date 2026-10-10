@@ -48,6 +48,38 @@
 */
 
 /*
+   ============================================================
+    [2026-10 P2] 删死代码: 每一条都做过 `src/` + `test/` 双零命中 grep, 再以编译器为准
+   ============================================================
+   `bmm` 死簇: `bmm` 是这一簇唯一的根 —— 删掉它, `at()` / `sub()` / `operator%` 同时失去
+   唯一调用者 (`.at(` / `.sub(` 在全仓只出现在 `bmm` 体内, 各 2 处), 于是整类
+   `SubTensor`(195 行) 与 `subTensor` 成员一并删掉: 对外零引用, 而且它自带一串静默出错
+   路径 (绕过 shape/totalSize 同步、`operator=(const Tensor_&)` 按 `x.totalSize` 写父张量)。
+   一并删的零引用项 (证据 = 全仓 grep; 逐项清单见 `docs/tensor_optimization_plan.md` Part 2.2):
+     `toVector` / `fromVector` / `slice` / `view` / `permute`(+`permuteIndexs`) /
+     `shapeEqual`(实现本身还越界读) / `size(const Shape&)` / `zeros`×2 / `ones`×2 /
+     `min` / `argmin` / `product2D` / `printValue`×2 / `printValue2D` / `printShape` /
+     `validateEncoded` / `base64Decode`(死解码器; 在用的是 `base64DecodeInto`/`base64Encode`) /
+     `MM` 的 4 个"2 参返回副本"重载 / 4 个别名 (`Tensorc/Tensoru8/Tensori/Tensord`) /
+     4 个构造 + 1 个赋值 (`Tensor_(Shape,Vector)`、`Tensor_(init_list,init_list)`、
+     `Tensor_(T)`、`operator=(const std::vector<T>&)`)。
+   净删 628 行 (2506 → 1878); 随后放回 `empty()` 并写下这段说明 ⇒ **最终 1924 行**
+   (`git diff --numstat`: +48 / −630, 净 **−582 行 / −23%**)。
+   逐位不变的验收见 `docs/tensor_optimization_plan.md` Part 6 台账。
+   ⚠ **方案 D1 清单里唯一被编译器否掉的一条**: `empty()`。它被列为"零引用", 但按验收纪律
+     "以编译结果为准"删掉后, 全量构建报 `error C2039: "empty" 不是 RL::Tensor_ 的成员`
+     (`src/rl/bc.h:73`、`src/rl/sac.cpp:175` / `:274`) ⇒ **已原样放回**, 并在它的定义处
+     写下了这段历史。"文本层零引用"对头文件里的成员函数不是充分证据。
+   ⚠ **保留但无生产调用者** (D3 —— 它们是测试抓手, 不是死代码):
+     `ptr()` / `alignedTo()` / `dataAlignment()` (test_transformer [9] 的对齐自检)、
+     `sum()`、`toDebugString()` (老格式往返)、`MM::kijk` (test_grad 的语义钉桩)、
+     `normalize()` (test_transformer [10] 的"零跨度必须响亮失败"用例)。
+   ⚠ 上游同源代码里那个**坏构造** `Tensor_(const std::vector<Tensor_>&)`
+     (`sizes.push_back(x[0].sizes)` —— 从来实例化不了, 所以一直过不了编译也没人发现)
+     的删除按 P0.1 那条线记进了 `docs/rl_sync.md` §1.4, 不是"偷偷删上游代码"。
+*/
+
+/*
    别名提示 (给编译器, 不影响语义): 只用在"逐元素的两条独立内存"这类循环上 ——
    裸指针默认要按可能别名处理, 编译器会因此放弃向量化。调用方本来就要求输出与输入
    不是同一块内存 (MM 的语义), 所以这是安全的。
@@ -72,205 +104,6 @@ public:
     using Size = std::vector<int>;
     using iterator = typename Vector::iterator;
     using const_iterator = typename Vector::const_iterator;
-    class SubTensor
-    {
-    public:
-        Tensor_ *pointer;
-        std::size_t pos;
-        std::size_t totalSize;
-    public:
-        SubTensor():pointer(nullptr),pos(0),totalSize(0){}
-        SubTensor(const SubTensor &r):pointer(r.pointer),pos(r.pos),totalSize(r.totalSize){}
-        SubTensor& operator=(const SubTensor &r)
-        {
-            if (this == &r) {
-                return *this;
-            }
-            pointer = r.pointer;
-            pos = r.pos;
-            totalSize = r.totalSize;
-            return *this;
-        }
-        inline void operator=(const Tensor_ &x)
-        {
-            for (std::size_t i = 0; i < x.totalSize; i++) {
-                pointer->val[i + pos] = x.val[i];
-            }
-            return;
-        }
-        inline void operator=(const std::vector<T> &x)
-        {
-            for (std::size_t i = 0; i < x.size(); i++) {
-                pointer->val[i + pos] = x[i];
-            }
-            return;
-        }
-
-        inline void operator=(T x)
-        {
-            for (std::size_t i = 0; i < totalSize; i++) {
-                pointer->val[i + pos] = x;
-            }
-            return;
-        }
-
-        inline void operator+=(const Tensor_ &x)
-        {
-            for (std::size_t i = 0; i < x.totalSize; i++) {
-                pointer->val[i + pos] += x.val[i];
-            }
-            return;
-        }
-
-        inline void operator-=(const Tensor_ &x)
-        {
-            for (std::size_t i = 0; i < x.totalSize; i++) {
-                pointer->val[i + pos] -= x.val[i];
-            }
-            return;
-        }
-
-        inline void operator*=(const Tensor_ &x)
-        {
-            for (std::size_t i = 0; i < x.totalSize; i++) {
-                pointer->val[i + pos] *= x.val[i];
-            }
-            return;
-        }
-
-        inline void operator/=(const Tensor_ &x)
-        {
-            for (std::size_t i = 0; i < x.totalSize; i++) {
-                pointer->val[i + pos] /= x.val[i];
-            }
-            return;
-        }
-
-        inline void operator+=(T x)
-        {
-            for (std::size_t i = 0; i < totalSize; i++) {
-                pointer->val[i + pos] += x;
-            }
-            return;
-        }
-
-        inline void operator-=(T x)
-        {
-            for (std::size_t i = 0; i < totalSize; i++) {
-                pointer->val[i + pos] -= x;
-            }
-            return;
-        }
-
-        inline void operator*=(T x)
-        {
-            for (std::size_t i = 0; i < totalSize; i++) {
-                pointer->val[i + pos] *= x;
-            }
-            return;
-        }
-
-        inline void operator/=(T x)
-        {
-            for (std::size_t i = 0; i < totalSize; i++) {
-                pointer->val[i + pos] /= x;
-            }
-            return;
-        }
-
-        inline T sum() const
-        {
-            T s = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                s += pointer->val[i + pos];
-            }
-            return s;
-        }
-
-        inline T mean() const
-        {
-            T s = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                s += pointer->val[i + pos];
-            }
-            return s/T(totalSize);
-        }
-
-        inline T variance(T u) const
-        {
-            T s = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                float d = pointer->val[i + pos] - u;
-                s += d*d;
-            }
-            return s/T(totalSize);
-        }
-
-        inline T max() const
-        {
-            T maxVal = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                T val = pointer->val[i + pos];
-                if (maxVal < val) {
-                    maxVal = val;
-                }
-            }
-            return maxVal;
-        }
-
-        inline std::size_t argmax() const
-        {
-            T maxVal = 0;
-            std::size_t index = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                T val = pointer->val[i + pos];
-                if (maxVal < val) {
-                    maxVal = val;
-                    index = i;
-                }
-            }
-            return index;
-        }
-
-        inline T min() const
-        {
-            T minVal = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                T val = pointer->val[i + pos];
-                if (minVal > val) {
-                    minVal = val;
-                }
-            }
-            return minVal;
-        }
-
-        inline std::size_t argmin() const
-        {
-            T minVal = 0;
-            std::size_t index = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                T val = pointer->val[i + pos];
-                if (minVal > val) {
-                    minVal = val;
-                    index = i;
-                }
-            }
-            return index;
-        }
-        inline T norm2() const
-        {
-            T s = 0;
-            for (std::size_t i = 0; i < totalSize; i++) {
-                T val = pointer->val[i + pos];
-                s += val*val;
-            }
-            return std::sqrt(s);
-        }
-    };
-
-protected:
-    SubTensor subTensor;
-public:
     std::size_t totalSize;
     Vector val;
     Size sizes;
@@ -355,48 +188,10 @@ public:
         val = std::vector<T, Alloc<T>>(totalSize, T(0));
     }
 
-    explicit Tensor_(const Shape &shape_,
-                     const std::vector<T, Alloc<T>> &val_):
-        totalSize(1),shape(shape_),val(val_)
-    {
-        initParams(shape, sizes, totalSize);
-    }
 
 
-    explicit Tensor_(const std::initializer_list<int> &shape_,
-                     const std::initializer_list<T> &val_):
-        totalSize(1),shape(shape_),val(val_)
-    {
-        initParams(shape, sizes, totalSize);
-    }
 
-    /*
-       ⚠ [2026-10 审计] 这个构造**是坏的、而且从来没被实例化过**: `x[0].totalsize`
-       拼错了成员名 (成员是 `totalSize`), `sizes.push_back(x[0].sizes)` 也把
-       `std::vector<int>` 往 `std::vector<int>` 里推了一个 vector —— 两处都过不了编译。
-       模板成员只在实例化时检查, 所以它一直静静躺在那里。
-       正确的"把 N 个子张量摞起来"的实现在 `fromVector()` (它有一整段注释写清楚了
-       旧版本 `std::copy` 越界写 `shape` 的那个 bug)。这里**不删也不改**: 它属于
-       上游 snakeAI 的同源代码, 删除/修复该走 `docs/rl_sync.md` 那条线, 不该混在
-       "Tensor 下标类型"这一轮里。
-    */
-    explicit Tensor_(const std::vector<Tensor_> &x)
-    {
-        totalSize = x.size()*x[0].totalsize;
-        sizes.push_back(x.size()*x[0].sizes[0]);
-        sizes.push_back(x[0].sizes);
-        shape.push_back(x.size());
-        shape.push_back(x[0].shape);
-        for (std::size_t i = 0; i < x.size(); i++) {
-            val.push_back(x[i].val);
-        }
-    }
 
-    explicit Tensor_(T x):
-        totalSize(1),shape({1, 1}),val({x})
-    {
-        initParams(shape, sizes, totalSize);
-    }
     /* construct with shape */
     template<typename ...Dim>
     explicit Tensor_(Dim ...dim):totalSize(1),shape({int(dim)...})
@@ -454,17 +249,6 @@ public:
         }
         return x;
     }
-    bool shapeEqual(const Tensor_ &x) const
-    {
-        bool flag = true;
-        for (std::size_t i = 0; i < shape.size(); i++) {
-            if (shape[i] != x.shape[i]) {
-                flag = false;
-                break;
-            }
-        }
-        return flag;
-    }
     /*
        [2026-10] `data()` 是"从 Tensor 拿裸缓冲"的**正名**入口。
        为什么要加: 仓库里 `.val.data()` 有 68 处 (其中 55 处在 tensor.hpp 之外),
@@ -490,6 +274,15 @@ public:
         while (a < 256 && (p & a) == 0) { a <<= 1; }
         return a;
     }
+    /*
+       ⚠ [2026-10 P2] `empty()` **留在 D1 清单里是个错判** —— 方案 Part 2.2 把它列为
+       "零引用", 但它是**活的**: `src/rl/bc.h:73`(`!state.empty()` 的结构自检)、
+       `src/rl/sac.cpp:175` / `:274`(`legalMask.empty()` 决定走掩码分支还是全量口径)。
+       发现方式就是 P2 的验收纪律: **以编译结果为准** —— 删掉它之后全量构建报了
+       `error C2039: "empty" 不是 RL::Tensor_ 的成员`(bc.h / sac.cpp), 于是原样放回。
+       教训: "文本层零引用"只对**非模板成员**是充分证据; 对头文件里的成员函数,
+       真正权威的是编译器。
+    */
     inline bool empty() const {return totalSize == 0;}
     /* iterator */
     inline iterator begin() noexcept { return val.begin();}
@@ -506,11 +299,6 @@ public:
         return sizes[N];
     }
 
-    inline std::size_t size(const Shape &indexes) const
-    {
-        std::size_t N = indexes.size() - 1;
-        return sizes[N];
-    }
 
     /*
        zero/fill 走 SIMD 内核 (内核写满所有元素, 所以 val 的长度必须已经是对的长度;
@@ -586,56 +374,6 @@ public:
         sizes.swap(r.sizes);
         val.swap(r.val);
     }
-    /* init */
-    static Tensor_ zeros(Shape &shape)
-    {
-        Tensor_ x(shape);
-        return x;
-    }
-
-    template<typename ...Dim>
-    static Tensor_ zeros(Dim ...dim)
-    {
-        Tensor_ x(dim...);
-        return x;
-    }
-
-    static Tensor_ ones(Shape &shape)
-    {
-        Tensor_ x(shape);
-        x.fill(1);
-        return x;
-    }
-
-    template<typename ...Dim>
-    static Tensor_ ones(Dim ...dim)
-    {
-        Tensor_ x(dim...);
-        x.fill(1);
-        return x;
-    }
-    /* subset */
-    template<typename ...Index>
-    Tensor_ sub(Index ...index) const
-    {
-        std::size_t N = sizeof ...(Index);
-        std::vector<int> subIndex(shape.begin() + N, shape.end());
-        Tensor_ y(subIndex);
-        std::size_t pos = posOf(index...);
-        for (std::size_t i = 0; i < y.totalSize; i++) {
-            y.val[i] = val[i + pos];
-        }
-        return y;
-    }
-
-    template<typename ...Index>
-    inline SubTensor& at(Index ...index)
-    {
-        subTensor.pointer = this;
-        subTensor.pos = posOf(index...);
-        subTensor.totalSize = size(index...);
-        return subTensor;
-    }
 
     Tensor_ block(const std::vector<int> &offset, const std::vector<int> &blockShape) const
     {
@@ -665,49 +403,6 @@ public:
             val[o] = x.val[i];
         }
         return;
-    }
-
-    template<typename ...Index>
-    void slice(Tensor_ &y, Index ...index) const
-    {
-        std::size_t pos = posOf(index...);
-        for (std::size_t i = 0; i < y.totalSize; i++) {
-            y.val[i] = val[i + pos];
-        }
-        return;
-    }
-
-    void toVector(std::vector<Tensor_> &vec) const
-    {
-        for (std::size_t i = 0; i < shape[0]; i++) {
-            vec.push_back(sub(i));
-        }
-        return;
-    }
-
-    static Tensor_ fromVector(const std::vector<Tensor_> &vec)
-    {
-        if (vec.empty()) {
-            return Tensor_();
-        }
-        /* Stack the sub-tensors: shape (N, d0, d1, ...) from N tensors of shape
-           (d0, d1, ...). The old code std::copy'd the sub-tensor's VALUES into
-           `shape` starting at begin()+1, which wrote past the end of a
-           1-element vector (out-of-bounds) and produced a bogus shape. */
-        std::vector<int> shape;
-        shape.push_back(static_cast<int>(vec.size()));
-        for (std::size_t i = 0; i < vec[0].shape.size(); i++) {
-            shape.push_back(vec[0].shape[i]);
-        }
-        Tensor_ x(shape);
-        std::size_t offset = 0;
-        for (std::size_t i = 0; i < vec.size(); i++) {
-            for (std::size_t j = 0; j < vec[i].totalSize; j++) {
-                x.val[j + offset] = vec[i][j];
-            }
-            offset += vec[i].totalSize;
-        }
-        return x;
     }
 
     /* visit */
@@ -831,14 +526,6 @@ public:
         return *this;
     }
 
-    template<typename ...Index>
-    Tensor_ view(Index ...index) const
-    {
-        Tensor_ x = *this;
-        x.shape = {index...};
-        x.initParams(x.shape, x.sizes, x.totalSize);
-        return x;
-    }
 
     Tensor_ flatten() const
     {
@@ -861,40 +548,6 @@ public:
         return x;
     }
 
-    static void permuteIndexs(const std::vector<int> &indexs,
-                              const std::vector<int> &permuteMap,
-                              std::vector<int> &newIndexs)
-    {
-        for (std::size_t i = 0; i < permuteMap.size(); i++) {
-            int k = permuteMap[i];
-            newIndexs[i] = indexs[k];
-        }
-        return;
-    }
-
-    template<typename ...Pos>
-    inline Tensor_ permute(Pos ...p) const
-    {
-        /*
-            shape: [3, 2, 1]
-            permute: (2, 1, 0)
-            new shape: [1, 2, 3]
-        */
-        std::vector<int> permuteMap = {p...};
-        /* permute shape */
-        std::vector<int> newShape(shape.size(), 0);
-        permuteIndexs(shape, permuteMap, newShape);
-        Tensor_ x(newShape);
-        /* permute value */
-        std::vector<int> indexs(shape.size(), 0);
-        std::vector<int> newIndexs(shape.size(), 0);
-        for (std::size_t i = 0; i < val.size(); i++) {
-            indexOf(i, indexs);
-            permuteIndexs(indexs, permuteMap, newIndexs);
-            x(newIndexs) = val[i];
-        }
-        return x;
-    }
 
     Tensor_ tr() const
     {
@@ -941,21 +594,6 @@ public:
     {
         Tensor_ y(shape);
         simdops::div(y.val.data(), val.data(), x.val.data(), val.size());
-        return y;
-    }
-
-    Tensor_ operator %(const Tensor_ &x) const
-    {
-        Tensor_ y(shape[0], x.shape[1]);
-        for (std::size_t i = 0; i < y.shape[0]; i++) {
-            for (std::size_t k = 0; k < shape[1]; k++) {
-                T vik = val[posOf(i, k)];
-                for (std::size_t j = 0; j < y.shape[1]; j++) {
-                    /* y(i, j) = val(i, k) * x(k, j) */
-                    y(i, j) += vik*x(k, j);
-                }
-            }
-        }
         return y;
     }
 
@@ -1080,12 +718,6 @@ public:
         return simdops::maxValue(val.data(), val.size());
     }
 
-    T min() const
-    {
-        requireNonEmpty("min");
-        return simdops::minValue(val.data(), val.size());
-    }
-
     std::size_t argmax() const
     {
         requireNonEmpty("argmax");
@@ -1093,20 +725,6 @@ public:
         std::size_t index = 0;
         for (std::size_t i = 0; i < val.size(); i++) {
             if (value < val[i]) {
-                value = val[i];
-                index = i;
-            }
-        }
-        return index;
-    }
-
-    std::size_t argmin() const
-    {
-        requireNonEmpty("argmin");
-        T value = val[0];
-        std::size_t index = 0;
-        for (std::size_t i = 0; i < val.size(); i++) {
-            if (value > val[i]) {
                 value = val[i];
                 index = i;
             }
@@ -1774,75 +1392,7 @@ public:
             return;
         }
 
-        inline static Tensor_ ikkj(const Tensor_ &x1, const Tensor_ &x2)
-        {
-            /* Tensor_ ctor zero-fills, so accumulating the result of the fast
-             * in-place kernel into it is the same computation as before (the
-             * old body duplicated the ikkj loop instead of reusing it). */
-            Tensor_ x(x1.shape[0], x2.shape[1]);
-            ikkj(x, x1, x2);
-            return x;
-        }
-
-        inline static Tensor_ kikj(const Tensor_ &x1, const Tensor_ &x2)
-        {
-            /* transpose x1; Tensor_ zero-fills x, so the in-place kernel gives
-             * exactly what the old duplicated loop computed */
-            Tensor_ x(x1.shape[1], x2.shape[1]);
-            kikj(x, x1, x2);
-            return x;
-        }
-
-        inline static Tensor_ ikjk(const Tensor_ &x1, const Tensor_ &x2)
-        {
-            Tensor_ x(x1.shape[0], x2.shape[0]);
-            /* transpose x2 */
-            ikjk(x, x1, x2);
-            return x;
-        }
-
-        inline static Tensor_ kijk(const Tensor_ &x1, const Tensor_ &x2)
-        {
-            Tensor_ x(x1.shape[1], x2.shape[0]);
-            /* transpose x1, x2 */
-            kijk(x, x1, x2);
-            return x;
-        }
     };
-
-    /* batch matrix multiplication */
-    inline static Tensor_ bmm(const Tensor_ &x1, const Tensor_ &x2)
-    {
-        /*
-            x1: (batch, n, m)
-            x2: (batch, m, p) or (m, p) for broadcasting
-            output: (batch, n, p)
-        */
-        if (x1.shape.size() == 3 && x2.shape.size() == 2) {
-            /* broadcasting case: x2 has no batch dimension */
-            int batch = x1.shape[0];
-            int n = x1.shape[1];
-            int p = x2.shape[1];
-            assert(x1.shape[2] == x2.shape[0]);
-            Tensor_ result(batch, n, p);
-            for (int b = 0; b < batch; b++) {
-                result.at(b) = x1.sub(b) % x2;
-            }
-            return result;
-        }
-        /* standard case: both are 3D tensors */
-        assert(x1.shape.size() == 3 && x2.shape.size() == 3);
-        assert(x1.shape[0] == x2.shape[0]);
-        assert(x1.shape[2] == x2.shape[1]);
-        int batch = x1.shape[0];
-        int n = x1.shape[1];
-        int p = x2.shape[2];
-        Tensor_ result(batch, n, p);
-        for (int b = 0; b < batch; b++) {
-            result.at(b) = x1.sub(b) % x2.sub(b);
-        }
-        return result;
-    }
 
     template<typename ...Arg>
     inline static Tensor_ concat(int dim, const Arg & ...args)
@@ -1879,87 +1429,9 @@ public:
         return x;
     }
 
-    inline static Tensor_ product2D(const Tensor_& x1, const Tensor_& x2)
-    {
-        int r = x1.shape[0]*x2.shape[0];
-        int c = x1.shape[1]*x2.shape[1];
-        Tensor_ y(r, c);
-        for (int i = 0; i < x1.shape[0]; i++) {
-            for (int j = 0; j < x1.shape[1]; j++) {
-                for (int h = 0; h < x2.shape[0]; h++) {
-                    for (int k = 0; k < x2.shape[1]; k++) {
-                        y(h + i*x1.shape[0], k + j*x1.shape[1]) = x1(i, j)*x2(h, k);
-                    }
-                }
-            }
-        }
-        return y;
-    }
-
     inline static T dot(const Tensor_& x1, const Tensor_& x2)
     {
         return simdops::dot(x1.val.data(), x2.val.data(), x1.totalSize);
-    }
-
-    /* display */
-    template<typename ...Index>
-    void printValue(Index ...index) const
-    {
-        std::size_t N = size(index...);
-        std::size_t pos = posOf(index...);
-        std::cout<<"[";
-        for (std::size_t i = 0; i < N; i++) {
-            std::cout<<val[i + pos];
-            if (i < N - 1) {
-                std::cout<<",";
-            }
-        }
-        std::cout<<"]"<<std::endl;
-        return;
-    }
-
-    void printValue() const
-    {
-        std::cout<<"[";
-        for (std::size_t i = 0; i < val.size(); i++) {
-            std::cout<<val[i];
-            if (i < totalSize - 1) {
-                std::cout<<",";
-            }
-        }
-        std::cout<<"]"<<std::endl;
-        return;
-    }
-
-    void printValue2D() const
-    {
-        std::cout<<"[";
-        for (std::size_t i = 0; i < shape[0]; i++) {
-            for (std::size_t j = 0; j < shape[1]; j++) {
-                std::cout<<val[i*shape[1] + j];
-                /* was `i < totalSize - 1`, comparing a ROW index against the
-                   element count, which printed commas in the wrong places */
-                if (!(i == shape[0] - 1 && j == shape[1] - 1)) {
-                    std::cout<<",";
-                }
-            }
-            std::cout<<std::endl;
-        }
-        std::cout<<"]"<<std::endl;
-        return;
-    }
-    void printShape() const
-    {
-        std::cout<<"(";
-        for (std::size_t i = 0; i < shape.size(); i++) {
-            std::cout<<shape[i];
-            /* was `i < totalSize - 1` instead of the shape's own length */
-            if (i != shape.size() - 1) {
-                std::cout<<",";
-            }
-        }
-        std::cout<<")"<<std::endl;
-        return;
     }
 
     /*
@@ -2053,15 +1525,13 @@ public:
          * v2 还要过 base64 合法性 + 长度 + CRC32。
     */
     /* 参数是**指针 + 长度**而不是 std::string: 预校验在一整块内存上跑, 一行可能
-       是 34 MB, 每行都拷成 std::string 就白省了。 */
-    static bool validateEncoded(const char *s, std::size_t sLen)
-    {
-        long long unused = 0;
-        return validateEncodedCount(s, sLen, unused);
-    }
-
+       是 34 MB, 每行都拷成 std::string 就白省了。
+       ⚠ [2026-10 P2] 这里原来还有一个 `validateEncoded(s, sLen)` 包装 (`unused` 计数
+       转发到本函数), 全仓零调用者 —— 已删。要"只校验、不要元素数"就直接传一个丢弃的
+       `long long`。 */
     /*
-       与 validateEncoded 完全同一趟解析, 额外把"这一行有多少个元素"报出来。
+       额外把"这一行有多少个元素"报出来 (预校验路径与 fromString 共用同一趟解析,
+       保证两边判定一致)。
        Net::load 用它把**整个文件的元素总数**与当前网络的 `paramCount()` 对齐 ——
        这是"同一套层结构但维度不同"的权重文件唯一的拦截点 (见 net.hpp 的说明)。
     */
@@ -2182,7 +1652,7 @@ public:
             }
             return elems;
         };
-        /* parse shape (与 validateEncoded 共用同一份解析, 保证两边判定一致) */
+        /* parse shape (与预校验 validateEncodedCount 共用同一份解析, 保证两边判定一致) */
         long long shapeProduct = 1;
         if (!parseShape(s.substr(0, pos), shapeProduct)) {
             lastDecodeFailedRef() = true;
@@ -2305,6 +1775,8 @@ public:
        为什么要有它: 权重文件里一个张量可以是一行 34 MB 的 base64, 而老实现是
          std::string(p + 13, n - 13)     先拷一份 34 MB
          base64Decode() 里 vector.push_back   再分配 34 MB
+           (那个**按 std::string 收、按 vector 吐**的死解码器已在 [2026-10 P2] 删掉 ——
+            全仓零调用者; 在用的只有本函数与 base64Encode)
          crc32(raw)                       再扫一遍
          memcpy 到张量                     再一遍
        而且"先校验一遍再真正载入"把这一串**整体做了两遍**。实测稀疏 MoE 那 3 个
@@ -2445,61 +1917,9 @@ public:
         return out;
     }
 
-    static bool base64Decode(const std::string &in, std::vector<unsigned char> &out)
-    {
-        auto val = [](char c) -> int {
-            if (c >= 'A' && c <= 'Z') return c - 'A';
-            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-            if (c >= '0' && c <= '9') return c - '0' + 52;
-            if (c == '+') return 62;
-            if (c == '/') return 63;
-            return -1;
-        };
-        out.clear();
-        if (in.size() % 4 != 0) {
-            return false;
-        }
-        out.reserve(in.size() / 4 * 3);
-        for (std::size_t i = 0; i < in.size(); i += 4) {
-            int q[4];
-            int pad = 0;
-            for (int k = 0; k < 4; k++) {
-                const char c = in[i + k];
-                if (c == '=') {
-                    /* 填充只允许出现在最后 4 字节组的末尾 */
-                    if (i + 4 != in.size() || k < 2) {
-                        return false;
-                    }
-                    q[k] = 0;
-                    pad++;
-                } else {
-                    q[k] = val(c);
-                    if (q[k] < 0) {
-                        return false;
-                    }
-                }
-            }
-            const unsigned int v = ((unsigned int)q[0] << 18)
-                                   | ((unsigned int)q[1] << 12)
-                                   | ((unsigned int)q[2] << 6)
-                                   | (unsigned int)q[3];
-            out.push_back((unsigned char)((v >> 16) & 0xFF));
-            if (pad < 2) {
-                out.push_back((unsigned char)((v >> 8) & 0xFF));
-            }
-            if (pad < 1) {
-                out.push_back((unsigned char)(v & 0xFF));
-            }
-        }
-        return true;
-    }
 };
 
-using Tensorc  = Tensor_<char>;
-using Tensoru8 = Tensor_<unsigned char>;
-using Tensori  = Tensor_<int>;
 using Tensorf  = Tensor_<float>;
-using Tensord  = Tensor_<double>;
 using Tensor   = Tensorf;
 
 }

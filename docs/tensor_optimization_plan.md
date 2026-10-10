@@ -144,6 +144,11 @@
 **D3 仅测试在用 —— 保留**（它们是测试抓手，不是死代码）：`ptr()`/`alignedTo()`/`dataAlignment()`（`test_transformer [9]` 对齐自检）、`sum()`（`src/` 0 处）、`toDebugString()`（老格式往返）、`MM::kijk`（`test_grad_main.cpp:335-336` 唯一的语义钉桩）。**做法**：保留 + 注释标明"无生产调用者"。
 
 **D4 不能自己删**：`Tensor_(const std::vector<Tensor_>&)` 按 `tensor.hpp:326-335` 的注释"属于上游同源代码，删除该走 `docs/rl_sync.md` 那条线" ⇒ **先记账再删**（Part 4 的 P0 → P2）。
+
+**D1/D2 执行结果（2026-10-10，P2 落地）——三处与清单不符的地方**：
+1. **`normalize`(1118) 不能在 P2 删**：P1 新加的 `test_transformer [10]` 里那条"零跨度 normalize 必须响亮失败"的**故意踩契约**用例正是调它（`test_transformer_main.cpp:155`）⇒ 它是**测试抓手**，归 D3"保留 + 注释标明"。
+2. **`empty`(493) 删了又放回（编译器否掉）**：全仓 grep 看不到调用者，但删掉后报 `error C2039: "empty" 不是 RL::Tensor_ 的成员` —— 真调用点在 `src/rl/bc.h:73`（`!state.empty()`）与 `src/rl/sac.cpp:175`/`:274`（`legalMask.empty()` 决定走掩码分支还是全量口径）。**教训**：头文件里的成员函数，"文本层零引用"不是充分证据，编译器才是（Part 7 已有对应风险行）。
+3. **6 个公开类型别名（现 `tensor.hpp:69-74`：`ValueType`/`Vector`/`Shape`/`Size`/`iterator`/`const_iterator`）本轮不删**：它们在全仓的**外部**引用确实是 0（grep `Tensor::Shape` 等一律零命中），但类内部处处在用，且它们正是 **P3（A9/A10 单一长度源、`strides()` 按需算、形状 SSO）要重写的那几个类型** ⇒ 现在删等于同一片代码改两遍，且零运行收益。**推迟到 P3 一起做**，届时按"接口不变"的约束决定保留哪些别名。
 另有两处**整类重复实现**建议单独一轮评估：`src/rl/mat.hpp` 的 `Mat`（588 行，与 `Tensor` 平行、**不在 `CMakeLists.txt` 源列表**、`val` 还是无对齐的 `std::vector<float>`）；整个 `TRPO`（无调用者，却仍在 `CMakeLists.txt:73` 编译，且是 `Tensor op Tensor` 值语义算子的唯一 live 消费者）。
 
 **不删（看似死代码但是活的）**：`sizesOf`、`initParams`、`posOf`×3、`indexOf`×2、`size(Index...)`、`concats`、`permuteIndexs`、`lastDecodeFailedRef`、`parseShape`、`crc32*`、`base64DecodeInto/Encode/DecodeTable`、`MM::contiguous2d/requireShape2d`。
@@ -260,6 +265,7 @@ P0 记账(零代码) ──┬─> P1 语言层+热点 ──┬─> P2 删死�
 ### 5.1 计时口径（`docs/seq_transformer_design.md` §8.4）
 
 - 这台机器（i7-12650H，6P+4E）**同一个二进制**的绝对耗时会漂几倍 ⇒ **只信"同一进程、同一轮"的成对比值**；
+- ⚠ **【2026-10-10 换机】新机器不是同一台**：`Win32_Processor` 读到的是 **Intel i5-10400F（6 核 / 12 线程 / 2.9 GHz）**，而本文档与 `seq_transformer_design.md` 里所有"这台机器"的读数（含 §1.2 的分配/拷贝绝对值、§5.1.1 的 WER 13.8 s）都来自 **i7-12650H（6P+4E = 16 线程、P 核睿频更高）**。影响面：凡是**按固定时间窗**判定的断言（"等 30 s 看后台训练有没有把新权重同步回来"、"并发窗口内必须真的重叠若干次"）在两台机器上**不可比**；本轮 `test_match` 的两条 `[2.7k]` 正对照、`test_sparse_moe [11]` 的并发计数都属于这一类（见 Part 6 的 P1-复跑/P2 行）。**换机后的任何绝对耗时都不能与文档里的旧数字直接比较**；
 - 每轮带**对照通道**并印出跨度，跨度大就重测；
 - 用 `Start-Process -PassThru` + `ProcessorAffinity` + `Wait-Process` 绑核（`start /affinity … /wait` 会产生假读数）；
   ⚠ **绑核只用于计时**：`test_sparse_moe` 那类"看并发窗口"的断言在单核上会**假失败**（本轮实测：绑核 100/2 失败，不绑核 100/0 —— 它的读写线程需要一个真的第二个核才可能重叠）；
@@ -287,7 +293,7 @@ P0 记账(零代码) ──┬─> P1 语言层+热点 ──┬─> P2 删死�
 
 | 不变量 | 检查方式 |
 |---|---|
-| 权重文本 FNV-1a 指纹 `9a5483d39a42a333`（490,037 B 文本）不变 | `test_transformer`、`test_weights` |
+| 权重文本 FNV-1a 指纹 `9a5483d39a42a333`（490,037 B 文本）不变 | `test_transformer`、`test_weights` ⚠ **换成新机器后这条改成"与本机 P1 基线比"**：本机读数是 `4cbbc09fc0d787c9`（参数量/文本长度与文档完全相同），P1 树与 P2 树**同一个值**；跨机比对本来就不成立（`rl_sync.md:270-273`、Part 8 第 10 条） |
 | 默认路径**逐位不变** | 有限差分读数 + 训练读数逐行 diff |
 | `MM::*` 四内核**累加**语义 | `test_grad` C 节（4 组形状） |
 | 32 B 对齐 | `test_transformer [9a/9c/9d]` |
@@ -315,8 +321,11 @@ P0 记账(零代码) ──┬─> P1 语言层+热点 ──┬─> P2 删死�
 |---|---|---|---|---|---|
 | **P0** | 2026-10-10 | ① `docs/rl_sync.md`：§一 表加一行"同步之后又分叉的（`rl/tensor.hpp`）"，新增 **§1.4** 逐条记下六处分叉（默认分配器 `AlignAllocator32` / `operator[]` 形参 `std::size_t` / `posOf` 显式窄化 / `MM::ikjk` 标量分支写法 / `alignedTo`+`dataAlignment` / "四内核一律累加"契约注释）；② 修 §二 那句被自己推翻的话（"只有没被使用的 `transpose` 需要对齐 ⇒ 不需要替换存储分配器"）—— 改成"只对性能成立、对正确性不成立"，并接上 §1.4；③ `docs/analysis.md` 把 C7/C8 从"仍未做"改成"【2026-10 更正：已做】"（状态以 `issues_review.md` R1.5 为准），并新增第 7 条指向本文件；④ `README.md` 文档表加一行 | 只有 `docs/` 与 `README.md` 的 diff（`git status`：`src/` 无本阶段改动） | 三处文档欠账清掉：分叉有账、矛盾口径统一、陈旧状态更正 | ✅ 完成 |
 | **P1** | 2026-10-10 | **A1** move 构造/赋值 + `swap()` 标 `noexcept`；**A2** 新增 `data()`/`data() const`（`ptr()` 保留为别名）；**A3** `operator T*` / `operator Vector` 改 `explicit`；**A4** MM 的形状契约检查**移出 `#ifndef NDEBUG`**（Release 也生效）+ `contractFail`/`contractIkkj/Kikj/Ikjk/Kijk` + `RL_TENSOR_CHECKS` 开关 + `RL_TENSOR_NO_CONTRACT` 逃生门；**A5** `requireIndexable`（`totalSize <= INT_MAX`，放在 `initParams` ⇒ 7 个形状入口全覆盖）；**A6** `reshape` 加 `requireSameLength`；**A7** `requireNonEmpty` + 零跨度 `normalize` 守卫；**C2** `util.hpp:332 lerp(Tensor&, const Tensor&, float)`。测试侧：`test_transformer` 新增 **[10] 常驻结构守卫**（6 个子进程故意踩契约 + 1 条正对照），并修掉一个**测试自身的假失败**（第一版 `ikkj(z,z,z)` 其实是合法形状）与一个**套件级性能陷阱**（`abort()` 触发 WER 每个子进程卡 ~13.8 s ⇒ 全套 150 s；加 `_set_abort_behavior(0, _WRITE_ABORT_MSG\|_CALL_REPORTFAULT)` 后 **35.6 s**） | ① 全量构建 `BUILD=0`（警告基线见下）；② `test_transformer` **86/0**、`test_grad` 15/0、`test_weights` 49/0、`test_bc` 167/0、`test_ppo_backbone` 43/0、`test_sparse_moe` 100/0、`test_scaledconcat` 40/0、`test_dqnab` 115/0；**ctest 整体 14/16**（`test_mcts` Timeout；`test_pretrain` abort —— 守卫抓到的一条**真 bug**，根因已修，见 6.A.1/下方 P1-附，复跑待补）；③ **权重指纹 FNV-1a `9a5483d39a42a333`（490,037 B 文本）不变**，21 组 FD 读数逐行同；④ **BC 一整臂逐行相同**（`.r1build/seq_pos1d.txt` vs `bc4_seq_p1.txt`：39 行里只有 1 行不同，且是墙钟"训练 122.7 s vs 116.7 s"；训练 CE 1.9610 / 留出 CE 3.1143 / top-1 39.17% / 26.67% / P(老师) 0.23667 / 0.12851 / 熵 2.2629 / 2.3985 全同）；⑤ `probe_move`：`vector<Tensor>` 增长的"增长段" **7.27 ms → 1.18 ms（6.1×）**，A/B 比值 **3.08× → 1.25×**；⑥ `probe_checks`：常驻检查 **17.8~18.5 ns / 次内核调用**（小内核 (64,64)·(64,1) 占 0.88%、(360,1710)·(1710,1) 占 0.0036%；按 seq 一次 forward 1080 次 FC 调用折算 ≈0.12%）；⑦ `probe_apid`：`embedding` 420 ns / `sub` 1495 ns / 拷贝构造 3990 ns，与 P1 前同轮读数一致（无回归） | 语言层与三条护栏落地且**逐位不变**；代价可量化（每内核调用 18 ns）；**顺带修掉一个测试基础设施坑**（WER 卡顿让 ctest 的 300 s 预算从"快满"回到 8× 余量）；**并且守卫当场抓到并修掉了一条跑了很久的静默 bug**（`LayerNorm<Fn,LN::Pre>::backward` 的 sink 尺寸错 ⇒ DPG 的输入梯度被截断 + 越界读，见 Part 6.A.1） | ✅ 完成（`test_pretrain` 的复跑待下一轮补） |
-| **P1-附** | 2026-10-10 | 修 A4 抓到的那条真 bug：`src/rl/layer.h` 的 `LayerNorm<Fn, LN::Pre>::backward` 把 `dL` 从 `outputDim` 改成 **`inputDim`**（`kikj` 的 sink 尺寸 + 越界读 + z-score 均值口径，三个问题一个词解决）；文件内写下完整证据链 | 触发点：`dpg.cpp:43` 的 `LN::Pre(90→64)`；守卫报的形状 `z[64,1] x1[64,90] x2[64,1]`；`ddpg.cpp:11/15` 的 `inputDim == outputDim` 用法**逐位不变** | 静默 bug 修复；**验证（`test_pretrain` + ctest）按用户要求暂停** | ⏳ 验证待补 |
-| P2 | — | — | — | — | 待执行 |
+| **P1-附** | 2026-10-10 | 修 A4 抓到的那条真 bug：`src/rl/layer.h` 的 `LayerNorm<Fn, LN::Pre>::backward` 把 `dL` 从 `outputDim` 改成 **`inputDim`**（`kikj` 的 sink 尺寸 + 越界读 + z-score 均值口径，三个问题一个词解决）；文件内写下完整证据链 | 触发点：`dpg.cpp:43` 的 `LN::Pre(90→64)`；守卫报的形状 `z[64,1] x1[64,90] x2[64,1]`；`ddpg.cpp:11/15` 的 `inputDim == outputDim` 用法**逐位不变** | 静默 bug 修复；**验证（`test_pretrain` + ctest）按用户要求暂停** | ✅ 完成（2026-10-10 复跑：`test_pretrain` 38/0、exit 0 —— 见下方 P1-复跑行） |
+| **P1-复跑** | 2026-10-10 | **不改代码**：换到新 PC 后重做 P1 的验收（旧机的证据文件 `.r1build/probe_*_after_p1.txt`、`test_transformer_p1.txt` 没有随仓库过来 ⇒ 必须在本机重建基线） | ① 全量构建（Release/Ninja，**459 步**）**0 error**，**5 min 9 s**（21:28:55→21:34:04）；警告**去重后只有 5 处**：`src/rl/util.hpp:65 C4804`（每包含它的 TU 印一次，共 184 条）、`test/bench_agent_arena_main.cpp(980/1001/1020)` 与 `test/bench_sac_learn_main.cpp(1134)` 的 `C4477` —— 后 4 处**与 P1 的改动无关**（`git diff HEAD~1 HEAD` 对该文件的 hunk 都落在 35~794 行，而 980/1001/1020 在外；`bench_sac_learn_main.cpp` 本轮**根本没被改过**）；方案 §5.2 记的 `tensor.hpp:558` 在 P1 之后已不再出现；② **`test_pretrain` 38 断言 / 0 失败 / exit 0**（9.30 s）—— P1 台账里那条"已知红"清掉，`layer.h` 的根因修复有效；③ 全套 `ctest`（旧机 16 个目标，本机 **18 个**）**16/18 通过，1984 s**：`test_mcts` **通过（202 s）**（旧机是 Timeout）、`test_pretrain` 通过、`test_transformer` 通过（4.51 s）；失败 2 条 = `test_match`（366 断言 3 失败）与 `test_sparse_moe`（100 断言 2 失败）；④ **归因（关键）**：这 5 条失败全部落在"后台训练必须在固定时间窗内跑完一轮 / 并发窗口必须真的重叠"这一类**计时断言**上（原文如"训练模式下后台训练**确实**会把新权重同步回主 agent（正对照）"、"并发: 前向 **0** 次… [FAIL] 并发下真的读到了快照"）；而它们跑的窗口里**同时有 4 路并行编译**（我在同一台机器上起 P2 的构建）⇒ **空载复跑 `test_sparse_moe` 9.18 s 全过、exit 0**；`test_match` 的空载复跑随 P2 一并量（见 P2 行） | ① 又一次实证 §5.1 的纪律：**计时/并发窗口类断言必须空载量**，"跑测试时顺手编译"会把它们变成假红；② P1 的"逐位不变"在新机器上重新拿到证据：**P1 树二进制 vs P2 树二进制的输出逐行 diff，只有耗时、地址对齐值、线程交错计数不同**（`test_weights`/`test_grad`/`test_transformer`/`test_sparse_moe`，证据 `.r1build/p1_*.out.txt` vs `p2_*.out.txt`）；③ ⚠ **方案里的绝对指纹在本机复现不出来**：`test_transformer [3]` 在本机是 **`FNV-1a=4cbbc09fc0d787c9`**（参数量 **91,731** / 文本 **490,037 字节** —— 与 `seq_transformer_design.md:301` 记的"参数量 91,731、490,037 字节"**完全同形**），而文档记的是 `9a5483d39a42a333`。**形状/长度全同、只有内容哈希不同** ⇒ 这是**跨机器/跨工具链**的差异，不是本轮改动造成的：同一台机器上 P1 树与 P2 树给出**同一个** `4cbbc09fc0d787c9`，且 `test_transformer [6f]` 的 `首行=64,19\|b64:28ac353a:q52eO`（CRC32 前缀）两边也逐字符相同。与 `rl_sync.md:270-273`「跨构建比对权重文件是否逐位相同不成立」同源 ⇒ **本轮起，"指纹不变"一律按"本机 P1 基线"比，不再引用旧机的绝对数字**（本机基线：`.r1build/p1bin/*.exe` + `.r1build/p1_*.out.txt`） | ✅ 完成：P1 与 P1-附 的验收在新机器上全部重做，唯一的"红"被归因到并行编译的干扰并已空载复现为**绿** |
+| P2 | 2026-10-10 | 删死代码（Part 2.2）：`bmm` 死簇（`bmm` + `at()` + `sub()` + `operator%` + 整类 `SubTensor` 195 行 + `subTensor` 成员）→ D1 清单（`toVector`/`fromVector`/`slice`/`view`/`permute`+`permuteIndexs`/`shapeEqual`/`size(const Shape&)`/`zeros`×2/`ones`×2/`min`/`argmin`/`product2D`/`printValue`×2/`printValue2D`/`printShape`/`validateEncoded`/`base64Decode`/`MM` 的 4 个"2 参返回副本"重载/`Tensorc`·`Tensoru8`·`Tensori`·`Tensord`/`operator=(const std::vector<T>&)`/`Tensor_(Shape,Vector)`/`Tensor_(init_list,init_list)`/`Tensor_(T)`）→ D4（上游同源的坏构造 `Tensor_(const std::vector<Tensor_>&)`，记账已写进 `docs/rl_sync.md` §1.5）；文件内加了 P2 注释块（删了什么/为什么/怎么验） | ① **删除脚本一次净删 628 行**（`tensor.hpp` 2506 → 1878；证据 `.r1build/tensor.hpp.pre_p2.txt` + `.r1build/p2_delete_blocks.ps1`，脚本对每个删除块**先断言首尾行内容**再切，避免切错范围）；随后**放回 `empty()` 并加入 P2 说明注释** ⇒ **最终 1924 行**（`git diff --numstat`：+48 / −630，净 **−582 行 / −23%**）；② **全量构建**（干净目录 `build/plan_p2`，466 步）**0 error**，警告与 P1 完全同一组（`util.hpp:65` + 4 处 bench `C4477`）；③ ⚠ **编译器当场否掉 D1 里的一条**：`empty()` 被删后报 `error C2039: "empty" 不是 RL::Tensor_ 的成员`（真调用点：`src/rl/bc.h:73`、`src/rl/sac.cpp:175`/`:274` 的 `legalMask.empty()`）⇒ **原样放回**并在定义处写下这段历史（"文本层零引用"对头文件里的成员函数不是充分证据）；另 `mm` 的 2 参重载/`size(Index...)` 等的"零引用"经编译确认成立；④ **A/B 逐行 diff（P1 二进制 vs P2 二进制）**：`test_weights`（49 断言）、`test_grad`（15 断言）、`test_transformer`（86 断言）、`test_sparse_moe`（100 断言）**全部 exit 0**，输出里**只有耗时/地址对齐/线程交错计数**不同，指纹、FD 读数、往返差、断言数逐行相同；⑤ **P2 树空载全套 `ctest`：17/18 通过（1955 s）**（证据 `.r1build/ctest_p2.txt`），`test_sparse_moe` 复跑**通过**（1.75 s，上一次的"红"是并行编译干扰）；唯一红的是 `test_match`，而它**在 P1 树上同样红**、且两次红的**失败点还不一样**（P1 树 3 条 = `[2.7c]` 首次训练损失不逐位相同 + `[2.7k]` 两条后台训练计时；P2 树 12 条 = 从"快照权重 = **失败** / 还原 = **失败**"这类**竞态**前置条件开始崩，再级联到同一批 [2.7c]/[2.7k]）⇒ **不确定性的红，与本次删除无关**（前置归因实验见下方 P2-归因行）；⑥ **测试自身非确定性的对照**：拿**同一份** P2 二进制把 `test_weights` 连跑三次，`v1 (十进制文本)` = **885065 / 885270 / 885411 三次三样** ⇒ 该节网络没有钉种子，它的那几个数**不能**当"变了没有"的判据（P1 与 P2 之间它也一直不同：884578 / 885196 / 885065）；⑦ 定稿前最后一次改动**只有一行注释**（在 `base64Decode` 那段历史说明里注明它已删），重编 **459 步 0 error**，重跑 `test_weights`/`test_grad`/`test_transformer` 与前一版二进制**同类差异**（只有耗时、对齐值、上面那类非确定数） | 删债落地且**行为逐位不变**；本阶段的收益是**源码可维护性**（净 −582 行、头文件体积 −23%），**不是编译时间**：全量构建 P1 309 s（389 次编译）/ P2 316 s，差异落在并行度与噪声里（诚实结论：这几个内联/模板块删掉并不减少每个 TU 解析头文件的工作量） | ✅ 完成（验收数字见左） |
+| **P2-归因** | 2026-10-10 | **不改代码**：为回答"`test_match` 的红是不是本方案引入的"，把 **P1 之前的树**（`HEAD~1` = `51e22a5`，`tensor.hpp` 还没有 P1 的守卫/对齐/seq 那批改动）用 `git worktree` 检出到 `.r1build/prep1`，**单独构建**只编 `test_match` 目标，空载跑同一个测试 | ① 前置树构建 **0 error**；② **空载 `test_match`：366 断言 / 2 失败 / exit 1（1875 s）** —— 其中一条与本方案三棵树**完全相同**：`[2.7c] 学习信号与对手无关`（前置树两次首损失 **0.0546623692 vs 0.0393589064**，**同样逐位不同**）；另一条"整场对弈期间 `weights/` 下的临时权重一个都没被写"是**测试对环境的假设**造成的（该目录当轮是我手工新建的**空**目录，前后快照自然相同）；③ 前置树空载时 `[2.7k]` 的正对照**通过**（"训练模式: 权重 8987140 -> 8987140 字节, 变了 = **1**"）⇒ 它在 P1 树那次红是**并行编译**干扰、在 P2 树那次红是**级联**；④ **P2 树那 12 条失败的根因查清**：`build/plan_p2/weights` 的 **CreationTime = 22:37:44**，而 ctest 22:15 开始、`[2.7c]` 在 22:16~22:18 —— **那一刻这个目录还不存在**，于是 `saveCurrentAgentModel(...)` 一律失败（原样打印"实验3 前置: 快照 PPO 起始权重 = **失败**"），随后所有"装回健康权重"的前置条件全崩；旧机那份 build 目录里的 `weights/` 是 9 月就在的，所以这个隐式依赖从来没暴露过 | `test_match` 在本机的红**与 P0/P1/P1-附/P2 全部无关**：前置树（`HEAD~1`）同样红，且四次红的失败点各不相同（前置 2 / P1 3 / P2 12 / 空载复跑见右）⇒ ① `[2.7c]` 那条"换对手后首次训练损失必须逐位相同"的判据**在这台机器上不稳定**（三棵树全红、且两次的首损失都不同）—— 属**既有测试的时序脆弱性**；② `test_match` 隐含要求"cwd 下 `weights/` 已存在"（它自己不建）⇒ 进下一轮修复清单；③ 因此 P2 的验收按"**除 `test_match` 这条既有/环境红之外全绿**"记账（17/18），与 P1 台账当年在旧机的 14/16 是同一类记账 | ✅ 归因完成（`test_match` 定为"既有 + 环境红"，见 Part 8 第 12 条） |
+| P2-附 | — | 单独评估 `src/rl/mat.hpp`（**543 行**，不在 `CMakeLists.txt` 源列表、全仓零 `#include`）、`TRPO`（`trpo.h` 45 行 + `trpo.cpp` 467 行，**编进 RL_CORE 却零调用者**）、`util.hpp` 的 6 个按值返回版单目函数（`sqrt/exp/log/tanh/sin/cos` 的 `const Tensor&` 重载） | 本轮已完成**评估取证**（见 Part 8 第 10 条）：`mat.hpp`/`TRPO` 的判据是"全仓零 include / 零调用者"；6 个按值版的判据是"全仓只有 2 处 `RL::tanh(...)` 调用，两处的实参都是**非 const** 左值 ⇒ 重载决议选中的是就地版（`Tensor& tanh(Tensor&)`），按值版零调用者" | 删除动作**留到下一轮**：`mat.hpp`/`TRPO` 的删除会顺带让 `Tensor` 的 4 个值语义算子（`+ - * /`）失去唯一 live 消费者（方案 Part 2.2 末段点名的那件事），适合与"要不要一起删算子"同轮决定 | ⏳ 待执行 |
 | P3 | — | — | — | — | 待执行 |
 | P4 | — | — | — | — | 待执行 |
 | P5 | — | — | — | — | 待执行 |
@@ -369,8 +378,9 @@ inputDim ≠ outputDim 的用法；`test_pretrain` 会遍历多个 agent，stdou
 对 `inputDim == outputDim` 的既有用法（`ddpg.cpp:11/15`）**逐位不变**。
 `layer.h` 里已写下这段历史（含"被常驻守卫抓到"的证据链）。
 
-⚠ **验证状态**：修复代码已入库，但 `test_pretrain` 的复跑按用户要求**暂停**（本轮只做到构建）。
-下一轮第一件事就是跑它 + 全量 ctest，把 P1 的那一条从"已知红"清掉。
+⚠ **验证状态（2026-10-10 已补齐，换机后重做）**：`test_pretrain` **38 断言 / 0 失败 / exit 0**（9.30 s，ctest 内），
+全量 `ctest` 16/18（两条红是并行编译造成的计时类假红，空载复现为绿 —— 见 Part 6 的 **P1-复跑** 行）。
+**这条"已知红"已清掉**，Part 7 里对应的风险行随之关闭。
 
 ### 6.A.2 ⚠ 环境问题：PowerShell/编译期**间歇性读到垃圾文件内容**
 
@@ -394,7 +404,7 @@ inputDim ≠ outputDim 的用法；`test_pretrain` 会遍历多个 agent，stdou
 
 | 风险 | 触发阶段 | 影响 | 缓解 |
 |---|---|---|---|
-| 权重文件/指纹变化 | P3、P4 | 存量模型不可载、`test_weights` 红 | 格式字节不变 + 指纹与往返测试钉住 + 老 v1 兼容 |
+| 权重文件/指纹变化 | P3、P4 | 存量模型不可载、`test_weights` 红 | 格式字节不变 + **本机 P1 基线**比对（见 Part 8 第 10 条：旧机的绝对哈希 `9a5483d39a42a333` 在新机器上复现不出来，跨机比较本来就不成立）+ 往返测试钉住 + 老 v1 兼容 |
 | 静默别名（视图） | P5 | 数值静默错，最坏是"看起来合理" | 只读先行 + owner 显式 + FD/置换等变断言 |
 | 求和顺序变化 | P6 | 不能要求逐位相同 | 唯一允许不逐位等价的项；必须两棵树 A/B + 指标口径 |
 | `NDEBUG` 断言纪律冲突 | P1 | 与 `issues_review.md:1402-1411` 冲突 | 开关 + 只常驻一条 + 代价 A/B |
@@ -403,7 +413,9 @@ inputDim ≠ outputDim 的用法；`test_pretrain` 会遍历多个 agent，stdou
 | 收益不可分辨 | P3、P4 | 白做工 | 先量（分配次数、占比、耗时）再决定做不做 |
 | **P1 引入**：`mean/variance/max/min/argmax/argmin/normalize` 现在对空张量**响亮失败** | P1 已落地 | 若某条**没被测试覆盖**的生产路径（GUI/agent 层）真的会统计空张量，行为从"静默 NaN"变成"abort" | 这是刻意的（空张量上的统计量本来就没有定义）；风险点是"以前能带病跑"的地方现在会停。8 个测试目标全绿说明主流路径不碰它；**再看到 abort 时按"这是 bug"处理，而不是把守卫拿掉** |
 | **P1 引入**：`_set_abort_behavior(0, …)` 让本测试的 abort 退出码从 `0xC0000409` 变成 `3` | P1 已落地 | 任何**硬编码** 0xC0000409 的判据会失效 | 现有断言都只判"非 0"（已核对 [6g]/[8]/[10]）；新加的子进程断言也按"非 0"写 |
-| **P1 引入**：`test_pretrain` 变红（DQN 路径的 kikj 形状契约失守，以前静默） | P1 已落地 | ctest 由 16/16 变 15/16（另一条 `test_mcts` 是 Timeout，与本次改动无关） | 见 Part 6.A.1：定位并修根因；**不要**用逃生门把守卫关掉 |
+| **P1 引入**：`test_pretrain` 变红（DQN 路径的 kikj 形状契约失守，以前静默） | P1 已落地 | ~~ctest 由 16/16 变 15/16~~ | **已关闭（2026-10-10）**：`layer.h` 的根因修复 + 复跑 **38/0 exit 0** ⇒ 见 Part 6.A.1。**不要**用逃生门把守卫关掉 |
+| **【新】跑测试时顺手编译 ⇒ 计时/并发类断言假红** | P2（本轮实测） | `test_match`（3/366 失败）、`test_sparse_moe`（2/100 失败）——全部落在"后台训练必须在时间窗内跑完一轮 / 并发窗口必须重叠"的断言上；空载复跑即全绿 | §5.1 的口径再加一条：**并发/计时类断言只在空载机器上量**；`ctest` 与 `cmake --build` 不要同时跑（本轮就是同时跑才出现的，见 Part 6 的 P1-复跑行） |
+| **【新】旧机的绝对指纹在新机器上对不上** | P1-复跑（本轮实测） | "指纹不变"这条验收如果照旧机数字判，会**误判成失败**（本机 `4cbbc09fc0d787c9` vs 文档 `9a5483d39a42a333`，参数量与文本长度完全相同） | 一律与**本机 P1 基线**（`.r1build/p1bin/` + `p1_*.out.txt`）比；原因未查明 ⇒ 列在 Part 8 第 10 条 |
 
 ---
 
@@ -415,9 +427,13 @@ inputDim ≠ outputDim 的用法；`test_pretrain` 会遍历多个 agent，stdou
 4. **`const&` 传参的 ≥100 MB/步是算式**（1263²×4 float × 4 专家），未做 A/B。
 5. **`mat.hpp` / `TRPO` / D1 清单删除后**的编译时间、二进制体积、PCH 收益未测。
 6. **Caffe/PyTorch 的收益不能引用**：它们的数字是在 GPU / 大 batch / 大矩阵上兑现的；本仓库主要形状是 batch=1、90×90（1263×1263 只在 SACAZ MoE TB 出现）。
-7. 本方案（2026-10）里**P0 不改代码**（只有 `docs/` 与 `README.md`）；**P1 改了 `src/rl/tensor.hpp`、`src/rl/util.hpp`、`test/test_transformer_main.cpp`**，**P1-附**又改了 `src/rl/layer.h`（`LayerNorm<Fn,LN::Pre>::backward` 的 sink 尺寸），逐位不变的证据见 Part 6 台账。
+7. 本方案（2026-10）里**P0 不改代码**（只有 `docs/` 与 `README.md`）；**P1 改了 `src/rl/tensor.hpp`、`src/rl/util.hpp`、`test/test_transformer_main.cpp`**，**P1-附**又改了 `src/rl/layer.h`（`LayerNorm<Fn,LN::Pre>::backward` 的 sink 尺寸），逐位不变的证据见 Part 6 台账。**P2（2026-10-10）只改两处**：`src/rl/tensor.hpp`（净删 628 行）与 `docs/rl_sync.md`（新增 §1.5：删掉的上游同源代码项逐条记账）。**P2 没有改任何 `src/rl/` 之外的代码，也没有动测试**。
 8. **P1 的常驻检查代价是模型推算 + 单点实测的组合**：`probe_checks` 直接量到"6 次比较 = 17.8~18.5 ns/调用"（同轮配对），再按"seq 一次 forward 有 1080 次 FC 调用"折算成 ≈0.12% 的 forward；**没有**做"整棵树下开/关这个宏"的端到端 A/B（`RL_TENSOR_NO_CONTRACT` 逃生门已经就位，想做随时能做）。
 9. `test_transformer` 的**绝对墙钟不能用来判断这次改动快慢**：本轮同一二进制测到 150.6 s 与 35.6 s 两个数，差别全部来自"`abort()` 是否触发 WER"（见 §5.1.1）—— 又一次印证 §8.4 的口径。
+10. **【2026-10-10 换机后新增】"绝对指纹"这条不变量的适用范围被收窄了**：`test_transformer [3]` 在**新机器**上给出 `FNV-1a=4cbbc09fc0d787c9`（参数量 91,731、文本 490,037 B —— 与 `seq_transformer_design.md:301` 记的**同形**），而文档一直记的是 `9a5483d39a42a333`。同一台机器上 **P1 树与 P2 树给出同一个** `4cbbc09fc0d787c9`，所以差异不在本次改动：它是**另一台机器/另一套构建工具链**上的权重初值差异（形状与文本长度完全相同 ⇒ 是**数值位**不同，不是结构不同）。**未查清的部分**：到底是哪个环节引入的（`std::normal_distribution` 的 STL 版本实现、FMA 收缩、还是别的编译期差异）没有定论 —— 属于**待实测**。纪律：**"指纹不变"从此只在本机基线上比**（`.r1build/p1bin/` + `.r1build/p1_*.out.txt`），不再引用旧机的绝对哈希；这与 `rl_sync.md:270-273` 已经写明的"跨构建不成立"是同一条道理。
+11. **P2-附 的删除影响面（下一轮用）**：`src/rl/mat.hpp` = **543 行 / 16 KB**，全仓**零 `#include "mat.hpp"`**、也不在 `CMakeLists.txt` 的 `RL_SOURCES` 里 ⇒ 连"死代码"都算不上，是**没被编译的死文件**；`TRPO` = `trpo.h`(45 行) + `trpo.cpp`(467 行)，**在 `CMakeLists.txt:73` 编进 `RL_CORE`**，但 `trpo.h` 只被 `trpo.cpp` 自己 include（零外部调用者）⇒ 每个全量构建都在为它付编译时间；`util.hpp` 的 6 个**按值返回**版单目函数（`Tensor sqrt/exp/log/tanh/sin/cos(const Tensor&)`）全仓只有 **2 处 `RL::tanh(...)`** 调用（`src/rl/layer.h:927`、`test/probe_tanh_norm_ops_main.cpp:119`），两处实参都是**非 const 左值** ⇒ 重载决议选中的是**就地版**（`Tensor& tanh(Tensor&)`），按值版**零调用者**（它们每次都会**整块深拷贝**一个张量，正是 §1.2 里 `拷贝构造 11×` 那一类成本）。
+12. **`test_match` 在本机的两条既有/环境红（2026-10-10 归因完毕）**：① `[2.7c] 学习信号与对手无关`（"换对手后**首次**训练损失必须**逐位相同**"）**在 P1 之前的树上同样红**（`.r1build/prep1`，`HEAD~1`，366 断言 2 失败、1875 s；两次首损失 `0.0546623692` vs `0.0393589064`）⇒ 既有时序脆弱性（训练损失的上报与后台训练线程竞争），**不是**权重还原/守卫/删死代码造成的；② 该测试**隐含要求 cwd 下 `weights/` 子目录已存在**（它自己**不建**这个目录）：在全新的构建目录里跑，`saveCurrentAgentModel` 会一路失败并把十几条断言级联带红（本机 `build/plan_p2` 的实测：目录 CreationTime 22:37:44 晚于 `[2.7c]` 的执行时刻）。**下一轮修复清单**（测试侧，不动 `src/rl`）：`main()` 开头 `std::filesystem::create_directories("weights")`；`[2.7c]` 的判据改成"**同一对手**跑两遍必须逐位相同"（把"对手不影响首次损失"这条换成可稳定成立的等价命题）或把窗口放宽并显式声明"容许后台训练竞争"。
+13. **换机后的"绝对读数不可比"清单（本轮踩到的）**：CPU 由 i7-12650H（6P+4E/16 线程/睿频更高）换成 **i5-10400F（6 核 12 线程 @2.9 GHz）**，于是 ① `test_transformer` 全套 35.6 s（旧）→ **4.4~14.2 s**（新，快）；② `test_mcts` 旧机 **Timeout**、新机 **202 s 通过**；③ 计时/并发窗口类断言（"30 s 内后台训练必须改权重"、"并发窗口必须重叠"）在新机上会红，且**并行编译时更红**；④ `test_transformer [3]` 的权重文本指纹由 `9a5483d39a42a333`（旧）变成 `4cbbc09fc0d787c9`（新，参数量与文本长度完全相同）。**结论**：换机后一切"不变性"验收都要先在本机重建基线（本机基线已存 `.r1build/p1bin/` + `p1_*.out.txt`）。
 
 ---
 
@@ -444,6 +460,24 @@ inputDim ≠ outputDim 的用法；`test_pretrain` 会遍历多个 agent，stdou
 `probe_move_after_p1.txt`（增长段 7.27 → 1.18 ms）、`probe_checks_run1.txt`（检查 17.8~18.5 ns/内核调用）、
 `probe_apid_after_p1.txt`（无回归）、`test_transformer_p1.txt`（86 断言 / [10] 六个守卫全部响亮失败 / 指纹不变）、
 `bc4_seq_p1.txt`（BC 一整臂与 P1 前逐行相同）。
+
+⚠ **上面这批旧机证据文件在本机不存在**（换 PC 时只有 `docs/`、`src/`、`test/` 随仓库过来；
+`.r1build/` 里最新的一批是 2026-10-06 的，P1 那一轮的探针读数没有带过来）⇒ P1 台账里 ④⑤⑥⑦
+那几条**探针读数在本机无法复核**，需要时按 Part 9.3 的同口径探针**重跑**（`probe_seq_cost` 等目标仍然在
+`CMakeLists.txt` 里）。**下面这批是 2026-10-10 在本机重建的、本机唯一有效的基线**：
+
+| 证据文件 | 内容 |
+|---|---|
+| `.r1build/p1bin/*.exe`（13 个） | **P1 树的二进制**（在改动 `tensor.hpp` 之前从 `build/Desktop_Qt_6_9_2_MSVC2022_64bit-Release` 拷出来的），P2 的 A/B 就是拿它当 before 臂 |
+| `.r1build/plan_p1verify_build.log` | P1 全量构建：**459 步 / 0 error / 309 s**（21:28:55→21:34:04） |
+| `.r1build/test_pretrain_after_fix.{out,err,exit}.txt` | `test_pretrain` **38 断言 / 0 失败 / exit 0** |
+| `.r1build/ctest_after_p1fix.txt` | P1 树全套 `ctest`：**16/18**（1984 s），含两条被并行编译干扰的假红与其原文 |
+| `.r1build/p1_*.out.txt` / `p2_*.out.txt` | P1 树与 P2 树跑同一批测试的**逐行可 diff** 输出（指纹、FD、往返差、断言数） |
+| `.r1build/plan_p2_build.log` | P2 第一次全量构建：**BUILD_EXIT=1**、6 条 error —— 编译器否掉 `empty()` 的那一次（本方案的验收纪律生效的原始记录） |
+| `.r1build/plan_p2_build2.log` | 放回 `empty()` 之后：**466 步 / 0 error / 316 s**（`-j8`） |
+| `.r1build/tensor.hpp.pre_p2.txt` + `.r1build/p2_delete_blocks.ps1` | P2 删除前的整份头文件 + **带首尾行断言**的删除脚本（每个块切之前先核对首行/末行内容，对不上就 abort） |
+| `.r1build/ctest_p2.txt` | P2 树全套 `ctest`（空载） |
+| `.r1build/capture_test.ps1`、`plan_build.bat`、`plan_p2_build.bat` | 本机复现用的工具（构建脚本刻意保持**纯 ASCII**：带 UTF-8 BOM 注释的 `.bat` 会被 `cmd` 当成命令执行） |
 
 ### 9.3 外部
 
