@@ -1912,6 +1912,23 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(probe_alloc)
 
+    # ------------------- 注意力「矩阵化」的只读可行性探针 ([2026-10] P6-前哨)
+    # 方案 Part 8 第 1 条: "注意力矩阵化的加速比未测" —— 本探针回答它。
+    # 把 seq 专家的标量 attnFwd/attnBwd 与"每头连续 (T×dk) + MM::"两实现**配对**对测
+    # (同进程/同轮/多轮中位数/带对照通道, 口径见方案 §5.1), 并报数值差。
+    # 运行: cmake --build <build> --target probe_attn_matrix && <build>\probe_attn_matrix.exe
+    add_executable(probe_attn_matrix
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/probe_attn_matrix_main.cpp)
+    target_include_directories(probe_attn_matrix PRIVATE ${SRC_DIR})
+    target_link_libraries(probe_attn_matrix PRIVATE RL_CORE)
+    target_compile_options(probe_attn_matrix PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(probe_attn_matrix PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(probe_attn_matrix)
+
     # 想用 AddressSanitizer 查这类问题 (arena 里"agent 返回非法走法"/堆损坏),
     # 必须**整个构建**都带 /fsanitize=address —— 只给一个目标加会在链接时报
     # LNK2038 (annotate_string/annotate_vector 不匹配, RL_CORE 没带 ASan)。
