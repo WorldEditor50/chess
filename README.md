@@ -430,8 +430,14 @@ ms/模拟再反推每步模拟次数）。**不进 ctest** 的理由同上，而
 ```bat
 build\...\bench_ppo_vs_ab.exe --games=20 --plies=120 --budget=106     # 等时间
 build\...\bench_ppo_vs_ab.exe --games=6 --sims=80 --depth=4           # 固定预算
-build\...\bench_ppo_vs_ab.exe --load=weights/ppomcts_agent.dat        # 用 GUI 存下的权重
+build\...\bench_ppo_vs_ab.exe --load=weights/ppomcts_seq_agent.dat    # 用 GUI 存下的权重
 ```
+
+> **[2026-10-11] 界面 `AGENT_PPOMCTS` 的骨干换成序列 Transformer 专家**（用户口径：
+> "PPO agent 的 TB 专家默认使用 seq transformer"）⇒ 界面这一支的权重前缀从
+> `weights/ppomcts_agent.dat` 改成 **`weights/ppomcts_seq_agent.dat`**（上面那条命令要跟着改）。
+> 旧前缀（TB 结构，279 MB × 2）留在盘上但界面不再读取；结构指纹不同，硬载会被明确拒绝。
+> 落地与实测见 `docs/agents_design.md` 的"两种骨干"一节。
 
 实测（2026-09，未训练的随机权重，20 局等时间）：**PPO+MCTS 0 胜 / Alpha-Beta 20 胜，
 全部被将死，平均 36 手**；双方耗时 139 vs 143 ms/步。加 20 局自对弈热身仍是 0 胜

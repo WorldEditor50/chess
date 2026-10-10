@@ -428,6 +428,37 @@ static constexpr float SACAZ_MOE_LOSSFREE_RATE = 0.01f;
 static constexpr bool  PPO_MOE_LOSSFREE = true;
 static constexpr float PPO_MOE_LOSSFREE_RATE = 0.01f;
 static constexpr int   PPO_MOE_MLP_GATE_HIDDEN = 0;
+
+/*
+ * ================================================================
+ *  [2026-10] 棋程序里 **AGENT_PPOMCTS 的骨干 = 序列 Transformer 专家**
+ * ================================================================
+ *  用户口径: "PPO agent 的 TB 专家默认使用 seq transformer"。
+ *
+ *  为什么做成**一处常量**而不是散在各构造点: 骨干决定网络结构与参数总量, 而 PPO+MCTS
+ *  这一支在界面里被构造 **7 次** (预加载、工厂、决策路径兜底、按需建网、后台训练 clone …),
+ *  漏掉任何一处都会让"训练用的那一支"与"决策用的那一支"不是同一个结构 —— 这种错在
+ *  权重往返上**看不出来** (与 applyPpoBalance 那条纪律同一个道理, 见它的注释)。
+ *  改骨干只改这一行。
+ *
+ *  ⚠ 两个骨干不是一回事:
+ *    `Backbone::TbExperts`  = `TransformerBlock<15,360>` 专家 (12.94 M 参数/专家,
+ *                             实测量级 ~3 ms/次前向)
+ *    `Backbone::SeqExperts` = `SeqTransformerExpert<90,4,2>` (91,731 参数/专家,
+ *                             Pre-LN 标准编码器, 见 docs/seq_transformer_design.md)
+ *    两者都是 E=4 / top-1 的稀疏 MoE, 差别只在**专家内部的结构**。
+ *
+ *  ⚠ 权重文件跟着换前缀 (见 defaultWeightPath: `weights/ppomcts_seq_agent.dat`):
+ *    结构指纹对不上时 `loadModel` 会**明确拒绝**, 所以存量的 TB 权重
+ *    (`weights/ppomcts_agent.dat_*`) 不会被误载入, 也不会被覆盖 (它仍在盘上, 需要时
+ *    用 `train_bc/train_ppo --backbone=tb` 那一侧; 界面这一支今后只认 seq 前缀)。
+ *
+ *  ⚠ `AGENT_PPOMCTS_MLP` 显式传 `MlpExperts`, **不受**本常量影响 (两支的权重前缀本来
+ *    就不同)。测试与 bench 里那些没传骨干的构造点是 `PPOMCTSAgent` 的**类默认**
+ *    (仍是 TB) —— 本常量只作用于界面这一支, 所以那些基线不动。
+ * ================================================================
+ */
+static const RL::PPO::Backbone PPOMCTS_BACKBONE = RL::PPO::Backbone::SeqExperts;
 /*
  * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
  * 单位是**搜索节点数** (= 网络前向次数), 不是模拟次数: TB 骨干实测 ~3 ms/节点,
@@ -1135,7 +1166,7 @@ void ChessBoard::startupLoad()
     if (s_weightPaths.count(AGENT_PPOMCTS)) {
         emit busyMessage(QStringLiteral("正在载入 PPO+MCTS 权重…"));
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
             /* MoE 均衡 + 门控接线 (必须在任何前向之前; 见 applyPpoBalance) */
             applyPpoBalance(*m_sfPPOMCTS);
         }
@@ -2586,7 +2617,7 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
            `enableMlpGate` 是幂等的, 所以"工厂建网"与"决策路径兜底建网"两处都接
            也不会互相破坏。
         */
-        PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+        PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
         applyPpoBalance(*ag);
         return ag;
     }
@@ -3844,7 +3875,7 @@ Step ChessBoard::aiThinkRaw(int color)
         /* PPO + MCTS (AlphaZero风格): argmax */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
             applyPpoBalance(*m_sfPPOMCTS);
             auto it = s_weightPaths.find(AGENT_PPOMCTS);
             if (it != s_weightPaths.end())
@@ -4258,7 +4289,7 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
     case AGENT_PPOMCTS: {
         PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTS, AGENT_PPOMCTS);
         if (ag == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
             applyPpoBalance(*m_sfPPOMCTS);
             ag = m_sfPPOMCTS;
         }
@@ -5419,8 +5450,11 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     switch (agentType) {
     case AGENT_PG:        return "weights/pg_agent.dat";
     case AGENT_DQN:       return "weights/dqn_agent.dat";
-    /* PPO+MCTS 系: 前缀 -> <prefix>_actor / _critic (两种骨干各一个文件前缀) */
-    case AGENT_PPOMCTS:   return "weights/ppomcts_agent.dat";
+    /* PPO+MCTS 系: 前缀 -> <prefix>_actor / _critic (两种骨干各一个文件前缀)
+       [2026-10] AGENT_PPOMCTS 的骨干换成了序列 Transformer 专家 (见 PPOMCTS_BACKBONE),
+       所以它的前缀也换了 —— 结构指纹不同, 沿用旧前缀只会每次都载入失败, 而旧文件
+       (`weights/ppomcts_agent.dat_*`, TB 结构) 留在盘上给 TB/MLP 那一侧用, 不会被覆盖。 */
+    case AGENT_PPOMCTS:   return "weights/ppomcts_seq_agent.dat";
     case AGENT_PPOMCTS_MLP: return "weights/ppomcts_mlp_agent.dat";
     case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
     case AGENT_EVAB:      return "weights/evab_agent.dat";
@@ -5593,7 +5627,7 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
     }
     case AGENT_PPOMCTS: {
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
             applyPpoBalance(*m_sfPPOMCTS);
         }
         return m_sfPPOMCTS->loadModel(filepath);
@@ -6602,7 +6636,7 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_PPOMCTS:
                 if (m_sfPPOMCTS == nullptr) {
-                    m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f);
+                    m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
                     applyPpoBalance(*m_sfPPOMCTS);
                 }
                 break;
@@ -6820,7 +6854,10 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             }
             case AGENT_PPOMCTS: {
-                PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f);
+                /* 骨干必须显式传 PPOMCTS_BACKBONE: 类默认是 TB, 传漏了 clone 的结构就与
+                   主 agent 不一致 (loadModel 会因结构指纹不匹配而每一轮都失败)。 */
+                PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
+                                   true, PPOMCTS_BACKBONE);
                 /*
                    训练 clone 必须与主 agent 用**同一套** MoE 均衡/门控接线 —— 否则
                    "训练用的那一支"与"决策用的那一支"不是同一个东西, 而且这件事情

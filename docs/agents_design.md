@@ -3269,6 +3269,38 @@ mainwindow    kAgents 里多一行, 于是两个骨干能在界面上直接对�
 后台训练、权重扫描、自检、`shutdownSave` 都已按新类型接好（见"零之二点二十三"），
 所以它和别的 agent 一样会被启动加载、每轮训练、并在面板里自检。
 
+> **[2026-10-11 口径变更] 界面 `AGENT_PPOMCTS` 的骨干：TB 专家 → seq 专家。**
+> 用户口径："PPO agent 的 TB 专家默认使用 seq transformer"。
+>
+> **落地方式（刻意只动界面这一支）**：`src/chessboard.cpp` 里加**一处常量**
+> `PPOMCTS_BACKBONE = RL::PPO::Backbone::SeqExperts`，界面里该 agent 的 **7 个构造点**
+> （预加载、按需建网/工厂、决策路径兜底、**后台训练 clone** —— 漏掉 clone 会让"训练用的
+> 那一支"与"决策用的那一支"结构不一致）全部显式传它。
+> ⚠ `PPOMCTSAgent` 的**类默认仍然是 TB**（`ppomcts_agent.h`），所以 `test_ppomcts` /
+> `test_match` / `test_pretrain` / `bench_*` 里那些"没传骨干"的构造点**基线一律不动** ——
+> 这也正是选择"改界面常量"而不是"改类默认"的原因（本机测试与 bench 的读数才可比）。
+>
+> **权重前缀随之下移**：`weights/ppomcts_seq_agent.dat`（`ChessBoard::defaultWeightPath`
+> 是单一来源，`weightFilesOf` 起的启动扫描 / 自检面板 / 退出保存全部跟着走）。旧前缀
+> `weights/ppomcts_agent.dat_*`（TB 结构，279 MB × 2）留在盘上但界面不再读它；两者的结构
+> 指纹不同，硬载会被 `Net::load` 明确拒绝（不是静默串权重）。
+>
+> **实测（同一条命令 `repro_concurrency 1 4 4`，走的就是界面路径
+> `ChessBoard` + 后台训练 + 自动保存；agent 序号 4 = `AGENT_PPOMCTS`）**：
+>
+> | | 旧二进制（改动前） | 新二进制（改动后） |
+> |---|---|---|
+> | 写出的文件 | `weights/ppomcts_agent.dat_actor/_critic` | **`weights/ppomcts_seq_agent.dat_actor/_critic`** |
+> | 体积 | **279,412,481 / 276,604,827 B** | **5,388,829 / 2,581,175 B** |
+> | actor 参数量 | 52,388,888（TB） | **1,009,772**（seq，`test_ppo_backbone` 43/0 打出） |
+>
+> ⚠ **后果要说清**：界面那一支的存量权重（279 MB × 2）**从此不再被使用**。要恢复棋力得
+> 用 `train_ppo --backbone=seq`（或 `train_bc --agent=ppo-seq` 克隆后接着训）重训一份
+> seq 权重；seq 专家本身的设计与验证见 `docs/seq_transformer_design.md`（91,731 参数/专家，
+> 21 组有限差分 + 置换等变断言），2026-10 的 P5/P6 两项优化（批量 FC + 矩阵化注意力）也在
+> 它身上：`forward+backward` 相对优化前合计 **1.6~2.0×**（见
+> `docs/tensor_optimization_plan.md` 的 Part 6 台账）。
+
 ### 21.4 顺带修掉的两个真问题
 
 1. **`trainVsRandom` 的奖励标签 = "每走一步 = 输一盘"**：没有"非终局就用即时奖励"那一支，
