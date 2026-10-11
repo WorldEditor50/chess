@@ -217,6 +217,7 @@ Wilson 下界 > 50%"的新骨干**（另三支 seq 的同预算读数都还 inco
 | 界面前缀可载入 | `bench_agent_arena --backbone-ppo-a=conv --load-a=weights/ppomcts_conv_agent.dat` ⇒ 载入成功，标签 `PPO+MCTS/稀疏MoE(conv2d+ResNet专家)` |
 | 已装训练权重 | `weights/convrl_*` → `weights/ppomcts_conv_agent.dat_*`（就是 §4 里对 MCTS 61.0% 的那一份），所以界面选这一支**开局就是训练过的模型**（6,891,237 / 4,083,583 B） |
 | 回归 | `test_weights` **49/0**、`test_conv_resnet` **32/0**、`test_ppo_backbone` **68/0**、`test_transformer` 89/0、`test_sparse_moe` 100/0、`test_bc` 全绿 |
+| **新 agent 进了 `test_match [2.11]`** | 我把 `AGENT_PPOMCTS_CONV` 加进那一节的两个清单（"下拉框里选得到它 + 显示名对得上 + 对弈时真的上报损失"那一张表，以及自检/权重状态的枚举）。实测：`type=18 报告 39 行 / 4598 字节, 权重状态 4 行, 可重复=1` ⇒ **新 agent 的自检真的被跑到了**（这一条原先没有测试覆盖：打印自检文本的只有 `test_match` / `test_dqnmcts*` / `test_sacaz`）。整场 `test_match` = **371 项断言 / 4 失败**，4 条全是既有的（3 条在"对弈模式下后台训练冻结"那一节 + `[2.22]` 那条时序敏感的窗口断言），**没有新增失败** |
 
 > ⚠ **构建陷阱（踩过一次，写下来）**：只 `build chess` **不会**重链 `repro_concurrency.exe`。
 > 用旧 exe 跑新枚举值 18 时，旧表里没有 18 ⇒ 落到 Alpha-Beta 兜底 ⇒ 打印"保存=0 +
@@ -257,4 +258,46 @@ Wilson 下界 > 50%"的新骨干**（另三支 seq 的同预算读数都还 inco
 ::     然后各训一份 (权重不通用, 见 test_conv_resnet [4])
 :: (d) 棋力确认: 把 §4.1 的 --games 提到 200 并换 2~3 个 seed 的开局集
 :: (e) 那份分析文档 §7 的独立红利: 把策略头换成 "Conv 1x1 -> 90 路" (对齐表示的翻案实验)
+```
+
+---
+
+## 8. 复现命令（本轮的每一个读数）
+
+```bat
+:: ---- 断言 (秒级) ----
+cmake --build <build> --target test_conv_resnet
+<build>\test_conv_resnet.exe          :: 32 条断言; [2] 是 7 组中心差分, [5] 是 Net 级往返
+
+:: ---- 相位1: 行为克隆 (与 seq/mlp 同一协议: 2000 局面 / AB 深度 4 / 软目标 / 8 epoch) ----
+<build>\train_bc.exe --agent=ppo-conv --positions=2000 --depth=4 --soft=1 --soft-depths=4 ^
+                     --epochs=8 --batch=64 --lr=0.002 --seed=20240901 --holdout=5 ^
+                     --save=weights/conv_bc
+:: 对照臂 (本轮实测): --agent=ppo-mlp --save=weights/mlp_bc  (留出 CE 2.5251)
+::                     --agent=ppo-seq --pos=2d --save=weights/seqenc_2d (留出 CE 2.5188, 见上一份文档)
+
+:: ---- 相位2: 自对弈一轮 (与 seq 那一支**同预算**: 40 局 x 120 模拟) ----
+<build>\train_ppo.exe --backbone=conv --load=weights/conv_bc --save=weights/convrl ^
+                     --games=40 --sims=120 --moves=60 --opening=8 --seed=20240901
+
+:: ---- 相位3: 对 MCTS agent (100 局 / 50 个配对开局 / 等模拟预算 64) ----
+<build>\bench_agent_arena.exe --mode=match --a=ppo --b=mcts --backbone-ppo-a=conv ^
+        --load-a=weights/convrl --games=100 --sims=64 --plies=120 --opening=8 ^
+        --paired-openings --seed-mcts-rng --seed=20240901
+
+:: ---- 相位4: 与界面现役 seq+2d 头对头 ----
+<build>\bench_agent_arena.exe --mode=match --a=ppo --b=ppo --backbone-ppo-a=conv --backbone-ppo-b=seq ^
+        --pos-ppo-b=2d --load-a=weights/convrl --load-b=weights/seqrl_2d ^
+        --games=60 --sims=64 --plies=120 --opening=8 --paired-openings --seed=20240901
+
+:: ---- 界面验证 (界面路径: ChessBoard + 后台训练 + 自动保存; 18 = AGENT_PPOMCTS_CONV) ----
+cmake --build <build> --target chess repro_concurrency     :: ⚠ 只 build chess 会留下**旧** harness
+<build>\repro_concurrency.exe 1 4 18
+::   期望: "全部跑完, 没有崩溃" + weights/ppomcts_conv_agent.dat_actor/_critic
+::        = 4,374,213 / 1,566,559 B (819,948 参数的结构指纹)
+```
+
+日志与 CSV：`.r1build/conv/`（`bc_ppo-conv.txt` / `bc_ppo-mlp.txt` / `rl_conv.txt` /
+`convrl_vs_mcts_100.{txt,csv}` / `conv_vs_seq2d_60.{txt,csv}` / `test_match_conv.txt`）。
+权重：`weights/conv_bc_*`（BC）→ `weights/convrl_*`（RL）→ 拷成 `weights/ppomcts_conv_agent.dat_*`（界面）。
 

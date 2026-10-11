@@ -387,6 +387,14 @@ int main(int argc, char *argv[])
             { ChessBoard::AGENT_SACAZ_OLD, "SAC+AZ-59e5233", true },
             { ChessBoard::AGENT_PPOMCTS_MLP, "PPO+MCTS-MLP", true },
             /*
+               [2026-10 第三轮] PPO+MCTS 的**第三个骨干** (conv2d + ResNet 专家,
+               AGENT_PPOMCTS_CONV)。加它的理由与上面 MLP 那一支逐字相同: 它是新增的
+               界面 agent 类型, 这一条覆盖"下拉框里选得到它 + 显示名对得上 + 对弈时
+               真的上报训练损失"。⚠ 它**必须有这一行**: 漏掉的话这一节会静默跳过它,
+               而"新 agent 的名字没接上曲线"是**不报错**的那一类缺陷。
+            */
+            { ChessBoard::AGENT_PPOMCTS_CONV, "PPO+MCTS (卷积残差)", true },
+            /*
                [2026-09 dev-dqnmcts-moetb] DQN+MCTS 的 **MoE+TB 专家骨干**那一支
                (独立类 DQNMCTSMOETbAgent)。它与上面 DQN+MCTS 那一支**不是同一个类**,
                而这里钉的是接口层面两件事: 下拉框里选得到它 (名字就是 agentDisplayName
@@ -1907,7 +1915,14 @@ int main(int argc, char *argv[])
                列文件名), 所以加它不会为这一节引入 TB 骨干的构造开销。
                有实例时报告必须满足下面那三条通判据 (非空 / 可重复 / 写明"不是棋力")。
             */
-            ChessBoard::AGENT_DQNMCTS_MOE
+            ChessBoard::AGENT_DQNMCTS_MOE,
+            /*
+               [2026-10 第三轮] PPO+MCTS 的第三个骨干 (conv2d + ResNet 专家)。
+               与上面各支同一个口径: 走**轻量**接口 (没有实例时自检返回空串、权重状态
+               只列文件名) ⇒ 加它不会为这一节引入建网开销; 有实例时报告必须满足下面
+               那三条通判据 (非空 / 可重复 / 写明"不是棋力")。
+            */
+            ChessBoard::AGENT_PPOMCTS_CONV
         };
         int reported = 0;
         for (ChessBoard::AgentType t : all) {

@@ -166,7 +166,9 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
   **动作别名**（同一局面里有多少互不相同的着法被迫共用一个 Q 槽位）、**终局通道**
   （`getResult()` 判出的终局里，旧口径 `isGameOver()` 漏掉了多少局）、搜索/训练口径
   （根搜索展开覆盖率、值门控的 gap 与回滚、MoE 路由直方图……）。
-  **十六个 agent 类全部实现了自检**（数据源 `AgentBase::selfCheckReport()`，由
+  **界面上的每个 agent 类型都实现了自检**（`enum AgentType` 里现在是 **19 个**，
+  2026-10 第三轮新增 `AGENT_PPOMCTS_CONV` —— 这个数是数枚举数出来的，别照抄旧文档；数据源
+  `AgentBase::selfCheckReport()`，由
   `ChessBoard::getAgentSelfCheck()` 转发），另外纯搜索的那几支（Alpha-Beta 四档
   / MCTS）还会在面板里跑一次**决策合法性自检**（"这一步返回值在合法集里吗"）—— 它正是
   "agent 返回默认 Step 被误读成无棋可走"那类 bug 的回归指示器。
@@ -319,10 +321,11 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 
 ## 测试与验证
 
-### `ctest`（14 个套件，全过）
+### `ctest`（**19 个套件**，以 `ctest -N` 的实测数为准）
 
 ```bat
 ctest --output-on-failure
+ctest -N                      :: 只列清单: 本仓库的套件数是**实测**出来的, 不靠这份表格记账
 ```
 
 | 套件 | 盯什么 |
@@ -332,19 +335,27 @@ ctest --output-on-failure
 | `test_rules` | 棋规回归：走法数 / 应将 / 自杀 / 照面 / 将杀 / 重复 / 限着 + **`Chess::Result` 与 `Stone::Color` 的枚举换算**（两者数值撞号，手写比较会把红胜记成黑胜） |
 | `test_diag` | **诊断指标的解析验证**（68 断言，秒级）：熵 / CE / KL / explained variance / 变异系数 / 校准分桶 / `qForParent` 的符号 / CSV 列数与表头一致 / `rootDiag` 的不变量（**根访问数之和 == 模拟次数**）/ **搜索能不能看见一步杀** |
 | `test_pretrain` | **探索不得改动真棋局**（逐字段比对） |
-| `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** + **必输局面仍返回合法走法** + 十六个 agent 的自检与**两支 SAC 的权重文件名必须不同**（[2.11]）+ 五条后台训练支路（含 59e5233 版 SAC 的派生类 clone）+ **自动保存 × 后台训练并发**（[2.15]/[2.16]） |
+| `test_match` | arena 统计（交换先后手 / 比分归属 / 判和 / 中止）+ 每个 agent 的**训练损失上报** + **即时奖励符号约定** + **每手奖励进度与局末奖励同账** + **曲线"换一批线"不残留空线** + **必输局面仍返回合法走法** + 界面每个 agent 类型的自检（枚举里 19 个）+**两支 SAC 的权重文件名必须不同**（[2.11]）+ 五条后台训练支路（含 59e5233 版 SAC 的派生类 clone）+ **自动保存 × 后台训练并发**（[2.15]/[2.16]） |
 | `test_grad` | **有限差分核对 SIMD 之后的解析梯度** + MM 内核"累加 vs 覆盖"语义探针 |
 | `test_weights` | 权重格式：逐比特往返 / 坏文件拒绝 / 失败不改动网络 / 老格式兼容 |
 | `test_sparse_moe` | 稀疏不变量 / 与上游 `MOE` 的等价性 / 反向有限差分 / 辅助损失 / `MOE` 的**专家模板参数**（默认 TB 保兼容、`MlpExpert`、`Layer<Fn>`）与 `copyTo` 是否真的复制专家 / **[11] 实时路由探针**（逐次核对、MLP 门控那一支、热度按时间衰减、**多线程读不撕裂**） |
 | `test_scaledconcat` | `ScaledConcat` 的结构不变量：**旧实现的门控上界 e¹ 与新实现的选择性**（有效路数）、门控与特征**逐位解耦**、参数与**输入梯度三条通路**的有限差分、三种专家模板参数、保维残差 / 存取往返 |
 | `test_sacaz` | 掩码 softmax 雅可比 / 走法合法性 / 软价值 α 恒等式 / 四种骨干 |
+| `test_sac` | SAC 的学习机制（多 epoch 的梯度成比例、优化器只调一次、`resetMoeBatchStats` 真的划出批边界，带正对照） |
+| `test_dqnab` | DQN+AB（AB 当 planning head）的口径：标签来源、TD 目标、一步杀命中率 |
+| `test_dqnmcts_moe` | DQN+MCTS（稀疏 MoE + TB 专家）独立类的结构/口径（与 `AGENT_DQNMCTS` 不共享权重前缀） |
 | **`test_bc`** | **行为克隆的口径与承诺**（**167 断言**，实测 2.2 s）：解析梯度两条独立路径一致 + 中心差分 / **非法列梯度恰好为 0** / 单局面过拟合 P(老师)→1 / **BC 不碰 critic**（权重文件字节摘要：PPO critic、SAC q1/q2、共享口径的 Q 头各自钉住）/ 权重往返逐位相同 / **目标落空的负对照**（老师着法不在合法集 → 丢弃 + 计数，而不是产出一条没有信息却会改权重的样本）/ 两个口径的**归一化差别**（合法列 Σ=1 vs 全量 Z≈0.006）/ SAC-MoE-MLP 冒烟 / **[9] 软目标（多深度一致）**：`Σp == 1`、每项都是合法着法、同着法合并、深度 1 退化成 one-hot（`H(t)=0`）、未归一权重被强制归一、**一个候选不合法 ⇒ 整条样本作废**、单老师重载 == 单候选多老师重载、`CE == H(t) + KL(t‖π)` 的手算对照。见 [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) |
-| **`test_match [2.7c] 实验3`** | ⚠ **当前是红的，且是既有问题**（`git worktree` 出来的干净 HEAD 复现同样失败）：它要求"只换对手 ⇒ 第一次训练损失相同"，而**回放池不在快照/还原范围内**（`RL::PPO::load` 不碰 `replay`）⇒ 第二场抽到的 batch 天然不同；训练对局模式下后台训练线程还会在对弈期间同步权重。时间线与两条候选机制见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点三十三"。另外整场 `test_match` 在 2700 s 预算下**超时**（既有记录，属预算过期） |
+| **`test_ppo_backbone`** | PPO 骨干的结构与读数（**68 断言**，秒级）：骨干枚举的解析/短名、TB 专家的**头数口径**（请求 == 实用，改动前"请求 16 / 实用 15"任何读数都不变）、参数构成三分法、`clipGrad` 的真实语义、**[6] 序列专家位置编码的 Net 级权重往返**（1d/2d/rope + 坏标记仍被拒 + 模式不匹配响亮失败） |
+| **`test_transformer`** | **真正的 Transformer 专家**（**89 断言**）：21 组有限差分、关位置嵌入 ⇒ 置换等变、常量 token ⇒ 输出逐位相同、旧 `MultiHeadAttention` 的反向（double 参考 + 中心差分，仓库此前**零覆盖**）、`SeqLayerNorm` 抽类后的单独验证、位置编码三模式（含 `[6f]` 往返**值**比对）、dropout、未接线死代码的守卫。见 [`docs/seq_transformer_design.md`](docs/seq_transformer_design.md) |
+| **`test_conv_resnet`** `[2026-10 第三轮]` | **conv2d + ResNet 专家**（**32 断言**，秒级）：19×10×9 图像口径/参数量（44,275 每专家）/前向 MAC、**7 组解析梯度 == 中心差分**（conv1 / 残差块 / 最后一个块 / head / 输入梯度 —— ResNet 两条反向路与 Tanh 导数写错都**不报错**）、im2col/col2im 自洽（patch 顺序、padding、散加语义）、坐标通道开关会改变参数量 ⇒ 权重不通用、专家级 + **Net 级**往返逐位一致、跨骨干载入被拒。见 [`docs/conv_resnet_agent_2026_10.md`](docs/conv_resnet_agent_2026_10.md) |
+| **`test_match [2.7c] 实验3`** | ⚠ **当前是红的，且是既有问题**（`git worktree` 出来的干净 HEAD 复现同样失败）：它要求"只换对手 ⇒ 第一次训练损失相同"，而**回放池不在快照/还原范围内**（`RL::PPO::load` 不碰 `replay`）⇒ 第二场抽到的 batch 天然不同；训练对局模式下后台训练线程还会在对弈期间同步权重。时间线与两条候选机制见 [`docs/issues_review.md`](docs/issues_review.md) 的"零之二点三十三"。另外整场 `test_match` 在 2700 s 预算下**超时**（既有记录，属预算过期）。**[2026-10 第三轮 复核]**：把改动全部 `git stash`、重建 HEAD 后仍是**同样 3 条**失败（改动无关）；另有 `[2.22] 对弈期间不落盘模型权重` 一条**对时序敏感**（窗口内出现"开始于对弈之前的保存"就会红，实测抓到的是 `_temp_train.dat` 的 `.tmp → 改名` 横跨 8 秒窗口）—— 已给这条断言加了"红时印出两个快照"的诊断，定位过程见 [`docs/seq_transformer_encoding_eval_2026_10.md`](docs/seq_transformer_encoding_eval_2026_10.md) §7.1 |
 | **`probe_hvai_flow`** | **人机对弈状态机**（走**真实点击路径** `mousePressEvent`）：一局**由 AI 的落子结束**之后按"开局"，红方再走第一步，黑方必须应手；换对战 agent 之后同理；外加沙漏那一行显示的 agent 名。**进 ctest**（约 5–12 s） |
 | **`repro_concurrency`** | **"对弈 × 后台训练"并发的最小复现**（对弈跑在独立线程 + 每手刷自检 + 后台训练 + 结束后保存；**故意不进 ctest**）。用法 `repro_concurrency.exe [轮数] [每局手数] [agent枚举值]` |
 
-`test_ppomcts` 也在这 14 个里（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 /
-置换表 / **PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）。
+`test_ppomcts`（盯 PPO+MCTS 的策略目标 / 回放池 / 镜像增广 / 稀疏策略头 / 置换表 /
+**PUCT 的 Q 符号** / **`loadModel` 必须报告真实结果** / **根噪声与出招温度**）是一个**构建目标
+但不在 ctest 清单里** —— 它在 TB 骨干下约 20 分钟，属于"刻意不进 ctest"的那一类
+（`ctest -N` 输出里没有它；需要时 `ctest -R test_ppomcts` 也跑不到，得直接跑 exe）。
 
 另外有 **`bench_moe`**（骨干 A/B/C/D 等时间对弈基准）**故意不进 ctest** —— 它跑真实对局、
 依赖随机开局，放进去只是偶发失败：
@@ -815,7 +826,10 @@ chess/
 | [`docs/training_optimization.md`](docs/training_optimization.md) | **训练流程优化总结（Phase 0–5）**：奖励量纲摆正、自举、势能塑形（PBRS）、棋盘局面价值评估（将安全/空间/机动性）、搜索展开按先验选；每阶段的实测数字、两档评估的工程决策、明确列出的未做项。**§9.5** 是 2026-09 的诊断矩阵与负面结果；**§7.7–7.11** 是行为克隆那一整条线的来龙去脉（价值头蒸馏没用 → BC 是杠杆 → 数据 scaling → 代理指标涨 9 倍而胜率不动）；**§11** 是 2026-10 的界面**价值评估曲线**（EV/校准接进 GUI：两种 z 口径、"为什么没有点"、"整局累计回报当 z 会把 EV 拉到 −24"那个坑） |
 | [`docs/behavior_cloning_2026_10.md`](docs/behavior_cloning_2026_10.md) | **行为克隆（PPO + SAC）**：四层结构（口径层 `rl/bc.*` / 内核层 `rl/ppo.*` / 胶水层 `bcagent.hpp` / 工具 `train_bc`）、**§2.5 原理**（最大似然 = 逐状态最小化到老师的前向 KL；`∂L/∂z = π − t` 与"目标落空不是零梯度"；只训策略头是原理要求；两种训练分布；**A/P/CE 三个读数与 `A − P = q(1−m₁) − (1−q)m₀`**，即"一致率在 P 上方 = 分布尖"）、口径（老师 = AB 选点、合法列掩码 CE、只动策略头）、稀疏内核被在线与 BC 共用的那次重构及回归证据、**实测读数表**（PPO 留出 top-1 2.26%→35.71%、SAC 1.38%→41.73%；全量口径对照臂 21.68% 且慢一倍）、三个"静默失败"与各自的读数、边界与已知缺口 |
 | [`docs/tb_expert_training_2026_10.md`](docs/tb_expert_training_2026_10.md) | **TB 专家骨干"更难训练"的实测归因 + 四处改动**（用户口径："用 TB 专家的 PPO agent 比 MLP 专家的更难训练"）。**结论与直觉相反**：受控 BC A/B 里两骨干的 CE 轨迹**几乎相同**（训练 3.649→2.046 vs 3.662→2.068、留出 top-1 31.5% vs 30.0%），差的是**代价**——同一个脚本的训练段 TB **159.8 s** / MLP **4.5 s**（35.5×，56 次更新、空载顺序跑）。实测根因：一个 TB 专家 **90.4% 的参数是注意力**（11.70 M / 12.94 M），而这条支路在初始化时**只占块输出方差的 1.45e-06**（`softmax(z)` 是**全局**归一 ⇒ 单头输出 ∝ `|v|/d_k`；实测 `|x|=11.53, |attn_out|=0.017, |ffn_out|=8.16`）⇒ 实际在跑的是"恒等残差 + 一个 360 宽 GELU FFN"。顺带修掉一处**静默降级**（`PPO_MOE_TB_HEADS` 写 16、`HonorHeads` 默认 false ⇒ 实际只跑 15 头；改成 15 + 显式 true，参数不变、存量权重可载）。**改动**：① 头数口径；② BC 路径接上 `finalizeMoeBatch()`（此前 BC 期间**完全没有** MoE 均衡回路，仓库自己列过这个缺口）；③ 三档梯度裁剪口径 + **新增梯度范数读数**（实测证明 `clipGrad` 其实是"逐张量单位范数归一"，而 RMSProp 的逐坐标归一会把整张量的等比缩放**全部抵消** ⇒ 换裁剪口径**不是**训练问题的解药）；④ 新骨干 `LayerExperts`（无 MHA 的廉价专家，复用已有 `ExpertFactory<Layer<Fn>>`）：**同一次更新便宜 2.8×，克隆保真度每一项都更好**（留出 CE 2.546 vs 2.685、top-1 32.5%、KL 1.989）。另加：`bench_agent_arena --backbone-ppo-a/-b`（**等模拟**的"只换骨干"对弈）、`test_ppo_backbone`（35 条断言，秒级进 ctest）、自检面板新增"请求/实用头数 + 注意力参数占比 + 裁剪口径 + 梯度范数"读数。**§9 是 `TransformerBlock`/`MultiHeadAttention` 的实现审计**：用 double 参考前向 + 中心差分**首次**验证了注意力反向（8 个非平凡项最差相对误 8.3e-7、输入梯度 1.4e-6 —— 仓库的 `test_grad` 只覆盖 FFN/LN/门控，注意力四栏从来没被查过），并给出七条结构判定（没有 token 轴 / 全局 softmax 的 1/d_k 衰减 / 参数比重倒挂 9.5:1 / q·kᵀ 秩 1 却按全矩阵算 / `Attention<N>` 与 `PositionalEncoder` 是死代码 / batch=1 不可重入 / `backward` 不清 `ei` 的调用方契约）。**§10 是实现真正的 Transformer**：新增 `src/rl/seq_transformer.hpp` 的 `SeqTransformerExpert<SeqLen,Heads,Blocks>`（按格 token 化 T=90 / 可学位置嵌入 / `Q Kᵀ/√d_k` 按 key 轴**逐行** softmax / Pre-LN 残差堆叠 / 逐格输出投影回 1710），接成 PPO 第四种骨干 `Backbone::SeqExperts`（`--agent=ppo-seq`）。**每专家 91,731 参数**（旧 TB 是 12,936,510；actor 1.01 M vs 52.4 M = **小 51.9×**），验证：21 组有限差分最差 2.28e-3、关位置嵌入时对 token 置换等变（2.9e-6）、常量 token 输出逐位相同（全局 softmax 会破坏这条）、开位置嵌入置换不再等变（正对照）、权重往返逐位一致 —— `test_transformer` **33 条断言**进 ctest（含 `SeqLayerNorm` 抽类后的单独验证：归一不变量 / 累加语义 / 写序）。**四臂同协议 BC 读数**（1000 局面 / AB 深度 4 / 软目标 / 104 次更新）：MLP 留出 CE 2.6917 / TB 2.6600（347.0 s）/ 廉价专家 2.5460（47.0 s）/ **序列 Transformer 2.6510（145.1 s，重测值；最初那轮 `2.6545/140.9 s/31.0%` 的 seq 臂跑的是"位置嵌入梯度还没修"的**旧二进制** —— 把那个错法重新注入当前树后读数逐位复现了旧值，§10.7 末尾有全过程）** ⇒ 把结构改对**不牺牲保真度**，而且 actor 小 51.9×、训练快 2.39× |
-| [`docs/seq_transformer_design.md`](docs/seq_transformer_design.md) | **`SeqTransformerExpert` 设计文档**（真正的 Transformer 专家）：全景数据流与形状表（T=90 每格一个 token / featDim=19 / tokDim=64 / Heads=4 / dk=16 / Blocks=2 / 注意力矩阵 90×90）· 单层内部与公式（**按 key 轴逐行** softmax，输出量级与 T/dk 无关 —— 与旧实现 `1/d_k` 衰减的对照）· 反向的逐步推导与代码函数逐一对应（含按行 softmax 的雅可比）· 参数清单逐项对账（**91,731**/专家；注意力 33,280 / FFN+嵌入 57,939 / LN 512）与初始化口径 · 乘加分解表（**9.67 M**，FFN 占 45.8%）与缓存表（≈1.1 MB/专家）· **12 条设计决策与各自的被否决备选**（D1 为什么新写类而不是改旧的 / D2 为什么按格切 token / D3 为什么逐格投影输出 / D8 为什么要重跑前向才能复用 `Layer<>` 的反向 / D10 为什么主体用裸 `float` 数组 / D11 为什么不整除就 abort …）· 与旧 `TransformerBlock` 的逐项对照 · 验证清单（**33 条断言**：21 组有限差分、输入梯度取 `\|ei\|` 最大坐标、置换等变、常量 token、往返、参考审计、**`SeqLayerNorm` 单独验证**）· **§8.1/§8.2**：两个 LayerNorm 抽成 `SeqLayerNorm` 类（10 处接线 → 一行循环）之后的**逐字符等价证据**（FNV-1a 权重指纹 `9a5483d39a42a333` 与 21 组 FD 读数全同）＋ 抽类时抓到的**一处真实数值差别**（旧 `lnFwd` 的 `(float)((x−m)/s)` 是 double 除法，改成 float 就会动数值）· 代码地图与**必须守住的不变量表** · **§8.4 计时口径**（同机同二进制也会漂 5~6 倍 ⇒ 只比"同一进程同一轮"的成对比值 + 对照通道；含 `start /affinity … /wait` 的假读数坑）· **§9.2 代价分解**（反向 = 前向的 7.4~8.1 倍；其中 84% 是 14 次 `fcBwd`、而 `fcBwd` 的 ~85% 是 `MM::ikjk` 的标量分支 —— 实测比手写慢 **12~25×**，两种写法逐位等价）· 已知限制与提速路线（按实测收益重排：先修 `ikjk`，整批 FC 只值 1.00~1.13×）· **§9.4~§9.6 补的三项未做结构项**：**位置编码三种模式**（`SeqPosEnc`：可学 1D=默认逐位不变 / **可学 2D 行列** / **RoPE**（无参数、相对位置），权重文件**自描述**、模式不匹配就 abort）· **dropout**（注意力概率 + 两条残差支路，默认 0 = 不消耗随机数；反向用**同一张** mask，`dV` 必须用乘过 mask 的 P —— 漏掉时冻 mask 的有限差分给出 wq 偏大 15.6%/embed 偏大 24.6%）· **未接线死代码守卫**（`requireWired`：默认禁止 `Attention<N>`/`PositionalEncoder`/`Dropout<Fn>`，并删掉 `net.hpp` 一条与 `else` 一字不差的空分支）⇒ 断言数 33 → **72**|
+| [`docs/seq_transformer_design.md`](docs/seq_transformer_design.md) | **`SeqTransformerExpert` 设计文档**（真正的 Transformer 专家：按格 token 化 T=90 / 逐行 softmax / Pre-LN 残差 / 可学位置嵌入；每专家 91,731 参数 = TB 的 1/141）—— 结构账、逐项对照、验证读数、未做项 |
+| [`docs/seq_transformer_encoding_eval_2026_10.md`](docs/seq_transformer_encoding_eval_2026_10.md) | **序列编码 A/B（1d / 2d / rope）+ 两个权重载入缺陷的修复**：`Net::load` 不认 `POS2D`/`POSROPE` 标记行、`SeqPosEnc::read` 在 ROPE 下多读一行（off-by-one）；三种编码在**同一协议**下对 MCTS 的棋力（100 局 / 50 配对开局：57.5 / 57.0 / 53.0%，**分不出来**）、界面选 `2d` 的依据、**"40 局那个 decisive 是开局样本假信号"** 的完整定位、三种编码的理论分析（323 种盘内位移被光栅下标折成 179 个 Δt 等） |
+| [`docs/conv_resnet_agent_2026_10.md`](docs/conv_resnet_agent_2026_10.md) | **新 agent：conv2d + ResNet + 稀疏 MoE 的 PPO+MCTS**（用户口径"19x9x10 特征输入"）：`ConvResNetExpert`（19 通道 × 10 行 × 9 列 + 4 个坐标/区域通道、3×3 卷积 + 4 个残差块 + 1×1 输出投影、每专家 44,275 参数、**im2col + `MM::ikkj` 实测 0.123 ns/MAC**）、32 条断言（含 7 组有限差分）、**对 MCTS 61.0%（Wilson [51.2, 70.0]，工程里最高）**、与界面现役 seq+2d 头对头 60.0%（17:5）、界面接线（`AGENT_PPOMCTS_CONV`）、以及**没做的那几项消融**与确切命令 |
+| [`docs/conv_resnet_moe_analysis.md`](docs/conv_resnet_moe_analysis.md) | **conv + ResNet + MoE 作为主干的理论分析**（2026-10；§0 已按实测回填）：为什么"conv 是修一个建模错误"、ResNet 为什么是 conv 的必要条件、`LayerNorm`/`BatchNorm` 为什么都不能用、MoE 在 conv 之后是否还值得（**该判断本轮仍未证实/证伪**） |家）：全景数据流与形状表（T=90 每格一个 token / featDim=19 / tokDim=64 / Heads=4 / dk=16 / Blocks=2 / 注意力矩阵 90×90）· 单层内部与公式（**按 key 轴逐行** softmax，输出量级与 T/dk 无关 —— 与旧实现 `1/d_k` 衰减的对照）· 反向的逐步推导与代码函数逐一对应（含按行 softmax 的雅可比）· 参数清单逐项对账（**91,731**/专家；注意力 33,280 / FFN+嵌入 57,939 / LN 512）与初始化口径 · 乘加分解表（**9.67 M**，FFN 占 45.8%）与缓存表（≈1.1 MB/专家）· **12 条设计决策与各自的被否决备选**（D1 为什么新写类而不是改旧的 / D2 为什么按格切 token / D3 为什么逐格投影输出 / D8 为什么要重跑前向才能复用 `Layer<>` 的反向 / D10 为什么主体用裸 `float` 数组 / D11 为什么不整除就 abort …）· 与旧 `TransformerBlock` 的逐项对照 · 验证清单（**33 条断言**：21 组有限差分、输入梯度取 `\|ei\|` 最大坐标、置换等变、常量 token、往返、参考审计、**`SeqLayerNorm` 单独验证**）· **§8.1/§8.2**：两个 LayerNorm 抽成 `SeqLayerNorm` 类（10 处接线 → 一行循环）之后的**逐字符等价证据**（FNV-1a 权重指纹 `9a5483d39a42a333` 与 21 组 FD 读数全同）＋ 抽类时抓到的**一处真实数值差别**（旧 `lnFwd` 的 `(float)((x−m)/s)` 是 double 除法，改成 float 就会动数值）· 代码地图与**必须守住的不变量表** · **§8.4 计时口径**（同机同二进制也会漂 5~6 倍 ⇒ 只比"同一进程同一轮"的成对比值 + 对照通道；含 `start /affinity … /wait` 的假读数坑）· **§9.2 代价分解**（反向 = 前向的 7.4~8.1 倍；其中 84% 是 14 次 `fcBwd`、而 `fcBwd` 的 ~85% 是 `MM::ikjk` 的标量分支 —— 实测比手写慢 **12~25×**，两种写法逐位等价）· 已知限制与提速路线（按实测收益重排：先修 `ikjk`，整批 FC 只值 1.00~1.13×）· **§9.4~§9.6 补的三项未做结构项**：**位置编码三种模式**（`SeqPosEnc`：可学 1D=默认逐位不变 / **可学 2D 行列** / **RoPE**（无参数、相对位置），权重文件**自描述**、模式不匹配就 abort）· **dropout**（注意力概率 + 两条残差支路，默认 0 = 不消耗随机数；反向用**同一张** mask，`dV` 必须用乘过 mask 的 P —— 漏掉时冻 mask 的有限差分给出 wq 偏大 15.6%/embed 偏大 24.6%）· **未接线死代码守卫**（`requireWired`：默认禁止 `Attention<N>`/`PositionalEncoder`/`Dropout<Fn>`，并删掉 `net.hpp` 一条与 `else` 一字不差的空分支）⇒ 断言数 33 → **72**|
 | [`docs/rl_sync.md`](docs/rl_sync.md) | 与上游 snakeAI `rl/` 的同步、chess 侧的差异、SIMD 之后梯度是否仍正确 |
 | [`docs/xiangqi_capacity.md`](docs/xiangqi_capacity.md) | "多少参数量才能覆盖象棋求解空间"（~10⁴⁰ 参数 → 物理上不可能） |
 | [`docs/analysis.md`](docs/analysis.md) | 文件树与模块分析 |
