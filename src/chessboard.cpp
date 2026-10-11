@@ -269,41 +269,44 @@ static constexpr int MCTS_SIMS = 800;         /* MCTS 模拟次数 */
  * "先验前 N 名的均匀分布"。80 次时实测仍有约 48% 的访问落在"每个孩子一次"的
  * 地板里 (bench_ppo_sims 的根节点诊断), 400 次降到约 10%。
  *
- * ---- [2026-10] E/top-k 已经来回切过一次, 这个预算的**代价**跟着变 (实测) ----
- * 同一台机器 (bench_ppo_backbone_tb + tools/measure_peak_working_set.ps1):
- *   E=4/top-1 (当前): 参数量 actor+critic **104.3 M**, **11.02 ms/模拟 ->
- *                     400 模拟 = 4.31 s/步**, 峰值工作集 **1,608 MB**
- *                     (2026-10 切回 4/1 当天实测; 早期注释里那个 "≈3.2 s" 是另一个
- *                      量法/另一个版本的旧读数, 以本节这组同工具同日读数为准)
- *   E=8/top-2 (已回退): 20.1 ms/模拟 -> 400 模拟 = 8.0 s/步; 参数量 207.8 M;
- *                     峰值工作集 3,301 MB (actor+critic 各背一套完整 TB 专家, 四份缓冲)
- * **2026-10 第二次用户口径已切回 4/1** (`rl/ppo.h` 的 PPO_MOE_EXPERTS/TOPK), 于是
- * 那个"每步等到 8 秒"的时代结束了 —— 而 400 这个数**刻意不动**:
- *   * 用户口径原文是"保持 400, 恢复到历史配对": 4/1 配 400 模拟本来就是 2026-10 之前
- *     的那一档, 切回去等于**免费把每步从 8.0 s 拿回 4.3 s**, 搜索深度一点没减;
- *   * "模拟次数 ≫ 分支数 (~38.7)"是 π 目标有没有信息量的分水岭 (见 BG_TRAIN_SIMS 的
- *     长注释), 而"模拟次数"又是本工程**唯一测出过棋力**的杠杆 (40/64/120 ->
- *     42.2%/50.0%/62.5%) —— 所以在"省下来的算力怎么花"这件事上, 唯一有证据的答案是
- *     **别花掉**: 留着它换墙钟。
- *   * 哪天真想把这省下来的时间再换成搜索, 就把这个数抬到 ~1000 (回到 ~10 s/步) —— 那是
- *     一个需要用户开口的取舍, 不该由代码偷偷改掉。
- *   * 想"又快又深"还有第三个出口: 换 `PPO+MCTS (MLP专家)` 那一支, 同一份搜索代码、
- *     0.22 ms/模拟, 1600 模拟 ≈ 0.35 s/步 —— 它的骨干便宜 ~90 倍 (见 rl/ppo.h 顶部那张表)。
- * 一句话: **top-k 那一半本来就是拿"模拟次数"换"容量"的**, 切回 4/1 就是把这个交换退掉。
+ * ---- 历史账 (为什么曾经是 400, 以及为什么现在不是) ----
+ *   * 2026-10 之前/之后一段: 骨干是 TB 专家 (E=4/top-1, actor+critic 104.3 M 参数),
+ *     实测 **11.02 ms/模拟 ⇒ 400 模拟 = 4.31 s/步** (bench_ppo_backbone_tb),
+ *     E=8/top-2 那一档更贵 (20.1 ms/模拟 = 8.0 s/步)。那时 400 是"4/1 配 400"的
+ *     历史配对, 用户口径是"保持 400, 恢复到历史配对"。
+ *   * [2026-10 第二轮] 骨干换成**序列 Transformer 专家** (见 PPOMCTS_BACKBONE:
+ *     E=4/top-1, actor 1.0 M 参数 = TB 的 1/52) 之后, 同一台机器上实测
+ *     (bench_agent_arena, 单进程, pos=2d 的 seq 权重):
+ *       400 模拟 = **1.49 s/步** (3.71 ms/模拟) | 800 = 2.98 s | **1600 = 5.96 s**
+ *     ⇒ 一次模拟便宜 ~3 倍, 于是"同样 6 秒"现在能搜 **1600** 次而不是 400 次。
+ *
+ * ---- [2026-10 第二轮] 用户口径: **模拟次数与 MLP 专家对齐** ⇒ 1600 ----
+ * 原文: "chess程序使用2d编码，模拟次数与mlp专家对齐"。两支 PPO 用**同一个预算**
+ * (PPO_MLP_SIMS) 之后, 界面上的两个 PPO 变体终于**可比**了 —— 在此之前
+ * "哪一个更强"在界面口径下无法回答, 因为比的其实是搜索预算 (400 vs 1600);
+ * 而 `bench_agent_arena` 的注释里早就把这件事写成纪律:
+ * "模拟次数是本工程**唯一测出过棋力**的杠杆 (40/64/120 -> 42.2%/50.0%/62.5%)"。
+ *
+ * 代价 (诚实记下): 界面上一手从 ~1.5 s 变成 **~6.0 s** (1600 x 3.71 ms)。这是
+ * "拿墙钟换棋力"的取舍, 与 2026-09 把这一档从 80 提到 400 是同一类决定 ——
+ * 搜索深度不够时, π 目标根本不含搜索结果 (见 BG_TRAIN_SIMS 的长注释)。
+ * 想改回去只动这一个数 (成本线性); 想"又快又深"就换 AGENT_PPOMCTS_MLP 那一支
+ * (MLP 专家 ~0.22 ms/模拟, 同一预算约 0.35 s/步)。
  */
-static constexpr int PPO_SIMS = 400;          /* PPO+MCTS 每次决策的模拟次数 */
+static constexpr int PPO_SIMS = 1600;         /* PPO+MCTS 每次决策的模拟次数 */
 /*
  * PPO+MCTS (MLP 专家骨干) 每次决策的模拟次数。
  *
- * 为什么比上面那个大 4 倍: 骨干便宜 ~25x (单网络前向实测 MlpExpert E=8 top-2
- * 0.139 ms vs TB<16,360> E=4 top-1 3.59 ms, 见 rl/ppo.h 顶部那张表), 而"模拟次数 ≫
- * 分支数(~39)"是 π 目标有没有信息量的分水岭 (见下面 BG_TRAIN_SIMS 的长注释)。
- * 给 4 倍既是"用便宜的算力换更准的访问分布", 也仍然比 TB 那一支**快**得多:
- * 实测本机 0.23 ~ 0.39 s/手 (test_match [2.14] 的两次 6 手小局; TB 那一支在 400 次
- * 模拟下约 3.2 s/手, 见 test_match [2.7] 的思考耗时读数)。
- * 想再换"更快"或"更准", 只需改这一个数 (成本线性)。
+ * [2026-10 第二轮] **刻意与 PPO_SIMS 相等** (用户口径: 两支对齐), 所以这里写成
+ * `= PPO_SIMS` 而不是两个独立的 1600 —— 写成两个数迟早会漂开, 而"漂开"这件事在
+ * 界面上看不出来, 只会让"哪个骨干更强"重新变成"哪个预算更大"。
+ *
+ * 历史 (为什么它以前是 PPO_SIMS 的 4 倍): MLP 专家比 TB 专家便宜 ~25x
+ * (单网络前向实测 0.139 ms vs TB<16,360> 3.59 ms, 见 rl/ppo.h 顶部那张表),
+ * 所以那时的口径是"用便宜的算力换更准的访问分布"。现在这一支仍是**最便宜**的
+ * (整步 ~0.35 s), 想再换"更快"或"更准"只需改 PPO_SIMS (两支一起动)。
  */
-static constexpr int PPO_MLP_SIMS = 1600;     /* PPO+MCTS (MLP 专家) 每次决策的模拟次数 */
+static constexpr int PPO_MLP_SIMS = PPO_SIMS; /* = PPO_SIMS (两支刻意对齐) */
 static constexpr int DQNMCTS_ITERATIONS = 200;/* DQN+MCTS 每次决策的迭代次数 */
 /*
  * SAC+AZ 每次决策的 MCTS 模拟次数。实测 (test_sacaz, 本机 AVX2): 64 次模拟约 3 ms,
@@ -459,6 +462,65 @@ static constexpr int   PPO_MOE_MLP_GATE_HIDDEN = 0;
  * ================================================================
  */
 static const RL::PPO::Backbone PPOMCTS_BACKBONE = RL::PPO::Backbone::SeqExperts;
+/*
+ * ================================================================
+ *  [2026-10 第二轮] AGENT_PPOMCTS 的**位置编码** = 可学 2D (10 行 + 9 列)
+ * ================================================================
+ *  用户口径: "chess程序使用2d编码, 模拟次数与mlp专家对齐"。
+ *
+ *  `1d`(默认) / `2d` / `rope` 三者的实测与理论见
+ *  `docs/seq_transformer_encoding_eval_2026_10.md`。选 2d 的依据 (三条, 按权重排):
+ *   1. **棋力打平**: 100 局 / 50 个配对开局 / 等模拟预算下对纯 MCTS 是
+ *      1d 57.5% / **2d 57.0%** / rope 53.0% (区间 ±10 个百分点, 三者互相分不出来),
+ *      头对头 6 场全部 inconclusive ⇒ **不能**用"它更强"来当理由;
+ *   2. **保真度最好**: 行为克隆的留出 CE 两种数据量下都是最低 (2000 局面 2.5188 /
+ *      6000 局面 **2.4750**), 且**过拟合最轻** (train/留出 CE 差 0.388, 1d 是 0.497);
+ *   3. **参数效率**: 位置参数 1,216 (1d 是 5,760), actor 991,596 (1d 1,009,772)。
+ *  理论上 2d 的行列分解正是棋盘"行效应 + 列效应"的因子结构, 而 rope 的相对性虽然
+ *  是这一类任务的正确方向, 但 `t = 9x + y` 的光栅下标把二维几何折掉了一半
+ *  (323 种盘内位移只对应 179 个 `Δt`), 且 base=10000 对 T=90 太长 (8 对旋转里只有
+ *  ~2 对提供无歧义相位)。
+ *
+ *  ⚠ **权重不兼容**: 位置编码是权重文件**自描述**的一部分 (非 1d 会多写一行
+ *    `POS2D` 标记, 且参数量不同: 1d 1,009,772 / 2d 991,596 / rope 986,732)。
+ *    改这一个常量 ⇒ 旧模式的 seq 权重会**被守卫明确拒绝**(不是静默错位), 必须重训
+ *    (`train_bc --agent=ppo-seq --pos=2d` 或 `train_ppo --backbone=seq --pos=2d`)。
+ *    实测本机盘上没有 seq 存量权重 (只有 TB 的 `weights/ppomcts_agent.dat_*`),
+ *    所以这次切换没有作废任何模型。
+ * ================================================================
+ */
+static const char *const PPOMCTS_POS_MODE = "2d";
+/*
+ * 把位置编码设到**界面上这一支**的网络上。
+ *
+ * 为什么做成函数而不是在 7 个构造点各写一行 `setExpertPosMode("2d")`:
+ * 漏掉任何一处都会让"训练用的那一支"与"决策用的那一支"不是同一个结构 ——
+ * 而这件事在权重往返上**看不出来**(参数量与标记一致时). 位置编码这一项更隐蔽:
+ * 漏设的那一处会退回类默认的 1d, 载入 2d 权重时**被守卫拒绝**(还算看得见),
+ * 但如果它恰好是"保存/克隆"那一处, 就会把 1d 的网当成 2d 的网存下去。
+ * 与 PPOMCTS_BACKBONE / applyPpoBalance 同一条纪律: 结构只允许有一个来源。
+ * 返回 false = 这个骨干不支持这个旋钮 ⇒ **响亮失败**(qFatal), 不静默退回 1d。
+ */
+static void applyPpomctsPosMode(PPOMCTSAgent &ag)
+{
+    if (!ag.setExpertPosMode(PPOMCTS_POS_MODE)) {
+        qFatal("[PPOMCTS] 位置编码 %s 设不上: 骨干 %s 不支持它 (只有 seq 骨干支持 "
+               "1d/2d/rope)。请把 PPOMCTS_BACKBONE 改回 SeqExperts, 或把 "
+               "PPOMCTS_POS_MODE 改成该骨干支持的口径。",
+               PPOMCTS_POS_MODE, RL::PPO::backboneName(PPOMCTS_BACKBONE));
+    }
+}
+/*
+ * 建"界面上那一支" PPO+MCTS 网络 (骨干 + 位置编码一次设好)。
+ * 所有 `new PPOMCTSAgent(... PPOMCTS_BACKBONE)` 的构造点都走这里 —— 见上一条的纪律。
+ */
+static PPOMCTSAgent *makePpomctsAgent(Chess &env)
+{
+    PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true,
+                                        PPOMCTS_BACKBONE);
+    applyPpomctsPosMode(*ag);
+    return ag;
+}
 /*
  * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
  * 单位是**搜索节点数** (= 网络前向次数), 不是模拟次数: TB 骨干实测 ~3 ms/节点,
@@ -1166,7 +1228,7 @@ void ChessBoard::startupLoad()
     if (s_weightPaths.count(AGENT_PPOMCTS)) {
         emit busyMessage(QStringLiteral("正在载入 PPO+MCTS 权重…"));
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+            m_sfPPOMCTS = makePpomctsAgent(env);   /* 骨干 + 位置编码一处给全, 见 makePpomctsAgent */
             /* MoE 均衡 + 门控接线 (必须在任何前向之前; 见 applyPpoBalance) */
             applyPpoBalance(*m_sfPPOMCTS);
         }
@@ -2239,8 +2301,9 @@ void ChessBoard::setDynamicRewardEnabled(bool on)
  *    AGENT_MCTS      : 蒙特卡洛树搜索 (800次模拟)
  *    AGENT_PG        : Policy Gradient (PGEagent)
  *    AGENT_DQN       : Deep Q-Network (DQNAgent)
- *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (默认 400 次模拟, 见 PPO_SIMS ——
- *                      这一行原文写"80", 与实际常量不符, 一并改正)
+ *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (**1600 次模拟**, 见 PPO_SIMS ——
+ *                      2026-10 第二轮与 MLP 专家对齐; 这一行原文写"80"、后来写"400",
+ *                      都与当时的常量不符, 一并改正)
  *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
  *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
  * ================================================================ */
@@ -2617,7 +2680,7 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
            `enableMlpGate` 是幂等的, 所以"工厂建网"与"决策路径兜底建网"两处都接
            也不会互相破坏。
         */
-        PPOMCTSAgent *ag = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+        PPOMCTSAgent *ag = makePpomctsAgent(env);
         applyPpoBalance(*ag);
         return ag;
     }
@@ -3875,7 +3938,7 @@ Step ChessBoard::aiThinkRaw(int color)
         /* PPO + MCTS (AlphaZero风格): argmax */
         std::lock_guard<std::mutex> agentLock(m_agentMutex);
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+            m_sfPPOMCTS = makePpomctsAgent(env);   /* 骨干 + 位置编码一处给全, 见 makePpomctsAgent */
             applyPpoBalance(*m_sfPPOMCTS);
             auto it = s_weightPaths.find(AGENT_PPOMCTS);
             if (it != s_weightPaths.end())
@@ -4289,7 +4352,7 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
     case AGENT_PPOMCTS: {
         PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTS, AGENT_PPOMCTS);
         if (ag == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+            m_sfPPOMCTS = makePpomctsAgent(env);   /* 骨干 + 位置编码一处给全, 见 makePpomctsAgent */
             applyPpoBalance(*m_sfPPOMCTS);
             ag = m_sfPPOMCTS;
         }
@@ -4528,7 +4591,8 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         /*
            PPO+MCTS+AlphaZero, 骨干 = 稀疏 MoE + **MLP 专家** (E=8 top-2): 与
            AGENT_PPOMCTS 共享同一份实现, 只有骨干这一项不同 (见 chessboard.h 的枚举注释)。
-           模拟次数给 PPO_MLP_SIMS —— 远比 TB 那一支多, 因为一次模拟便宜 ~25x。
+           模拟次数 = PPO_MLP_SIMS, 它 **= PPO_SIMS** (2026-10 第二轮: 两支刻意对齐;
+           它仍是最便宜的一支: MLP 专家 ~0.22 ms/模拟 vs seq 的 ~3.7 ms/模拟)。
         */
         PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTSMLP, AGENT_PPOMCTS_MLP);
         if (ag == nullptr) {
@@ -5627,7 +5691,7 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
     }
     case AGENT_PPOMCTS: {
         if (m_sfPPOMCTS == nullptr) {
-            m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+            m_sfPPOMCTS = makePpomctsAgent(env);   /* 骨干 + 位置编码一处给全, 见 makePpomctsAgent */
             applyPpoBalance(*m_sfPPOMCTS);
         }
         return m_sfPPOMCTS->loadModel(filepath);
@@ -6636,7 +6700,7 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_PPOMCTS:
                 if (m_sfPPOMCTS == nullptr) {
-                    m_sfPPOMCTS = new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, PPOMCTS_BACKBONE);
+                    m_sfPPOMCTS = makePpomctsAgent(env);   /* 骨干 + 位置编码一处给全, 见 makePpomctsAgent */
                     applyPpoBalance(*m_sfPPOMCTS);
                 }
                 break;
@@ -6855,9 +6919,12 @@ void ChessBoard::backgroundTrainLoop()
             }
             case AGENT_PPOMCTS: {
                 /* 骨干必须显式传 PPOMCTS_BACKBONE: 类默认是 TB, 传漏了 clone 的结构就与
-                   主 agent 不一致 (loadModel 会因结构指纹不匹配而每一轮都失败)。 */
+                   主 agent 不一致 (loadModel 会因结构指纹不匹配而每一轮都失败)。
+                   位置编码同理, 而且它必须在 `loadModel` **之前**设好 —— 模式是权重文件
+                   自描述的一部分 (2d 多一行 POS2D 标记, 参数量也不同)。 */
                 PPOMCTSAgent clone(trainChess, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f,
                                    true, PPOMCTS_BACKBONE);
+                applyPpomctsPosMode(clone);
                 /*
                    训练 clone 必须与主 agent 用**同一套** MoE 均衡/门控接线 —— 否则
                    "训练用的那一支"与"决策用的那一支"不是同一个东西, 而且这件事情
@@ -6869,6 +6936,15 @@ void ChessBoard::backgroundTrainLoop()
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
                     break;
                 }
+                /*
+                   [2026-10 第二轮] 后台训练**刻意不用** PPO_SIMS(1600), 仍走
+                   BG_TRAIN_SIMS(400): 决策预算是"一步等多久", 训练预算是"一轮多久"。
+                   实测 seq 骨干 3.71 ms/模拟 ⇒ 60 手一轮在 400 次下约 **89 s**、
+                   在 1600 次下约 **357 s** —— 后者会把后台训练循环变成"一轮 6 分钟",
+                   而 400 已经远大于分支数 (~39, π 目标有信息量的分水岭, 见
+                   BG_TRAIN_SIMS 的长注释)。MLP 那一支用 PPO_MLP_SIMS 是因为它便宜
+                   (0.35 s/手 ⇒ 一轮 21 s), 不是因为它该有更大预算。
+                */
                 clone.trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
                                     roundMaxMoves, false);
                 roundLoss = clone.getLastTrainLoss();
@@ -6882,8 +6958,8 @@ void ChessBoard::backgroundTrainLoop()
             case AGENT_PPOMCTS_MLP: {
                 /*
                    MLP 专家骨干的同一套往返。模拟次数用 PPO_MLP_SIMS (与界面同一预算):
-                   一轮 60 手在 MLP 专家上约 12 s (一次模拟便宜 ~25x), 而 TB 那一支
-                   同规模要分钟级 —— 这正是这条支路值得接的原因。
+                   一轮 60 手在 MLP 专家上约 21 s (0.35 s/手, 一次模拟便宜 ~17x),
+                   而 seq 那一支同规模要分钟级 —— 这正是这条支路值得接的原因。
                    骨干必须显式传: 默认是 TB, 传漏了 clone 的结构就与主 agent 不一致,
                    loadModel 会因结构指纹不匹配而每一轮都失败。
                 */

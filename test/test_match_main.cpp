@@ -2911,6 +2911,17 @@ int main(int argc, char *argv[])
         const bool stillRunning = board.isMatchRunning();
         std::printf("    对弈中: 临时权重目录 %s, 改道写 %d -> %d 次, 对局仍在跑 = %d\n",
                     (snap1 == snap2) ? "未变" : "**变了**", w1, w2, (int)stillRunning);
+        /*
+           [2026-10 第二轮] **红的时候要把"哪一个文件变了"印出来**。
+           原来只报"变了" —— 而这一节的真假题眼恰恰在"是哪一个 `_temp*` 被写了"
+           (后台训练的临时权重? 某个测试探针? 一次跨窗口的保存?), 没有这一行就只能靠
+           猜。本工程记过很多次"读数说不清 = 下次还得重查一遍"。
+        */
+        if (snap1 != snap2) {
+            std::printf("    [诊断] 窗口内 weights/ 下的 `_temp*` 快照 (名字|大小|mtime):\n");
+            std::printf("      --- snap1 (窗口开始) ---\n%s", snap1.c_str());
+            std::printf("      --- snap2 (窗口结束) ---\n%s", snap2.c_str());
+        }
         CHECK(snap1 == snap2,
               "整场对弈期间 weights/ 下的临时权重**一个都没被写**"
               " (名字/大小/修改时间前后完全相同, 覆盖写也会被抓到)");

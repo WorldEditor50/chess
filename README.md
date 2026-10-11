@@ -250,8 +250,8 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **Alpha-Beta Pruning** | 经典 α-β + 静态搜索 | 深度 4，约 90 ms |
 | **Alpha-Beta L1 / L2 / L3** | **同一套搜索的三档弱等级**（只有深度不同：1 / 2 / 3）。**纯搜索、无权重**：既不训练也不上报训练损失。用途是当**陪练与标尺**——棋力可调、且完全不随训练漂移；与深度 4 那一档一起构成一条棋力阶梯 | 每步 0 / 3 / 34 ms |
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
-| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **TB 专家**（**[2026-10 第二轮] E=4 top-1**；上一轮曾按用户口径提到 8/2 —— actor+critic 207.8 M、20.1 ms/模拟、峰值 3,301 MB，同月又按用户口径降回，见 `docs/moe_gate_experiment_2026_10.md` §13/§14 与 `rl/ppo.h` 顶部）。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | 400 次模拟，约 **4.31 s**（E=4/top-1 实测；E=8/top-2 那一档要 7.99 s —— **模拟次数刻意保持 400**：切回 4/1 等于免费把每步拿回 3.7 s，搜索深度不变） |
-| **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~25×、容量小 ~18×，于是同一时间预算下模拟次数给到 4 倍 | 1600 次模拟，约 0.23~0.39 s |
+| **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **序列 Transformer 专家**（`SeqExperts`，每专家 91,731 参数；**[2026-10 第二轮] 位置编码 = 可学 2D**，见 `docs/seq_transformer_encoding_eval_2026_10.md`）。之前的两档骨干：TB 专家（E=4 top-1，104.3 M 参数）与更早的 MLP 专家。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | **1600 次模拟**（[2026-10 第二轮] 按用户口径**与 MLP 专家对齐**），约 **5.96 s**（seq 骨干实测 3.71 ms/模拟）；TB 骨干同一预算是 17.6 s |
+| **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~17×/模拟、容量小，于是同样 1600 次模拟只要 0.23~0.39 s（**预算已与上面那一支对齐**，于是"哪个骨干更强"在界面口径下可以回答） | 1600 次模拟，约 0.23~0.39 s |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **DQN+MCTS (稀疏MoE+TB专家)** | 同一算法的另一个骨干（独立类 `DQNMCTSMOETbAgent`）：稀疏 MoE + TB 专家、规范视角 1263 维、PUCT + negamax 符号、Double DQN + clampTarget/Huber。权重独立（`weights/dqnmcts_moe_agent_*`） | 40 次模拟，约 175 ms |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |
@@ -414,8 +414,11 @@ powershell -ExecutionPolicy Bypass -File tools\measure_peak_working_set.ps1 ^
 | 峰值工作集 | 3,301 MB | **1,608 MB** | 2.05× |
 | SAC 支 `test_sacaz` 整轮 | 324.9 s | **162.9 s** | 1.99× |
 
-而 `PPO_SIMS` **仍是 400**（用户口径"保持 400，恢复到历史配对"）⇒ 每步墙钟减半而
+而 `PPO_SIMS` 当时**仍是 400**（用户口径"保持 400，恢复到历史配对"）⇒ 每步墙钟减半而
 **搜索深度一点没减**（模拟次数是本工程唯一测出过棋力的杠杆，所以省下来的算力刻意**不**换别的）。
+（**后来变了**：界面骨干换成 seq 专家之后，[2026-10 第二轮] 按用户口径把 `PPO_SIMS`
+提到 **1600** 与 MLP 专家对齐 —— 那时 TB 骨干已经不在这条路径上了，见本文档上面
+"界面 AGENT_PPOMCTS" 那两条 2026-10-11 的注记。）
 同一改动也落在 SAC 那一支（`SACAZMoETbAgent::MOE_TB_EXPERTS/TOPK`）。
 ⚠ **两支的存量权重全部作废**（PPO `weights/ppomcts_agent.dat_*`、SAC `weights/sacaz_moe*`），
 必须从随机初始化重训 —— 参数量守卫会明确拒绝旧文件，不会静默错读。
@@ -437,6 +440,21 @@ build\...\bench_ppo_vs_ab.exe --load=weights/ppomcts_seq_agent.dat    # 用 GUI 
 > "PPO agent 的 TB 专家默认使用 seq transformer"）⇒ 界面这一支的权重前缀从
 > `weights/ppomcts_agent.dat` 改成 **`weights/ppomcts_seq_agent.dat`**（上面那条命令要跟着改）。
 > 旧前缀（TB 结构，279 MB × 2）留在盘上但界面不再读取；结构指纹不同，硬载会被明确拒绝。
+>
+> **[2026-10-11 第二轮] 界面 `AGENT_PPOMCTS` 改用 2D 位置编码 + 模拟次数与 MLP 专家对齐**
+> （用户口径："chess程序使用2d编码，模拟次数与mlp专家对齐"）：
+> * `PPOMCTS_POS_MODE = "2d"`（可学 10 行 + 9 列；`chessboard.cpp` 一处常量 +
+>   `makePpomctsAgent` 唯一构造入口 ⇒ 7 个构造点不会漏设）；
+> * `PPO_SIMS = PPO_MLP_SIMS = 1600`（原来 400，那是 TB 骨干时代的预算）；
+>   实测每手 **1.49 s → 5.96 s**（seq 骨干 3.71 ms/模拟 ×1600）；
+> * 选 2d 的依据（**不是**"它更强"——棋力上三者打平）：100 局 / 50 个配对开局下
+>   1d 57.5% / **2d 57.0%** / rope 53.0% 对 MCTS，头对头 6 场全 inconclusive；
+>   而 2d 的**行为克隆留出 CE 两种数据量下都最好**（2.5188 / 2.4750）、过拟合最轻
+>   （train/留出差 0.388 vs 1d 0.497）、位置参数 1,216（1d 5,760）。实测与理论见
+>   `docs/seq_transformer_encoding_eval_2026_10.md`。
+> * ⚠ 位置编码是权重自描述的一部分（`POS2D` 标记 + 参数量），换模式后**必须重训**：
+>   `train_bc --agent=ppo-seq --pos=2d …` 或 `train_ppo --backbone=seq --pos=2d …`。
+>   实测盘上当时没有 seq 存量权重，所以这次切换没有作废任何模型。
 > 落地与实测见 `docs/agents_design.md` 的"两种骨干"一节。
 
 实测（2026-09，未训练的随机权重，20 局等时间）：**PPO+MCTS 0 胜 / Alpha-Beta 20 胜，

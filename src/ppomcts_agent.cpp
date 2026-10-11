@@ -925,16 +925,28 @@ std::string PPOMCTSAgent::selfCheckReport() const
         /*
            [2026-10] 真正的序列 Transformer: 读数与前三支**不可比**, 所以口径要写全 ——
            "token 数 / token 宽度 / 头数 / 层数 / 注意力矩阵规模" 缺一个都会被误读。
+           [2026-10 第二轮] 这一支**已经接进界面** (AGENT_PPOMCTS, 见 chessboard.cpp 的
+           PPOMCTS_BACKBONE), 所以原来那句"实验骨干 (未接界面)"是过期读数, 已改。
         */
         const int dkSeq = expertHidden / (RL::PPO::SEQ_HEADS > 0 ? RL::PPO::SEQ_HEADS : 1);
         std::snprintf(buf, sizeof(buf),
-                      "  实验骨干 (未接界面): **真正的序列 Transformer** —— %d 个 token "
+                      "  现役骨干 (界面 AGENT_PPOMCTS): **真正的序列 Transformer** —— %d 个 token "
                       "(每格一个), token 宽 %d, %d 头 (d_k=%d), %d 层, 注意力矩阵 %d x %d\n",
                       RL::PPO::SEQ_LEN, expertHidden, RL::PPO::SEQ_HEADS, dkSeq,
                       RL::PPO::SEQ_BLOCKS, RL::PPO::SEQ_LEN, RL::PPO::SEQ_LEN);
         out += buf;
-        out += "    按 key 轴**逐行** softmax + 可学位置嵌入 + Pre-LN 残差 "
+        out += "    按 key 轴**逐行** softmax + Pre-LN 残差 "
                "(与 TB 专家的单向量外积 + 全局 softmax 是两种东西, 见文档 §10)\n";
+        /*
+           [2026-10 第二轮] **位置编码是用户可见的口径** (界面用 `2d`), 所以必须报出来:
+           它是权重文件自描述的一部分 (非 1d 多一行 POS2D 标记且参数量不同), 换模式必须
+           重训; 而"设了却没生效"这类事故在本工程记过很多次 —— 面板是唯一能当场看见
+           它的地方 (位参数量 1d 5,760 / 2d 1,216 / rope 0, 所以三个模式在面板上可分)。
+        */
+        std::snprintf(buf, sizeof(buf), "    位置编码: %s | 专家 dropout: %.3f "
+                                        "(模式与权重文件必须一致, 不一致时载入会响亮失败)\n",
+                      posModeInUse().c_str(), (double)expertDropoutInUse());
+        out += buf;
         break;
     }
     case Backbone::TbExperts:

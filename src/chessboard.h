@@ -84,7 +84,15 @@ public:
         AGENT_MCTS,              /* Monte Carlo Tree Search */
         AGENT_PG,                /* Policy Gradient (PGEagent) */
         AGENT_DQN,               /* Deep Q-Network (DQNAgent) */
-        AGENT_PPOMCTS,           /* PPO + MCTS AlphaZero-style (PPOMCTSAgent) */
+        /*
+           PPO + MCTS AlphaZero-style (PPOMCTSAgent)。
+           [2026-10] 骨干 = **序列 Transformer 专家** (SeqExperts, 见 chessboard.cpp 的
+           PPOMCTS_BACKBONE), 权重前缀 weights/ppomcts_seq_agent.dat;
+           [2026-10 第二轮] **位置编码 = 可学 2D** (PPOMCTS_POS_MODE = "2d"),
+           模拟预算 1600 (与 AGENT_PPOMCTS_MLP 对齐)。实测与依据见
+           docs/seq_transformer_encoding_eval_2026_10.md。
+        */
+        AGENT_PPOMCTS,
         AGENT_DQNMCTS,           /* DQN + MCTS (DQNMCTSAgent) */
         AGENT_EVAB,              /* EVAB: 学会评估的 Alpha-Beta (EVABAgent) */
         AGENT_SACAZ,             /* SAC + MCTS + AlphaZero (SACAZAgent) */
@@ -105,13 +113,15 @@ public:
         /*
            PPO+MCTS+AlphaZero 的**另一个骨干**: 稀疏 MoE + **MLP 专家** (E=8 top-2),
            也就是 2026-09 那次改版之前的配置 (当时它是唯一骨干, 见 rl/ppo.h 顶部)。
-           与 AGENT_PPOMCTS (TransformerBlock<16,360> 专家, E=4 top-1) 的关系:
+           与 AGENT_PPOMCTS (2026-10 起 = **序列 Transformer 专家**, E=4 top-1) 的关系:
              * **算法、搜索、训练、自检是同一份代码** (同一个 PPOMCTSAgent 类, 只是
                构造时传的 Backbone 不同) —— 与 AGENT_SACAZ / AGENT_SACAZ_MOE 同一种
                做法, 所以两者能在界面上直接对弈比较, 而不是两份会漂移的实现;
-             * 差别只在骨干: MlpExpert 便宜 ~25x (前向 0.139 ms vs 3.59 ms)、容量小
-               ~18x (2.15 M vs 38.0 M 参数), 所以同一时间预算下它能跑更多模拟
-               (界面预算见 chessboard.cpp 的 PPO_MLP_SIMS);
+             * 差别只在骨干: MlpExpert 便宜 ~17x/模拟 (seq 实测 3.71 ms/模拟)、容量小
+               (2.15 M vs seq 的 1.0 M actor 参数), 所以同一时间预算下它能跑更多模拟
+               —— 但 [2026-10 第二轮] 两支的模拟预算已按用户口径**对齐**
+               (`PPO_MLP_SIMS = PPO_SIMS = 1600`), 于是"哪个骨干更强"在界面口径下
+               可以回答, 而不是在比搜索预算;
              * **权重文件不同** (weights/ppomcts_mlp_agent.dat): 两种骨干参数量不同,
                权重格式的结构指纹也保证交叉载入当场失败, 不会静默串权重。
            **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
