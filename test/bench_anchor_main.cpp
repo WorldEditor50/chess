@@ -48,6 +48,7 @@
 
 #include "abagent.h"
 #include "chess.h"
+#include "opening_book.h"   /* [2026-10] 固定开局集 (原来长在本文件里, 见下面的注释) */
 #include "ppomcts_agent.h"
 #include "rl/util.hpp"
 
@@ -100,69 +101,12 @@ const char *resultName(int r)
 /* ============================================================
  *  固定开局集
  *
- *  与各 bench 的 --opening 同一套做法 (随机走合法棋), 但**随机源是局部的** ——
- *  这样开局集只由 (seed, index) 决定, 不受 agent 内部 RNG 消耗顺序的影响。
+ *  [2026-10] 生成逻辑已抽到 `test/opening_book.h` (第二个调用方
+ *  `bench_agent_arena` 出现才抽的, 见该文件顶部): 开局集是"两次读数可不可比"的
+ *  前提, 两份拷贝迟早会漂移成"都叫固定开局集, 规则却不一样"。
+ *  抽取是**纯搬家**: 同一套局部 RNG 公式 (seed*7919 + i*104729 + 17)、同一个 FNV
+ *  覆盖同一批坐标 —— 实测指纹不变 (--openings=4 --plies=4 = DDDD94620C8692C0)。
  * ============================================================ */
-typedef std::vector<Step> Opening;
-
-unsigned long long fnv1a(unsigned long long h, unsigned long long v)
-{
-    h ^= v;
-    return h * 1099511628211ull;
-}
-
-bool makeOpenings(Chess &scratch, int count, int plies, unsigned seed,
-                  std::vector<Opening> &out, unsigned long long &fingerprint)
-{
-    out.clear();
-    fingerprint = 1469598103934665603ull;   /* FNV-1a 偏移基 */
-    for (int i = 0; i < count; i++) {
-        std::mt19937_64 rng((unsigned long long)seed * 7919ull
-                            + (unsigned long long)i * 104729ull + 17ull);
-        scratch.reset();
-        Opening op;
-        for (int p = 0; p < plies; p++) {
-            if (scratch.getResult(scratch.sideToMove) != Chess::RESULT_ONGOING) {
-                break;
-            }
-            std::vector<Step *> legal;
-            scratch.sample(scratch.sideToMove, legal);
-            if (legal.empty()) {
-                Steps::instance().put(legal);
-                break;
-            }
-            std::uniform_int_distribution<int> pick(0, (int)legal.size() - 1);
-            const Step s = *legal[(std::size_t)pick(rng)];
-            Steps::instance().put(legal);
-            op.push_back(s);
-            double dummy = 0.0;
-            scratch.moveForward(&s, dummy);
-        }
-        if (op.empty()) {
-            std::printf("[错误] 第 %d 个开局造不出来 (开局的随机手数太多?)\n", i);
-            return false;
-        }
-        for (std::size_t k = 0; k < op.size(); k++) {
-            fingerprint = fnv1a(fingerprint, (unsigned long long)op[k].pos.x);
-            fingerprint = fnv1a(fingerprint, (unsigned long long)op[k].pos.y);
-            fingerprint = fnv1a(fingerprint, (unsigned long long)op[k].nextPos.x);
-            fingerprint = fnv1a(fingerprint, (unsigned long long)op[k].nextPos.y);
-        }
-        out.push_back(op);
-    }
-    return true;
-}
-
-/* 把开局摆上棋盘; 返回该谁走 */
-int applyOpening(Chess &c, const Opening &op)
-{
-    c.reset();
-    for (std::size_t i = 0; i < op.size(); i++) {
-        double dummy = 0.0;
-        c.moveForward(&op[i], dummy);
-    }
-    return c.sideToMove;
-}
 
 /* ============================================================
  *  一局

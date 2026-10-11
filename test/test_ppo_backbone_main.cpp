@@ -21,10 +21,13 @@
  *
  * 用法: test_ppo_backbone  (无参数; 失败以非 0 退出码报告, 与其它 test_* 同口径)
  */
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -300,6 +303,136 @@ int main()
         CHECK(ppo.actorGradNorm > 0.0, "打开 trackGradNorm 后 PPO 记下了 actor 的梯度范数");
         std::printf("    actor 梯度范数读数 = %.6g | 头权重 |w| %.6f -> %.6f\n",
                     ppo.actorGradNorm, w0, w1);
+    }
+
+    /*
+       ================= [6] 序列专家位置编码的 **Net 级**权重往返 =================
+       [2026-10] 这一段是一个**实测出来的缺陷**的回归:
+
+         现象: `train_bc --agent=ppo-seq --pos=2d --save=weights/x` 保存成功, 但
+               `bench_agent_arena --backbone-ppo-a=seq --pos-ppo-a=2d --load-a=weights/x`
+               载入失败 —— `weights/x_actor: 第 5 个张量校验失败 (文件被截断/损坏?)`。
+         根因: `SeqPosEnc::write` 在非默认模式下先写一行**标记** (`POS2D` / `POSROPE`),
+               而 `Net::load` 的预校验**要求每一行都是能解码的张量** ⇒ 标记行被当成损坏。
+               `test_transformer [6]` 全绿也发现不了它: 那条路径走的是**专家级**
+               `write/read`, 绕过了 `Net::load`。
+         修法: `codec::isMetaMarkerLine` 白名单 (精确匹配那两个标记), 预校验跳过它们
+               且**不计入元素总数**; 其它任何解码不了的行走原来的失败路径。
+
+       所以这里钉三件事 (缺一条, 上面那个缺陷都能悄悄回来):
+         (a) 2d / rope 的 PPO 权重能**存下去、载回来**, 且载回后同一输入同一输出;
+         (b) 白名单**没有放宽损坏检测**: 把标记改成不在名单里的字符串 (或截断一行),
+             载入必须仍然失败;
+         (c) 模式不匹配 (2d 的权重载进 1d 的网) 必须**响亮失败**, 不能静默错位。
+    */
+    std::printf("\n[6] 序列专家位置编码的 Net 级权重往返 (2d / rope / 1d)\n");
+    {
+        RL::Tensor state((std::size_t)D, 1);
+        for (int i = 0; i < D; i++) {
+            state[(std::size_t)i] = ((i % 13) == 0) ? 0.75f : (((i % 7) == 0) ? -0.5f : 0.0f);
+        }
+        /* 同一输入在两个网上的输出 (逐位比较; 权重相同 ⇒ 输出必须完全相同) */
+        auto actorOut = [&](RL::PPO &p) {
+            RL::Tensor &o = p.actorP.forward(state);
+            std::vector<float> v(o.size());
+            for (std::size_t k = 0; k < o.size(); k++) { v[k] = o[k]; }
+            return v;
+        };
+        auto maxAbsDiff = [](const std::vector<float> &a, const std::vector<float> &b) {
+            if (a.size() != b.size()) { return 1e30; }
+            double m = 0.0;
+            for (std::size_t k = 0; k < a.size(); k++) {
+                m = std::max(m, std::fabs((double)a[k] - (double)b[k]));
+            }
+            return m;
+        };
+
+        struct Case { const char *key; const char *tag; long long actorParams; };
+        /*
+           actor 参数量的三个已知值就是"模式真的生效了"的**结构指纹** (没有回读接口时
+           它比"设置函数返回 true"强得多): 每专家的位置参数 1d 90×64=5,760 /
+           2d (10+9)×64=1,216 / rope 0, 乘 4 个专家 ⇒ 1,009,772 / 991,596 / 986,732。
+        */
+        const Case cases[] = { { "1d", "1d", 1009772LL },
+                               { "2d", "2d", 991596LL },
+                               { "rope", "rope", 986732LL } };
+        for (int c = 0; c < 3; c++) {
+            const std::string base = std::string("ppo_pos_") + cases[c].tag;
+            const std::string ap = base + "_a.wgt";
+            const std::string cp = base + "_c.wgt";
+
+            RL::PPO src(D, H, A, 64, 0.1f, false, RL::PPO::Backbone::SeqExperts);
+            CHECK(src.setExpertPosMode(cases[c].key), "setExpertPosMode 受理该模式");
+            const long long pc = src.actorParamCount();
+            CHECK(pc == cases[c].actorParams, "参数量 == 该模式的结构指纹 (模式真的生效)");
+            const std::vector<float> before = actorOut(src);
+            std::printf("    [%s] save -> %s\n", cases[c].tag, ap.c_str());
+            std::fflush(stdout);
+            CHECK(src.save(ap, cp), "save 成功");
+
+            RL::PPO dst(D, H, A, 64, 0.1f, false, RL::PPO::Backbone::SeqExperts);
+            CHECK(dst.setExpertPosMode(cases[c].key), "目标网切到同一模式");
+            std::printf("    [%s] load (往返)\n", cases[c].tag);
+            std::fflush(stdout);
+            const bool loaded = dst.load(ap, cp);
+            CHECK(loaded, "(a) **Net 级载入成功** (标记行不再被误判成损坏)");
+            CHECK(dst.actorParamCount() == pc, "载入后参数量一致");
+            const std::vector<float> after = actorOut(dst);
+            const double d = maxAbsDiff(before, after);
+            std::printf("    %-4s 参数量 %lld | 载回后同输入输出最大差 = %.3e\n",
+                        cases[c].tag, pc, d);
+            CHECK(d == 0.0, "(a) 往返后同一输入**逐位相同**");
+
+            /*
+               (b) 白名单必须**窄**: 把标记换成一个不在名单里的行 (结构与它一样是纯字母),
+               预校验必须仍然拒绝 —— 否则"首字符是字母就跳过"式的实现会放过损坏文件。
+            */
+            if (c > 0) {
+                std::string blob;
+                {
+                    std::ifstream in(ap.c_str(), std::ios::binary);
+                    blob.assign((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+                }
+                const char *bad = (c == 1) ? "POSXYZ" : "POSROT";
+                const std::size_t at = blob.find(cases[c].tag == std::string("2d") ? "POS2D"
+                                                                                    : "POSROPE");
+                if (at != std::string::npos) {
+                    blob.replace(at, std::strlen(bad), bad);
+                }
+                const std::string bp = base + "_bad.wgt";
+                {
+                    std::ofstream out(bp.c_str(), std::ios::binary);
+                    out.write(blob.data(), (std::streamsize)blob.size());
+                }
+                RL::PPO badNet(D, H, A, 64, 0.1f, false, RL::PPO::Backbone::SeqExperts);
+                badNet.setExpertPosMode(cases[c].key);
+                std::printf("    [%s] load (bad marker '%s' -> 期望被拒)\n",
+                            cases[c].tag, bad);
+                std::fflush(stdout);
+                CHECK(badNet.load(bp, cp) == false,
+                      "(b) 不在白名单里的标记行仍然被拒 (损坏检测没被放宽)");
+                std::remove(bp.c_str());
+            }
+        }
+
+        /* (c) 模式不匹配: 2d 的权重载进 1d 的网必须失败 (不是静默错位) */
+        {
+            const std::string ap = "ppo_pos_2d_a.wgt";
+            const std::string cp = "ppo_pos_2d_c.wgt";
+            RL::PPO one(D, H, A, 64, 0.1f, false, RL::PPO::Backbone::SeqExperts);
+            CHECK(one.actorParamCount() == 1009772LL, "新网的默认模式是 1d (参数量指纹)");
+            std::printf("    [c] load (2d 权重 -> 1d 网, 期望被拒)\n");
+            std::fflush(stdout);
+            CHECK(one.load(ap, cp) == false, "(c) 2d 的权重载进 1d 的网必须响亮失败");
+            std::printf("    (c) 模式不匹配: 载入被拒绝 (参数量也不同: 1d 1009772 vs 2d 991596)\n");
+        }
+        std::remove("ppo_pos_1d_a.wgt");
+        std::remove("ppo_pos_1d_c.wgt");
+        std::remove("ppo_pos_2d_a.wgt");
+        std::remove("ppo_pos_2d_c.wgt");
+        std::remove("ppo_pos_rope_a.wgt");
+        std::remove("ppo_pos_rope_c.wgt");
     }
 
     std::printf("\n=== test_ppo_backbone: %d 项断言, %d 失败 ===\n", g_pass + g_fail, g_fail);

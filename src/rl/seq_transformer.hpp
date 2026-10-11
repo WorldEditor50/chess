@@ -592,7 +592,22 @@ public:
             if (first == "POS2D")        { fileMode = LEARN_2D; }
             else if (first == "POSROPE") { fileMode = ROPE; }
             else { fail("不认识的位置编码标记: " + first); }
-            if (!std::getline(f, s)) { fail("标记 " + first + " 之后没有张量行"); }
+            /*
+               ⚠ **只有带参数的模式才再读一行** (2026-10 修; 原来是无条件再读一行):
+               标记行本身不携带数据, 而张量行是**紧跟其后的那一行** —— 对 LEARN_2D 来说
+               它就是行嵌入, 于是"再读一行"正好把数据取到 `s` 里给下面用。但 ROPE
+               **一个参数都没有**, 那一次 getline 会**吞掉后面那一层的第一个张量**:
+               流的错位在后面才发作 (下一个专家的 `read` 在位置编码那一段看到的是张量行
+               ⇒ 报成"文件里是 1d, 专家配的是 rope"并 abort)。
+
+               为什么原来的测试没抓到: `test_transformer [6f]` 的往返只比了**参数量/组数**,
+               而 ROPE 的参数量恰好都是 0 —— 吞掉一行在"只有一个专家"的夹具里只表现为
+               "最后少一行"(由 `Net::load` 的 payload.fail() 兜住), 而那条路径没被测到。
+               实测暴露点: `test_ppo_backbone [6]` 的 Net 级往返 (4 个专家的 MoE)。
+            */
+            if (fileMode != ROPE) {
+                if (!std::getline(f, s)) { fail("标记 " + first + " 之后没有张量行"); }
+            }
         }
         if (fileMode != mode) {
             fail(std::string("权重文件里的位置编码是 ") + modeKey(fileMode)

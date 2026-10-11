@@ -1224,6 +1224,32 @@ int main(int argc, char **argv)
                     }
                 }
                 CHECK(sameParams, "(f) 往返两边的位置编码参数量/组数一致");
+                /*
+                   ⚠ **只比参数量是不够的** —— 这是 2026-10 实测抓到的一个盲点:
+                   `SeqPosEnc::read` 在 ROPE 模式下**多读了一行** (标记行之后再 getline
+                   一次, 而 ROPE 一个参数都没有) ⇒ 标记行后面的张量整体错位一格, 而
+                   参数量/组数**全都对得上** (ROPE 的参数量恰好是 0)。这条断言因此改成
+                   "同一输入同一输出、逐位相同" —— 错位一格必然让输出变掉。
+                   (同一条缺陷还在 `test_ppo_backbone [6]` 的 Net 级往返里被独立抓到:
+                    MoE 的 4 个专家让错位当场升级成 abort。)
+                */
+                std::vector<float> oSrc, oDst;
+                Tensor xr((std::size_t)D_IN, 1);
+                for (int i = 0; i < D_IN; i++) {
+                    xr[(std::size_t)i] = ((i % 11) == 0) ? 0.5f : (((i % 5) == 0) ? -0.25f : 0.0f);
+                }
+                run(ex, xr, oSrc);
+                run(ex2, xr, oDst);
+                double dOut = 0.0;
+                if (oSrc.size() == oDst.size()) {
+                    for (std::size_t k = 0; k < oSrc.size(); k++) {
+                        dOut = std::max(dOut, std::fabs((double)oSrc[k] - (double)oDst[k]));
+                    }
+                } else {
+                    dOut = 1e30;
+                }
+                std::printf("    (f) %-4s 往返后同输入输出最大差 = %.3e\n", modes[k].name, dOut);
+                CHECK(dOut == 0.0, "(f) 往返后同一输入**逐位相同** (参数量相等但张量错位也抓得住)");
             }
         }
 

@@ -125,6 +125,17 @@ struct Cfg {
     std::string backbone = "tb";
     std::string gradClip = "legacy";
     float gradClipNorm = 1.0f;
+    /*
+       ---- [2026-10] 序列专家的两个旋钮 (补上: `rl/ppo.cpp` 的
+       `setExpertPosMode` 注释里早就写着 `train_ppo --backbone=seq --pos=rope`,
+       而这条参数一直没接 —— 没接的后果是"以为在用 2d/rope 训练, 其实用 1d",
+       本工程把这类"设了却没生效"列为最贵的一类错)。
+         * `posKey`   : "1d"(默认 = 老行为) / "2d"(可学 10 行+9 列) / "rope"(无参数);
+         * `dropoutP` : <0 = 不调用 (默认), >=0 = 显式设置 (0 = 关闭)。
+       两者都**只在 seq 骨干上有效**, 其它骨干会响亮失败 (转发接口返回 false)。
+    */
+    std::string posKey;
+    float dropoutP = -1.0f;
 };
 
 Cfg g_cfg;
@@ -176,6 +187,8 @@ bool parseArgs(int argc, char **argv)
            就是专家类型 (同一个工厂 makeMoeLayer), 所以直接可做受控对照。
         */
         else if (k == "--backbone") { g_cfg.backbone = v; }
+        else if (k == "--pos") { g_cfg.posKey = v; }
+        else if (k == "--dropout") { g_cfg.dropoutP = (float)std::atof(v.c_str()); }
         else if (k == "--grad-clip") { g_cfg.gradClip = v; }
         else if (k == "--grad-clip-norm") { g_cfg.gradClipNorm = (float)std::atof(v.c_str()); }
         else if (k == "--quiet") { g_cfg.verbose = false; }
@@ -194,6 +207,9 @@ bool parseArgs(int argc, char **argv)
                 "                 [--lossfree-bias-rate=F] 它的步长 (默认 0.01; 见 Cfg 的刻度坑)\n"
                 "                 [--backbone=tb|mlp|layer|seq] 专家骨干 (默认 tb = 界面现役;\n"
                 "                                          seq = 真正的序列 Transformer, 见 rl/seq_transformer.hpp)\n"
+                "                 [--pos=1d|2d|rope]      序列专家的位置编码 (默认 1d = 老行为;\n"
+                "                                          只对 --backbone=seq 有效, 其它骨干响亮失败)\n"
+                "                 [--dropout=F]           序列专家的 dropout (默认不调用 = 关闭)\n"
                 "                 [--grad-clip=legacy|global|none] [--grad-clip-norm=F]\n");
             return false;
         } else {
@@ -245,10 +261,31 @@ int main(int argc, char **argv)
     */
     RL::PPO::Backbone bb = RL::PPO::Backbone::TbExperts;
     if (!RL::PPO::parseBackbone(g_cfg.backbone.c_str(), bb)) {
-        std::printf("[错误] 未知 --backbone: %s (可选 tb / mlp / layer)\n", g_cfg.backbone.c_str());
+        std::printf("[错误] 未知 --backbone: %s (可选 tb / mlp / layer / seq)\n",
+                    g_cfg.backbone.c_str());
         return 2;
     }
     PPOMCTSAgent ag(board, g_cfg.hidden, 0.99f, 0.001f, 1.414f, g_cfg.expert, 0.1f, true, bb);
+    /*
+       [2026-10] 序列专家的两个旋钮: **构造之后、载入权重之前** (与 bench_agent_arena
+       同一个顺序纪律 —— 位置编码模式是权重文件自描述的一部分, 换模式必须重训/换权重)。
+    */
+    if (!g_cfg.posKey.empty()) {
+        if (!ag.setExpertPosMode(g_cfg.posKey)) {
+            std::printf("[错误] --pos=%s: 骨干 %s 不支持位置编码模式 (只有 seq 骨干支持)\n",
+                        g_cfg.posKey.c_str(), RL::PPO::backboneName(bb));
+            return 2;
+        }
+        std::printf("  [seq] 位置编码 %s (参数量 %lld)\n",
+                    ag.posModeInUse().c_str(), ag.actorParamCount());
+    }
+    if (g_cfg.dropoutP >= 0.0f) {
+        if (!ag.setExpertDropout(g_cfg.dropoutP)) {
+            std::printf("[错误] --dropout=%.3f: 骨干 %s 不支持专家 dropout (只有 seq 骨干支持)\n",
+                        (double)g_cfg.dropoutP, RL::PPO::backboneName(bb));
+            return 2;
+        }
+    }
     {
         int mode = RL::GRAD_CLIP_PER_TENSOR_UNIT_NORM;
         if (!RL::parseGradClipMode(g_cfg.gradClip.c_str(), mode)) {

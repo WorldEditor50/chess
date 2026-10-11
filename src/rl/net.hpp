@@ -621,6 +621,16 @@ public:
             if (len == 0) {
                 continue;   /* 末尾多一个换行是正常的 */
             }
+            /*
+               [2026-10] **非张量的自描述标记行**要跳过, 且**不计入**元素总数。
+               目前唯一的生产者 = 序列专家的位置编码 (`POS2D` / `POSROPE`; 见
+               `codec::isMetaMarkerLine` 的说明: 不跳它就会出现"存得下去、载不回来" ——
+               实测 `第 5 个张量校验失败`)。白名单是精确匹配, 不是"首字符是字母就放行",
+               所以"文件被截断成半行"这类真损坏仍然会被拦下。
+            */
+            if (codec::isMetaMarkerLine(buffer.data() + lineStart, len)) {
+                continue;
+            }
             lineNo++;
             long long lineElements = 0;
             if (!Tensor::validateEncodedCount(buffer.data() + lineStart, len, lineElements)) {

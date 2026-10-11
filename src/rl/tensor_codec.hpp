@@ -151,6 +151,42 @@ inline bool parseLine(const char *s, std::size_t n, LineView &out)
 /* v2 的 payload 真实起点/长度（跳过 `b64:<8 位 crc>:` 这 13 个字符） */
 inline const char *v2Payload(const LineView &li) { return li.payload + 13; }
 inline std::size_t v2PayloadLen(const LineView &li) { return li.payloadLen - 13; }
+
+/* ============================================================
+ *  **非张量**的自描述标记行（白名单，精确匹配）
+ * ============================================================
+ * 为什么需要它（2026-10，一处实测出来的缺陷）: `Net::load` 的预校验要求**每一行**
+ * 都是一个能解码的张量（形状 + base64 + CRC32 全过），于是任何"层自己写的元信息行"
+ * 都会被判成"文件被截断/损坏"⇒ **权重存得下去、载不回来**。
+ *
+ * 第一个（也是目前唯一）生产者是序列专家的位置编码: `SeqPosEnc::write` 在非默认模式
+ * 下先写一行 `POS2D` / `POSROPE`（`LEARN_1D` 不写，保持存量文件逐字节不变），
+ * 而 `SeqPosEnc::read` 靠这一行比对模式、不一致就响亮失败。它的单元测试走的是
+ * **专家级** `write/read`，绕过了 `Net::load`，所以这个缺陷在 `test_transformer`
+ * 全绿的情况下依然存在 —— 直到用 `bench_agent_arena --pos-ppo-a=2d` 载入真实权重
+ * 才暴露（实测: `seqenc_2d_actor: 第 5 个张量校验失败`）。
+ *
+ * 判据刻意写成**白名单 + 精确匹配**，而不是"首字符是字母就跳过":
+ * 后者会把"真的损坏了"的文件（例如被截断成半行）也放过去，正是预校验要挡的东西。
+ * 新增一种标记时必须同时改这里，并在 `test_ppo_backbone` 里加一条载入断言。
+ */
+inline bool isMetaMarkerLine(const char *s, std::size_t n)
+{
+    while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ')) {
+        n--;
+    }
+    struct Marker { const char *text; std::size_t len; };
+    static const Marker kMarkers[] = {
+        { "POS2D",   5 },
+        { "POSROPE", 7 },
+    };
+    for (std::size_t i = 0; i < sizeof(kMarkers) / sizeof(kMarkers[0]); i++) {
+        if (n == kMarkers[i].len && std::memcmp(s, kMarkers[i].text, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 inline const std::uint32_t *crc32Table()
 {
     static const std::vector<std::uint32_t> table = [] {

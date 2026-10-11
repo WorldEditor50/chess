@@ -43,6 +43,17 @@
  *         ② `--sims` 本来就是 A/B 共用, 所以这一场是**等搜索预算**的;
  *         ③ 界面口径下两支 PPO 的模拟预算不同 (400 vs 1600), 那样比的是搜索预算
  *            而不是骨干 —— 而模拟次数是本工程唯一测出过棋力的杠杆。
+ *
+ *   ---- [2026-10] "只换序列编码"的等模拟对照 (seq 专家) ----
+ *   bench_agent_arena.exe --mode=match --a=ppo --b=ppo ^
+ *                         --backbone-ppo-a=seq --backbone-ppo-b=seq ^
+ *                         --pos-ppo-a=2d --pos-ppo-b=1d ^
+ *                         --load-a=weights/enc_2d --load-b=weights/enc_1d ^
+ *                         --games=40 --sims=64
+ *   要点: `--pos-ppo-a/-b` 是**每侧**的位置编码 (1d 可学 90 个位置向量 / 2d 可学
+ *         10 行+9 列 / rope 无参数相对位置); 三者的参数量与权重格式都不同
+ *         (91,731 / 87,187 / 85,971), 所以两边必须各自载入对应模式的权重 ——
+ *         模式与权重文件不匹配时 `SeqPosEnc::read` 会**响亮失败**, 不会静默串权重。
  */
 #include <algorithm>
 #include <chrono>
@@ -58,6 +69,7 @@
 #include "chess.h"
 #include "abagent.h"
 #include "mcts.h"
+#include "opening_book.h"   /* [2026-10] 固定开局集 (与 bench_anchor 同一份实现) */
 #include "sacaz_variants.h"
 #include "ppomcts_agent.h"
 #include "rl/ppo.h"
@@ -133,6 +145,36 @@ struct Cfg {
     */
     std::string backbonePpoA = "mlp";
     std::string backbonePpoB = "mlp";
+    /*
+       [2026-10] **每侧**的序列专家旋钮 (只对 `--backbone-ppo-*=seq` 有效)。
+       为什么必须每侧一份: "哪种序列编码(位置编码)棋力更好"这个问题只有让 A/B
+       **一边一种编码、其余全同**才能回答 —— 与 `--backbone-ppo-a/-b` 同一个理由。
+         * `posPpoA/B`   : "1d"(可学 90 个位置向量) / "2d"(可学 10 行+9 列) / "rope"(无参数旋转);
+         * `dropoutPpoA/B`: <0 = 不调用该旋钮 (默认), >=0 = 显式设置 (0 = 关闭);
+         * `expertPpoA/B`: token 宽度 (0 = 默认 64), 走 PPOMCTSAgent 的 expertHidden。
+       **空串 / 负数 / 0 一律表示"不调用"** ⇒ 不传这几个参数时行为与改动前逐位相同。
+       非 seq 骨干上显式设置会**响亮失败**(转发接口返回 false), 不静默忽略。
+    */
+    std::string posPpoA, posPpoB;
+    float dropoutPpoA = -1.0f, dropoutPpoB = -1.0f;
+    int expertPpoA = 0, expertPpoB = 0;
+    /*
+       [2026-10] 两个"让读数可比"的开关 (默认**关** ⇒ 不传参数时行为与改动前逐位相同)。
+       为什么需要它们: 本工具的每一局开局是"用共享的 `RL::Random` 随机走 opening 手"
+       (randomOpening), 而 `RL::Random` 同时被 agent 自己的搜索消耗 ⇒ **各臂看到的开局
+       并不相同** (第一局相同, 之后随各自的走子分叉)。而"固定开局集"是 bench_anchor
+       的配对口径, 面对"分辨三个序列编码"这种小差异时, 它是最大的一笔方差削减。
+         * `pairedOpenings=1`: 用 `test/opening_book.h` 预生成 games 个开局 (局部
+           `std::mt19937_64`, 只由 seed/index 决定), 每局用其中一个, 并打印开局集
+           **FNV 指纹** —— 指纹变了 = 开局集变了, 两次读数不可比。
+         * `seedPlainRng=1`: `MCTS` 基线的 rollout 走 `std::rand()`, 而它的播种是
+           `std::srand(time(nullptr))` (**一次/进程**, 见 mcts.cpp 的构造函数) ⇒ 基线
+           本身跨运行不可复现。打开它 = 用 `--seed` 显式播种, 于是同一命令**逐位可复现**。
+    */
+    bool pairedOpenings = false;
+    bool seedPlainRng = false;
+    std::vector<Opening> book;
+    unsigned long long bookFnv = 0;
     int sacHidden = 64;
     float sacCpuct = 1.5f;
     float sacValueScale = 1.0f;   /* 只影响搜索期叶子估值 (默认 1 = 原行为) */
@@ -275,6 +317,11 @@ struct Agent {
     Kind kind = Kind::NONE;
     std::string label;
     std::string backboneName;
+    /* [2026-10] 序列专家的实际生效读数 (非 seq 骨干留空/0): 报告与 CSV 里要打出来,
+       否则"这一场用的是哪种编码"只能靠命令行回看 —— 而报告是要被单独引用的。 */
+    std::string posKeyUsed;
+    float expertDropoutUsed = 0.0f;
+    int tokenDimUsed = 0;
     std::unique_ptr<sacazx::AnySac> sac;   /* [2026-09 独立类] 任意骨干的 SAC+AZ */
     std::unique_ptr<PPOMCTSAgent> ppo;
     std::unique_ptr<MCTS> mcts;
@@ -369,14 +416,22 @@ static void randomOpening(Chess &c, int &turn, int plies)
 
 /* ============================================================
  *  打一局: A 执 aColor (RED/BLACK), B 执另一色
+ *
+ *  `opening` != nullptr 时用它 (配对开局); 为 nullptr 时走原来的
+ *  `randomOpening` 路径 —— 后者是"用共享 RL::Random 现场随机", 默认口径不变。
  * ============================================================ */
-static GameStat playGame(Chess &c, Agent &A, Agent &B, int aColor, int sims)
+static GameStat playGame(Chess &c, Agent &A, Agent &B, int aColor, int sims,
+                         const Opening *opening = nullptr)
 {
     GameStat g;
 
     c.reset();
     int turn = Stone::COLOR_RED;
-    randomOpening(c, turn, g_cfg.openingPlies);
+    if (opening != nullptr) {
+        turn = applyOpening(c, *opening);
+    } else {
+        randomOpening(c, turn, g_cfg.openingPlies);
+    }
 
     double aMsSum = 0.0, bMsSum = 0.0;
     int aMoves = 0, bMoves = 0;
@@ -611,7 +666,8 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
 /* ============================================================
  *  Agent 构造
  * ============================================================ */
-static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbonePpo)
+static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbonePpo,
+                       const std::string &posKey, float dropoutP, int expertHidden)
 {
     ag.kind = kind;
     switch (kind) {
@@ -658,13 +714,44 @@ static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbo
         */
         RL::PPO::Backbone bb = RL::PPO::Backbone::MlpExperts;
         if (!RL::PPO::parseBackbone(backbonePpo.c_str(), bb)) {
-            std::printf("[错误] 未知 PPO 骨干: %s (可选 tb / mlp / layer)\n",
+            std::printf("[错误] 未知 PPO 骨干: %s (可选 tb / mlp / layer / seq)\n",
                         backbonePpo.c_str());
             std::exit(1);
         }
-        ag.ppo.reset(new PPOMCTSAgent(c, 64, 0.99f, 0.001f, 1.414f, 64, 0.1f, true, bb));
+        const int tokDim = (expertHidden > 0) ? expertHidden : 64;
+        ag.ppo.reset(new PPOMCTSAgent(c, 64, 0.99f, 0.001f, 1.414f, tokDim, 0.1f, true, bb));
+        /*
+           [2026-10] 序列专家的两个旋钮。**构造之后、载入权重之前**调用 —— 位置编码模式是
+           权重文件自描述的一部分 (`SeqPosEnc::read` 会比对标记), 2d/rope 与 1d 的参数量也
+           不同 (91,731 / 87,187 / 85,971), 所以顺序写反了会变成"权重与网不匹配":
+           要么被守卫拒绝, 要么静默错位 (本工程被后者咬过多次)。
+        */
+        if (!posKey.empty()) {
+            if (!ag.ppo->setExpertPosMode(posKey)) {
+                std::printf("[错误] --pos-ppo=%s: 骨干 %s 不支持位置编码模式 "
+                            "(只有 seq 骨干支持)\n",
+                            posKey.c_str(), RL::PPO::backboneName(bb));
+                std::exit(1);
+            }
+        }
+        if (dropoutP >= 0.0f) {
+            if (!ag.ppo->setExpertDropout(dropoutP)) {
+                std::printf("[错误] --dropout-ppo=%.3f: 骨干 %s 不支持专家 dropout "
+                            "(只有 seq 骨干支持)\n",
+                            (double)dropoutP, RL::PPO::backboneName(bb));
+                std::exit(1);
+            }
+        }
         ag.backboneName = RL::PPO::backboneName(bb);
         ag.label = std::string("PPO+MCTS/") + ag.backboneName;
+        if (bb == RL::PPO::Backbone::SeqExperts) {
+            /* 标签里写**实际生效**的模式 (从网里读回来), 不是命令行的请求值 ——
+               "设了却没生效"这类事故在本工程里出现过, 读回来才看得见。 */
+            ag.label += "/pos=" + ag.ppo->posModeInUse();
+            ag.posKeyUsed = ag.ppo->posModeInUse();
+            ag.expertDropoutUsed = ag.ppo->expertDropoutInUse();
+            ag.tokenDimUsed = tokDim;
+        }
         break;
     }
     case Kind::MCTS:
@@ -719,6 +806,20 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--backbone-sac")) { g_cfg.backboneSac = v; }
         else if (const char *v = val("--backbone-ppo-a")) { g_cfg.backbonePpoA = v; }
         else if (const char *v = val("--backbone-ppo-b")) { g_cfg.backbonePpoB = v; }
+        /*
+           [2026-10] 每侧的序列专家旋钮 (见 Cfg 里的说明)。`--expert-ppo-*` 与
+           `train_bc --expert=` / `PPOMCTSAgent::expertHidden` 同一个口径 (token 宽度)。
+        */
+        else if (const char *v = val("--pos-ppo-a")) { g_cfg.posPpoA = v; }
+        else if (const char *v = val("--pos-ppo-b")) { g_cfg.posPpoB = v; }
+        else if (const char *v = val("--dropout-ppo-a")) { g_cfg.dropoutPpoA = (float)std::atof(v); }
+        else if (const char *v = val("--dropout-ppo-b")) { g_cfg.dropoutPpoB = (float)std::atof(v); }
+        else if (const char *v = val("--expert-ppo-a")) { g_cfg.expertPpoA = std::atoi(v); }
+        else if (const char *v = val("--expert-ppo-b")) { g_cfg.expertPpoB = std::atoi(v); }
+        else if (std::strcmp(a, "--paired-openings") == 0
+                 || std::strcmp(a, "--paired-openings=1") == 0) { g_cfg.pairedOpenings = true; }
+        else if (std::strcmp(a, "--seed-mcts-rng") == 0
+                 || std::strcmp(a, "--seed-mcts-rng=1") == 0) { g_cfg.seedPlainRng = true; }
         else if (const char *v = val("--sac-hidden"))   { g_cfg.sacHidden = std::atoi(v); }
         else if (const char *v = val("--sac-cpuct"))    { g_cfg.sacCpuct = (float)std::atof(v); }
         else if (const char *v = val("--sac-value-scale")) { g_cfg.sacValueScale = (float)std::atof(v); }
@@ -794,9 +895,37 @@ int main(int argc, char **argv)
 
     const double tBuild0 = nowMs();
     Agent A, B;
-    buildAgent(A, ka, board, g_cfg.backbonePpoA);
-    buildAgent(B, kb, board, g_cfg.backbonePpoB);
+    buildAgent(A, ka, board, g_cfg.backbonePpoA,
+               g_cfg.posPpoA, g_cfg.dropoutPpoA, g_cfg.expertPpoA);
+    buildAgent(B, kb, board, g_cfg.backbonePpoB,
+               g_cfg.posPpoB, g_cfg.dropoutPpoB, g_cfg.expertPpoB);
     const double tBuild1 = nowMs();
+
+    /*
+       [2026-10] 固定开局集 (opt-in): 预生成, 于是**每一局的开局与 agent 的随机流无关**。
+       必须在建 agent **之后**做 (它只用局部 RNG, 与 agent 无关, 但把顺序写在这里
+       可以保证"开局集在任何一次 agent 随机数消耗之前就已经定下来了")。
+    */
+    if (g_cfg.pairedOpenings && g_cfg.mode == "match") {
+        Chess scratch;
+        scratch.reset();
+        /*
+           开局数 = 局数的一半 (向上取整): 第 2j 与第 2j+1 局**共用第 j 个开局**,
+           而这两局正好是 A 执红 / A 执黑 —— 与 bench_anchor 的配对口径一致
+           (中国象棋先手优势大, 一个开局只下一次等于在测"谁执红")。
+        */
+        if (!makeOpenings(scratch, (g_cfg.games + 1) / 2, g_cfg.openingPlies, g_cfg.seed,
+                          g_cfg.book, g_cfg.bookFnv)) {
+            std::printf("VERDICT: FAIL (开局集生成失败)\n");
+            return 1;
+        }
+    }
+    /*
+       MCTS 基线的 `std::rand()`: 构造函数里 `srand(time(nullptr))` 只播一次/进程,
+       所以**在它之后**再播一次才能覆盖掉时间种子 (顺序反了会被构造函数覆盖)。
+       只影响走 `std::rand()` 的 agent (MCTS 的 rollout), 对 PPO/AB 无影响。
+    */
+    if (g_cfg.seedPlainRng) { std::srand(g_cfg.seed); }
 
     if (!g_cfg.quiet) {
         std::printf("=== bench_agent_arena: %s  vs  %s ===\n", A.label.c_str(), B.label.c_str());
@@ -810,7 +939,27 @@ int main(int argc, char **argv)
         if (B.paramCount() > 0) {
             std::printf("B 结构  : %s  可训练参数=%lld\n", B.label.c_str(), B.paramCount());
         }
-        std::printf("构建耗时: %.2f s\n\n", (tBuild1 - tBuild0) / 1000.0);
+        /* [2026-10] 序列骨干的"实际生效"读数: 位置编码 / token 宽度 / dropout */
+        if (!A.posKeyUsed.empty()) {
+            std::printf("A 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f\n",
+                        A.posKeyUsed.c_str(), A.tokenDimUsed, (double)A.expertDropoutUsed);
+        }
+        if (!B.posKeyUsed.empty()) {
+            std::printf("B 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f\n",
+                        B.posKeyUsed.c_str(), B.tokenDimUsed, (double)B.expertDropoutUsed);
+        }
+        std::printf("构建耗时: %.2f s\n", (tBuild1 - tBuild0) / 1000.0);
+        if (!g_cfg.book.empty()) {
+            std::printf("开局集  : %d 个 x %d 手 (局部 RNG, 与 agent 随机流无关; 每个开局下 2 局换先手) "
+                        "| 指纹 %016llX\n",
+                        (int)g_cfg.book.size(), g_cfg.openingPlies, g_cfg.bookFnv);
+            std::printf("          (指纹变了 = 开局集变了, 两次运行**不可比**)\n");
+        }
+        if (g_cfg.seedPlainRng) {
+            std::printf("基线 RNG: std::srand(%u) (MCTS rollout 显式播种 => 可复现)\n",
+                        g_cfg.seed);
+        }
+        std::printf("\n");
     }
 
     /* ============================================================
@@ -931,13 +1080,32 @@ int main(int argc, char **argv)
     int aReportedTotal = 0, bReportedTotal = 0;
     double aMsAcc = 0.0, bMsAcc = 0.0;
     int aMoveAcc = 0, bMoveAcc = 0;
+    /*
+       [2026-10] 终局**材料差** (A 视角, 单位 = Stone::value 的和): 和棋占多数时,
+       "得分率"的分辨力被和棋吃光 (全和 = 50%), 而材料差是同一批对局里天然带出的
+       连续读数 —— 只当**代理**, 不当棋力结论 (本工程的"代理读数"纪律: 见
+       docs/mcts_sims_scaling.md §3 的终局评估代理)。
+    */
+    double aMatDiffAcc = 0.0;
     bool anyBroken = false;
 
     const double tStart = nowMs();
     for (int i = 0; i < g_cfg.games; i++) {
         const bool aIsRed = (i % 2 == 0);   /* 交换先后手 */
         const int aColor = aIsRed ? Stone::COLOR_RED : Stone::COLOR_BLACK;
-        const GameStat g = playGame(board, A, B, aColor, g_cfg.sims);
+        /*
+           配对开局: 第 i 局用开局集里的第 i % N 个 (局数 > 开局数时循环使用);
+           同时把共享随机流按局**重置** —— 否则第 i 局的随机状态取决于前 i-1 局
+           双方的随机消耗量, 各臂之间会一路漂开 (这不是配对, 只是同协议)。
+        */
+        const Opening *op = nullptr;
+        if (!g_cfg.book.empty()) {
+            op = &g_cfg.book[((std::size_t)i / 2) % g_cfg.book.size()];
+            if (g_cfg.seedPlainRng) {
+                std::srand(g_cfg.seed + 7919u * (unsigned)(i + 1));
+            }
+        }
+        const GameStat g = playGame(board, A, B, aColor, g_cfg.sims, op);
 
         const bool bad = g.aIllegal || g.bIllegal;
         if (bad)            { st.broken++; anyBroken = true; }
@@ -952,6 +1120,9 @@ int main(int argc, char **argv)
         bReportedTotal += g.bReported;
         aMsAcc += g.aMsPerMove; bMsAcc += g.bMsPerMove;
         aMoveAcc++; bMoveAcc++;
+        aMatDiffAcc += (aColor == Stone::COLOR_RED)
+                           ? (g.redMaterial - g.blackMaterial)
+                           : (g.blackMaterial - g.redMaterial);
 
         if (!g_cfg.quiet) {
             const char *verdict = bad ? "BROKEN"
@@ -978,12 +1149,14 @@ int main(int argc, char **argv)
         if (st.broken > 0) { std::printf("  (+%d 局机制违规)", st.broken); }
         std::printf("\n");
         std::printf("  得分率    : %.1f%%   95%% Wilson 区间 [%.1f%%, %.1f%%]  -> %s\n",
-                    100.0 * rate, 100.0 * lo, 100.0 * hi, st.verdict());
+                    100.0 * rate, 100.0 * lo, 100.0 * hi, st.verdict().c_str());
         std::printf("  Elo 差    : %+.0f (A 相对 B)\n", st.eloDiff());
         std::printf("  平均手数  : %.1f\n", st.n() > 0 ? (double)pliesTotal / (double)st.n() : 0.0);
         std::printf("  思考时间  : A %.1f ms/步, B %.1f ms/步  -> B 是 A 的 %.2fx\n",
                     aMs, bMs, (aMs > 0.0) ? bMs / aMs : 0.0);
         std::printf("  搜索节点  : A %lld, B %lld\n", aNodesTotal, bNodesTotal);
+        std::printf("  终局材料差: A 平均 %+.1f (A-B, 单位=子力值; 和棋多时它比得分率分辨力高)\n",
+                    st.n() > 0 ? aMatDiffAcc / (double)st.n() : 0.0);
         std::printf("  损失上报  : A %d 次, B %d 次 (每次 = 一步优化器更新)\n",
                     aReportedTotal, bReportedTotal);
         std::printf("  总耗时    : %.1f s (%.2f s/局)\n", elapsedSec,
@@ -997,18 +1170,28 @@ int main(int argc, char **argv)
                             "a_wins,b_wins,draws,broken,score_rate,wilson_lo,wilson_hi,"
                             "elo_diff,verdict,a_ms_per_move,b_ms_per_move,"
                             "a_loss_reports,b_loss_reports,a_nodes,b_nodes,"
-                            "a_params,b_params,a_backbone,b_backbone,elapsed_s\n");
+                            "a_params,b_params,a_backbone,b_backbone,elapsed_s,"
+                            /* [2026-10] 追加在**末尾**: 上面 29 列的序号一位不动,
+                               既有解析脚本 (按列号取) 不受影响 */
+                            "a_pos,b_pos,a_token_dim,b_token_dim,a_dropout,b_dropout,"
+                            "a_material_diff_avg\n");
             std::fprintf(f, "match,%s,%s,%d,%d,%d,%d,%u,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.2f,%s,"
-                            "%.3f,%.3f,%d,%d,%lld,%lld,%lld,%lld,%s,%s,%.1f\n",
+                            "%.3f,%.3f,%d,%d,%lld,%lld,%lld,%lld,%s,%s,%.1f,"
+                            "%s,%s,%d,%d,%.3f,%.3f,%.3f\n",
                          g_cfg.aName.c_str(), g_cfg.bName.c_str(),
                          st.n(), g_cfg.sims, g_cfg.maxPlies, g_cfg.openingPlies, g_cfg.seed,
                          st.wins, st.losses, st.draws, st.broken, rate, lo, hi,
-                         st.eloDiff(), st.verdict(), aMs, bMs,
+                         st.eloDiff(), st.verdict().c_str(), aMs, bMs,
                          aReportedTotal, bReportedTotal, aNodesTotal, bNodesTotal,
                          A.paramCount(), B.paramCount(),
                          A.backboneName.empty() ? "-" : A.backboneName.c_str(),
                          B.backboneName.empty() ? "-" : B.backboneName.c_str(),
-                         elapsedSec);
+                         elapsedSec,
+                         A.posKeyUsed.empty() ? "-" : A.posKeyUsed.c_str(),
+                         B.posKeyUsed.empty() ? "-" : B.posKeyUsed.c_str(),
+                         A.tokenDimUsed, B.tokenDimUsed,
+                         (double)A.expertDropoutUsed, (double)B.expertDropoutUsed,
+                         st.n() > 0 ? aMatDiffAcc / (double)st.n() : 0.0);
             std::fclose(f);
             if (!g_cfg.quiet) { std::printf("  CSV       : %s\n", g_cfg.csvPath.c_str()); }
         } else if (!g_cfg.quiet) {
@@ -1022,6 +1205,6 @@ int main(int argc, char **argv)
                 anyBroken ? "FAIL" : "PASS",
                 g_cfg.aName.c_str(), g_cfg.bName.c_str(), st.n(),
                 st.wins, st.losses, st.draws, 100.0 * rate,
-                100.0 * lo, 100.0 * hi, st.eloDiff(), st.verdict());
+                100.0 * lo, 100.0 * hi, st.eloDiff(), st.verdict().c_str());
     return anyBroken ? 1 : 0;
 }
