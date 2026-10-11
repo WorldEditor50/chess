@@ -85,7 +85,15 @@ public:
            与 LAYER_TRANSFORMERBLOCK 分开: 那个是"单向量 + 外积伪注意力"的旧实现,
            两者并不是同一种层 —— 混在一个 type 里会让诊断读数张冠李戴。
         */
-        LAYER_SEQTRANSFORMER
+        LAYER_SEQTRANSFORMER,
+        /*
+           [2026-10 第三轮] conv2d + ResNet 专家 (src/rl/conv_resnet.hpp)。
+           与 LAYER_CONV2D 分开: 那一个是"单层卷积层" (ConvDQN 用的那个类),
+           本专家是"卷积 + 残差堆叠 + 逐点输出投影"的一整块 MoE 专家。
+           混在一个 type 里会让自检面板与权重指纹张冠李戴 —— 与 LAYER_SEQTRANSFORMER
+           当初从 LAYER_TRANSFORMERBLOCK 分出来是同一条理由。
+        */
+        LAYER_CONVRESNET
     };
     using sptr = std::shared_ptr<iLayer>;
 public:

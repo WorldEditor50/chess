@@ -3324,6 +3324,22 @@ mainwindow    kAgents 里多一行, 于是两个骨干能在界面上直接对�
 > （`weights/seqopt_rl_2d_*` → `weights/ppomcts_seq_agent.dat_*`，结构与界面口径完全一致，
 > 对 MCTS 实测 60.0% [50.2, 69.1]，是本轮唯一 Wilson 下界 > 50% 的权重）。
 
+> **[2026-10-11 第三轮 新增 agent] `AGENT_PPOMCTS_CONV`（= 枚举 18）：PPO+MCTS + 稀疏 MoE +
+> conv2d/ResNet 专家。** 用户口径："使用 19x9x10 特征输入，实现 conv2d + resnet 专家，
+> 接入 ppo + mcts + alphazero + moe 实现新的 agent，与 mcts agent 对弈验证棋力，
+> 最终加入 chess 程序。" 完整读数/验证/未做项见 **`docs/conv_resnet_agent_2026_10.md`**。
+>
+> | 项 | 内容 |
+> |---|---|
+> | 专家 | `src/rl/conv_resnet.hpp` 的 `ConvResNetExpert`：状态当 **19 通道 × 10 行 × 9 列**的图像（另加 4 个坐标/区域通道：行/列 ramp、河界、九宫），`Conv(23→32,3×3)+Tanh` → **4 个残差块** → `Conv 1×1(32→19)` → 展平回 1710。每专家 **44,275 参数 / 3.97 M MAC**；actor **819,948** 参数 |
+> | 卷积怎么算 | **im2col + `MM::ikkj/ikjk`**（实测 **0.123 ns/MAC**）；`conv2d.hpp` 的朴素实现是 ~10 ns/MAC ⇒ 差 80 倍，所以**不共用也不修改**它（ConvDQD 的数值一位没动）。一次 forward 0.487 ms、fwd+bwd 1.497 ms |
+> | 骨干枚举 | `RL::PPO::Backbone::ConvExperts`（短名 `conv`，`--backbone=conv` / `train_bc --agent=ppo-conv`），E=4/top-1 |
+> | 界面 | 枚举**追加在末尾**（值 18；中间插入会静默改号）+ `makePpomctsConvAgent()` 唯一构造入口（7 个构造点全走它）+ 权重前缀 `weights/ppomcts_conv_agent.dat` + 临时前缀 `_temp_train_ppomcts_conv` + 自检面板新分支 + 下拉框 "PPO+MCTS (卷积残差)" |
+> | **棋力** | 与 MCTS agent：**61.0%（39/17/44，100 局 / 50 个配对开局，Wilson [51.2, 70.0]，decisive，Elo +78）** —— 本工程目前得分率最高的一支；同预算的 seq 三支是 57.5 / 57.0 / 53.0%。与界面现役 seq+2d **头对头 60.0%（17:5，+70 Elo）** |
+> | 反直觉的一条 | conv 的 **BC 留出 CE 比 seq+2d 差 0.038 nats**（2.5567 vs 2.5188）却在棋力上更好 ⇒ **保真度不是棋力**；收益更可能来自空间归纳偏置在"BC 没覆盖到的局面"上的泛化（该解释**本轮没有直接验证**） |
+> | 顺手修的缺陷 | `PPOMCTSAgent::selfCheckReport()` 的 backbone switch 原来是 `case TbExperts: default:` ⇒ **任何新骨干都会被错报成 TB**；现在五个枚举值逐个显式列出（第 6 种骨干会由 MSVC 提醒） |
+> | 明确没做 | MoE 的 E=1 vs E=4 消融、残差块数 1/2/4/6、坐标通道消融、200 局确认 —— 每一项都要另训一份权重 + 一轮对局，命令都写在上面那份文档 §7 |
+
 ### 21.4 顺带修掉的两个真问题
 
 1. **`trainVsRandom` 的奖励标签 = "每走一步 = 输一盘"**：没有"非终局就用即时奖励"那一支，

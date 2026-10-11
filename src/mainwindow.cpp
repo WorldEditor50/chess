@@ -97,6 +97,16 @@ const AgentChoice kAgents[] = {
          (2.15 M vs 38.0 M 参数), 所以同一时间预算下它能跑更多模拟 (PPO_MLP_SIMS=1600)。
     */
     { "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)", ChessBoard::AGENT_PPOMCTS_MLP },
+    /*
+       [2026-10 第三轮] PPO+MCTS 的**第三个骨干**: 稀疏 MoE + **conv2d + ResNet 专家**
+       (E=4 top-1)。把状态当图像看 (19 通道 x 10 行 x 9 列 + 4 个坐标/区域通道) ——
+       与前两支是"同一份实现 + 不同 Backbone", 所以挨着放才能直接选中互相对弈比较。
+       它的每专家容量最小 (44,275 参数 / 3.97 M MAC), 但实测 0.123 ns/MAC, 一次模拟与
+       seq 同量级, 所以模拟预算同样是 PPO_SIMS(1600)。**权重文件独立**
+       (weights/ppomcts_conv_agent.dat_actor/_critic): conv 的参数结构与 tb/mlp/seq 都不同,
+       共用一个前缀只会让两边静默互相覆盖。
+    */
+    { "PPO+MCTS (卷积残差)",         ChessBoard::AGENT_PPOMCTS_CONV },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
     /*
        [2026-09 dev-dqnmcts-moetb] **同一个算法, 另一个骨干** —— 与上面那一项成对排列
@@ -187,6 +197,8 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 有参数可存 (主干 + Q 头) */
     case ChessBoard::AGENT_DQNMCTS_MOE:
     case ChessBoard::AGENT_PPOMCTS_MLP:
+    /* [2026-10 第三轮] conv 骨干那一支同样有参数可存 (actor + critic 两个文件) */
+    case ChessBoard::AGENT_PPOMCTS_CONV:
         return true;
     default:
         return false;
@@ -2127,6 +2139,9 @@ void MainWindow::selfCheckWorkerLoop()
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
             ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
             ChessBoard::AGENT_PPOMCTS_MLP,
+            /* [2026-10 第三轮] conv 骨干那一支: 它的骨干读数 (图像口径/通道数/块数/参数量)
+               只能从这里看见, 所以在"全部模型自检"里也要有它一格 */
+            ChessBoard::AGENT_PPOMCTS_CONV,
             /* [2026-10] SAC 59e5233 还原版两支同样删除 (同上: 不再预加载, 列出来只是噪声)。
                两个类与它们的自检文本都还在, `test_sacaz` [14] 节仍在断言。 */
             /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 独立类, 自检面板

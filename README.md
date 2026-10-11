@@ -252,6 +252,7 @@ cd build\Desktop_Qt_6_9_2_MSVC2022_64bit-Release && ctest --output-on-failure
 | **MCTS** | UCB1 蒙特卡洛树搜索 | 800 次模拟 |
 | **PPO+MCTS** | AlphaZero 风格：搜索访问分布监督 actor；骨干 = 稀疏 MoE + **序列 Transformer 专家**（`SeqExperts`，每专家 91,731 参数；**[2026-10 第二轮] 位置编码 = 可学 2D**，见 `docs/seq_transformer_encoding_eval_2026_10.md`）。之前的两档骨干：TB 专家（E=4 top-1，104.3 M 参数）与更早的 MLP 专家。同时默认开着**无辅助损失偏置均衡**（负载均衡见 §12） | **1600 次模拟**（[2026-10 第二轮] 按用户口径**与 MLP 专家对齐**），约 **5.96 s**（seq 骨干实测 3.71 ms/模拟）；TB 骨干同一预算是 17.6 s |
 | **PPO+MCTS (稀疏MoE+MLP专家)** | **同一套实现**，骨干换成 `MlpExpert`（E=8 top-2）：便宜 ~17×/模拟、容量小，于是同样 1600 次模拟只要 0.23~0.39 s（**预算已与上面那一支对齐**，于是"哪个骨干更强"在界面口径下可以回答） | 1600 次模拟，约 0.23~0.39 s |
+| **PPO+MCTS (卷积残差)** `[2026-10 第三轮]` | **同一套实现**，骨干换成 **conv2d + ResNet 专家**（`ConvExperts`，E=4 top-1）：把状态当 **19 通道 × 10 行 × 9 列**的棋盘图像（另加 4 个坐标/区域通道），`3×3 卷积 + 4 个残差块 + 1×1 输出投影`。每专家 **44,275** 参数（seq 是 91,731）、actor **819,948**；实测 **0.123 ns/MAC**、**2.51 ms/模拟**（比 seq 便宜 1.48×）⇒ 同样预算能多搜约 48%。**对 MCTS 实测 61.0%（Wilson [51.2, 70.0]，100 局 / 50 个配对开局，本工程目前最高的一支）**，与界面现役 seq+2d 的头对头 60.0%（分出胜负的 22 局 17:5）—— 见 `docs/conv_resnet_agent_2026_10.md` | 1600 次模拟，约 **4.0 s** |
 | **DQN+MCTS** | 用 Q 值做叶子估值 + 树搜索 | 200 次迭代 |
 | **DQN+MCTS (稀疏MoE+TB专家)** | 同一算法的另一个骨干（独立类 `DQNMCTSMOETbAgent`）：稀疏 MoE + TB 专家、规范视角 1263 维、PUCT + negamax 符号、Double DQN + clampTarget/Huber。权重独立（`weights/dqnmcts_moe_agent_*`） | 40 次模拟，约 175 ms |
 | **EVAB** | **学会评估的 Alpha-Beta**：置换表/迭代加深/排序 + 学习到的价值网按 `blend` 混合 | 深度 6 + 800 ms 上限 |

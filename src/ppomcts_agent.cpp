@@ -950,9 +950,28 @@ std::string PPOMCTSAgent::selfCheckReport() const
         break;
     }
     case Backbone::TbExperts:
-    default:
         out += "  界面 agent 类型 PPO+MCTS (AGENT_PPOMCTS): TransformerBlock 专家"
                " (E=4 top-1), 现役骨干\n";
+        break;
+    case Backbone::ConvExperts:
+        /*
+           [2026-10 第三轮] conv2d+ResNet 专家 (界面 AGENT_PPOMCTS_CONV)。
+           这一支的**表示口径**与另外四支都不同 (状态被当成图像而不是词袋), 而且它的
+           "hidden" 是**通道数** —— 不写出来就会被按 MLP/seq 的语义误读。
+           参数与算力取自 conv_resnet.hpp 的设计读数 (44,275 参数 / 3.97 M MAC 每专家,
+           PPO actor = 4 专家 + 门控 + 头 = 819,948), 与 test_conv_resnet 的断言同源。
+        */
+        std::snprintf(buf, sizeof(buf),
+                      "  棋盘图像骨干 (界面 AGENT_PPOMCTS_CONV): conv2d+ResNet 专家 —— "
+                      "%d 通道 x 10 行 x 9 列 (+%d 个坐标/区域通道), %d 个残差块, "
+                      "1x1 头\n",
+                      RL::PPO::CONV_CHANNELS, RL::ConvResNetExpert::COORD_PLANES,
+                      RL::PPO::CONV_BLOCKS);
+        out += buf;
+        out += "    每专家 44,275 参数 / 每次前向约 3.97 M MAC (actor = 819,948 参数; "
+               "实测 0.123 ns/MAC)\n";
+        out += "    ⚠ 权重**与 tb/mlp/seq 三种骨干都不通用** (参数量与写序都不同): "
+               "交叉载入会被结构指纹拒绝, 前缀也另起一个\n";
         break;
     }
     /*

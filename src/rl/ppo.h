@@ -17,6 +17,7 @@
 #include "expert.hpp"          /* 专家类型 / ExpertFactory / scaleExpertInit */
 #include "transformer.hpp"
 #include "seq_transformer.hpp" /* [2026-10] 真正的序列 Transformer 专家 (SeqExperts 骨干) */
+#include "conv_resnet.hpp"     /* [2026-10 第三轮] conv2d+ResNet 专家 (ConvExperts 骨干) */
 
 namespace RL {
 
@@ -210,6 +211,33 @@ constexpr int PPO_MOE_SEQ_TOPK    = 1;
 using PPOSeqExpert = SeqTransformerExpert<PPO_SEQ_LEN, PPO_SEQ_HEADS, PPO_SEQ_BLOCKS>;
 
 /*
+ * ================================================================
+ *  [2026-10 第三轮] 第五种骨干: **conv2d + ResNet 专家** (`ConvExperts`)
+ * ================================================================
+ *  前四支的专家都在"向量"上做文章 (TB/MLP/Layer 是单向量, seq 是按格切 token),
+ *  而这一支把状态**当成图像**看: `1710 = 19 通道 x 10 行 x 9 列`
+ *  (`state[plane*90 + cell]`, `cell = x*9 + y`, 数据本来就是行主序 ⇒ 零拷贝重排)。
+ *  结构: `Conv(23->C,3x3)+Tanh` → `Blocks x [Conv(C->C,3x3)+Tanh+残差]` →
+ *  `Conv 1x1(C->19)` → 展平回 1710。19 个通道之外还拼了 4 个**坐标/区域通道**
+ *  (行 ramp / 列 ramp / 河界 / 九宫, 零参数) —— 纯平移等变在象棋上是**部分错误**的
+ *  假设 (兵的过河、九宫), 见 `docs/conv_resnet_moe_analysis.md` §6.1。
+ *
+ *  实现与验证细节见 `src/rl/conv_resnet.hpp` 顶部; 实测与棋力读数见
+ *  `docs/conv_resnet_agent_2026_10.md`。
+ *
+ *  为什么保留 MoE (那份分析文档 §5 建议"先别上 MoE"): 这是**用户口径** ——
+ *  "接入 ppo + mcts + alphazero + moe 实现新的 agent"。文档当时的理由是
+ *  "conv 之后参数变得极便宜、而算力成为瓶颈, MoE 解决的是不缺的问题";
+ *  本支按口径实现, 并把那份担心变成**可测的读数** (E=4/top-1 下每步的墙钟与
+ *  BC 保真度, 与不带 MoE 的同结构对照 —— 见文档的 §A/B)。
+ */
+constexpr int PPO_CONV_CHANNELS = 32;   /* 主干通道数 (expertHidden 的语义) */
+constexpr int PPO_CONV_BLOCKS   = 4;    /* 残差块数 (编译期, 与 conv_resnet.hpp 一致) */
+constexpr int PPO_MOE_CONV_EXPERTS = 4;
+constexpr int PPO_MOE_CONV_TOPK    = 1;
+using PPOConvExpert = ConvResNetExpert;
+
+/*
  * Simplified PPO for AlphaZero-style Chinese Chess.
  *
  * 骨干 (2026-09 第二次改版): **专家从 MlpExpert 换成 TransformerBlock**。
@@ -296,6 +324,11 @@ public:
     static constexpr int SEQ_LEN         = PPO_SEQ_LEN;
     static constexpr int SEQ_HEADS       = PPO_SEQ_HEADS;
     static constexpr int SEQ_BLOCKS      = PPO_SEQ_BLOCKS;
+    /* conv2d+ResNet 那一套的别名 (E=4 / top-1; 通道数 = expertHidden, 块数 = 编译期) */
+    static constexpr int MOE_CONV_EXPERTS = PPO_MOE_CONV_EXPERTS;
+    static constexpr int MOE_CONV_TOPK    = PPO_MOE_CONV_TOPK;
+    static constexpr int CONV_CHANNELS    = PPO_CONV_CHANNELS;
+    static constexpr int CONV_BLOCKS      = PPO_CONV_BLOCKS;
 
     /*
      * ---- 骨干选择 (本工程的扩展, 2026-09; 第三支 2026-10) ----
@@ -314,7 +347,8 @@ public:
         TbExperts = 0,   /* TransformerBlock<15,360,HonorHeads> 专家, E=4 top-1 (现役) */
         MlpExperts,      /* MlpExpert 专家, E=8 top-2 (便宜 ~25x, 容量小 ~21x) */
         LayerExperts,    /* Layer<Gelu> 专家 (无 MHA), E=4 top-1 —— 见文件顶部那一节 */
-        SeqExperts       /* SeqTransformerExpert: **真正的**序列 Transformer, E=4 top-1 */
+        SeqExperts,      /* SeqTransformerExpert: **真正的**序列 Transformer, E=4 top-1 */
+        ConvExperts      /* [2026-10 第三轮] ConvResNetExpert: 棋盘图像 + 卷积残差, E=4 top-1 */
     };
     static const char *backboneName(Backbone b);
     /* 骨干名 (供工具/测试做参数与文件名用; 与界面显示名分开) */

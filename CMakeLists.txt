@@ -1699,6 +1699,29 @@ if(CHESS_BUILD_TESTS)
     add_test(NAME test_transformer COMMAND test_transformer)
     set_tests_properties(test_transformer PROPERTIES TIMEOUT 300)
 
+    # ------------------- conv2d + ResNet 专家 (2026-10 第三轮, 秒级进 ctest)
+    # 与 test_transformer 分开: 两者没有共享代码 (只共享 MM/Optimize 内核)。
+    # 盯五类事 (每一类都能在"看起来正常"的情况下错):
+    #   [1] 结构与参数量 (19 通道 x 10 行 x 9 列 / 每专家 44,275 参数 / 3.97 M MAC);
+    #   [2] **解析梯度 == 中心差分** (conv1 / 残差块 / head / 输入梯度) —— ResNet 的反向
+    #       有两条路, 而 Tanh 的导数必须用 tanh(pre) 而不是 act (act 里含残差);
+    #   [3] im2col / col2im 的自洽 (patch 下标、padding、散加语义);
+    #   [4] 坐标通道开关会改变参数量 ⇒ 权重不通用 (把"零参数=零代价"这个想当然钉死);
+    #   [5] 专家级 + **Net 级**权重往返逐位一致 (写序), 以及跨骨干载入必须被拒。
+    add_executable(test_conv_resnet
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_conv_resnet_main.cpp)
+    target_include_directories(test_conv_resnet PRIVATE ${SRC_DIR})
+    target_link_libraries(test_conv_resnet PRIVATE
+        RL_CORE)
+    target_compile_options(test_conv_resnet PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_conv_resnet PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF)
+    chess_add_header_deps(test_conv_resnet)
+    add_test(NAME test_conv_resnet COMMAND test_conv_resnet)
+    set_tests_properties(test_conv_resnet PROPERTIES TIMEOUT 300)
+
     # ------------------- PG "lastLoss 变非有限值且不复位" 的定位探针 (不进 ctest)
     # test_match [2.7b] 曾经时真时假 (一次绿一次红), 根因就是 dpg.lastLoss 会变成
     # NaN/Inf 而曲线控件丢弃非有限值 ⇒ 损失曲线静默停止上报。这个探针把"哪一手开始坏"

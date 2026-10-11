@@ -29,6 +29,7 @@
 #include <fstream>      /* 自检面板要报"权重文件在不在、多大" */
 #include <iterator>     /* 审计的逐字节比对用 istreambuf_iterator */
 #include <limits>
+#include <memory>       /* 后台训练 clone: unique_ptr 保证每条 break 都释放那一份 conv 网络 */
 #include <set>          /* backgroundTrainLoop: "没接后台训练"每种 agent 只报一次 */
 #include <string>
 #include <vector>
@@ -74,6 +75,11 @@ QString agentDisplayName(ChessBoard::AgentType type)
     */
     case ChessBoard::AGENT_DQNMCTS_MOE: return QStringLiteral("DQN+MCTS (稀疏MoE+TB专家)");
     case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
+    /*
+       [2026-10 第三轮] PPO+MCTS 的 conv2d+ResNet 专家骨干那一支。名字里必须带上骨干口径
+       —— 三支 PPO 在同一个下拉框里, 日志/奖励曲线/比分表上不能同名 (同名 = 读数没法归因)。
+    */
+    case ChessBoard::AGENT_PPOMCTS_CONV: return QStringLiteral("PPO+MCTS (卷积残差)");
     }
     return QStringLiteral("agent");
 }
@@ -96,6 +102,8 @@ bool agentCanExplore(ChessBoard::AgentType type)
     /* 本类实现了 exploreAndTrain (AgentBase 口径), 所以状态条上是"① 探索" */
     case ChessBoard::AGENT_DQNMCTS_MOE:
     case ChessBoard::AGENT_PPOMCTS_MLP:
+    /* conv 骨干那一支同样实现了 exploreAndTrain (同一个类), 所以状态条上是"① 探索" */
+    case ChessBoard::AGENT_PPOMCTS_CONV:
         return true;
     default:
         return false;
@@ -120,6 +128,8 @@ bool agentHasLearningRewardTable(ChessBoard::AgentType type)
     case ChessBoard::AGENT_DQN:
     case ChessBoard::AGENT_PPOMCTS:
     case ChessBoard::AGENT_PPOMCTS_MLP:
+    /* conv 骨干那一支的奖励口径与另外两支 PPO 逐字相同 (同一个类) */
+    case ChessBoard::AGENT_PPOMCTS_CONV:
     case ChessBoard::AGENT_DQNMCTS:
     case ChessBoard::AGENT_SACAZ:
     case ChessBoard::AGENT_SACAZ_MOE:
@@ -522,6 +532,33 @@ static PPOMCTSAgent *makePpomctsAgent(Chess &env)
     return ag;
 }
 /*
+ * ================================================================
+ *  [2026-10 第三轮] **AGENT_PPOMCTS_CONV** (骨干 = conv2d + ResNet 专家)
+ * ================================================================
+ *  与 AGENT_PPOMCTS / AGENT_PPOMCTS_MLP 是**同一个类、不同 Backbone** (算法/搜索/训练/
+ *  自检一份代码), 只有第 9 个构造参数不同 —— 与 mlp 那一支同一手法, 所以三支能在界面上
+ *  直接对弈比较。
+ *
+ *  为什么参数只有这一处: 这一支在 chessboard.cpp 里被构造 **7 次** (预加载、工厂、
+ *  决策兜底、按需建网、后台兜底建网、后台训练 clone …), 手抄参数迟早就漏一处, 而
+ *  "漏掉"的表现是"训练用的那一支"与"决策用的那一支"结构不一致 —— 这件事在权重往返上
+ *  **看不出来** (与 PPOMCTS_BACKBONE / applyPpoBalance 同一条纪律: 结构只允许有一个来源)。
+ *
+ *  ⚠ 第 6 个参数 (expertHidden) 在 conv 专家里的语义是**通道数**, 所以必须传
+ *    `RL::PPO_CONV_CHANNELS` (=32)。传成别处的 64 会改变 conv1/各块的权重形状,
+ *    `Net::load` 的参数量守卫会让每一轮载入都失败。
+ *  ⚠ **没有位置编码旋钮**: `setExpertPosMode` 对 conv 骨干返回 false (只有 seq 骨干有
+ *    1d/2d/rope), 所以这里刻意**不调** applyPpomctsPosMode —— 调了会当场 qFatal。
+ *  ⚠ 均衡/门控接线仍由调用方在构造后立刻 applyPpoBalance (与另外两支一致)。
+ * ================================================================
+ */
+static PPOMCTSAgent *makePpomctsConvAgent(Chess &env)
+{
+    return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f,
+                            RL::PPO_CONV_CHANNELS, 0.1f, true,
+                            RL::PPO::Backbone::ConvExperts);
+}
+/*
  * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
  * 单位是**搜索节点数** (= 网络前向次数), 不是模拟次数: TB 骨干实测 ~3 ms/节点,
  * 所以 256 节点 ≈ 0.8 s/步、能搜到 2~3 层 (bench_dqnab_vs_ab 实测深度 2.5)。
@@ -626,6 +663,13 @@ static constexpr int BG_TRAIN_SACAZ_MOE_SIMS = 64;
  */
 static const char *TMP_WEIGHTS       = "weights/_temp_train.dat";        /* 单文件 + PPO(TB) */
 static const char *TMP_WEIGHTS_PPOMCTS_MLP = "weights/_temp_train_ppomcts_mlp";
+/*
+   [2026-10 第三轮] conv2d+ResNet 专家骨干那一支 (AGENT_PPOMCTS_CONV) 的临时前缀。
+   **必须独立**: PPO 这三支写出的文件名是同一对 `<prefix>_actor` / `<prefix>_critic`,
+   共用前缀 = 上一轮留下的那一份会被本轮 loadModel 读到 (结构指纹会当场拒绝, 但"靠断言
+   兜住的设计"不值得留 —— 见上面那段说明)。
+*/
+static const char *TMP_WEIGHTS_PPOMCTS_CONV = "weights/_temp_train_ppomcts_conv";
 static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
 /*
    [2026-09 dev-sacmoetb] AGENT_SACAZ_MOE 改成共享骨干口径 ⇒ 临时文件前缀也跟着换。
@@ -663,6 +707,8 @@ static const char *tmpWeightsOf(ChessBoard::AgentType type)
 {
     switch (type) {
     case ChessBoard::AGENT_PPOMCTS_MLP: return TMP_WEIGHTS_PPOMCTS_MLP;
+    /* conv 骨干那一支: 自己的临时前缀 (理由见它的定义处) */
+    case ChessBoard::AGENT_PPOMCTS_CONV: return TMP_WEIGHTS_PPOMCTS_CONV;
     case ChessBoard::AGENT_SACAZ:     return TMP_WEIGHTS_SACAZ;
     case ChessBoard::AGENT_SACAZ_MOE: return TMP_WEIGHTS_SACAZ_MOE;
     /* [2026-09 独立类] MoE+MLP 专家那一支的临时前缀: 与另外三支**必须不同** (同一条纪律) */
@@ -1071,6 +1117,11 @@ static bool trainSACRound(AgentT &clone,
 static const ChessBoard::AgentType kWeightAgents[] = {
     ChessBoard::AGENT_EVAB,
     ChessBoard::AGENT_PPOMCTS_MLP,
+    /*
+       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支: 权重只有 ~4.3 MB (819,948 参数),
+       与 MLP 那一支同属"毫秒级读盘", 所以排在 TB 那两组之前读起来最清楚。
+    */
+    ChessBoard::AGENT_PPOMCTS_CONV,
     ChessBoard::AGENT_DQNMCTS,
     ChessBoard::AGENT_PPOMCTS,
     ChessBoard::AGENT_SACAZ,
@@ -1108,6 +1159,8 @@ static std::vector<std::string> weightFilesOf(ChessBoard::AgentType type)
     /* 一个模型两个文件: actor + critic (PPO 系的两个骨干都是这样) */
     case ChessBoard::AGENT_PPOMCTS:
     case ChessBoard::AGENT_PPOMCTS_MLP:
+    /* conv 骨干那一支同样是 <prefix>_actor / <prefix>_critic (前缀不同) */
+    case ChessBoard::AGENT_PPOMCTS_CONV:
         return { p + "_actor", p + "_critic" };
     /* 一个模型三个文件: actor + 双 critic */
     case ChessBoard::AGENT_SACAZ:
@@ -1140,6 +1193,8 @@ PGEagent *ChessBoard::m_sfPG = nullptr;
 DQNAgent *ChessBoard::m_sfDQN = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTS = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTSMLP = nullptr;
+/* conv2d+ResNet 专家骨干那一支 (AGENT_PPOMCTS_CONV): 同一个类, 不同 Backbone */
+PPOMCTSAgent *ChessBoard::m_sfPPOMCTSConv = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
 SACAZAgent *ChessBoard::m_sfSACAZ = nullptr;
@@ -1332,6 +1387,21 @@ void ChessBoard::startupLoad()
         }
         m_sfPPOMCTSMLP->loadModel(s_weightPaths[AGENT_PPOMCTS_MLP]);
         logLoad("PPO+MCTS (MLP专家)");
+    }
+    if (s_weightPaths.count(AGENT_PPOMCTS_CONV)) {
+        /*
+           [2026-10 第三轮] conv2d+ResNet 专家骨干那一支的预加载: 与 MLP 那块对称。
+           它的权重最小 (819,948 参数 ≈ 4.3 MB 文本), 读盘是毫秒级。
+           ⚠ 构造必须走 makePpomctsConvAgent: 第 6 个参数在 conv 专家里是**通道数**,
+           手抄成 64 会让结构指纹对不上 (表现是每一轮载入都失败)。
+        */
+        emit busyMessage(QStringLiteral("正在载入 PPO+MCTS (卷积残差) 权重…"));
+        if (m_sfPPOMCTSConv == nullptr) {
+            m_sfPPOMCTSConv = makePpomctsConvAgent(env);
+            applyPpoBalance(*m_sfPPOMCTSConv);
+        }
+        m_sfPPOMCTSConv->loadModel(s_weightPaths[AGENT_PPOMCTS_CONV]);
+        logLoad("PPO+MCTS (卷积残差)");
     }
     if (s_weightPaths.count(AGENT_DQNAB)) {
         emit busyMessage(QStringLiteral("正在载入 DQN+AB 权重… (主干 146 MB + 两个头)"));
@@ -2304,6 +2374,8 @@ void ChessBoard::setDynamicRewardEnabled(bool on)
  *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (**1600 次模拟**, 见 PPO_SIMS ——
  *                      2026-10 第二轮与 MLP 专家对齐; 这一行原文写"80"、后来写"400",
  *                      都与当时的常量不符, 一并改正)
+ *    AGENT_PPOMCTS_CONV : 同一个算法, 骨干 = 稀疏 MoE + conv2d+ResNet 专家
+ *                      (**同 1600 次模拟** —— 它的每模拟代价与 seq 同量级)
  *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
  *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
  * ================================================================ */
@@ -2599,6 +2671,8 @@ AgentBase *ChessBoard::agentInstance(AgentType type) const
     case AGENT_DQN:         return m_sfDQN;
     case AGENT_PPOMCTS:     return m_sfPPOMCTS;
     case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP;
+    /* [2026-10 第三轮] 同一个类的第三个骨干 (conv2d+ResNet 专家) */
+    case AGENT_PPOMCTS_CONV: return m_sfPPOMCTSConv;
     case AGENT_DQNMCTS:     return m_sfDQNMCTS;
     case AGENT_EVAB:        return m_sfEVAB;
     case AGENT_SACAZ:       return m_sfSACAZ;
@@ -2691,6 +2765,15 @@ AgentBase *ChessBoard::makeAgentInstance(AgentType type)
         applyPpoBalance(*ag);
         return ag;
     }
+    case AGENT_PPOMCTS_CONV: {
+        /*
+           conv 骨干那一支: 参数 (含通道数 = PPO_CONV_CHANNELS) 只有 makePpomctsConvAgent
+           一处给全 —— 手抄一遍就是"训练用的那一支与决策用的那一支结构不一致"的老路。
+        */
+        PPOMCTSAgent *ag = makePpomctsConvAgent(env);
+        applyPpoBalance(*ag);
+        return ag;
+    }
     case AGENT_DQNMCTS:   return new DQNMCTSAgent(env, 128, 0.99f, 0.001f, 1.0f, 1.414f);
     case AGENT_EVAB:      return new EVABAgent(env, 48, EVAB_DEPTH, EVAB_BUDGET_MS);
     case AGENT_SACAZ:     return createSACAZAgent(env, AGENT_SACAZ, m_dynamicReward);
@@ -2745,6 +2828,8 @@ bool ChessBoard::saveWeightsOf(AgentBase *inst, AgentType type, const std::strin
     case AGENT_DQN:         return static_cast<DQNAgent *>(inst)->saveModel(filepath);
     case AGENT_PPOMCTS:     return static_cast<PPOMCTSAgent *>(inst)->saveModel(filepath);
     case AGENT_PPOMCTS_MLP: return static_cast<PPOMCTSAgent *>(inst)->saveModel(filepath);
+    /* [2026-10 第三轮] conv 骨干那一支: 同一个类, 只是权重文件不同 (<prefix>_actor/_critic) */
+    case AGENT_PPOMCTS_CONV: return static_cast<PPOMCTSAgent *>(inst)->saveModel(filepath);
     case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->saveModel(filepath);
     case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->saveModel(filepath);
     case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->saveModel(filepath);
@@ -2772,6 +2857,8 @@ bool ChessBoard::loadWeightsInto(AgentBase *inst, AgentType type, const std::str
     case AGENT_DQN:         return static_cast<DQNAgent *>(inst)->loadModel(filepath);
     case AGENT_PPOMCTS:     return static_cast<PPOMCTSAgent *>(inst)->loadModel(filepath);
     case AGENT_PPOMCTS_MLP: return static_cast<PPOMCTSAgent *>(inst)->loadModel(filepath);
+    /* [2026-10 第三轮] 同上: 三个骨干预共一个类, 差别只在权重文件的前缀 */
+    case AGENT_PPOMCTS_CONV: return static_cast<PPOMCTSAgent *>(inst)->loadModel(filepath);
     case AGENT_DQNMCTS:     return static_cast<DQNMCTSAgent *>(inst)->loadModel(filepath);
     case AGENT_EVAB:        return static_cast<EVABAgent *>(inst)->loadModel(filepath);
     case AGENT_SACAZ:       return static_cast<SACAZAgent *>(inst)->loadModel(filepath);
@@ -2824,6 +2911,9 @@ static void verifyTransientWeightPathsOnce()
         const std::string paths[] = {
             TMP_WEIGHTS,
             TMP_WEIGHTS_PPOMCTS_MLP,
+            /* [2026-10 第三轮] conv 骨干那一支的临时前缀也在这条检查里:
+               它一旦漂出 `weights/_temp` 前缀, "对弈期间不落盘"就对它静默失效 */
+            TMP_WEIGHTS_PPOMCTS_CONV,
             TMP_WEIGHTS_SACAZ,
             TMP_WEIGHTS_SACAZ_MOE,
             TMP_WEIGHTS_SACAZ_MOE_MLP,
@@ -3295,6 +3385,16 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
             return m_sfPPOMCTSMLP->selfCheckReport();
         }
         break;
+    /*
+       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支: 自检报告里那一节骨干读数由
+       `PPOMCTSAgent::selfCheckReport` 按 Backbone 分派给出 (见 ppomcts_agent.cpp) ——
+       不在这里转述, 免得两处漂移。
+    */
+    case AGENT_PPOMCTS_CONV:
+        if (m_sfPPOMCTSConv != nullptr) {
+            return m_sfPPOMCTSConv->selfCheckReport();
+        }
+        break;
     /* AGENT_ALPHABETA / AGENT_MCTS 在函数开头就返回了 (它们不碰常驻 agent) */
     default:
         break;
@@ -3309,10 +3409,11 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
  *  与 `getAgentSelfCheck` **同一把锁、同一条约束**: 常驻实例的内部计数器要在
  *  `m_agentMutex` 上读, 所以 GUI 线程不能直接调它 —— 界面侧复用自检那个 worker。
  *
- *  哪些 agent 有稀疏 MoE 层 (本工程目前三个):
+ *  哪些 agent 有稀疏 MoE 层 (本工程目前这些):
  *    * AGENT_SACAZ_MOE      -> SACAZMoETbAgent    (TB 专家,  E=4 top-1)
  *    * AGENT_SACAZ_MOE_MLP  -> SACAZMoEMlpAgent   (MLP 专家, E=8 top-2)
  *    * AGENT_DQNMCTS_MOE    -> DQNMCTSMOETbAgent  (TB 专家,  E=4 top-1)
+ *    * AGENT_PPOMCTS / _MLP / _CONV -> PPOMCTSAgent (seq / MLP / conv 专家各一种)
  *  前两个的**训练侧/推理侧拆分**已经接线 (`moeUsageSplit`: 训练侧由 learnBatch 在批
  *  边界累计); 第三个目前只有生命周期合计 (`moeUsage`), 所以 `splitReady=false` ——
  *  界面会明说这一点, 而不是拿合计冒充训练侧。
@@ -3417,6 +3518,23 @@ bool ChessBoard::getMoeLoad(AgentType type, MoeLoadSnapshot &out) const
             out.splitReady = !out.train.empty();
             out.applicable = (out.experts > 0);
             m_liveMoeProbe.store(m_sfPPOMCTSMLP->moeRouteProbe(), std::memory_order_release);
+        }
+        break;
+    /*
+       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支同样是稀疏 MoE (E=4 top-1),
+       `PPOMCTSAgent::moeUsage/Split` 对它一样成立 —— 不接的话表现与上面 PPO 那一支
+       当初一样: "选到它就什么都不显示" (用户报过"负载均衡状态控件并没有显示")。
+    */
+    case AGENT_PPOMCTS_CONV:
+        out.capable = true;
+        if (m_sfPPOMCTSConv != nullptr) {
+            out.experts = m_sfPPOMCTSConv->moeExpertCount();
+            out.topK = m_sfPPOMCTSConv->moeTopK();
+            m_sfPPOMCTSConv->moeUsage(out.total);
+            m_sfPPOMCTSConv->moeUsageSplit(out.train, out.infer);
+            out.splitReady = !out.train.empty();
+            out.applicable = (out.experts > 0);
+            m_liveMoeProbe.store(m_sfPPOMCTSConv->moeRouteProbe(), std::memory_order_release);
         }
         break;
     default:
@@ -3639,8 +3757,9 @@ Step ChessBoard::humanTurnAiMoveForTest(int color)
  * 名单里每一支的机制依据:
  *   PureSearch        : AgentBase 没有可训练参数 (AB 各档按深度, MCTS 无权重);
  *   RealSample        : 实现了 notifyGameResult 且保留 decision 样本 (SAC 三支 + DQN+MCTS MoE);
- *   Rollout           : 在学, 但样本是"从某局面滚出去的一串" —— PPO 两支 / DQN / DQN+AB /
- *                       EVAB / SAC 还原版两支 (后两支同样没有 decision 样本这条通道)。
+ *   Rollout           : 在学, 但样本是"从某局面滚出去的一串" —— PPO 三支 (seq/mlp/conv) /
+ *                       DQN / DQN+AB / EVAB / SAC 还原版两支 (后两支同样没有 decision
+ *                       样本这条通道)。
  */
 ChessBoard::HumanEndChannel ChessBoard::humanEndChannel(AgentType type)
 {
@@ -3661,6 +3780,8 @@ ChessBoard::HumanEndChannel ChessBoard::humanEndChannel(AgentType type)
     case AGENT_DQN:
     case AGENT_PPOMCTS:
     case AGENT_PPOMCTS_MLP:
+    /* [2026-10 第三轮] conv 骨干那一支: 同上 (它也在学, 样本来自 rollout) */
+    case AGENT_PPOMCTS_CONV:
     case AGENT_DQNMCTS:
     case AGENT_EVAB:
     case AGENT_DQNAB:
@@ -3960,6 +4081,24 @@ Step ChessBoard::aiThinkRaw(int color)
         }
         preTrainThenDecide(m_sfPPOMCTSMLP, color);
         return m_sfPPOMCTSMLP->selectMove(color, PPO_MLP_SIMS, 0.0f);
+    }
+    case AGENT_PPOMCTS_CONV: {
+        /*
+           [2026-10 第三轮] 同一个算法, 骨干 = 稀疏 MoE + conv2d+ResNet 专家 (E=4 top-1)。
+           构造走 makePpomctsConvAgent (参数一处给全, 含通道数); 模拟预算 = PPO_SIMS,
+           与 seq 那一支同档 —— conv 专家实测 0.123 ns/MAC, 一次模拟与 seq 同量级,
+           所以**不新增预算常量** (新增一个数就是给"两支到底谁强"再掺一个变量)。
+        */
+        std::lock_guard<std::mutex> agentLock(m_agentMutex);
+        if (m_sfPPOMCTSConv == nullptr) {
+            m_sfPPOMCTSConv = makePpomctsConvAgent(env);
+            applyPpoBalance(*m_sfPPOMCTSConv);
+            auto it = s_weightPaths.find(AGENT_PPOMCTS_CONV);
+            if (it != s_weightPaths.end())
+                m_sfPPOMCTSConv->loadModel(it->second);
+        }
+        preTrainThenDecide(m_sfPPOMCTSConv, color);
+        return m_sfPPOMCTSConv->selectMove(color, PPO_SIMS, 0.0f);
     }
     case AGENT_DQNMCTS: {
         /*
@@ -4608,6 +4747,27 @@ Step ChessBoard::decideOnEnvRawLocked(int color, AgentType agentType)
         }
         preTrainThenDecide(ag, color);
         return ag->selectMove(color, PPO_MLP_SIMS, 0.0f);
+    }
+    case AGENT_PPOMCTS_CONV: {
+        /*
+           [2026-10 第三轮] PPO+MCTS+AlphaZero, 骨干 = 稀疏 MoE + **conv2d+ResNet 专家**
+           (E=4 top-1): 与 AGENT_PPOMCTS / _MLP 共享同一份实现, 只有骨干这一项不同。
+           模拟次数 = PPO_SIMS (与 seq 那一支同档: 一次模拟代价同量级, 见 aiThinkRaw 的说明)。
+        */
+        PPOMCTSAgent *ag = decisionInstance(m_sfPPOMCTSConv, AGENT_PPOMCTS_CONV);
+        if (ag == nullptr) {
+            /* 构造参数只有 makePpomctsConvAgent 一处 (含通道数), 免得两处漂开 */
+            m_sfPPOMCTSConv = makePpomctsConvAgent(env);
+            applyPpoBalance(*m_sfPPOMCTSConv);
+            ag = m_sfPPOMCTSConv;
+            /* 与上面 DQNAB / SACAZ_MOE / PPO-MLP 同一条约定: 建了对象就把权重载上 */
+            auto it = s_weightPaths.find(AGENT_PPOMCTS_CONV);
+            if (it != s_weightPaths.end()) {
+                ag->loadModel(it->second);
+            }
+        }
+        preTrainThenDecide(ag, color);
+        return ag->selectMove(color, PPO_SIMS, 0.0f);
     }
     default:
         /* 兜底: 同 aiThinkRaw 的 default (加一行 warning, 让它不是静默的降级) */
@@ -5520,6 +5680,13 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
        (`weights/ppomcts_agent.dat_*`, TB 结构) 留在盘上给 TB/MLP 那一侧用, 不会被覆盖。 */
     case AGENT_PPOMCTS:   return "weights/ppomcts_seq_agent.dat";
     case AGENT_PPOMCTS_MLP: return "weights/ppomcts_mlp_agent.dat";
+    /*
+       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支: **前缀独立**, 理由是权重格式不同 ——
+       conv 的参数是 `conv1(w,b) / 每块(w,b) / head(w,b)` 一串卷积张量, 与 tb/mlp/seq 三种
+       的参数量与写序都对不上 (结构指纹会拒绝交叉载入, 但共用前缀至少会让"这份权重是哪
+       一支的"变成只能靠猜, 并且后训练的那一支会**静默覆盖**另一支的同名文件)。
+    */
+    case AGENT_PPOMCTS_CONV: return "weights/ppomcts_conv_agent.dat";
     case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
     case AGENT_EVAB:      return "weights/evab_agent.dat";
     /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 (共享口径那一支是 _trunk + 三个头) */
@@ -5588,6 +5755,8 @@ bool ChessBoard::hasAgentInstance(AgentType agentType) const
     /* DQN+MCTS (MoE+TB 专家): 独立类, 有自己的常驻实例 */
     case AGENT_DQNMCTS_MOE: return m_sfDQNMCTSMOE != nullptr;
     case AGENT_PPOMCTS_MLP: return m_sfPPOMCTSMLP != nullptr;
+    /* [2026-10 第三轮] conv 骨干那一支: 自己的常驻实例 (退出保存按这一列决定存不存) */
+    case AGENT_PPOMCTS_CONV: return m_sfPPOMCTSConv != nullptr;
     default:              return false;
     }
 }
@@ -5704,6 +5873,14 @@ bool ChessBoard::loadAgentModel(AgentType agentType, const std::string &filepath
             applyPpoBalance(*m_sfPPOMCTSMLP);
         }
         return m_sfPPOMCTSMLP->loadModel(filepath);
+    }
+    case AGENT_PPOMCTS_CONV: {
+        /* 同上: 参数 (含通道数 = PPO_CONV_CHANNELS) 只有 makePpomctsConvAgent 一处 */
+        if (m_sfPPOMCTSConv == nullptr) {
+            m_sfPPOMCTSConv = makePpomctsConvAgent(env);
+            applyPpoBalance(*m_sfPPOMCTSConv);
+        }
+        return m_sfPPOMCTSConv->loadModel(filepath);
     }
     case AGENT_DQNMCTS: {
         if (m_sfDQNMCTS == nullptr) {
@@ -5869,6 +6046,8 @@ bool ChessBoard::bcSupported(AgentType type)
     switch (type) {
     case AGENT_PPOMCTS:
     case AGENT_PPOMCTS_MLP:
+    /* [2026-10 第三轮] conv 骨干那一支也走同一条 BC 路径 (同一个类 + 同一个胶水层) */
+    case AGENT_PPOMCTS_CONV:
     case AGENT_SACAZ:
     case AGENT_SACAZ_MOE:
     case AGENT_SACAZ_MOE_MLP:
@@ -6179,6 +6358,10 @@ void ChessBoard::bcOnStudentMove(AgentType studentType, const Chess &pos, int co
     case AGENT_PPOMCTS_MLP:
         bcCollectFromStudent(static_cast<PPOMCTSAgent *>(base), pos, color, teacher, softMoves, softProbs);
         break;
+    /* [2026-10 第三轮] conv 骨干那一支: 与另外两支 PPO 同一个类 ⇒ 同一份采集 */
+    case AGENT_PPOMCTS_CONV:
+        bcCollectFromStudent(static_cast<PPOMCTSAgent *>(base), pos, color, teacher, softMoves, softProbs);
+        break;
     case AGENT_SACAZ:
         bcCollectFromStudent(static_cast<SACAZAgent *>(base), pos, color, teacher, softMoves, softProbs);
         break;
@@ -6453,13 +6636,15 @@ bool ChessBoard::valueProbeOf(AgentType type, Chess &pos, int color, double &out
         return false;               /* 实例还没建 (懒建): 这一手不采 */
     }
     /*
-       只有 PPO 两支有**标量 V 头** (critic)。SAC 三支的批评家是 Q(s,a) 而不是 V(s),
-       EV/校准在那边要换一套口径 (目标不同), 所以这里明确返回 false —— 让界面保持
-       "没有这条读数的 agent 就说明原因"的语义, 而不是塞一个含义不同的数进去。
+       只有 PPO 那几支 (seq / mlp / conv) 有**标量 V 头** (critic)。SAC 三支的批评家是
+       Q(s,a) 而不是 V(s), EV/校准在那边要换一套口径 (目标不同), 所以这里明确返回 false
+       —— 让界面保持"没有这条读数的 agent 就说明原因"的语义, 而不是塞一个含义不同的数。
     */
     switch (type) {
     case AGENT_PPOMCTS:
     case AGENT_PPOMCTS_MLP:
+    /* [2026-10 第三轮] conv 骨干那一支的 critic 同样是标量 V(s), 所以这条读数也成立 */
+    case AGENT_PPOMCTS_CONV:
         return static_cast<PPOMCTSAgent *>(base)->valueOfPosition(pos, color, out);
     default:
         return false;
@@ -6660,6 +6845,9 @@ void ChessBoard::backgroundTrainLoop()
            接入"或"种子权重写入失败", 见 4981 行那段说明) */
         case AGENT_DQNMCTS_MOE:
         case AGENT_PPOMCTS_MLP:
+        /* [2026-10 第三轮] conv 骨干那一支: 有可训练权重, 下面四个 switch 里都有 case
+           (漏一个的表现是"该 agent 的后台训练尚未接入"或"种子权重写入失败") */
+        case AGENT_PPOMCTS_CONV:
             trainable = true;
             break;
         default:
@@ -6712,6 +6900,13 @@ void ChessBoard::backgroundTrainLoop()
                                                       0.1f, true,
                                                       RL::PPO::Backbone::MlpExperts);
                     applyPpoBalance(*m_sfPPOMCTSMLP);
+                }
+                break;
+            /* [2026-10 第三轮] conv 骨干那一支同样走 makePpomctsConvAgent (参数一处给全) */
+            case AGENT_PPOMCTS_CONV:
+                if (m_sfPPOMCTSConv == nullptr) {
+                    m_sfPPOMCTSConv = makePpomctsConvAgent(env);
+                    applyPpoBalance(*m_sfPPOMCTSConv);
                 }
                 break;
             case AGENT_DQNMCTS:
@@ -6813,6 +7008,10 @@ void ChessBoard::backgroundTrainLoop()
                 break;
             case AGENT_PPOMCTS_MLP:
                 if (m_sfPPOMCTSMLP) seeded = m_sfPPOMCTSMLP->saveModel(tmpWeights);
+                break;
+            /* [2026-10 第三轮] conv 骨干那一支: 写自己的临时前缀 (TMP_WEIGHTS_PPOMCTS_CONV) */
+            case AGENT_PPOMCTS_CONV:
+                if (m_sfPPOMCTSConv) seeded = m_sfPPOMCTSConv->saveModel(tmpWeights);
                 break;
             case AGENT_DQNMCTS:
                 if (m_sfDQNMCTS) seeded = m_sfDQNMCTS->saveModel(tmpWeights);
@@ -6979,6 +7178,35 @@ void ChessBoard::backgroundTrainLoop()
                 roundLoss = clone.getLastTrainLoss();
                 if (!clone.saveModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS-MLP 训练权重写回失败, 本轮丢弃";
+                    break;
+                }
+                roundApplied = true;
+                break;
+            }
+            case AGENT_PPOMCTS_CONV: {
+                /*
+                   [2026-10 第三轮] conv 骨干那一支的同一套往返。
+                   clone 走**堆对象 + makePpomctsConvAgent**: 构造参数 (含通道数) 只有那
+                   一处 —— 手抄一遍参数就是"clone 与主 agent 结构不一致"的老路 (结构指纹
+                   会让每一轮 load 都失败, 不静默但白跑)。`unique_ptr` 保证每条 break 都
+                   释放那一份网络 (它带着 4 个专家的前向/反向缓存)。
+                   模拟预算 = BG_TRAIN_SIMS: 训练预算是"一轮多久", 不是"一步等多久",
+                   与 seq 那一支同档 (决策路径才用 PPO_SIMS)。
+                */
+                std::unique_ptr<PPOMCTSAgent> clone(makePpomctsConvAgent(trainChess));
+                /* 与另外两支同一条纪律: 均衡/门控接线必须与主 agent 一致, 且在 loadModel
+                   之前 (偏置是非参数缓冲, 不进权重文件 —— 漏掉在读数上看不出来) */
+                applyPpoBalance(*clone);
+                if (!clone->loadModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS (卷积残差) clone 载入种子权重失败, 本轮丢弃"
+                               << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
+                    break;
+                }
+                clone->trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
+                                     roundMaxMoves, false);
+                roundLoss = clone->getLastTrainLoss();
+                if (!clone->saveModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS (卷积残差) 训练权重写回失败, 本轮丢弃";
                     break;
                 }
                 roundApplied = true;
@@ -7220,6 +7448,12 @@ void ChessBoard::backgroundTrainLoop()
                     qWarning() << "[train] PPO+MCTS-MLP 权重同步回主 agent 失败";
                 }
                 break;
+            /* [2026-10 第三轮] conv 骨干那一支: 从**自己的**临时前缀同步回**自己的**实例 */
+            case AGENT_PPOMCTS_CONV:
+                if (m_sfPPOMCTSConv && !m_sfPPOMCTSConv->loadModel(tmpWeights)) {
+                    qWarning() << "[train] PPO+MCTS (卷积残差) 权重同步回主 agent 失败";
+                }
+                break;
             case AGENT_DQNMCTS:
                 if (m_sfDQNMCTS && !m_sfDQNMCTS->loadModel(tmpWeights)) {
                     qWarning() << "[train] DQN+MCTS 权重同步回主 agent 失败";
@@ -7357,7 +7591,10 @@ int ChessBoard::saveAllInstantiatedAgentsOnExit()
                               AGENT_PPOMCTS_MLP, AGENT_SACAZ_OLD, AGENT_SACAZ_OLD_MOE,
                               /* [2026-09 dev-dqnmcts-moetb] 独立类, 正式前缀
                                  weights/dqnmcts_moe_agent_* (与旧类的单文件不同) */
-                              AGENT_DQNMCTS_MOE };
+                              AGENT_DQNMCTS_MOE,
+                              /* [2026-10 第三轮] conv 骨干那一支: 正式前缀
+                                 weights/ppomcts_conv_agent.dat_actor / _critic */
+                              AGENT_PPOMCTS_CONV };
     /*
        ⚠ [2026-10] 表里这四个 (PG / DQN / AGENT_SACAZ_OLD / AGENT_SACAZ_OLD_MOE)
        现在是**不可达**的: 它们已从下拉框与启动预加载里移除 (见 kWeightAgents 注释),

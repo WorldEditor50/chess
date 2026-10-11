@@ -260,7 +260,29 @@ public:
            同理, **不要**把它插到 AGENT_DQNMCTS 旁边去"排得好看" ——
            下拉框里的位置由 mainwindow.cpp 的 kAgents 决定, 与枚举值无关。
         */
-        AGENT_DQNMCTS_MOE
+        AGENT_DQNMCTS_MOE,
+        /*
+           ================================================================
+           PPO+MCTS+AlphaZero 的**第三个骨干**: 稀疏 MoE + **conv2d + ResNet 专家**
+           (ConvExperts, E=4 top-1) —— 界面类型 AGENT_PPOMCTS_CONV。
+           ================================================================
+           与 AGENT_PPOMCTS / AGENT_PPOMCTS_MLP 的关系就是那两个之间的关系:
+           **算法、搜索、训练、自检是同一份代码** (同一个 PPOMCTSAgent 类, 只是构造时传的
+           Backbone 不同), 所以三支能在界面上直接对弈比较, 而不是三份会漂移的实现。
+             * 骨干把状态**当成图像**看: 19 通道 x 10 行 x 9 列 + 4 个坐标/区域通道,
+               3x3 卷积 + 4 个残差块 + 1x1 头 (见 src/rl/conv_resnet.hpp);
+             * 每专家 44,275 参数 / 每次前向 3.97 M MAC ⇒ actor **819,948** 参数,
+               实测 0.123 ns/MAC (与 seq 专家同一量级) ⇒ 模拟预算沿用 PPO_SIMS,
+               **不新增预算常量**;
+             * **权重文件独立** (`weights/ppomcts_conv_agent.dat`): conv 的参数结构与
+               tb/mlp/seq 三种都不同, 结构指纹会拒绝交叉载入 —— 但名字上分开才不用猜
+               "这份权重是哪一支的"(共用前缀 = 后训练的那一支静默覆盖另一支)。
+           ⚠ 这一支**没有位置编码旋钮** (`setExpertPosMode` 对 conv 骨干返回 false,
+             只有 seq 骨干有 1d/2d/rope), 所以它的构造点**刻意不调** applyPpomctsPosMode。
+           **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
+           (见 mainwindow.cpp 的 kAgents), 插在中间会静默改变既有 agent 的编号。
+        */
+        AGENT_PPOMCTS_CONV
     };
 
 public:
@@ -1025,6 +1047,8 @@ private:
     static PPOMCTSAgent *m_sfPPOMCTS;
     /* PPO+MCTS 的 MLP 专家骨干那一个变体 (AGENT_PPOMCTS_MLP): 同一个类, 不同 Backbone */
     static PPOMCTSAgent *m_sfPPOMCTSMLP;
+    /* 同上, 骨干换成 conv2d + ResNet 专家 (AGENT_PPOMCTS_CONV) */
+    static PPOMCTSAgent *m_sfPPOMCTSConv;
     static DQNMCTSAgent *m_sfDQNMCTS;
     static EVABAgent *m_sfEVAB;
     static SACAZAgent *m_sfSACAZ;
@@ -1449,16 +1473,18 @@ public:
      *   3. **读数是"这一场/这一局"的累计**: 对局每场归零一次, 人机那条路**每局**归零
      *      一次 (那里没有"场"这个概念), 都写进自检面板。
      */
-    /* 这个 agent 类型能不能做 BC 的学生 (PPO 两支 + SAC 三支) */
+    /* 这个 agent 类型能不能做 BC 的学生 (PPO 三支 + SAC 三支; 见 bcSupported 的判据) */
     static bool bcSupported(AgentType type);
     /*
      * 这个 agent 类型能不能报**标量 V(s)** —— 价值评估曲线 (EV/校准) 的采样前提。
-     * 只有 PPO 两支: 它们的 critic 就是 V(s); SAC 三支的批评家是 Q(s,a) (目标不同),
-     * 拿 Q 冒充 V 会让 EV 的含义变掉, 所以那边明确"没有这条读数"(界面上说明原因)。
+     * 只有 PPO 那几支 (seq / mlp / conv): 它们的 critic 就是 V(s); SAC 三支的批评家是
+     * Q(s,a) (目标不同), 拿 Q 冒充 V 会让 EV 的含义变掉, 所以那边明确"没有这条读数"
+     * (界面上说明原因)。
      */
     static bool valueProbeOfSupported(AgentType type)
     {
-        return type == AGENT_PPOMCTS || type == AGENT_PPOMCTS_MLP;
+        return type == AGENT_PPOMCTS || type == AGENT_PPOMCTS_MLP
+               || type == AGENT_PPOMCTS_CONV;
     }
     /*
      * 这一对选手**能不能**开"对局中克隆": 只要**至少一侧**是能做 BC 的学生就行 ——

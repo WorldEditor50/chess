@@ -9,12 +9,14 @@
  *   4. 报告 训练/留出 两套读数 (prior top-1 / P(老师着法) / CE / 策略熵);
  *   5. 可选的 `--load` / `--save` (权重与界面的 agent 同一份格式, 结构指纹照旧)。
  *
- * 支持四种 agent (都走同一套 BC 口径, 见 src/bcagent.hpp):
+ * 支持五种 PPO 骨干 + 三种 SAC 口径 (都走同一套 BC 口径, 见 src/bcagent.hpp):
  *   --agent=ppo           PPO+MCTS (TB 专家骨干, 界面现役; 建网/内存都很贵)
  *   --agent=ppo-mlp       PPO+MCTS (MLP 专家骨干; 便宜 ~25x, 冒烟与小实验用它)
  *   --agent=ppo-layer     PPO+MCTS (廉价专家骨干: Layer<Gelu>, **无 MHA**; 2026-10)
  *   --agent=ppo-seq       PPO+MCTS (**真正的**序列 Transformer 专家: 按格 token 化 +
- *                          逐行 softmax 注意力 + 位置嵌入 + Pre-LN 残差; 2026-10)
+ *                         逐行 softmax 注意力 + 位置嵌入 + Pre-LN 残差; 2026-10)
+ *   --agent=ppo-conv      PPO+MCTS (**conv2d + ResNet** 专家: 状态当 19x10x9 的图像,
+ *                         3x3 卷积 + 4 个残差块 + 逐点输出投影; 2026-10 第三轮)
  *   --agent=sac           SAC+AZ (纯 MLP, 界面 AGENT_SACAZ)
  *   --agent=sac-moe-mlp   SAC+AZ-MoE-MLP
  *   --agent=sac-moe       SAC+AZ-MoE (TB 专家; 建网数秒)
@@ -283,7 +285,7 @@ int main(int argc, char *argv[])
 
     /* ---- 造 agent (与界面 / 既有 bench 同一套形状参数) ---- */
     if (g_cfg.agent == "ppo" || g_cfg.agent == "ppo-mlp" || g_cfg.agent == "ppo-layer"
-        || g_cfg.agent == "ppo-seq") {
+        || g_cfg.agent == "ppo-seq" || g_cfg.agent == "ppo-conv") {
         RL::PPO::Backbone bb = RL::PPO::Backbone::MlpExperts;
         const char *label = "PPO+MCTS (MLP 专家)";
         if (g_cfg.agent == "ppo") {
@@ -297,6 +299,11 @@ int main(int argc, char *argv[])
             /* [2026-10] 真正的序列 Transformer 专家 (token 化 + 逐行 softmax + 位置嵌入) */
             bb = RL::PPO::Backbone::SeqExperts;
             label = "PPO+MCTS (序列Transformer专家)";
+        } else if (g_cfg.agent == "ppo-conv") {
+            /* [2026-10 第三轮] conv2d + ResNet 专家 (19x10x9 棋盘图像 + 4 个坐标/区域通道)。
+               `--expert=` 在这一支里的语义是**主干通道数** (默认 32)。 */
+            bb = RL::PPO::Backbone::ConvExperts;
+            label = "PPO+MCTS (conv2d+ResNet专家)";
         }
         PPOMCTSAgent agent(env, g_cfg.hidden, 0.99f, 0.001f, 1.414f,
                            g_cfg.expert, 0.1f, true, bb);

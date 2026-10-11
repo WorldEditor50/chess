@@ -87,6 +87,16 @@ std::shared_ptr<RL::iLayer> makeMoeLayer(int stateDim, bool withGrad, int expert
                                               RL::PPO_MOE_SEQ_TOPK> >(
             stateDim, withGrad, expertHidden);
     }
+    if (backbone == RL::PPO::Backbone::ConvExperts) {
+        /* [2026-10 第三轮] conv2d + ResNet 专家 (把 19x10x9 的棋盘当图像看)。
+           这里 `expertHidden` 是**通道数** (默认 32; 4 个残差块由编译期常量给)。
+           同样要求 stateDim 能被 90 整除 (1710 = 19 × 90 ✓); 不整除时构造函数
+           响亮失败 (见 conv_resnet.hpp 顶部)。 */
+        return std::make_shared<RL::SparseMoE<RL::PPOConvExpert,
+                                              RL::PPO_MOE_CONV_EXPERTS,
+                                              RL::PPO_MOE_CONV_TOPK> >(
+            stateDim, withGrad, expertHidden);
+    }
     return std::make_shared<RL::SparseMoE<RL::PPOExpert,
                                           RL::PPO_MOE_EXPERTS,
                                           RL::PPO_MOE_TOPK> >(
@@ -102,6 +112,7 @@ const char *RL::PPO::backboneName(Backbone b)
     case Backbone::MlpExperts:   return "稀疏MoE(MLP专家)";
     case Backbone::LayerExperts: return "稀疏MoE(廉价专家,无MHA)";
     case Backbone::SeqExperts:   return "稀疏MoE(序列Transformer专家)";
+    case Backbone::ConvExperts:  return "稀疏MoE(conv2d+ResNet专家)";
     }
     return "?";
 }
@@ -114,6 +125,7 @@ const char *RL::PPO::backboneKey(Backbone b)
     case Backbone::MlpExperts:   return "mlp";
     case Backbone::LayerExperts: return "layer";
     case Backbone::SeqExperts:   return "seq";
+    case Backbone::ConvExperts:  return "conv";
     }
     return "?";
 }
@@ -132,6 +144,9 @@ bool RL::PPO::parseBackbone(const char *s, Backbone &out)
     }
     if (v == "seq" || v == "seq-transformer" || v == "real-transformer" || v == "seqtr") {
         out = Backbone::SeqExperts; return true;
+    }
+    if (v == "conv" || v == "conv-resnet" || v == "resnet" || v == "cnn") {
+        out = Backbone::ConvExperts; return true;
     }
     return false;
 }
