@@ -997,6 +997,37 @@ void MainWindow::populateAgentComboBox()
                          &MainWindow::onOpponentRolloutPliesChanged);
     }
 
+    {
+        /*
+           [2026-10 第四轮] **混合对手池** (后台训练的对手, 用户口径):
+           "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%, 其余 abagent 平分,
+            按照均匀分布采样选择 agent 对弈训练"。
+           与上面那个"对手入训"是**两件事**: 那个管的是"探索时问不问对手"(在线学的那条路),
+           这个管的是**后台训练那一轮** (trainSelfPlay) 的对手从哪来 —— 纯自对弈时对手是
+           学习方自己, 勾上之后每局从池子里抽一个真对手。
+        */
+        QCheckBox *cb = new QCheckBox(QStringLiteral("混合对手池"), this);
+        cb->setObjectName(QStringLiteral("mixedOpponentCheck"));
+        cb->setChecked(ui->gameWidget->isMixedOpponentTrainingEnabled());
+        cb->setToolTip(QStringLiteral(
+            "后台训练的对手池 (用户口径): MCTS 占 50%%, AB-L1/L2/L3/L4 各 12.5%%\n\n"
+            "打开后: 每一局**开头**按一次均匀分布采样抽一个对手 (用同一颗随机引擎,"
+            " 所以同一 seed 下对手序列可复现), 这一局由它陪练。\n\n"
+            "两条由实现强制的边界:\n"
+            "  1. 对手的手**只推进局面, 不进学习方的样本** —— 自对弈里\"对手那一半\"是学习方"
+            "自己采样的 (on-policy), 换成真对手就会变成\"off-policy 却打着 on-policy 的标签\","
+            " 对 PPO 是实打实的偏差;\n"
+            "  2. **每局换先手** (奇数局对手执红), 否则红黑两侧样本量不对称。\n\n"
+            "⚠ 代价: MCTS 对手 800 次迭代 ≈ 1.0 s/手 (与界面 MCTS agent 同预算), 一局 60 手"
+            "上限大约多花 ~30 s; AB-L1..L4 是 0/3/34/90 ms 量级, 可忽略。\n"
+            "⚠ 关掉它就回到纯自对弈 (与改动前逐位相同)。\n"
+            "⚠ 每一轮训练结束会在应用输出里打一行\"混合对手: 共 N 局 | MCTS(800)(0.500) x局/y手 …\","
+            " —— 采样比例错了在那行里看得见, 在损失曲线上看不见。"));
+        place(rowOpp, cb);
+        QObject::connect(cb, &QCheckBox::toggled, this,
+                         &MainWindow::onMixedOpponentsToggled);
+    }
+
     /*
        ---- [2026-09 奖励方法开关] "动态奖励" (默认不勾 = 保留旧奖励) ----
        用户口径: "保留旧的奖励方法" —— 所以默认**不勾**, 勾上才切到 `rewardShape = 3`
@@ -1447,6 +1478,24 @@ void MainWindow::onOpponentRolloutPliesChanged(int n)
 {
     ui->gameWidget->setOpponentRolloutPlies(n);
     qInfo().noquote() << QStringLiteral("[P1] 每次探索最多问对手 %1 手").arg(n);
+}
+
+/*
+   [2026-10 第四轮] 混合对手池 (后台训练)。读数是"开/关 + 实际生效的比例与预算" ——
+   把比例印出来是因为它属于**界面不可见**的那一半 (池子按权重采样, 面板上没有别的地方
+   能看到"这一轮到底抽了谁"; 每轮训练结束还会再打一行逐对手的局数/手数)。
+*/
+void MainWindow::onMixedOpponentsToggled(bool on)
+{
+    ui->gameWidget->setMixedOpponentTrainingEnabled(on);
+    const double share = (double)ui->gameWidget->getMixedOpponentMctsShare();
+    const int abDepth = std::max(1, ui->gameWidget->getMixedOpponentAbDepth());
+    qInfo().noquote() << QStringLiteral(
+        "[train] 混合对手池 = %1 (MCTS %2%% + AB-L1..L%3 各 %4%%, 每局均匀分布抽一次)")
+        .arg(on ? QStringLiteral("开") : QStringLiteral("关"))
+        .arg(100.0 * share, 0, 'f', 1)
+        .arg(ui->gameWidget->getMixedOpponentAbDepth())
+        .arg(100.0 * (1.0 - share) / (double)abDepth, 0, 'f', 1);
 }
 
 /*

@@ -59,6 +59,13 @@ private slots:
     void onOpponentRolloutToggled(bool on);
     void onOpponentRolloutPliesChanged(int n);
     /*
+     * [2026-10 第四轮] **混合对手池** (后台训练那一轮的对手): 每局按均匀分布抽一个 ——
+     * MCTS 占 50%, AB-L1/L2/L3/L4 各 12.5%。与上面那个"对手入训"是**两条不同的路径**
+     * (那个管探索时的对手, 这个管 trainSelfPlay 的对手)。语义见 chessboard.h 的
+     * setMixedOpponentTrainingEnabled 与 ppomcts_agent.h 的"训练对手池"。
+     */
+    void onMixedOpponentsToggled(bool on);
+    /*
      * [2026-09 奖励方法开关] "动态奖励" 勾选框 (默认不勾 = **保留旧奖励**)。
      * 语义见 ChessBoard::setDynamicRewardEnabled —— 它不是棋力旋钮, 而且"杀将"那一半
      * 在当前训练协议下没有样本 (done=0), 所以打开它目前只改到吃子那一半。

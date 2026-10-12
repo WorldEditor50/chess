@@ -3350,7 +3350,7 @@ mainwindow    kAgents 里多一行, 于是两个骨干能在界面上直接对�
 > | 两条边界 | ① 对手的手**只推进局面、不进学习方的样本**（自对弈里"对手那一半"是 on-policy，换成真对手就变成"off-policy 打着 on-policy 的标签"，PPO 要行为策略）；② **每局换先手**（否则红黑样本量不对称）。与 `aiagent.h` 的 `OpponentPolicy` 同一套纪律 |
 > | API | `PPOMCTSAgent::enableMixedOpponentTraining(mctsShare=0.5, mctsIterations=800, abMaxDepth=4)` / `disable…()` / `trainOpponentUsage()` / `mixedOpponentGames()` / `learnerPlyCount()`；默认**关** ⇒ 纯自对弈与改动前逐位相同 |
 > | 工具 | `train_ppo --opponents=mixed [--mcts-share] [--opponent-mcts-sims] [--ab-max-depth]` + 报告末尾的**采样直方图**与"学习方进轨迹的手数" |
-> | 界面 | `chessboard.cpp` 的 `BG_TRAIN_MIXED_OPPONENTS = true`（两个 PPO 变体的后台训练 clone 都打开；关掉 = 回到纯自对弈）。代价：MCTS 800 次迭代 ≈ 1.0 s/手 ⇒ 一轮 60 手多 ~30 s |
+> | 界面 | **训练面板里的"混合对手池"勾选框**（`mainwindow.cpp` 用代码插入，状态由 `ChessBoard::isMixedOpponentTrainingEnabled()` 给出）+ `BG_TRAIN_MIXED_OPPONENTS = true` 作为出厂默认；两个 PPO 变体的后台训练 clone 都按运行期开关打开池子（关掉 = 回到纯自对弈）。每轮训练结束打一行 `[train] 混合对手: …`（采样比例错了只在这行里看得见）。代价：MCTS 800 次迭代 ≈ 1.0 s/手 ⇒ 一轮 60 手多 ~30 s；实测界面路径 `repro_concurrency 1 4 4` 的耗时 **17 s → 50 s** |
 > | 验证 | 新 ctest 套件 **`test_mixed_opponents`（33 断言 / 0 失败）**：池子权重和为 1、**200 局直方图落在二项 5σ 内**（MCTS 正好 100/200）、换先手、`maxMoves=1` 时"对手 10 手 / 学习方 10 手"对账、默认关、参数越界被纠正。端到端 `train_ppo` 12 局：对手 112 手 / 学习方 112 手、`unmatched=0`；界面路径 `repro_concurrency 1 4 4` 不崩 |
 > | CMake 坑 | 池子的构造放在**独立 TU** `src/ppo_train_opponents.cpp`（否则 15 个链接 `ppomcts_agent.cpp` 的目标都要补 mcts.cpp + abagent.cpp）；`trainSelfPlay` 驱动对手**只走虚函数**，MCTS 预算由 `BudgetMcts` 薄壳实现。⚠ 本轮又踩了仓库记过的那条：新增 .cpp 要加到**每个直接列源文件的目标**上（漏了 `repro_concurrency`），而且**只 build `chess` 不会重链 `repro_concurrency.exe`** ⇒ 旧二进制会给出假通过 |
 

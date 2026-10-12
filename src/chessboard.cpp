@@ -1586,6 +1586,29 @@ std::string ChessBoard::weightLoadHint() const
     return s.toStdString();
 }
 
+/*
+   [2026-10 第四轮] 把"这一轮训练抽到了哪些对手"写成一行日志。
+   为什么要有它: 采样比例错了 (少一档 AB / 全抽 MCTS) 在损失曲线上**完全看不出来**,
+   而这一行是界面路径上唯一能看见它的地方 (工具侧的对应读数是 train_ppo 的直方图)。
+   口径: 每轮一行, 列出"名字 (占比) 局数/手数"; 全 0 局的对手也印出来, 便于发现问题。
+*/
+static QString mixedOpponentRoundLine(const PPOMCTSAgent &ag)
+{
+    const std::vector<PPOMCTSAgent::OpponentUse> pool = ag.trainOpponentUsage();
+    if (pool.empty()) {
+        return QString();
+    }
+    QString s = QStringLiteral("[train] 混合对手: 共 %1 局 |").arg(ag.mixedOpponentGames());
+    for (std::size_t i = 0; i < pool.size(); i++) {
+        s += QStringLiteral(" %1(%.3f) %2局/%3手")
+                 .arg(QString::fromStdString(pool[i].name))
+                 .arg((double)pool[i].weight, 0, 'f', 3)
+                 .arg(pool[i].games)
+                 .arg(pool[i].plies);
+    }
+    s += QStringLiteral(" | 学习方进轨迹 %1 手").arg(ag.learnerPlyCount());
+    return s;
+}
 ChessBoard::ChessBoard(QWidget *parent) :
     QWidget(parent),
     selectID(-1),
@@ -1596,6 +1619,14 @@ ChessBoard::ChessBoard(QWidget *parent) :
     m_dbEnabled(false),
     m_agentType(AGENT_ALPHABETA)
 {
+    /*
+       [2026-10 第四轮] 混合对手池的**默认值来自那四个常量** (单一来源): 只有一处决定
+       "出厂口径", 而界面上那个勾选框 (setMixedOpponentTrainingEnabled) 改的是运行期值。
+    */
+    m_mixedOpponents.store(BG_TRAIN_MIXED_OPPONENTS);
+    m_mixedMctsShare.store(BG_TRAIN_MCTS_SHARE);
+    m_mixedMctsSims.store(BG_TRAIN_OPPONENT_MCTS_SIMS);
+    m_mixedAbDepth.store(BG_TRAIN_OPPONENT_AB_DEPTH);
     connect(this, &ChessBoard::sendResult,
             this, &ChessBoard::checkGameOver, Qt::QueuedConnection);
     initThinkVisuals();
@@ -6005,6 +6036,20 @@ void ChessBoard::stopBackgroundTraining()
     }
 }
 
+void ChessBoard::setMixedOpponentConfig(float mctsShare, int mctsSims, int abMaxDepth)
+{
+    /*
+       参数越界时**纠正到合法区间** —— 与 PPOMCTSAgent::enableMixedOpponentTraining 同一条
+       口径 (两处都做, 因为"界面上填错了"与"库里被直接调用"是两条入口)。
+    */
+    if (mctsShare < 0.0f) { mctsShare = 0.0f; }
+    if (mctsShare > 1.0f) { mctsShare = 1.0f; }
+    if (abMaxDepth < 0) { abMaxDepth = 0; }
+    m_mixedMctsShare.store(mctsShare);
+    m_mixedMctsSims.store((mctsSims > 0) ? mctsSims : 800);
+    m_mixedAbDepth.store(abMaxDepth);
+}
+
 void ChessBoard::setBackgroundTrainRound(int episodes, int maxMoves)
 {
     m_bgTrainEpisodes = (episodes > 0) ? episodes : 1;
@@ -7159,10 +7204,10 @@ void ChessBoard::backgroundTrainLoop()
                    池子是运行期对象、不进权重文件, 所以放在 loadModel 前/后都等价; 关键是
                    必须在 `trainSelfPlay` 之前。
                 */
-                if (BG_TRAIN_MIXED_OPPONENTS) {
-                    clone.enableMixedOpponentTraining(BG_TRAIN_MCTS_SHARE,
-                                                      BG_TRAIN_OPPONENT_MCTS_SIMS,
-                                                      BG_TRAIN_OPPONENT_AB_DEPTH);
+                if (isMixedOpponentTrainingEnabled()) {
+                    clone.enableMixedOpponentTraining(getMixedOpponentMctsShare(),
+                                                      getMixedOpponentMctsSims(),
+                                                      getMixedOpponentAbDepth());
                 }
                 if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS clone 载入种子权重失败, 本轮丢弃"
@@ -7178,6 +7223,11 @@ void ChessBoard::backgroundTrainLoop()
                    BG_TRAIN_SIMS 的长注释)。MLP 那一支用 PPO_MLP_SIMS 是因为它便宜
                    (0.35 s/手 ⇒ 一轮 21 s), 不是因为它该有更大预算。
                 */
+                /* [2026-10 第四轮] 本轮抽到了哪些对手 (界面路径上唯一能看见采样的地方) */
+                {
+                    const QString line = mixedOpponentRoundLine(clone);
+                    if (!line.isEmpty()) { qInfo().noquote() << line; }
+                }
                 clone.trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
                                     roundMaxMoves, false);
                 roundLoss = clone.getLastTrainLoss();
@@ -7232,15 +7282,19 @@ void ChessBoard::backgroundTrainLoop()
                    之前 (偏置是非参数缓冲, 不进权重文件 —— 漏掉在读数上看不出来) */
                 applyPpoBalance(*clone);
                 /* [2026-10 第四轮] 混合对手池 (与 seq 那一支同一条口径, 见那里的注释) */
-                if (BG_TRAIN_MIXED_OPPONENTS) {
-                    clone->enableMixedOpponentTraining(BG_TRAIN_MCTS_SHARE,
-                                                       BG_TRAIN_OPPONENT_MCTS_SIMS,
-                                                       BG_TRAIN_OPPONENT_AB_DEPTH);
+                if (isMixedOpponentTrainingEnabled()) {
+                    clone->enableMixedOpponentTraining(getMixedOpponentMctsShare(),
+                                                       getMixedOpponentMctsSims(),
+                                                       getMixedOpponentAbDepth());
                 }
                 if (!clone->loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS (卷积残差) clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
                     break;
+                }
+                {
+                    const QString line = mixedOpponentRoundLine(*clone);
+                    if (!line.isEmpty()) { qInfo().noquote() << line; }
                 }
                 clone->trainSelfPlay(roundEpisodes, BG_TRAIN_SIMS,
                                      roundMaxMoves, false);

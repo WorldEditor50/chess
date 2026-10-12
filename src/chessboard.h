@@ -637,6 +637,30 @@ public:
     int getPreTrainSteps() const { return m_preTrainSteps.load(); }
     /* 每次"探索环境 + 预训练"的说明 (线程安全) */
     std::string getLastExploreInfo() const;
+    /*
+       ================================================================
+       [2026-10 第四轮] **混合对手池** (后台训练的对手, 用户口径)
+       ================================================================
+       用户口径: "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%,
+       其余 abagent 平分, 按照均匀分布采样选择 agent 对弈训练"。
+
+       这一组是**界面上的开关** (训练面板里的"混合对手池"勾选框): 勾上之后, 两个 PPO
+       变体 (AGENT_PPOMCTS / AGENT_PPOMCTS_CONV) 的**后台训练 clone** 会带着对手池训练
+       —— 每局按均匀分布抽一个对手 (MCTS 占 `mctsShare`, 其余平分给 AB-L1..L4),
+       对手的手只推进局面、**不进学习方的样本**, 且每局换先手 (完整说明见
+       `ppomcts_agent.h` 的"训练对手池"一节)。
+
+       默认值在构造函数里从 `chessboard.cpp` 的四个常量取一次, 所以"什么都不动"时
+       行为与那一版逐位相同。⚠ 代价: MCTS 对手 800 次迭代 ≈ 1.0 s/手 ⇒ 一局 60 手
+       上限大约多花 ~30 s; 把 `mctsSims` 调小可以换墙钟。
+       ================================================================
+    */
+    void setMixedOpponentTrainingEnabled(bool on) { m_mixedOpponents.store(on); }
+    bool isMixedOpponentTrainingEnabled() const { return m_mixedOpponents.load(); }
+    void setMixedOpponentConfig(float mctsShare, int mctsSims, int abMaxDepth);
+    float getMixedOpponentMctsShare() const { return m_mixedMctsShare.load(); }
+    int getMixedOpponentMctsSims() const { return m_mixedMctsSims.load(); }
+    int getMixedOpponentAbDepth() const { return m_mixedAbDepth.load(); }
 
     /*
      * 当前 agent 的**自检报告** (界面"模型自检"面板的数据源)。
@@ -1948,7 +1972,14 @@ private:
      * 每轮开头读, 两边不需要更强的同步 (读到的是"上一轮或这一轮"的规模, 都合法)。
      * 初值 = chessboard.cpp 里的 BG_TRAIN_EPISODES / BG_TRAIN_MAX_MOVES。
      */
-    std::atomic<int> m_bgTrainEpisodes{1};
+    /*
+       [2026-10 第四轮] 混合对手池的开关与参数 (界面训练面板的那一个勾选框)。
+       真值由**构造函数**从 chessboard.cpp 的 BG_TRAIN_* 常量取 (单一来源)。
+    */
+    std::atomic<bool> m_mixedOpponents{false};
+    std::atomic<float> m_mixedMctsShare{0.5f};
+    std::atomic<int> m_mixedMctsSims{800};
+    std::atomic<int> m_mixedAbDepth{4};    std::atomic<int> m_bgTrainEpisodes{1};
     std::atomic<int> m_bgTrainMaxMoves{60};
     /*
      * mutable: 自检 (const 方法) 要读常驻 agent 的内部状态, 而那与"决策中的搜索"和

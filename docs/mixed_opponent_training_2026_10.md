@@ -109,7 +109,35 @@ cmake --build <build> --target chess repro_concurrency   :: ⚠ 两个都要 bui
 <build>\repro_concurrency.exe 1 4 4
 ```
 
-## 7. 诚实边界
+---
+
+## 7. 界面接线（用户口径："接入 chess 程序"）
+
+不只是"后台训练默认打开"，而是**界面上一等的开关 + 可见读数**：
+
+| 项 | 位置 / 内容 |
+|---|---|
+| **勾选框** | 训练面板那一行（"模式 / 对手入训 / **混合对手池** / 动态奖励"）：`mainwindow.cpp` 用代码插入（与旁边那个"对手入训"同一手法 —— 不写进 `mainwindow.ui`，免得那个文件的编码被一串新控件搞乱）。名字 `mixedOpponentCheck`，勾选状态启动时由 `ChessBoard::isMixedOpponentTrainingEnabled()` 给出 |
+| 提示框 | 完整写清：**MCTS 50% + AB-L1..L4 各 12.5%**、每局开头抽一次、两条边界（对手的手不进样本 / 每局换先手）、代价（MCTS 800 次迭代 ≈ 1.0 s/手 ⇒ 一局 60 手多 ~30 s）、关掉即回纯自对弈 |
+| 开关语义 | `ChessBoard::setMixedOpponentTrainingEnabled(bool)`（`std::atomic`，与 `setPreTrainEnabled` 同一套线程口径）；参数 `setMixedOpponentConfig(mctsShare, mctsSims, abMaxDepth)` 带越界纠正；**默认值来自 `chessboard.cpp` 的四个常量**（构造函数里取一次）⇒ 只有一处决定"出厂口径" |
+| 生效点 | 两个 PPO 变体（`AGENT_PPOMCTS` / `AGENT_PPOMCTS_CONV`）的**后台训练 clone** 在 `trainSelfPlay` 之前按运行期开关打开池子；MLP 那一支与 SAC/DQN 那几支**不受影响**（口径是"PPO 这条线的对弈训练"） |
+| **每轮读数** | 每轮训练结束打一行：`[train] 混合对手: 共 N 局 \| MCTS(800)(0.500) x局/y手 AB-L1(0.125) … \| 学习方进轨迹 M 手`。**为什么要它**：采样比例错了（少一档 AB / 全抽 MCTS）在损失曲线上**完全看不出来**，这一行是界面路径上唯一能看见它的地方（工具侧的对应读数是 `train_ppo` 报告末尾的直方图）。走 Qt 的 `qInfo`，与仓库其它诊断（`[P1] 对手入训 = …`、`[weights] …`）同一条通道，在 Qt Creator 的 Application Output 里看 |
+
+**验证（实测）**：
+
+| 项 | 读数 |
+|---|---|
+| `chess` + `repro_concurrency` 构建 | 0 error（56 步；⚠ 必须两个一起 build，只 build `chess` 不会重链 harness —— 见 §4 的坑） |
+| **界面路径真的在跑池子** | `repro_concurrency 1 4 4`（界面路径：`ChessBoard` + 后台训练 + 自动保存）**耗时 17 s → 50 s** —— 这一轮 60 手上限的后台训练里，对手（MCTS 800 次迭代 ≈ 1.0 s/手）大约走一半 ⇒ 与"池子生效"的预期吻合；不崩、`保存=1`。**关掉勾选框就回到原来的 ~17 s** |
+| 人机路径 | `probe_hvai_flow`（构造 `MainWindow` ⇒ 新的勾选框代码真的跑到了）`失败项: 0` |
+| 单元 | `test_mixed_opponents` **33 断言 / 0 失败**（§3） |
+
+> **为什么"每轮一行 qInfo"就够了**：这一支的读数归 Qt 的日志通道（仓库里 `[P1] 对手入训`、
+> `[weights]`、`[selfcheck]` 都是这么报的），而不是画在某个面板上；面板上真要看"这一轮用了
+> 哪些对手"，要么新加一个列表控件、要么把对手名混进损失曲线的线名（那会污染按 agent 名分线的
+> 既有读数）。**本轮选了 qInfo + 工具侧直方图这两条**，并把"没做面板控件"写在这里。
+
+## 8. 诚实边界
 
 1. **本轮没有量棋力**：这份交付是"训练分布"的实现与验证（采样比例、两条边界、
    端到端能跑通）。"混合对手训练出来的权重比纯自对弈强多少"需要按
@@ -120,5 +148,5 @@ cmake --build <build> --target chess repro_concurrency   :: ⚠ 两个都要 bui
 3. **AB 的深度口径是"ABAgent 的搜索深度"**（1..4），与界面上的 `AGENT_AB_L1/L2/L3` +
    `AGENT_ALPHABETA`(深度 4) 同源；MCTS 的预算显式给 800（= 界面 MCTS agent），
    可用 `--opponent-mcts-sims` 改小来换墙钟。
-4. **默认关**这一点是刻意的：不开池子时 `trainSelfPlay` 一行额外代码都不执行
-   （不画随机数、不建实例），所以既有的自对弈读数与改动前**逐位可比**。
+4. **界面默认开、库默认关**：库侧 `trainSelfPlay` 在不打开池子时一行额外代码都不执行
+   （不画随机数、不建实例），所以既有的自对弈读数与改动前**逐位可比**；界面侧默认勾上（`BG_TRAIN_MIXED_OPPONENTS = true`），不想用就取消勾选。
