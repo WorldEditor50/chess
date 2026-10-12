@@ -3339,6 +3339,20 @@ mainwindow    kAgents 里多一行, 于是两个骨干能在界面上直接对�
 > | 反直觉的一条 | conv 的 **BC 留出 CE 比 seq+2d 差 0.038 nats**（2.5567 vs 2.5188）却在棋力上更好 ⇒ **保真度不是棋力**；收益更可能来自空间归纳偏置在"BC 没覆盖到的局面"上的泛化（该解释**本轮没有直接验证**） |
 > | 顺手修的缺陷 | `PPOMCTSAgent::selfCheckReport()` 的 backbone switch 原来是 `case TbExperts: default:` ⇒ **任何新骨干都会被错报成 TB**；现在五个枚举值逐个显式列出（第 6 种骨干会由 MSVC 提醒） |
 > | 明确没做 | MoE 的 E=1 vs E=4 消融、残差块数 1/2/4/6、坐标通道消融、200 局确认 —— 每一项都要另训一份权重 + 一轮对局，命令都写在上面那份文档 §7 |
+> **[2026-10 第四轮] PPO 的训练加了「混合对手池」**（MCTS 50% + AB-L1..L4 各 12.5%）。**
+> 用户口径："实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%, 其余 abagent 平分,
+> 按照均匀分布采样选择 agent 对弈训练"。完整读数与验证见
+> **`docs/mixed_opponent_training_2026_10.md`**。
+>
+> | 项 | 内容 |
+> |---|---|
+> | 语义 | **每局开头**按一次 `U(0,1)` 落在权重累积区间抽一个对手（MCTS `[0,0.5)`、AB-L1 `[0.5,0.625)`…）；用 `RL::Random` ⇒ 同一 seed 下对手序列可复现 |
+> | 两条边界 | ① 对手的手**只推进局面、不进学习方的样本**（自对弈里"对手那一半"是 on-policy，换成真对手就变成"off-policy 打着 on-policy 的标签"，PPO 要行为策略）；② **每局换先手**（否则红黑样本量不对称）。与 `aiagent.h` 的 `OpponentPolicy` 同一套纪律 |
+> | API | `PPOMCTSAgent::enableMixedOpponentTraining(mctsShare=0.5, mctsIterations=800, abMaxDepth=4)` / `disable…()` / `trainOpponentUsage()` / `mixedOpponentGames()` / `learnerPlyCount()`；默认**关** ⇒ 纯自对弈与改动前逐位相同 |
+> | 工具 | `train_ppo --opponents=mixed [--mcts-share] [--opponent-mcts-sims] [--ab-max-depth]` + 报告末尾的**采样直方图**与"学习方进轨迹的手数" |
+> | 界面 | `chessboard.cpp` 的 `BG_TRAIN_MIXED_OPPONENTS = true`（两个 PPO 变体的后台训练 clone 都打开；关掉 = 回到纯自对弈）。代价：MCTS 800 次迭代 ≈ 1.0 s/手 ⇒ 一轮 60 手多 ~30 s |
+> | 验证 | 新 ctest 套件 **`test_mixed_opponents`（33 断言 / 0 失败）**：池子权重和为 1、**200 局直方图落在二项 5σ 内**（MCTS 正好 100/200）、换先手、`maxMoves=1` 时"对手 10 手 / 学习方 10 手"对账、默认关、参数越界被纠正。端到端 `train_ppo` 12 局：对手 112 手 / 学习方 112 手、`unmatched=0`；界面路径 `repro_concurrency 1 4 4` 不崩 |
+> | CMake 坑 | 池子的构造放在**独立 TU** `src/ppo_train_opponents.cpp`（否则 15 个链接 `ppomcts_agent.cpp` 的目标都要补 mcts.cpp + abagent.cpp）；`trainSelfPlay` 驱动对手**只走虚函数**，MCTS 预算由 `BudgetMcts` 薄壳实现。⚠ 本轮又踩了仓库记过的那条：新增 .cpp 要加到**每个直接列源文件的目标**上（漏了 `repro_concurrency`），而且**只 build `chess` 不会重链 `repro_concurrency.exe`** ⇒ 旧二进制会给出假通过 |
 
 ### 21.4 顺带修掉的两个真问题
 

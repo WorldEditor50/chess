@@ -273,6 +273,45 @@ public:
     int ttMaxDepth = 12;               /* 只把深度 ≤ 它的节点登记进置换表 */
 
     /* ================================================================
+     *  训练对手池 (混合对局) —— 见下面 训练对手池 一节的完整说明 (2026-10 第四轮)
+     * ================================================================
+     *  全空 (默认) = 纯自对弈, 行为与改动前逐位相同。对手实例**绑定在本 agent 的
+     *  `chess` 上** —— 与 bench_agent_arena 的"所有 agent 必须绑定同一个棋盘"
+     *  是同一条纪律 (各持一个棋盘的后果是"第二个走子的那一方永远被判非法走子")。
+     *
+     *  ⚠ `TrainOpponent` / `OpponentUse` 必须在**成员声明之前**定义 (C++ 里成员的类型
+     *  要先可见), 所以这两个小结构放在这里而不是与那几个方法挨着。
+     * ================================================================ */
+    struct TrainOpponent
+    {
+        std::string name;            /* "MCTS" / "AB-L1" … (读数与日志用) */
+        float weight = 0.0f;         /* 采样概率 (和为 1) */
+        int abDepth = 0;             /* 0 = MCTS; >0 = ABAgent 的深度 */
+        std::shared_ptr<AgentBase> agent;   /* 绑定在**本 agent 的棋盘**上 */
+        int games = 0;               /* 被抽中的局数 */
+        int plies = 0;               /* 它真的走了多少手 */
+        int unmatched = 0;           /* 着法非法/问不到而回退给学习方的次数 */
+    };
+    struct OpponentUse
+    {
+        std::string name;
+        float weight = 0.0f;
+        int games = 0;
+        int plies = 0;
+        int unmatched = 0;
+    };
+    std::vector<TrainOpponent> m_opponents;
+    bool m_mixedOpponents = false;
+    float m_mctsShare = 0.5f;
+    int m_mctsIterations = 800;
+    int m_oppGames = 0;
+    /*
+       学习方**真正进了轨迹**的手数 (混合对局里用来核对"对手的手不进样本"这条边界:
+       对手走的手只推进局面, 不计进这里)。纯自对弈时它 == "学习方走的手数"。
+    */
+    int m_learnerPlies = 0;
+
+    /* ================================================================
      *  根节点 Dirichlet 噪声 (AlphaZero 的探索机制, 2026-09 补)
      * ================================================================
      *  为什么必须有它: 这套搜索的"扩展开关"是**确定性**的 (按先验挑最大的未展开着法),
@@ -937,6 +976,57 @@ public:
     void trainSelfPlay(int episodes, int simulations,
                        int maxMoves = 200, bool verbose = true,
                        float tempRoot = 1.0f, float tempFinal = 0.1f);
+
+    /*
+       ================================================================
+       [2026-10 第四轮] **训练对手池 (混合对局)**
+       ================================================================
+       用户口径: "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%,
+       其余 abagent 平分, 按照均匀分布采样选择 agent 对弈训练"。
+
+       语义 (三条, 缺一条就不是这句话的意思):
+         * **每局抽一个对手** (而不是每手): "对局数量占 50%" 说的是**局**的比例;
+         * 采样 = 一次 `U(0,1)` 落在权重累积区间的那一段 ⇒ MCTS **50%**,
+           AB-L1/2/3/4 **各 12.5%** (由 `mctsShare` 与 `abMaxDepth` 参数化,
+           默认就是用户口径的 0.5 / 4 档);
+         * 用 `RL::Random` (与 `setSeed` 同一颗引擎) ⇒ 同一 seed 下**同一串对手序列**,
+           训练可复现 —— 这也是本工程所有随机性的统一口径。
+
+       ⚠ 两条必须写清楚的**边界** (它们决定了这个功能的适用范围):
+        1. **对手的手不进学习方的样本**。自对弈里"对手那一半"是学习方自己采样出来的,
+           所以记成它的动作转移是 on-policy; 换成真对手之后同一份记录会变成
+           "off-policy 却打着 on-policy 的标签" (PPO 要行为策略) ⇒ 那是实打实的偏差。
+           所以对手的手**只推进局面**: 学习方自己的转移落在"被真对手应手之后的局面"上,
+           回报因此带着对手的影响 —— 这正是"从对手身上学"的内容。
+           (与 `OpponentPolicy` 的纪律逐字相同, 见 aiagent.h 顶部。)
+        2. **每局换先手** (奇数局对手执红) —— 否则红黑两侧的样本量会不对称,
+           而象棋的先手优势很大 (判据与 `bench_agent_arena` 的"交换先后手"同源)。
+
+       默认**关**: 不开时 `trainSelfPlay` 的行为与改动前**逐位相同**
+       (不画额外的随机数、不建任何对手实例)。
+       (`TrainOpponent` / `OpponentUse` 两个结构定义在成员声明那一段, 见那里的说明。)
+    */
+    /*
+       启用混合对手训练: `mctsShare` 给 MCTS, 剩下的**平分**给深度 1..`abMaxDepth` 的 AB。
+       `mctsIterations` 是 MCTS 对手每手的预算 (界面 MCTS agent 是 800, 也是本函数的默认)。
+    */
+    void enableMixedOpponentTraining(float mctsShare = 0.5f,
+                                     int mctsIterations = 800,
+                                     int abMaxDepth = 4);
+    void disableMixedOpponentTraining();
+    bool mixedOpponentTrainingEnabled() const { return m_mixedOpponents; }
+    float mixedOpponentMctsShare() const { return m_mctsShare; }
+    int mixedOpponentMctsSims() const { return m_mctsIterations; }
+    /* 混合对局里"抽中过对手"的局数 (对照总对局数就能看出采样有没有生效) */
+    int mixedOpponentGames() const { return m_oppGames; }
+    /* 学习方进过轨迹的手数 (对手的手不计; 见 m_learnerPlies 的说明) */
+    int learnerPlyCount() const { return m_learnerPlies; }
+    std::vector<OpponentUse> trainOpponentUsage() const;
+    /* 这一手该由对手走吗 (供测试直接核对"换先手"与"对手不进样本"两条边界) */
+    int mixedOpponentColorForEpisode(int episode) const
+    {
+        return (episode % 2 == 0) ? Stone::COLOR_BLACK : Stone::COLOR_RED;
+    }
 
     /* Warmup: self-play several episodes from current board state (in place) */
     void warmupFromCurrent(int episodes = 5, int simulations = 200,

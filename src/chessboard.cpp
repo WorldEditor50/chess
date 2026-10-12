@@ -621,6 +621,28 @@ static constexpr int BG_TRAIN_EPISODES = 1;   /* 每轮训练局数 */
 static constexpr int BG_TRAIN_MAX_MOVES = 60; /* 每局步数上限 (必须 > 32, 见上) */
 static constexpr int BG_TRAIN_SIMS = 400;     /* MCTS 类 agent 每步的模拟次数 (须远大于分支数) */
 /*
+ * ================================================================
+ *  [2026-10 第四轮] 后台训练的**对手池** (混合对局)
+ * ================================================================
+ *  用户口径: "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%,
+ *            其余 abagent 平分, 按照均匀分布采样选择 agent 对弈训练"。
+ *
+ *  落地: 两个 PPO 变体 (AGENT_PPOMCTS / AGENT_PPOMCTS_CONV) 的后台训练 clone 在
+ *  `trainSelfPlay` 之前打开对手池 —— 每局按均匀分布抽一个对手 (MCTS 50%,
+ *  AB-L1..L4 各 12.5%), 对手的手**不进学习方的样本** (只推进局面), 每局换先手。
+ *  语义与两条边界的完整说明见 `src/ppomcts_agent.h` 的"训练对手池"一节。
+ *
+ *  ⚠ **代价**: MCTS 对手 800 次迭代 ≈ 1.0 s/手 (实测 1.24 ms/迭代), 一局 60 手上限里
+ *    它大约走一半 ⇒ **每轮多 ~30 s**; AB-L1..L4 是 0/3/34/90 ms 量级, 可忽略。
+ *    换来的东西是"学习方的回报带着真对手的影响" —— 纯自对弈学到的永远是"怎么跟自己下"。
+ *  ⚠ 关掉它就回到纯自对弈 (与改动前逐位相同): 把下面这个常量改成 false。
+ * ================================================================
+ */
+static constexpr bool BG_TRAIN_MIXED_OPPONENTS = true;
+static constexpr float BG_TRAIN_MCTS_SHARE = 0.5f;            /* 用户口径: MCTS 占一半 */
+static constexpr int BG_TRAIN_OPPONENT_MCTS_SIMS = MCTS_SIMS; /* = 800, 与界面 MCTS agent 同预算 */
+static constexpr int BG_TRAIN_OPPONENT_AB_DEPTH = 4;          /* AB-L1..L4 平分剩下的一半 */
+/*
  * EVAB 后台训练的搜索深度。**不能照抄界面的 EVAB_DEPTH(6)**: 一轮是
  * BG_TRAIN_EPISODES 局 x BG_TRAIN_MAX_MOVES 手, 而 EVAB 的每一手要搜两次
  * (playDepth 选步 + labelDepth 生成 TD-leaf 标签, 见 evagent.h 的 trainSelfPlay)。
@@ -7130,6 +7152,18 @@ void ChessBoard::backgroundTrainLoop()
                    在权重往返上**看不出来** (偏置是非参数缓冲, 不进权重文件)。
                 */
                 applyPpoBalance(clone);
+                /*
+                   [2026-10 第四轮] **混合对手池** (用户口径): 这一轮训练里每局按均匀分布
+                   抽一个对手 —— MCTS 50%, AB-L1..L4 各 12.5%。对手的手只推进局面, **不进
+                   学习方的样本** (见 ppomcts_agent.h 的"训练对手池"一节)。
+                   池子是运行期对象、不进权重文件, 所以放在 loadModel 前/后都等价; 关键是
+                   必须在 `trainSelfPlay` 之前。
+                */
+                if (BG_TRAIN_MIXED_OPPONENTS) {
+                    clone.enableMixedOpponentTraining(BG_TRAIN_MCTS_SHARE,
+                                                      BG_TRAIN_OPPONENT_MCTS_SIMS,
+                                                      BG_TRAIN_OPPONENT_AB_DEPTH);
+                }
                 if (!clone.loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
@@ -7197,6 +7231,12 @@ void ChessBoard::backgroundTrainLoop()
                 /* 与另外两支同一条纪律: 均衡/门控接线必须与主 agent 一致, 且在 loadModel
                    之前 (偏置是非参数缓冲, 不进权重文件 —— 漏掉在读数上看不出来) */
                 applyPpoBalance(*clone);
+                /* [2026-10 第四轮] 混合对手池 (与 seq 那一支同一条口径, 见那里的注释) */
+                if (BG_TRAIN_MIXED_OPPONENTS) {
+                    clone->enableMixedOpponentTraining(BG_TRAIN_MCTS_SHARE,
+                                                       BG_TRAIN_OPPONENT_MCTS_SIMS,
+                                                       BG_TRAIN_OPPONENT_AB_DEPTH);
+                }
                 if (!clone->loadModel(tmpWeights)) {
                     qWarning() << "[train] PPO+MCTS (卷积残差) clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";

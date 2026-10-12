@@ -136,6 +136,18 @@ struct Cfg {
     */
     std::string posKey;
     float dropoutP = -1.0f;
+    /*
+       ---- [2026-10 第四轮] 混合对手训练 (用户口径) ----
+       "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%, 其余 abagent 平分,
+        按照均匀分布采样选择 agent 对弈训练"。
+         * `mixedOpponents=false` (默认) ⇒ **纯自对弈, 与改动前逐位相同**;
+         * `mctsShare` 给 MCTS, 剩下的平分给深度 1..`abMaxDepth` 的 AB;
+         * 对手的手**不进学习方的样本** (只推进局面), 见 ppomcts_agent.h 那一节。
+    */
+    bool mixedOpponents = false;
+    float mctsShare = 0.5f;
+    int opponentMctsSims = 800;   /* = 界面 MCTS agent 的预算 (MCTS_SIMS) */
+    int abMaxDepth = 4;
 };
 
 Cfg g_cfg;
@@ -189,6 +201,14 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--backbone") { g_cfg.backbone = v; }
         else if (k == "--pos") { g_cfg.posKey = v; }
         else if (k == "--dropout") { g_cfg.dropoutP = (float)std::atof(v.c_str()); }
+        /*
+           [2026-10 第四轮] 混合对手池 (见 Cfg 那一节)。`--opponents=mixed` 打开,
+           其余三个参数只在打开时生效 (不开时它们不影响任何行为)。
+        */
+        else if (k == "--opponents") { g_cfg.mixedOpponents = (v == "mixed" || v == "1"); }
+        else if (k == "--mcts-share") { g_cfg.mctsShare = (float)std::atof(v.c_str()); }
+        else if (k == "--opponent-mcts-sims") { g_cfg.opponentMctsSims = std::atoi(v.c_str()); }
+        else if (k == "--ab-max-depth") { g_cfg.abMaxDepth = std::atoi(v.c_str()); }
         else if (k == "--grad-clip") { g_cfg.gradClip = v; }
         else if (k == "--grad-clip-norm") { g_cfg.gradClipNorm = (float)std::atof(v.c_str()); }
         else if (k == "--quiet") { g_cfg.verbose = false; }
@@ -210,6 +230,11 @@ bool parseArgs(int argc, char **argv)
                 "                 [--pos=1d|2d|rope]      序列专家的位置编码 (默认 1d = 老行为;\n"
                 "                                          只对 --backbone=seq 有效, 其它骨干响亮失败)\n"
                 "                 [--dropout=F]           序列专家的 dropout (默认不调用 = 关闭)\n"
+                "                 [--opponents=mixed]     [2026-10] **混合对手训练**: 每局抽一个对手\n"
+                "                                         (MCTS 占 --mcts-share, 其余平分给 AB-L1..--ab-max-depth)\n"
+                "                 [--mcts-share=F]        MCTS 的对局占比 (默认 0.5)\n"
+                "                 [--opponent-mcts-sims=N] MCTS 对手每手的模拟次数 (默认 800 = 界面 MCTS)\n"
+                "                 [--ab-max-depth=N]      AB 对手的最高深度 (默认 4 ⇒ L1..L4 各 12.5%)\n"
                 "                 [--grad-clip=legacy|global|none] [--grad-clip-norm=F]\n");
             return false;
         } else {
@@ -360,6 +385,23 @@ int main(int argc, char **argv)
                 g_cfg.materialReward ? "开" : "关",
                 g_cfg.truncationBootstrap ? "开" : "关");
     std::printf("  I/O    : 每局 0 次权重往返 (GUI 路径是 3 趟 x ~555 MB)\n");
+    /*
+       [2026-10 第四轮] 混合对手池: **建网之后、训练之前**打开一次 (对手实例绑定在
+       agent 自己的棋盘上, 所以必须在 agent 建好之后)。不开时这一段一行都不执行 ⇒
+       纯自对弈的行为与改动前逐位相同。
+    */
+    if (g_cfg.mixedOpponents) {
+        ag.enableMixedOpponentTraining(g_cfg.mctsShare, g_cfg.opponentMctsSims,
+                                       g_cfg.abMaxDepth);
+        std::printf("  对手池 : **混合对局** (均匀分布采样, 每局抽一次)\n");
+        const std::vector<PPOMCTSAgent::OpponentUse> pool = ag.trainOpponentUsage();
+        for (std::size_t i = 0; i < pool.size(); i++) {
+            std::printf("           %-6s 占比 %.3f (%d 局 / %d 手)\n", pool[i].name.c_str(),
+                        (double)pool[i].weight, pool[i].games, pool[i].plies);
+        }
+        std::printf("           ⚠ 对手的着法**不进学习方的样本** (只推进局面), 见 "
+                    "ppomcts_agent.h 的'训练对手池'一节\n");
+    }
 
     if (!g_cfg.loadPrefix.empty()) {
         if (ag.loadModel(g_cfg.loadPrefix)) {
@@ -590,6 +632,29 @@ int main(int argc, char **argv)
         RL::Diag::scalarRow(tb, "sum_mean_plies", step, agg.meanPlies());
         RL::Diag::scalarRow(tb, "sum_distinct_openings", step, (double)agg.distinctOpenings());
         std::printf("  CSV 汇总行已写入 (step=%lld)\n", step);
+    }
+
+    /*
+       [2026-10 第四轮] 混合对手的**实测直方图** (读数, 不是自称):
+       采样是"每局一次 U(0,1) 落在权重区间", 所以实际抽中的比例要与配置比对 ——
+       "以为在用 50/12.5x4, 其实全抽到 MCTS" 这类偏差在损失曲线上看不出来。
+       期望值 = 权重 x 总对局数; 报**偏差**比报比例更直接 (小样本下方差本来就有)。
+    */
+    if (g_cfg.mixedOpponents) {
+        const std::vector<PPOMCTSAgent::OpponentUse> pool = ag.trainOpponentUsage();
+        const int total = ag.mixedOpponentGames();
+        std::printf("=== 混合对手采样直方图 (共 %d 局抽过对手 / 自计对局 %d) ===\n",
+                    total, ag.getTotalEpisodes());
+        for (std::size_t i = 0; i < pool.size(); i++) {
+            const double expect = (double)pool[i].weight * (double)total;
+            std::printf("  %-6s 权重 %.3f | 实测 %3d 局 (期望 %.1f, 偏差 %+d) | 走了 %4d 手"
+                        " | 回退 %d 次\n",
+                        pool[i].name.c_str(), (double)pool[i].weight, pool[i].games, expect,
+                        pool[i].games - (int)(expect + 0.5), pool[i].plies,
+                        pool[i].unmatched);
+        }
+        std::printf("  学习方进轨迹的手数 = %d (对手的手不计, 这就是"
+                    "\"对手不进样本\"的读数)\n", ag.learnerPlyCount());
     }
 
     if (!g_cfg.savePrefix.empty()) {

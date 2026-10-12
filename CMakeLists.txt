@@ -165,6 +165,11 @@ set(CHESS_CORE_SOURCES
     ${SRC_DIR}/sacazlegacyagent.cpp
     ${SRC_DIR}/dqnabagent.cpp
     ${SRC_DIR}/dqnmctsmoetbagent.cpp
+    # [2026-10 第四轮] 混合对手训练池的**构造** (它需要 MCTS/ABAgent 两个类)。
+    # 为什么单独一个 TU: 写进 ppomcts_agent.cpp 会让 15 个链接它的目标
+    # (train_ppo / bench_ppo_* / test_diag …) 全都得再加 mcts.cpp + abagent.cpp,
+    # 而其中大多数根本不用这个功能。理由见 src/ppo_train_opponents.cpp 顶部。
+    ${SRC_DIR}/ppo_train_opponents.cpp
     ${SRC_DIR}/chessboard.cpp
 )
 add_library(CHESS_CORE STATIC ${CHESS_CORE_SOURCES})
@@ -693,6 +698,11 @@ if(CHESS_BUILD_TESTS)
         # —— 他构建的是整个工程 (Qt Creator 会连带构建这个目标), 不是单独构建 chess。
         # ⚠ 教训: 新增一个 .cpp 要加到**每一个直接列源文件的目标**上, 不能只加
         # CHESS_CORE; 只在 --target chess 下构建是查不出来的。
+        # [2026-10 第四轮] 同一条教训又踩了一次: chessboard.cpp 的后台训练 clone
+        # 现在会调 `PPOMCTSAgent::enableMixedOpponentTraining` (混合对手池), 而它的
+        # 定义在 ppo_train_opponents.cpp 里 —— 本目标直接列源文件, 所以必须显式加它
+        # (漏了的报错正是 LNK2019 指向 enableMixedOpponentTraining)。
+        ${SRC_DIR}/ppo_train_opponents.cpp
         ${SRC_DIR}/dqnmctsmoetbagent.cpp)
     target_include_directories(repro_concurrency PRIVATE ${SRC_DIR})
     target_link_libraries(repro_concurrency PRIVATE
@@ -1527,7 +1537,12 @@ if(CHESS_BUILD_TESTS)
         ${SRC_DIR}/gamedb.cpp
         ${SRC_DIR}/pos.cpp
         ${SRC_DIR}/stone.cpp
-        ${SRC_DIR}/ppomcts_agent.cpp)
+        ${SRC_DIR}/ppomcts_agent.cpp
+        # [2026-10 第四轮] 混合对手池 (--opponents=mixed): 池子的构造在独立 TU 里,
+        # 它需要 MCTS 与 ABAgent 两个类 —— 所以这三个文件只为**用到它的目标**而加。
+        ${SRC_DIR}/ppo_train_opponents.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp)
     target_include_directories(train_ppo PRIVATE ${SRC_DIR})
     target_link_libraries(train_ppo PRIVATE
         RL_CORE
@@ -1721,6 +1736,41 @@ if(CHESS_BUILD_TESTS)
     chess_add_header_deps(test_conv_resnet)
     add_test(NAME test_conv_resnet COMMAND test_conv_resnet)
     set_tests_properties(test_conv_resnet PROPERTIES TIMEOUT 300)
+
+    # ------------------- 混合对手训练池 (2026-10 第四轮, 秒级进 ctest)
+    # 用户口径: "实现 mcts, abagent-1,2,3,4 混合对局, mcts 对局数量占 50%,
+    #           其余 abagent 平分, 按照均匀分布采样选择 agent 对弈训练"。
+    # 这段逻辑住在 PPOMCTSAgent::trainSelfPlay 里 (训练主路径), 采样比例错了不会报错、
+    # 损失曲线也看不出来 ⇒ 必须有一条秒级断言。跑的是**廉价骨干** (MLP 专家,
+    # 每局 1 手 1 模拟), 所以几百局只要几秒 —— 它量的是采样分布, 不是棋力。
+    #   [1] 池子构成与权重 (MCTS 0.5 / AB-L1..L4 各 0.125, 和为 1);
+    #   [2] 200 局的采样直方图落在 5sigma 内 (均匀分布采样生效);
+    #   [3] 每局换先手; [4] 对手的手**不进学习方样本** (learnerPly 对账);
+    #   [5] 默认关 = 纯自对弈; [6] 参数越界被纠正而不是静默换分布。
+    add_executable(test_mixed_opponents
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mixed_opponents_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/ppo_train_opponents.cpp)
+    target_include_directories(test_mixed_opponents PRIVATE ${SRC_DIR})
+    target_link_libraries(test_mixed_opponents PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_mixed_opponents PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_mixed_opponents PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_mixed_opponents)
+    add_test(NAME test_mixed_opponents COMMAND test_mixed_opponents)
+    set_tests_properties(test_mixed_opponents PROPERTIES TIMEOUT 600)
 
     # ------------------- PG "lastLoss 变非有限值且不复位" 的定位探针 (不进 ctest)
     # test_match [2.7b] 曾经时真时假 (一次绿一次红), 根因就是 dpg.lastLoss 会变成

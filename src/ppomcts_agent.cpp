@@ -2250,6 +2250,33 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
         unsigned long long openingHash = 0;
         int capRed = 0, capBlack = 0;
         /*
+           ================================================================
+           [2026-10 第四轮] **本局的对手** (混合对局): 一次 U(0,1) 落在权重累积区间
+           ================================================================
+           采样发生在**每局开头** (不是每手): 用户口径说的是"对局数量占 50%"。
+           用 `RL::Random` 而不是新开一颗引擎 —— 同一 seed 下对手序列可复现,
+           而且它与"随机开局"共用同一个随机流 (顺序固定: 先开局后抽对手, 两者都只在
+           每局开头各画一次数)。
+           `oppColor` 每局翻转 (奇数局对手执红): 见头文件那两条边界里的第 2 条。
+           ================================================================
+        */
+        int oppIdx = -1;
+        int oppColor = -1;
+        if (m_mixedOpponents) {
+            std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+            const float u = uni(RL::Random::engine);
+            float acc = 0.0f;
+            for (std::size_t i = 0; i < m_opponents.size(); i++) {
+                acc += m_opponents[i].weight;
+                if (u <= acc || i + 1 == m_opponents.size()) { oppIdx = (int)i; break; }
+            }
+            if (oppIdx >= 0) {
+                m_oppGames++;
+                m_opponents[(std::size_t)oppIdx].games++;
+                oppColor = mixedOpponentColorForEpisode(ep);
+            }
+        }
+        /*
            B-5: **每局**清一次树 (而不是每 ply 清一次)。一局之内子树跨 ply 复用,
            跨局必须失效 —— 否则每个新对局都会在初始局面上命中上一局的根。
            (acquireRoot 的"≤2 步可达"判据也会挡住跨局命中, 这里是显式的双保险。)
@@ -2275,6 +2302,90 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                之后 moveForward 会按落子方的颜色重设 sideToMove, 两者自然一致。
             */
             chess.sideToMove = currentColor;
+            /*
+               ================================================================
+               [2026-10 第四轮] 混合对局: 这一手轮到对手 ⇒ 由对手 agent 直接走
+               ================================================================
+               三条纪律 (缺一条就会静默出错):
+                1. **不入 trajectory / legalPerStep** —— 对手的着法不是学习方采样出来的,
+                   记进去就是把 off-policy 的动作打上 on-policy 的标签 (PPO 要的是行为策略);
+                   它只**推进局面**, 让学习方下一手的转移落在"被真对手应手之后"。
+                2. **着法逐手校验** (与 bench_agent_arena 同): 非法/无效着法记一次
+                   `unmatched` 并**回退到学习方自己走这一手** —— 不是静默跳过, 更不是把
+                   非法着法落到棋盘上。
+                3. 对手也可能**直接终局** (它把学习方将死了): 那条分支按"最后一手是
+                   **对手**"给终局值, 与学习方那条分支用**同一个**表达式
+                   `outcomeForMover(gameResult, currentColor)`。
+               ================================================================
+            */
+            if (oppIdx >= 0 && currentColor == oppColor) {
+                TrainOpponent &op = m_opponents[(std::size_t)oppIdx];
+                Step oppStep;
+                /*
+                   **只走虚函数** `AgentBase::getBestMove` —— 对手的模拟预算由
+                   `ppo_train_opponents.cpp` 里的 `BudgetMcts` 子类实现。
+                   这里若 `static_cast<MCTS*>` 再调 `findBestMove`, 就会让**本文件**
+                   产生对 mcts.cpp 的符号依赖, 而本文件被 15 个目标链接
+                   (其中大多数根本不用这个功能) ⇒ 那 15 个目标都要补两个 .cpp。
+                */
+                oppStep = op.agent->getBestMove(currentColor);
+                std::vector<Step *> oppLegal;
+                chess.sample(currentColor, oppLegal);
+                const bool oppOk = oppStep.valid && !oppLegal.empty()
+                                   && chess.isLegalMove(currentColor, &oppStep);
+                Steps::instance().put(oppLegal);
+                if (oppOk) {
+                    double dummy = 0.0;
+                    chess.moveForward(&oppStep, dummy);
+                    op.plies++;
+                    if (oppStep.nextId != Stone::ID_NONE) {
+                        if (currentColor == Stone::COLOR_RED) { capRed++; } else { capBlack++; }
+                    }
+                    if (moveNum + 1 == 8) { openingHash = chess.computeHash(); }
+
+                    Chess::DrawReason drawReason = Chess::DRAW_NONE;
+                    const int gameResult = chess.getResult(chess.sideToMove, &drawReason);
+                    if (gameResult != Chess::RESULT_ONGOING) {
+                        /* 终局值按**最后一步走子方** (= 对手) 的视角给 */
+                        const float outcomeForLastMover =
+                            outcomeForMover(gameResult, currentColor);
+                        if (!trajectory.empty()) {
+                            commitEpisode(trajectory, outcomeForLastMover, &legalPerStep);
+                        }
+                        totalEpisodes++;
+                        const int winnerColor = winnerOfResult(gameResult);
+                        if (winnerColor == Stone::COLOR_BLACK) { totalWins[1]++; }
+                        if (winnerColor == Stone::COLOR_RED) { totalWins[0]++; }
+                        if (gameLog != nullptr) {
+                            RL::Diag::GameStat gs;
+                            int kind = RL::Diag::END_MATE;
+                            if (gameResult == Chess::RESULT_DRAW) {
+                                kind = (drawReason == Chess::DRAW_NO_CAPTURE60)
+                                           ? RL::Diag::END_DRAW_NO_CAPTURE60
+                                           : RL::Diag::END_DRAW_REPEAT;
+                            }
+                            fillGameStat(gs, (long long)ep + 1, moveNum + 1, gameResult,
+                                         kind, (int)drawReason, openingHash,
+                                         capRed, capBlack);
+                            gameLog->push_back(gs);
+                        }
+                        if (verbose && (ep % printInterval == 0 || ep == episodes - 1)) {
+                            printf("  Episode %4d/%d: 对手 %s 走到第 %d 手 -> %s\n",
+                                   ep + 1, episodes, op.name.c_str(), moveNum + 1,
+                                   (gameResult == Chess::RESULT_DRAW)
+                                       ? "和"
+                                       : ((winnerColor == Stone::COLOR_BLACK) ? "黑胜"
+                                                                             : "红胜"));
+                        }
+                        break;
+                    }
+                    currentColor = (currentColor == Stone::COLOR_RED)
+                                       ? Stone::COLOR_BLACK
+                                       : Stone::COLOR_RED;
+                    continue;    /* 这一手走完, 进入下一手 */
+                }
+                op.unmatched++;   /* 问不到/非法 ⇒ 回退给学习方走这一手 */
+            }
             /* 势能塑形 (Phase 2): 首手之前那个局面的势能, 是第 0 步的 Φ_before */
             m_phiInit = potentialOf(currentColor);
             ppoTrainTrace("[ppo] ep=%d move=%d phi 完成\n", ep, moveNum);
@@ -2548,6 +2659,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                     }
                     trajectory.emplace_back(state, policyTarget,
                                             computeReward(chosenStep, currentColor));
+                    m_learnerPlies++;   /* [2026-10 第四轮] 学习方真的进轨迹的手 (对手走的不计, 见 m_learnerPlies) */
                     /* 势能塑形 (Phase 2): 记下落子**之后**局面的势能 Φ(s_{i+1}) */
                     trajectory.back().potential = potentialOf(chess.sideToMove);
 
@@ -2590,6 +2702,7 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                 }
                 float reward = computeReward(chosenStep, currentColor);
                 trajectory.emplace_back(state, policyTarget, reward);
+                /* 同上: 只有学习方自己的手进轨迹 */ m_learnerPlies++;
                 /* 势能塑形 (Phase 2): 落子后局面的势能 Φ(s_{i+1}) */
                 trajectory.back().potential = potentialOf(chess.sideToMove);
 
