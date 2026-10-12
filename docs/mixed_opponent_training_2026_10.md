@@ -183,7 +183,7 @@ cmake --build <build> --target chess repro_concurrency   :: ⚠ 两个都要 bui
 | 2 | 选中它的那一方**每局**抽一个真 agent，抽中谁就由谁**下完这一局**（整局固定 —— 每手换对手不是"混合对局"，那样连"这一局输给谁"都说不清） | `matchAgents` 每局循环开头 |
 | 3 | 抽签走 `RL::MixedPool::sampleIndex` + `defaultPool` —— 与**训练侧陪练池同一个函数**（唯一定义在 `rl/mixed_opponents.hpp`），所以"训练时的对手分布"与"对局时的对手分布"不会漂开 | `rl/mixed_opponents.hpp` |
 | 4 | 胜负**按抽中的对手分组**记（`MatchStats::poolStats` / `poolGames`），报告里单列一段 | `MatchStats::detail()` |
-| 5 | 自检面板报**它是什么**（构成 / 抽签口径 / 深度→档位映射），不是空串 | `ChessBoard::getAgentSelfCheck(AGENT_MIXED_POOL)` |
+| 5 | 自检面板报**它是什么**（构成 / 抽签口径 / 深度→档位映射），不是空串；"全部模型自检"的名单（`kAll`）里也有它一格 | `ChessBoard::getAgentSelfCheck(AGENT_MIXED_POOL)`、`mainwindow.cpp` |
 
 抽中之后的落点会**写回 `redType/blackType`**，于是对局其余机制（决策路径、开场快照、
 奖励口径、模式闸门、BC 采样）一行都不用改 —— 它们看到的是一支正常的 agent。
@@ -259,7 +259,8 @@ inline int matchAbLevelOfDepth(int abDepth);   // 1..3 -> 1..3; 4 -> 0 (= 主 Al
 | 两边都是池子 | `repro_concurrency 1 4 19 19`：`混合对手池: 出场 2 局`，`A 方: …` / `B 方: …` 两行**各自独立抽签**；`无效走法` 0 次（若只抽一次不带 B 方，这里会出现"每手走第一个合法走法"的兜底计数） |
 | 冻结口径那一行 | 同上（harness 在双池子时拨到评估模式）：`B 方冻结口径: 双方都是混合对手池: 抽出的 MCTS/AB 各档都没有可训练权重 … (快照不需要)` |
 | 配置改了就下一场生效 | 见 §9.2 的四轮读数 |
-| **自检面板**说明它是什么 | `getAgentSelfCheck(AGENT_MIXED_POOL)` 报的是"本场构成 + 抽签口径 + 深度→界面档位映射"（不是空串 —— 空串在面板上会被读成"还没接线"）：<br>`混合对手池 (对局侧伪 agent, 没有权重/实例)` / `本场构成: MCTS(800) 0.500 + AB-L1..L4 0.125` / `AB-L4 (深度 4) -> 界面档位: Alpha-Beta (主档)` |
+| **自检面板**说明它是什么 | `getAgentSelfCheck(AGENT_MIXED_POOL)` 报的是"本场构成 + 抽签口径 + 深度→界面档位映射"（不是空串 —— 空串在面板上会被读成"还没接线"）：<br>`混合对手池 (对局侧伪 agent, 没有权重/实例)` / `本场构成: MCTS(800) 0.500 + AB-L1..L4 0.125` / `AB-L4 (深度 4) -> 界面档位: Alpha-Beta (主档)`。"全部模型自检"的 `kAll` 名单里也有它一格（那份横向对照是它**唯一**能被看见的地方） |
+| 下拉框位置 | 放在 **MCTS 那一行之后**（"纯搜索、无权重"的那一组旁边）：它最常见的用法就是当 B 方对手。⚠ `kAgents` 重排是安全的 —— `fillAgentCombo` 默认项按**类型** `findData` 选而不是按下标（那条注释记着历史上"插入一项后 matchB 静默变成 DQN+MCTS"的坑） |
 | 不崩 | 6 / 20 / 1 轮各跑完，退出码 0；`probe_hvai_flow` 构建 `MainWindow`（下拉框 + 勾选框都在）失败项 0 |
 
 ### 9.5 代价
@@ -269,3 +270,11 @@ inline int matchAbLevelOfDepth(int abDepth);   // 1..3 -> 1..3; 4 -> 0 (= 主 Al
   一局 120 手上限最多多花约 1 分钟；抽到 AB 各档最快（深度 1 几乎瞬时，深度 4 = 主 AB 档的代价）；
 * 所以"池子当某一方"的**一场比分**的墙钟取决于抽签结果 —— 这也是"逐对手分组"必须存在的
   另一个理由（同一场里各局的代价与强度都不同）。
+
+> **⚠ 界面二进制要重链**（与 §4 那条 CMake/构建坑同一类）：这一轮改了 `mainwindow.cpp`
+> （下拉框那一项的位置 + "全部模型自检"名单），所以**必须重新链接 `chess.exe`**；
+> 而 `chess.exe` 正被一个**正在运行的界面实例**占用时，链接会以
+> `LNK1104: 无法打开文件"chess.exe"` 失败 —— 那是"文件被锁"，不是编译错误（同一份
+> `mainwindow.cpp` 在 `probe_hvai_flow` 里链接成功并 `失败项: 0`）。关掉那个实例再
+> `build.ps1 chess` 即可。**旧的 `chess.exe` 不会自己更新**：它跑起来仍然看不到这次
+> 的改动（下拉框位置/自检名单），而"看着能跑"最容易被当成本轮已经生效。
