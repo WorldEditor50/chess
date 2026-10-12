@@ -3175,7 +3175,7 @@ DQN+MCTS 一度报出"50 胜 0 负 50 和"与"损失最低 22"。这两个数字
 ### 21.3 界面接线：`selfCheckReport()`
 
 ```
-<Agent>::selfCheckReport()                // 只读, 副本 + 局部解码 (枚举里 19 个界面 agent 类型全部实现; [2026-10 第三轮] 新增 AGENT_PPOMCTS_CONV 之后这个数是数枚举数出来的)
+<Agent>::selfCheckReport()                // 只读, 副本 + 局部解码 (枚举里 19 个**真** agent 类型全部实现; [2026-10 第三轮] 新增 AGENT_PPOMCTS_CONV 之后这个数是数枚举数出来的 —— 第四轮又在末尾追加了第 20 个值 AGENT_MIXED_POOL, 它是**对局侧伪类型** (没有实例/权重/自检), 不在此列)
   -> ChessBoard::getAgentSelfCheck(type)  // 按类型取实例 (不遍历); AB/MCTS 现场造一个
   -> ChessBoard::getAgentWeightStatus()   // 权重文件在不在 / 启动扫描有没有命中
   -> MainWindow::updateSelfCheckPanel()   // 写进右侧 "模型自检" QPlainTextEdit
@@ -3185,9 +3185,9 @@ DQN+MCTS 一度报出"50 胜 0 负 50 和"与"损失最低 22"。这两个数字
   GUI 线程调用，而棋盘正被搜索使用 —— 所以报告里要算"标准开局的动作别名"时必须用
   `Chess` 的**副本**。这条契约有断言钉住：调用前后棋盘哈希 / 走子方 / halfMoveClock /
   历史栈都不许变（`test_dqnmcts` 第 [6] 节）；"同一局面下两次调用逐字节相同"由
-  `test_match` **[2.11]** 对界面上的每个 agent 类型（枚举里 19 个）逐个钉住（MCTS 的第一版就是被这条抓住的：它那次
+  `test_match` **[2.11]** 对界面上的每个真 agent 类型（枚举里 19 个; 第四轮新增的 `AGENT_MIXED_POOL` 是对局侧伪类型, 没有实例/权重/自检, 因此**不在**这一节的清单里 —— 它由 `test_mixed_opponents` 的共用采样件断言 + `repro_concurrency` 的真对局覆盖）逐个钉住（MCTS 的第一版就是被这条抓住的：它那次
   模拟要 `std::rand()`，于是拆成"0 次模拟（兜底路径，可报坐标）/ 1 次模拟（只报合法性）"）。
-* **界面上的每个 agent 类型都实现了自检**（枚举里 19 个；2026-10 第三轮新增 `AGENT_PPOMCTS_CONV`，并把它加进 `test_match [2.11]` 的清单）（2026-09：此前只有 DQN+MCTS 一个，其余七个显示"没有自检项"；
+* **界面上的每个真 agent 类型都实现了自检**（枚举里 19 个；2026-10 第三轮新增 `AGENT_PPOMCTS_CONV`，并把它加进 `test_match [2.11]` 的清单；2026-10 第四轮新增的第 20 个值 `AGENT_MIXED_POOL` 是对局侧伪类型, 无实例/权重/自检）（2026-09：此前只有 DQN+MCTS 一个，其余七个显示"没有自检项"；
   随后又补上了新 agent PPO+MCTS-MLP，见 §21.6；再往后是 59e5233 还原版的两支
   —— `AGENT_SACAZ_OLD`（MLP）与 `AGENT_SACAZ_OLD_MOE`（TB 专家），两者是同一个类的
   两个骨干，见上面第五轮那段；最后是 Alpha-Beta 的三档弱等级 `AGENT_AB_L1/L2/L3`，
@@ -3351,7 +3351,8 @@ mainwindow    kAgents 里多一行, 于是两个骨干能在界面上直接对�
 > | API | `PPOMCTSAgent::enableMixedOpponentTraining(mctsShare=0.5, mctsIterations=800, abMaxDepth=4)` / `disable…()` / `trainOpponentUsage()` / `mixedOpponentGames()` / `learnerPlyCount()`；默认**关** ⇒ 纯自对弈与改动前逐位相同 |
 > | 工具 | `train_ppo --opponents=mixed [--mcts-share] [--opponent-mcts-sims] [--ab-max-depth]` + 报告末尾的**采样直方图**与"学习方进轨迹的手数" |
 > | 界面 | **训练面板里的"混合对手池"勾选框**（`mainwindow.cpp` 用代码插入，状态由 `ChessBoard::isMixedOpponentTrainingEnabled()` 给出）+ `BG_TRAIN_MIXED_OPPONENTS = true` 作为出厂默认；两个 PPO 变体的后台训练 clone 都按运行期开关打开池子（关掉 = 回到纯自对弈）。每轮训练结束打一行 `[train] 混合对手: …`（采样比例错了只在这行里看得见）。代价：MCTS 800 次迭代 ≈ 1.0 s/手 ⇒ 一轮 60 手多 ~30 s；实测界面路径 `repro_concurrency 1 4 4` 的耗时 **17 s → 50 s** |
-> | 验证 | 新 ctest 套件 **`test_mixed_opponents`（33 断言 / 0 失败）**：池子权重和为 1、**200 局直方图落在二项 5σ 内**（MCTS 正好 100/200）、换先手、`maxMoves=1` 时"对手 10 手 / 学习方 10 手"对账、默认关、参数越界被纠正。端到端 `train_ppo` 12 局：对手 112 手 / 学习方 112 手、`unmatched=0`；界面路径 `repro_concurrency 1 4 4` 不崩 |
+> | 验证 | 新 ctest 套件 **`test_mixed_opponents`（44 断言 / 0 失败）**：池子权重和为 1、**200 局直方图落在二项 5σ 内**（MCTS 正好 100/200）、换先手、`maxMoves=1` 时"对手 10 手 / 学习方 10 手"对账、默认关、参数越界被纠正、**共用采样件与"深度 → 界面档位"映射**。端到端 `train_ppo` 12 局：对手 112 手 / 学习方 112 手、`unmatched=0`；界面路径 `repro_concurrency 1 4 4` 不崩 |
+> | **对局侧**（第二轮追加口径"增加 B 方混合 agent"） | 下拉框新增 **`AGENT_MIXED_POOL`（枚举值 19，追加在末尾）**：选中它的那一方**每局**抽一个真 agent 下完这一局（抽签走与训练侧**同一个** `RL::MixedPool`），胜负**按对手分组**记进 `MatchStats::poolStats`，报告里单列"混合对手池: 出场 N 局 (逐对手)"并声明总分是混合比分。两边都选池子时**各自独立抽一次**（否则另一方会带着伪类型进决策 switch ⇒ 退化成"每手走第一个合法走法"的假对局），逐对手名字带 `A 方:` / `B 方:` 前缀。池子**每场对弈重算**（不是 `static`：否则改了界面配置仍沿用旧权重）。⚠ 本轮抓到一处真事故：`AGENT_AB_L1 + (深度-1)` 把"AB-L4"映射到枚举 16 = `AGENT_SACAZ_MOE_MLP`（是那一局奖励口径变成"学习口径"才暴露的）—— 现在由 `RL::MixedPool::matchAbLevelOfDepth()` 显式列出并进断言。读数见 `docs/mixed_opponent_training_2026_10.md` §9 |
 > | CMake 坑 | 池子的构造放在**独立 TU** `src/ppo_train_opponents.cpp`（否则 15 个链接 `ppomcts_agent.cpp` 的目标都要补 mcts.cpp + abagent.cpp）；`trainSelfPlay` 驱动对手**只走虚函数**，MCTS 预算由 `BudgetMcts` 薄壳实现。⚠ 本轮又踩了仓库记过的那条：新增 .cpp 要加到**每个直接列源文件的目标**上（漏了 `repro_concurrency`），而且**只 build `chess` 不会重链 `repro_concurrency.exe`** ⇒ 旧二进制会给出假通过 |
 
 ### 21.4 顺带修掉的两个真问题

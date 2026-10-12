@@ -1746,7 +1746,12 @@ if(CHESS_BUILD_TESTS)
     #   [1] 池子构成与权重 (MCTS 0.5 / AB-L1..L4 各 0.125, 和为 1);
     #   [2] 200 局的采样直方图落在 5sigma 内 (均匀分布采样生效);
     #   [3] 每局换先手; [4] 对手的手**不进学习方样本** (learnerPly 对账);
-    #   [5] 默认关 = 纯自对弈; [6] 参数越界被纠正而不是静默换分布。
+    #   [5] 默认关 = 纯自对弈; [6] 参数越界被纠正而不是静默换分布;
+    #   [7] 对局侧 (B 方混合 agent) 与训练侧**共用**的采样件 (池子构成 / 直方图 / 空池回退)。
+    # 为什么不在这里跑真对局: `ChessBoard` 是 QWidget, 拉进本测试要额外编一整套 agent 源
+    # 码 (20 个 .cpp, 构成本翻倍), 而这条口径里**可证伪**的部分就是采样本身; 对局侧只剩
+    # "把 sampleIndex 的结果映射成 AgentType 并记账"那几行, 由界面路径的一次真对局覆盖
+    # (repro_concurrency 把池子当 A 方, 见 docs/mixed_opponent_training_2026_10.md §7)。
     add_executable(test_mixed_opponents
         ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mixed_opponents_main.cpp
         ${SRC_DIR}/chess.cpp

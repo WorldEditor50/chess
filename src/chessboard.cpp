@@ -7,6 +7,7 @@
    放在 chessboard.cpp 顶层: 本文件里"武装/解除 + 三条边界"是它唯一的用法。
 */
 #include "rl/weightio.hpp"
+#include "rl/mixed_opponents.hpp"   /* [2026-10 第四轮] 混合对手池的权重/采样 (与训练侧同源) */
 /*
    [2026-10] 实时路由探针的**完整定义** (界面呼吸灯)。
    chessboard.h 只有它的前向声明 (那个头要保持轻), 而 `liveMoeRoute` 要读它的原子
@@ -80,6 +81,12 @@ QString agentDisplayName(ChessBoard::AgentType type)
        —— 三支 PPO 在同一个下拉框里, 日志/奖励曲线/比分表上不能同名 (同名 = 读数没法归因)。
     */
     case ChessBoard::AGENT_PPOMCTS_CONV: return QStringLiteral("PPO+MCTS (卷积残差)");
+    /*
+       [2026-10 第四轮] **混合对手池** (它不是一支网): 这一方每一局抽一个真 agent
+       (MCTS 50% + AB-L1..L4 各 12.5%) 来下这一局。名字里写清它是池子, 否则
+       比分表上会让人以为存在第五支 PPO。
+    */
+    case ChessBoard::AGENT_MIXED_POOL: return QStringLiteral("混合对手池 (MCTS+AB1-4)");
     }
     return QStringLiteral("agent");
 }
@@ -3362,6 +3369,44 @@ std::string ChessBoard::getAgentSelfCheck(AgentType type) const
         return mcts.selfCheckReport();
     }
 
+    /*
+       [2026-10 第四轮] **混合对手池**: 它不是一支网 (没有实例/权重), 所以这里报的是
+       "这一档会抽出什么" —— 池子构成 + 权重 + 深度到界面档位的映射 + 与训练侧同源的
+       说明。为什么要有一份报告而不是空串: 面板上显示"没有自检项"会让读者以为这是
+       "还没接线" (与 AB/MCTS 那两个真有自检的纯搜索 agent 看不出区别), 而这一档的
+       口径恰恰是"它自己不下棋, 它每局替你选一个真对手"。
+       只读、不建实例、不碰棋盘 ⇒ 与 AB/MCTS 那两支一样放在报表锁之外。
+    */
+    if (type == AGENT_MIXED_POOL) {
+        const std::vector<RL::MixedPool::Entry> pool =
+            RL::MixedPool::defaultPool(m_mixedMctsShare.load(), m_mixedAbDepth.load(),
+                                       m_mixedMctsSims.load());
+        std::string s = "混合对手池 (对局侧伪 agent, 没有权重/实例)\n";
+        s += "  本场构成: " + RL::MixedPool::describe(pool) + "\n";
+        s += "  抽签: 每局开头一次 U(0,1) 落在权重累积区间; 整局固定 (抽中谁下完这一局)\n";
+        s += "  来源: 与训练侧陪练池是**同一个** rl/mixed_opponents.hpp (分布不会漂开)\n";
+        for (std::size_t i = 0; i < pool.size(); i++) {
+            if (pool[i].abDepth <= 0) { continue; }
+            const int lvl = RL::MixedPool::matchAbLevelOfDepth(pool[i].abDepth);
+            char buf[160];
+            if (lvl == 0) {
+                std::snprintf(buf, sizeof(buf),
+                              "  %s (深度 %d) -> 界面档位: Alpha-Beta (主档)\n",
+                              pool[i].name.c_str(), pool[i].abDepth);
+            } else if (lvl > 0) {
+                std::snprintf(buf, sizeof(buf), "  %s (深度 %d) -> 界面档位: AB-L%d\n",
+                              pool[i].name.c_str(), pool[i].abDepth, lvl);
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                              "  %s (深度 %d) -> !! 界面上没有这一档 (按主 AB 档出场并报警)\n",
+                              pool[i].name.c_str(), pool[i].abDepth);
+            }
+            s += buf;
+        }
+        s += "  比分: 按抽中的对手分组记进报告 (那一段以「混合对手池: 出场 N 局」开头)";
+        return s;
+    }
+
     /* 常驻实例: 与决策/训练串行 (理由见函数头那段"只读不等于可以并发") */
     std::lock_guard<std::mutex> agentLock(m_agentMutex);
     switch (type) {
@@ -4910,6 +4955,23 @@ QString ChessBoard::MatchStats::detail() const
        "A 赢了 B" 既可能因为 A 变强、也可能因为 B 变弱。用户读到的却只是一行比分。
        这里把模式**直接印出来**, 于是读数自带前提, 不再需要读者自己去悟。
     */
+    /*
+       [2026-10 第四轮] **混合对手池: 按对手分组的比分** (用户口径: "增加 B 方混合 agent")
+       ────────────────────────────────────────────────────────────────
+       为什么必须有这一段: 池子出场的那一方**每局换对手**, 所以上面那行总分是
+       "对一堆不同强度对手的**混合**比分" —— 单独看它归因不了 (输了不知道输给谁)。
+       这里按抽中的对手分组给出 胜/负/和, 并说明池子出场了几局 (与 Σgames 对账)。
+    */
+    if (!poolStats.empty()) {
+        d += QStringLiteral("\n混合对手池: 出场 %1 局 (逐对手):").arg(poolGames);
+        for (std::size_t i = 0; i < poolStats.size(); i++) {
+            const PoolStat &ps = poolStats[i];
+            /* 以**池子那一方**为视角报 胜/负/和, 免得读者再去换算 A/B */
+            d += QStringLiteral("\n  %1: %2 局  %3 胜 / %4 负 / %5 和")
+                     .arg(ps.name).arg(ps.games).arg(ps.wins).arg(ps.losses).arg(ps.draws);
+        }
+        d += QStringLiteral("\n  ⚠ 总分是**混合**比分 (每局对手不同); 要下结论请看逐对手那一行");
+    }
     d += QStringLiteral("\n对弈模式: %1").arg(modeName);
     /*
        ---- B 方到底冻住了什么 (P0-b 收尾) ----
@@ -5476,6 +5538,19 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         } else if (m == MATCH_TRAIN) {
             st.frozenNote = QStringLiteral("训练模式: 不冻结任何一方 (双方都在学,"
                                            " 权重本来就会变)");
+        } else if (typeA == AGENT_MIXED_POOL && typeB == AGENT_MIXED_POOL) {
+            /*
+               [2026-10 第四轮] 两边都是混合对手池时**不需要快照**, 也不该套用下面那两条
+               判据: 池子抽出来的每一档 (MCTS / AB-L1..L4) 都**没有可训练权重** ——
+               决策是每手现场构造搜索器的 (见 aiThinkForAgentRaw 的 AB/MCTS 分支),
+               所以"A 学一次 B 就变一次"这条通道在这里根本不存在。
+               写清楚这件事的理由与 P0-b 相同: 报告里那句"冻结口径"是结论可信度的前提,
+               让读者看到"冻结快照没建起来"会被误读成"本场比分不可归因"。
+            */
+            st.frozenNote = QStringLiteral("双方都是混合对手池: 抽出的 MCTS / AB 各档都没有"
+                                           "可训练权重 (每手现场构造搜索器), 且两边"
+                                           "**各自独立抽样** ⇒ 不存在'B 跟着 A 变'的通道"
+                                           " (快照不需要)");
         } else if (typeA != typeB) {
             st.frozenNote = QStringLiteral("A/B 不是同一个 agent 类型 ⇒ 各自一个常驻实例,"
                                            " A 的学习写不到 B 身上; 后台训练本模式停摆"
@@ -5549,6 +5624,26 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
                            m_preTrainEnabled.load() ? m_preTrainSteps.load() : 0);
     emit matchStarted(st.agentA, st.agentB, games);
 
+    /*
+       [2026-10 第四轮] 本场对弈的**混合对手池** (只在 A/B 里有 AGENT_MIXED_POOL 时才建)。
+       为什么在这里建 (而不是每局建、也不是函数内 static):
+         * 每局建 ⇒ 每局都要归一化一遍权重 (同一个池子, 白算);
+         * 函数内 `static` ⇒ 只在**第一次**进入时初始化, 之后配置被改过 (界面上是那个勾选框,
+           占比/深度走 `setMixedOpponentConfig` 或出厂常量) 再开一局, 用的还是老权重 ——
+           这是最坏的一种错: 读数看起来正常, 但与当前设置不一致。所以每场对弈**重算一次**。
+       权重与采样的**唯一定义**在 rl/mixed_opponents.hpp (与训练侧的陪练池同一个函数),
+       随机数取同一颗 RL::Random ⇒ 同一 seed 下对手序列可复现。
+    */
+    const bool usePool = (typeA == AGENT_MIXED_POOL || typeB == AGENT_MIXED_POOL);
+    const std::vector<RL::MixedPool::Entry> pool = usePool
+        ? RL::MixedPool::defaultPool(m_mixedMctsShare.load(), m_mixedAbDepth.load(),
+                                     m_mixedMctsSims.load())
+        : std::vector<RL::MixedPool::Entry>();
+    if (usePool) {
+        qInfo() << "[混合对手池] 本场对弈的对手分布:" << QString::fromStdString(
+            RL::MixedPool::describe(pool));
+    }
+
     for (int g = 0; g < games; ++g) {
         if (m_matchAbort.load()) {
             st.aborted = true;
@@ -5558,9 +5653,95 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
 
         /* 每局交换先后手: 偶数局 A 执红, 奇数局 B 执红 */
         const bool aIsRed = (g % 2 == 0);
-        const AgentType redType = aIsRed ? typeA : typeB;
-        const AgentType blackType = aIsRed ? typeB : typeA;
+        AgentType redType = aIsRed ? typeA : typeB;
+        AgentType blackType = aIsRed ? typeB : typeA;
+        /*
+           ================================================================
+           [2026-10 第四轮] **混合对手池** (用户口径: "增加 B 方混合 agent")
+           ================================================================
+           这一方如果是 AGENT_MIXED_POOL, 那么**本局**先抽一个真 agent, 抽中谁就由谁下完
+           这一局 (整局固定 —— 每手换对手不是"混合对局", 而且那样连"这一局输给谁"都说不清)。
+           抽签走 RL::MixedPool::sampleIndex (与**训练侧**的陪练池同源, 见
+           rl/mixed_opponents.hpp), 随机数取同一颗 RL::Random ⇒ 同一 seed 可复现。
 
+           ⚠ 三条必须一起做的记账 (缺一条这场比分的口径就不成立):
+             1. 抽中的落点写回 redType/blackType ⇒ 其余对局机制 (决策路径/快照/奖励/
+                模式闸门) 一行都不用改, 它看到的是一支正常的 agent;
+             2. **逐对手分组**: 把这一局的胜负记到抽中那一支名下 (st.poolStats) ——
+                一场里每局换对手时, 总分是"对一堆不同强度的混合比分", 只有分组之后
+                才能归因;
+             3. st.poolGames 累计"池子出场的局数", 与 Σgames 对账。
+
+           ⚠ **两边都选池子**是允许的, 但必须**各自独立抽一次**: 只抽一次、只替换 A 方的话,
+           B 方会带着 `AGENT_MIXED_POOL` 走进决策 switch, 而那里**没有这一档** (它不是一个
+           真 agent), 结局是"每手退化成第一个合法走法"这种**看着有比分**的假对局。
+           两边都抽时, 逐对手那一栏的名字带 A/B 前缀 —— 否则同名对手会把两方(互为对手)
+           的胜负混进同一行, 归因又丢了。
+           ================================================================
+        */
+        struct PoolDraw {
+            int row = -1;        /* 本局在 st.poolStats 里的那一行 (-1 = 这一方没用池子) */
+            int onSideA = 0;     /* 抽中的对手这一局在 A(1)/B(0) */
+            bool used = false;
+        };
+        PoolDraw drawA, drawB;
+        if (usePool) {
+            const bool bothPools = (typeA == AGENT_MIXED_POOL) && (typeB == AGENT_MIXED_POOL);
+            std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+            for (int slotSide = 0; slotSide < 2; ++slotSide) {   /* 0 = A 方, 1 = B 方 */
+                const bool sideIsPool = (slotSide == 0) ? (typeA == AGENT_MIXED_POOL)
+                                                        : (typeB == AGENT_MIXED_POOL);
+                if (!sideIsPool) { continue; }
+                PoolDraw &draw = (slotSide == 0) ? drawA : drawB;
+                const int slot = RL::MixedPool::sampleIndex(pool, uni(RL::Random::engine));
+                if (slot < 0) { continue; }      /* 空池: 这一方这一局不抽 (正常不会发生) */
+                const RL::MixedPool::Entry &e = pool[(std::size_t)slot];
+                /*
+                   深度 -> 界面上那一档 AB。**不许**写 `AGENT_AB_L1 + (abDepth - 1)`:
+                   界面枚举里 AB 只有 L1/L2/L3, 深度 4 是主"Alpha-Beta"档, 而
+                   `AGENT_AB_L1 + 3` == 16 == AGENT_SACAZ_MOE_MLP (见
+                   rl/mixed_opponents.hpp 的 matchAbLevelOfDepth)。
+                */
+                AgentType sampled = AGENT_ALPHABETA;
+                if (e.abDepth > 0) {
+                    const int level = RL::MixedPool::matchAbLevelOfDepth(e.abDepth);
+                    if (level < 0) {
+                        /* 界面上没有这一档: 报警 + 用主 AB 档兜底 (不静默取近似) */
+                        qWarning() << "[混合对手池] 池子里的" << QString::fromStdString(e.name)
+                                   << "深度" << e.abDepth
+                                   << "在界面上没有对应档位, 已按主 Alpha-Beta 档出场";
+                    } else if (level > 0) {
+                        sampled = (AgentType)((int)AGENT_AB_L1 + (level - 1));
+                    }
+                } else {
+                    sampled = AGENT_MCTS;
+                }
+                /* 抽中的落点写回红/黑: A 方执红时替换 redType, 否则替换 blackType */
+                if (slotSide == 0) { if (aIsRed) { redType = sampled; } else { blackType = sampled; } }
+                else               { if (aIsRed) { blackType = sampled; } else { redType = sampled; } }
+                /* 逐对手的槽位: 名字相同的对手复用一行 (池子里的名字是稳定的) */
+                const QString rowName = bothPools
+                    ? QStringLiteral("%1: %2")
+                          .arg(slotSide == 0 ? QStringLiteral("A 方") : QStringLiteral("B 方"))
+                          .arg(QString::fromStdString(e.name))
+                    : QString::fromStdString(e.name);
+                int row = -1;
+                for (std::size_t i = 0; i < st.poolStats.size(); i++) {
+                    if (st.poolStats[i].name == rowName) { row = (int)i; break; }
+                }
+                if (row < 0) {
+                    MatchStats::PoolStat ps;
+                    ps.name = rowName;
+                    st.poolStats.push_back(ps);
+                    row = (int)st.poolStats.size() - 1;
+                }
+                st.poolStats[(std::size_t)row].games++;
+                draw.row = row;
+                draw.onSideA = (slotSide == 0) ? 1 : 0;
+                draw.used = true;
+                st.poolGames++;      /* 池子"出场"的局数: 两边都是池子时这一局算 2 */
+            }
+        }
         double rewardRed = 0.0;
         double rewardBlack = 0.0;
         double rewardA = 0.0;
@@ -5575,6 +5756,25 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         const int capAvailB0 = st.capAvailB, capChosenB0 = st.capChosenB;
         const int res = playMatchGame(redType, blackType, aIsRed, st, rewardRed,
                                       rewardBlack, rewardA, rewardB);
+        /*
+           [2026-10 第四轮] 把这一局的胜负记到**抽中的那一支**名下 —— 这就是"按对手分组
+           报比分"的来源。池子那一方是红还是黑, 由 draw.onSideA + aIsRed 两个布尔决定。
+           被中止的局 (res == RESULT_ONGOING) 不计进任何一栏: 它没有终局, 归因不了。
+           两边都是池子时会有**两笔**: 各自以**自己那一方**为视角记 (一方胜必伴随另一方
+           负), 这正是"抽到谁、输给了谁"要说清的东西。
+        */
+        if (res != Chess::RESULT_ONGOING) {
+            const PoolDraw *draws[2] = { &drawA, &drawB };
+            for (int k = 0; k < 2; ++k) {
+                const PoolDraw &dr = *draws[k];
+                if (!dr.used) { continue; }
+                const bool poolIsRed = (dr.onSideA != 0) ? aIsRed : (!aIsRed);
+                MatchStats::PoolStat &ps = st.poolStats[(std::size_t)dr.row];
+                if (res == Chess::RESULT_DRAW) { ps.draws++; }
+                else if ((res == Chess::RESULT_RED_WIN) == poolIsRed) { ps.wins++; }
+                else { ps.losses++; }
+            }
+        }
         const int gCapAvailA = st.capAvailA - capAvailA0;
         const int gCapChosenA = st.capChosenA - capChosenA0;
         const int gCapAvailB = st.capAvailB - capAvailB0;
@@ -6928,7 +7128,14 @@ void ChessBoard::backgroundTrainLoop()
                AB 等级之后, 再按枚举逐个点名就会漏掉新类型, 于是每次轮转都打一条
                "该 agent 的后台训练尚未接入"的假警告, 把真正的"忘了接线"淹掉。
             */
-            if (abDepthOf(type) == 0 && type != AGENT_MCTS
+            /*
+               [2026-10 第四轮] `AGENT_MIXED_POOL` 也归进"预期没有后台训练"这一支:
+               它不是一个真 agent, 而是**对局时**每局抽一个真对手的开关 (它自己没有权重,
+               也没有实例)。不排除它的话, 用户把下拉框选到"混合对手池"就会每轮刷一条
+               "该 agent 的后台训练尚未接入"的假警告 —— 与当初给 AB 三档做的那次修正
+               同一个理由 (假警告会把真正的"忘了接线"淹掉)。
+            */
+            if (abDepthOf(type) == 0 && type != AGENT_MCTS && type != AGENT_MIXED_POOL
                 && notWiredWarned.insert(type).second) {
                 /* 现在十一个 agent 里"有权重可训"的**全部**接上了, 所以这一支只有在
                    以后新增 agent 类型而忘了接线时才会响 —— 留着它就是为了那一天:

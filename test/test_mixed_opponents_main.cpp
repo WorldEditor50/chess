@@ -11,14 +11,16 @@
  * `test_ppomcts` 虽然覆盖这个类, 但它不在 ctest 里 (~20 分钟, TB 骨干) ——
  * 这条口径必须秒级可查, 所以单开一个用**廉价骨干**跑的套件。
  *
- * 六段 (每段都对应一个"不报错但结果不对"的可能性):
+ * 七段 (每段都对应一个"不报错但结果不对"的可能性):
  *   [1] 池子的构成与权重: MCTS 0.5 / AB-L1..L4 各 0.125 (和为 1);
  *   [2] **采样直方图** (真正跑 N 局, 只给小模拟数): 每个对手的局数落在
  *       二项分布的合理区间内 —— 这条是"均匀分布采样"的直接证据;
  *   [3] **每局换先手**: 奇数局对手执红 (否则红黑样本量不对称);
  *   [4] **对手的手不进学习方的样本**: 用 `learnerPlyCount()` 与总手数对账;
  *   [5] **默认关**: 不打开池子时行为与纯自对弈一致 (对手局数 == 0, 且不建任何实例);
- *   [6] 参数越界时的**纠正读数** (mctsShare=2 或 abMaxDepth=0 都不能静默变成别的分布)。
+ *   [6] 参数越界时的**纠正读数** (mctsShare=2 或 abMaxDepth=0 都不能静默变成别的分布);
+ *   [7] **对局侧共用的采样件** (`RL::MixedPool`, 界面里的 `AGENT_MIXED_POOL` 走它) ——
+ *       用户口径的第二半"增加 B 方混合 agent"就是这条: 对局时每局抽一个真 agent。
  *
  * 用法: test_mixed_opponents   (无参数; 失败以非 0 退出码报告, 与其它 test_* 同口径)
  */
@@ -29,6 +31,7 @@
 #include <vector>
 
 #include "chess.h"
+#include "rl/mixed_opponents.hpp"   /* [2026-10 第四轮] 对局侧与训练侧**共用**的池子/采样 */
 #include "ppomcts_agent.h"
 #include "rl/util.hpp"
 
@@ -251,6 +254,104 @@ int main()
         ag.disableMixedOpponentTraining();
         CHECK(!ag.mixedOpponentTrainingEnabled() && ag.trainOpponentUsage().empty(),
               "disable 之后池子清空");
+    }
+
+    /* ================= [7] 对局侧与训练侧**共用**的采样件 ================= */
+    std::printf("\n[7] 共用采样件 RL::MixedPool (界面里的 AGENT_MIXED_POOL 走的就是它)\n");
+    {
+        /*
+           用户口径的第二步是"增加 B 方混合 agent" —— 也就是**对局**那一侧: A/B 下拉框里
+           选中"混合对手池"的那一方, 每局从池子里抽一个真 agent 来下完这一局。对局侧
+           (`ChessBoard::matchAgents`) 与训练侧 (`PPOMCTSAgent::trainSelfPlay`) 调的是
+           **同一个** `RL::MixedPool::defaultPool` + `sampleIndex` (唯一定义在
+           rl/mixed_opponents.hpp), 所以这一段的直方图同时钉住两处。
+
+           为什么对局侧的断言落在这里而不是跑一场真对局: `ChessBoard` 是 QWidget, 把它
+           拉进本测试要额外编一整套 agent 源码 (20 个 .cpp, 构成本翻倍), 而这条口径里
+           **可证伪**的部分就是采样本身 —— 对局侧只剩"把 `sampleIndex` 的结果映射成
+           AgentType 并逐对手记账"那几行, 由界面路径的一次真对局覆盖
+           (`repro_concurrency 1 4 19`: 池子当 A 方 vs AlphaBeta, 见 docs §7)。
+        */
+        const std::vector<RL::MixedPool::Entry> pool = RL::MixedPool::defaultPool(0.5f, 4, 800);
+        std::printf("    defaultPool(0.5, 4, 800) = %s\n",
+                    RL::MixedPool::describe(pool).c_str());
+        CHECK(pool.size() == 5, "池子 = MCTS + AB-L1..L4");
+        CHECK(pool[0].abDepth == 0 && pool[0].mctsSims == 800, "第 0 项是 MCTS(800)");
+        /*
+           对局侧的映射是 `abDepth<=0 ? AGENT_MCTS : AGENT_AB_L1 + (abDepth-1)`,
+           所以 abDepth 必须是**连续的 1..4** —— 否则会抽到一个不存在的 AgentType
+           (下拉框里没有那一档, `agentName` 会退回"未知"), 而权重看着仍然是对的。
+        */
+        bool abOk = true;
+        for (std::size_t i = 1; i < pool.size(); i++) {
+            if (pool[i].abDepth != (int)i) { abOk = false; }
+            if (std::fabs((double)pool[i].weight - 0.125) > 1e-6) { abOk = false; }
+        }
+        CHECK(abOk, "AB-L1..L4 的 abDepth == 1..4 (连续) 且各 0.125 ⇒ 能对到 AGENT_AB_L*");
+
+        /*
+           ⚠ 这一段是**真实事故**的回归: 对局侧曾经写 `AGENT_AB_L1 + (abDepth - 1)`,
+           而界面枚举里 AB 只有 L1/L2/L3 —— 深度 4 是主"Alpha-Beta"档, `+3` 落在
+           枚举值 16 = **AGENT_SACAZ_MOE_MLP** (SAC+AZ 稀疏 MoE)。于是"AB-L4"上场的是
+           一个完全不同的 agent, 报告里却仍写着 AB-L4, 而且因为它有"学习口径"奖励,
+           那局还会打印出 SAC 的奖励数字 —— 看着正常、归因全错。
+           所以映射要显式列出来, 并在这里钉住: 1/2/3 -> 对应档, 4 -> 主 AB 档(0),
+           5 及以上 -> -1 (对局侧必须报警而不是静默取近似)。
+        */
+        CHECK(RL::MixedPool::matchAbLevelOfDepth(1) == 1
+                  && RL::MixedPool::matchAbLevelOfDepth(2) == 2
+                  && RL::MixedPool::matchAbLevelOfDepth(3) == 3,
+              "深度 1/2/3 -> 界面上的 AB-L1/L2/L3");
+        CHECK(RL::MixedPool::matchAbLevelOfDepth(4) == 0,
+              "深度 4 -> **主 Alpha-Beta 档** (不是 AGENT_AB_L3+1 = SAC+AZ-MoE!)");
+        CHECK(RL::MixedPool::matchAbLevelOfDepth(5) == -1,
+              "深度 5 界面上没有对应档位 -> -1 (调用方报警, 不静默取近似)");
+        {
+            /* 默认池里每一档都必须是界面上真有的一档 (-1 一个都不许有) */
+            bool allMappable = true;
+            for (std::size_t i = 0; i < pool.size(); i++) {
+                if (pool[i].abDepth > 0
+                    && RL::MixedPool::matchAbLevelOfDepth(pool[i].abDepth) < 0) {
+                    allMappable = false;
+                }
+            }
+            CHECK(allMappable, "默认池 (AB 深度 1..4) 的每一档在界面上都有对应 agent");
+        }
+
+        /*
+           直方图: 直接喂**均匀 u** 给纯函数 sampleIndex (200000 次)。比 [2] 的 200 局更紧
+           (sigma 小 ~30 倍), 而代价是毫秒级 —— 它查的是采样函数本身, 不查对局。
+        */
+        {
+            const int n = 200000;
+            std::vector<int> hit(pool.size(), 0);
+            std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+            for (int i = 0; i < n; i++) {
+                const int k = RL::MixedPool::sampleIndex(pool, uni(RL::Random::engine));
+                if (k >= 0 && k < (int)hit.size()) { hit[(std::size_t)k]++; }
+            }
+            bool inRange = true;
+            for (std::size_t i = 0; i < pool.size(); i++) {
+                const double p = (double)pool[i].weight;
+                const double sigma = std::sqrt((double)n * p * (1.0 - p));
+                const double lo = (double)n * p - 5.0 * sigma;
+                const double hi = (double)n * p + 5.0 * sigma;
+                std::printf("      %-9s 期望 %8.0f 实测 %6d (5sigma [%.0f, %.0f])\n",
+                            pool[i].name.c_str(), (double)n * p, hit[i], lo, hi);
+                if ((double)hit[i] < lo || (double)hit[i] > hi) { inRange = false; }
+            }
+            CHECK(inRange, "200000 次采样落在 5sigma 内 (对局侧/训练侧共用这一段)");
+        }
+
+        /* 空池与单档池: 对局侧必须能安全回退 (`sampleIndex` 返回 -1 时本局不抽) */
+        CHECK(RL::MixedPool::sampleIndex(std::vector<RL::MixedPool::Entry>(), 0.5f) == -1,
+              "空池返回 -1 (调用方据此回退, 而不是当成抽到第 0 项)");
+        const std::vector<RL::MixedPool::Entry> onlyAb = RL::MixedPool::defaultPool(0.0f, 4, 800);
+        CHECK(onlyAb.size() == 4 && onlyAb[0].abDepth == 1 && onlyAb[3].abDepth == 4,
+              "mctsShare=0 ⇒ 只剩 AB-L1..L4 (各 0.25)");
+        const std::vector<RL::MixedPool::Entry> onlyMcts = RL::MixedPool::defaultPool(1.0f, 4, 800);
+        CHECK(onlyMcts.size() == 1 && onlyMcts[0].abDepth == 0,
+              "mctsShare=1 ⇒ 只剩 MCTS (权重 0 的档位不生成, 读数与实抽一一对应)");
     }
 
     std::printf("\n=== test_mixed_opponents: %d 项断言, %d 失败 ===\n", g_pass + g_fail, g_fail);

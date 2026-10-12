@@ -107,6 +107,13 @@ const AgentChoice kAgents[] = {
        共用一个前缀只会让两边静默互相覆盖。
     */
     { "PPO+MCTS (卷积残差)",         ChessBoard::AGENT_PPOMCTS_CONV },
+/*
+   [2026-10 第四轮] **混合对手池** (用户口径: "增加 B 方混合 agent")。
+   它不是一支网: 选中的那一方**每一局**抽一个真 agent (MCTS 50% + AB-L1..L4 各 12.5%)
+   来下这一局 —— 所以放在这一组"纯搜索、无权重"的对手旁边, 而不是跟三支 PPO 排在一起。
+   比分**按对手分组**报在报告末尾 (见 MatchStats::poolStats)。
+*/
+{ "混合对手池 (MCTS+AB1-4)",     ChessBoard::AGENT_MIXED_POOL },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
     /*
        [2026-09 dev-dqnmcts-moetb] **同一个算法, 另一个骨干** —— 与上面那一项成对排列
