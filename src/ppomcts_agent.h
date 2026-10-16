@@ -217,17 +217,44 @@ public:
         std::vector<int> untriedActionIndices; /* actions not yet expanded */
         std::vector<Step> untriedSteps;
 
+        /* ----------------------------------------------------------------
+         *  [2026-10 第五轮] ★Z1: 该节点的**策略先验缓存**
+         * ----------------------------------------------------------------
+         *  `priorActionIndices` / `priorValues` = 该节点**完整合法集**上的策略前向
+         *  结果 (即 `ppo.actionMasked(parentState, 完整合法集, …)` 的输出),
+         *  首次展开时算一次, 之后一直复用。`priorCached=false` 表示还没算过。
+         *
+         *  为什么可以缓存: 节点的局面与它的合法着法集在**节点被创建时**就固定了,
+         *  而先验是"局面 + 完整合法集"的确定性函数 (稀疏 softmax 的归一化分母正是
+         *  这个集合) ⇒ 同一个节点无论被展开多少次, 这一份输出都**逐位相同**。
+         *  原来是每次展开都重算一遍 (一个节点有几个孩子就重算几次; 根节点在 1600
+         *  模拟里被展开 ~40 次), 那是纯重复计算 —— 省下来的是**搜索吞吐**。
+         *
+         *  口径不变: 选中的动作与返回的 prior 与缓存前逐位相同 (见
+         *  `pickUntriedByPrior` 里"按动作下标查表"的说明) ⇒ 这是**只省算力、
+         *  不改行为**的一项。`azPriorCache=false` 可切回逐步重算做 A/B。
+         *
+         *  ⚠ 与树复用 (B-5) 的关系: 复用只在**同一局内**发生 (权重不变), 所以缓存的
+         *  先验仍然有效; 跨局必然重开一棵树 (B-5 的接受条件), 缓存不会跨局残留。
+         *  内存: 每节点约 (|合法集| × (4 + 4) + 24) B ≈ 350 B, 1600 节点约 0.5 MB/次决策。
+         * ---------------------------------------------------------------- */
+        std::vector<int>   priorActionIndices;
+        std::vector<float> priorValues;
+        bool priorCached;
+
         /* Current color at this node */
         int currentColor;
 
         AZNode()
             : parentID(-1), parentAction(-1), hash(0), depth(0),
               visitCount(0), totalValue(0.0), prior(0.0),
+              priorCached(false),
               currentColor(Stone::COLOR_NONE) {}
         AZNode(int pid, int pa, const Step &st, float p, int color,
                unsigned long long h = 0, int d = 0)
             : parentID(pid), parentAction(pa), step(st), hash(h), depth(d),
               visitCount(0), totalValue(0.0), prior(p),
+              priorCached(false),
               currentColor(color) {}
 
         double getQ() const {
@@ -444,6 +471,13 @@ public:
     float potentialOf(int colorToMove);
 
     /*
+     *  [2026-10 第五轮] R-2 用的帮手: 某一方**非将**棋子的价值合计。
+     *  口径与 `ChessState::materialPhase` 一致 (跳过将 —— 它的价值就是"被吃"= 终局),
+     *  子力价值取自 `Stone::value` (与 `computeReward` 里 `victim->value` 同一份)。
+     */
+    double materialOfColor(int color);
+
+    /*
      *  把势能塑形**原地**写进轨迹每一手的 reward:
      *      reward_i <- reward_i + Φ(s_i) + γ·Φ(s_{i+1})
      *  (推导见 stone.h 的 shapedStepReward())。之后 learnSelfPlay / commitEpisode
@@ -487,6 +521,33 @@ public:
      *  置 false 即为那个对照: 显式奖励只留每步代价, 材质完全交给 Φ。
      */
     bool materialRewardEnabled = true;
+
+    /*
+     * ====================================================================
+     *  [2026-10 第五轮] R-2: 混合对手池下的**材质回报补齐** (默认 false)
+     * ====================================================================
+     *  问题 (读代码可见): 混合对局里**只有学习方自己的手进轨迹**
+     *  (`trainSelfPlay` 里对手那一支只 `moveForward`、不记样本), 而显式材质项是按
+     *  "**我这手**吃了什么"给的 (`computeReward` → `stepReward`) —— **被吃没有任何
+     *  即时惩罚**。纯自对弈里这没问题 (对手那一手也在轨迹里, 经 negamax 号翻转后
+     *  等价于我方的 −0.1v, 两边平衡), 但换成真对手之后这一项直接消失:
+     *
+     *      学习方轨迹的稠密回报 **系统性偏高** (缺了"对手吃我的子"那一项),
+     *      而 V 正是 MCTS 的叶子估值 ⇒ 搜索会**低估对手的威胁**。
+     *
+     *  这条偏差不在混合池那一轮的账里 (`docs/mixed_opponent_training_2026_10.md`
+     *  §2.1 只讨论了"off-policy 却打着 on-policy 标签"的策略面问题)。
+     *
+     *  置 true 时的口径 (区间一致): 对手走完那一手之后, 把**学习方材质的变化**
+     *  `REWARD_MATERIAL_COEF × (我的材质_后 − 我的材质_前)` 折进学习方上一手的奖励,
+     *  并把上一手的势能 Φ **重测到"对手应完"之后的局面** —— 于是
+     *  "奖励"与"势能"覆盖的是同一个区间 (两次学习方决策之间), 自举与 telescoping
+     *  的配对关系也保持一致。
+     *
+     *  ⚠ 只在**混合对局**这一支有对手; 纯自对弈 (每一手都是学习方) 不受影响,
+     *  所以开它不会改变"纯自对弈"的读数。默认 false = 与改动前逐位相同 (A/B 的对照臂)。
+     */
+    bool mixedOpponentMaterialDelta = false;
 
     /*
      * ====================================================================
@@ -769,6 +830,39 @@ public:
         "两次运行的聚合一致率差不多"这种弱证据。
     */
     bool sparsePolicyHead = true;
+
+    /*
+       ================================================================
+       [2026-10 第五轮] ★Z1: 节点先验缓存 (默认开)
+       ================================================================
+       问题 (读代码可见): `pickUntriedByPrior` 每次调用都做一次完整骨干前向
+       (`ppo.actionMasked`), 而它**每次展开一个孩子就被调用一次** —— 一个节点有几个
+       合法着法就被重算几次 (根节点在 1600 模拟里约 40 次)。每次模拟的前向次数是
+       "1 次 actor (选中的节点) + 1 次 critic (新建的孩子)", 其中 **actor 那一次里
+       绝大多数是同一个局面的重复计算**。
+
+       做法: 把"完整合法集 + 其先验"缓存进 `AZNode` (见那里字段的说明),
+       首次展开算一次, 之后按**动作下标**查表。
+
+       收益 (推导, 见 docs/expert_search_optimization_plan_2026_10.md §5.1):
+       N 次模拟的骨干前向从 `2N` 降到 `N + D` (D = 树里被展开过的节点数),
+       D 由搜索树形状决定 ⇒ 约 1.4~1.6× (上界 2×)。D 可通过下面的
+       `azPriorCacheMisses()` (它就是"真正做了前向的节点数") 直接读出来。
+
+       ⚠ 默认开的前提是"**逐位不变**": 选中动作与 prior 都不该变。判据:
+       `azPriorCache=false` 与 `true` 两臂在同一 seed 下的决策/访问分布应相同
+       (A/B 用 `setAzPriorCache()`); 若不同, 说明"合法集不变"这条假设在这条路径上
+       不成立, 此时应把它改回 false 并查清原因。
+    */
+    bool azPriorCache = true;
+    long long m_priorCacheHits = 0;
+    long long m_priorCacheMisses = 0;
+    void setAzPriorCache(bool on) { azPriorCache = on; }
+    bool azPriorCacheEnabled() const { return azPriorCache; }
+    /* 命中 = 复用了缓存 (省下一次前向); 未命中 = 真的做了前向 (≈ 被展开过的节点数) */
+    long long azPriorCacheHits() const { return m_priorCacheHits; }
+    long long azPriorCacheMisses() const { return m_priorCacheMisses; }
+    void resetAzPriorCacheStats() { m_priorCacheHits = 0; m_priorCacheMisses = 0; }
 
     /*
        一局结束: 按折现回报把这条轨迹推进回放池, 池子够大时触发一次批量学习。

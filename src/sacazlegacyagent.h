@@ -1,6 +1,42 @@
 #ifndef SACAZ_LEGACY_AGENT_H
 #define SACAZ_LEGACY_AGENT_H
 
+/*
+   [2026-10 第五轮 / 2026-10-15] 编译期开关: 序列 Transformer 专家
+   (`SACAZ_LEGACY_MOE_EXPERT_SEQ=1`) —— 本类的两个 MoE 骨干 (SparseMoeTb / DenseMoeTb)
+   的专家从 `TransformerBlock` 换成 `SeqTransformerExpert` (与 PPO 支同一份实现)。
+
+   **它隐含"对齐表示"**: 序列专家按**格子**切 token, 要求 `dIn % SeqLen == 0`
+   (`SeqLen == POS_ROWS*POS_COLS == 90`), 而改前表示的
+   `STATE_DIM = 17*90 + 3 = 1263` (那 3 个规则标量是**追加的尾巴**、不是第 18 个平面)
+   不满足整除, 构造时会 abort。所以本类把两件事绑在一起:
+
+       打开 SACAZ_LEGACY_MOE_EXPERT_SEQ ⇒ 本类的 ALIGNED_REPR 自动为 true (1710 = 19×90)
+
+   这与 `SACAZMoETbAgent` (`SACAZ_MOE_EXPERT_SEQ`) 和 `DQNMCTSMOETbAgent`
+   (`DQNMCTS_MOE_EXPERT_SEQ`) 是同一套做法 —— 三个类的开关都各自隐含自己的 19x90。
+   下面这个宏因此 = **本类**"表示是否对齐"的唯一来源, 而**其它 SAC 类共用**的
+   `SACAZ_ALIGNED_REPR` 语义一个字都不动 (那个宏仍然只表示"用户显式要求对齐表示",
+   四个 SAC 类各读各的); 本类只是在它之上再**或上**自己的序列专家开关。
+
+   紧跟其后的 `#error` 是**守卫**: 它要求"开关打开 ⇒ 表示必须是对齐的"。按上面的绑定,
+   这一条现在是**恒真**的 (开关一开就自带对齐), 所以它的作用是**tripwire** —— 以后谁把
+   那个耦合改掉 (比如让 ALIGNED_REPR 只认 SACAZ_ALIGNED_REPR), 谁就会在这里当场编不过,
+   而不是等到运行时 construct 序列专家时 abort (那时已经建完网、进过 RL::Random 了)。
+   真正的**算术**检查 (STATE_DIM % 90 == 0) 在类里那条 static_assert 上, 与兄弟类一致。
+*/
+#if (defined(SACAZ_ALIGNED_REPR) && SACAZ_ALIGNED_REPR) || \
+    (defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ)
+#define RL_SACAZ_LEGACY_ALIGNED_REPR 1
+#else
+#define RL_SACAZ_LEGACY_ALIGNED_REPR 0
+#endif
+
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ && \
+    !RL_SACAZ_LEGACY_ALIGNED_REPR
+#error "SACAZ_LEGACY_MOE_EXPERT_SEQ=1 必须落在对齐表示上 (19 平面 x 90 格 = 1710): 序列专家按格子切 token, 要求 dIn % 90 == 0, 而改前表示的 STATE_DIM = 17*90 + 3 = 1263 (3 个规则标量是追加的尾巴) 不满足整除。本类已让这个开关自动带上对齐表示 (见 RL_SACAZ_LEGACY_ALIGNED_REPR); 出现这条 #error 说明有人把那个耦合改坏了。"
+#endif
+
 #include <vector>
 #include <string>
 #include <deque>
@@ -25,6 +61,17 @@
 */
 #include "sacazagent.h"
 
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+/*
+   [2026-10 第五轮] 只有"专家换成序列 Transformer"的那一支才需要这个头 —— 与
+   sacazmoetbagent.cpp 里那条守卫 include 同一个纪律: 默认构建的**编译面**一个字节都
+   没动 (与它的权重/读数逐位不变相配套)。
+   区别只有一处: 本类的 `SeqExpert` typedef 是**类的一部分** (开关选的就是它, 调用点
+   与读数都要用), 所以 include 落在头文件里; 参考实现把它留在 .cpp 的局部 typedef 上。
+*/
+#include "rl/seq_transformer.hpp"
+#endif
+
 /* 稀疏 MoE 层只需要指针/引用 (定义在 rl/sparse_moe.hpp, 由 .cpp 包含) */
 namespace RL {
 class ISparseMoE;
@@ -42,6 +89,9 @@ class ISparseMoE;
  *  只把骨干换成稀疏 MoE + TransformerBlock 专家 (与 AGENT_SACAZ_MOE 那一支同骨干)。
  *  它是"同一份还原口径、两个骨干", 所以本类的身份 = **界面类型(由骨干决定)**, 而不是
  *  写死的单一字符串 —— 见 guiAgentLabel() 与 defaultWeightPrefix(Backbone) 的说明。
+ *  [2026-10 第五轮] 那两个骨干的专家在 SACAZ_LEGACY_MOE_EXPERT_SEQ=1 下换成**序列
+ *  Transformer** (用户口径: "把 TB 专家换成序列 transformer, 输入 19x90, 与 PPO 对齐")
+ *  —— 可选项, 默认不定义; 逐条见 MOE_EXPERT_SEQ 那一段。
  *
  * ---------------------------------------------------------------------------
  *  2026-09 后续: 本类改为**独立类**, 不再继承 SACAZAgent
@@ -112,6 +162,9 @@ class ISparseMoE;
  *  网络结构 / 隐层激活     | 与 59e5233 逐字相同     | buildNet 同一份代码 (Layer<Tanh>)
  *  动作/状态表示           | 128 槽 / 1263 维        | 默认构建 (SACAZ_ALIGNED_REPR 未定义)
  *  ------------------------|-------------------------|--------------------------------
+ *  上表是**默认构建**那一份 (本类的还原对象)。[2026-10 第五轮] 序列专家开关
+ *  (`SACAZ_LEGACY_MOE_EXPERT_SEQ=1`) 会让表示变成对齐的 19x90/8100 —— 它不是第三个
+ *  表示, 而是"要求对齐表示的专家实现", 逐条见 MOE_EXPERT_SEQ 那一段。
  *
  *  α 的口径 (0.98 / 1e-3) 与当前实现**恰好相同**, 但原因不同: 2026-09 的受控实验证明
  *  "目标熵 0.5 + αlr 5e-3"那一套在对弈里**有害** (训练后 37.5% vs 未训练 52.5%), 于是
@@ -123,8 +176,13 @@ class ISparseMoE;
  * ---------------------------------------------------------------------------
  *   AGENT_SACAZ      -> weights/sacaz_agent          (_actor / _q1 / _q2)
  *   AGENT_SACAZ_OLD  -> weights/sacaz_old_agent      (_actor / _q1 / _q2)   <- 本类 (MLP)
- *   AGENT_SACAZ_OLD_MOE -> weights/sacaz_old_moe_agent (_actor / _q1 / _q2) <- 本类 (TB 专家)
+ *   AGENT_SACAZ_OLD_MOE -> weights/sacaz_old_moe_agent (_actor / _q1 / _q2) <- 本类 (MoE 专家)
  *   AGENT_SACAZ_MOE  -> weights/sacaz_moe_agent      (_actor / _q1 / _q2)
+ *
+ *   [2026-10 第五轮] 序列专家开关打开时, 本类那两个 MoE 骨干**再各分一个前缀**
+ *   (结构变了就换名字, 见 defaultWeightPrefix 的说明):
+ *     SparseMoeTb (序列专家) -> weights/sacaz_old_moe_seq_agent
+ *     DenseMoeTb  (序列专家) -> weights/sacaz_old_dense_seq_agent
  *
  *  为什么不能共用一个前缀 (两个后果都是**静默**的):
  *    * 两者的训练口径不同 (上表), 同一个局面会被训成两组不同的权重 —— 共用前缀 =
@@ -136,6 +194,10 @@ class ISparseMoE;
  *  前缀由本类的 defaultWeightPrefix() / defaultWeightPrefix(Backbone) 给出**单一来源**
  *  (前者 = MLP 那一支, 保留给既有调用方); 后台训练的临时前缀也独立
  *  (weights/_temp_train_sacaz_old* / _temp_train_sacaz_old_moe*)。
+ *  ⚠ 那条临时前缀是 **chessboard.cpp 里硬编码的** (TMP_WEIGHTS_SACAZ_OLD_MOE), **不随
+ *  本开关变** —— 打开序列专家开关之后它仍与 TB 那一支同名, 所以"后台训练 + 两种专家
+ *  构建交替跑"会在同一个临时文件上互相覆盖。本文件管不到它, 用之前先看一眼
+ *  chessboard.cpp 的 TMP_WEIGHTS_* 那一组常量。
  *
  * ---------------------------------------------------------------------------
  *  本文件 / 实现的位置
@@ -171,16 +233,43 @@ public:
      *    * 对齐表示保留为**可编译进来的选项**, 供"数据量足够时重新评估"用;
      *    * 两边都保留 critic 值域约束与 Huber —— 它们在**两种**表示下都不损失棋力
      *      (改前表示 + 钳位 = 73.1%, 与不加钳位的 72.5% 同水平)。
+     *    * [2026-10 第五轮] 序列专家开关 (`SACAZ_LEGACY_MOE_EXPERT_SEQ`) **自带**对齐
+     *      表示: 它不是"第三个表示", 而是"要求对齐表示的专家实现" (见下面 ALIGNED_REPR
+     *      与 MOE_EXPERT_SEQ 两段)。
      *
      *  完整数据与复现命令见 docs/sac_regression_2026_09.md。
      * ================================================================ */
     static constexpr int CELLS = 90;                  /* 10x9 */
     static constexpr int PIECE_PLANES = 14;           /* 7 类棋子 x {己方, 对方} */
 
-#if defined(SACAZ_ALIGNED_REPR) && SACAZ_ALIGNED_REPR
-    static constexpr bool ALIGNED_REPR = true;
+    /*
+       ---- 本类自己的对齐条件 (单一来源 = 文件顶部那个 RL_SACAZ_LEGACY_ALIGNED_REPR) ----
+       与其它 SAC 类共用 `SACAZ_ALIGNED_REPR` 的**语义没有被改动** —— 恰好相反: 那个宏
+       仍然只表示"用户显式要求对齐表示", 四个 SAC 类各读各的。本类在它之上**或上**自己的
+       序列专家开关, 于是 `-DSACAZ_LEGACY_MOE_EXPERT_SEQ=1` **单独一个宏**就能得到
+       ALIGNED_REPR = true -> STATE_DIM = 19*90 = 1710。这与 `SACAZMoETbAgent` /
+       `DQNMCTSMOETbAgent` 的 `ALIGNED_REPR = (RL_*_SEQ_ON != 0)` 是同一套写法。
+
+       为什么必须这样 (而不是"让用户自己记得同时给两个宏"): 序列专家按**格子**切 token
+       (第 t 个 token = 19 个平面在第 t 格上的取值), 构造时要求 `dIn % SeqLen == 0`;
+       而改前表示的 1263 = 17*90 + 3 —— 那 3 个规则标量是**追加的尾巴**、不是第 18 个
+       平面 ⇒ **不可能**满足整除。这是表示层面的事实, 不是取整/裁剪能绕过去的, 所以
+       "序列专家" 与 "对齐表示" 在本类里是绑定的: 谁能开, 谁就自动带上它。
+       (界面口径要的就是"AGENT_SACAZ_OLD_MOE 默认就是 19x90 + 序列专家", 见 CMakeLists
+       里 `chess` 目标的四个开关; 文件顶部有 #error 守卫 + 下面一条 static_assert。)
+    */
+    static constexpr bool ALIGNED_REPR = (RL_SACAZ_LEGACY_ALIGNED_REPR != 0);
+
+    /*
+       [2026-10 第五轮] 用户口径: "把 TB 专家换成序列 transformer, 输入 19x90 特征,
+       与 PPO agent 对齐"。本常量是那个编译期开关的**类内读数** (真正的旋钮是文件顶部的
+       `SACAZ_LEGACY_MOE_EXPERT_SEQ`), 详细说明在 MOE_SEQ_* 那一段。
+       ⚠ 它同时决定 `legacyHashAction` 的默认值 —— 两处共用同一个常量, 不各写一套 #if。
+    */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    static constexpr bool MOE_EXPERT_SEQ = true;
 #else
-    static constexpr bool ALIGNED_REPR = false;
+    static constexpr bool MOE_EXPERT_SEQ = false;
 #endif
 
     /* ---- 上下文个数: 对齐 = 5 (与 PPOMCTS 同), 改前 = 3 (无吃子/重复/将军) ---- */
@@ -204,8 +293,46 @@ public:
     static constexpr int ACTION_DIM = ALIGNED_REPR ? ALIGNED_ACTION_DIM : LEGACY_ACTION_DIM;
 
     /*
+       **编译期算术检查** (与文件顶部那条 #error 分工不同: 那条查"开关与表示有没有绑住",
+       这条查"算术真的成立"): 序列专家要按格子切 token, 要求 `dIn % SeqLen == 0`。
+       这里用类里的**真值** STATE_DIM 判, 所以以后谁把表示的宽度改窄/改宽 (或把
+       ALIGNED_REPR 的推导改回去), 都在**编译阶段**响 —— 而不是等到 seq_transformer.hpp
+       的构造函数里 abort (那时已经建完网、进过 RL::Random 了)。
+    */
+    static_assert(!MOE_EXPERT_SEQ || (STATE_DIM % CELLS) == 0,
+                  "SACAZ_LEGACY_MOE_EXPERT_SEQ=1 要求 STATE_DIM 能被 90 整除: 序列专家按"
+                  "格子切 token (每个 token = 19 个平面在这一格上的取值), 而改前表示的 "
+                  "1263 = 17*90 + 3 —— 那 3 个规则标量是追加的尾巴, 不满足整除。");
+
+    /*
        运行时消融开关 (只在**对齐**表示下有意义): 把动作退回 128 槽哈希, 用来单独
        隔离"动作空间"这个变量。ALIGNED_REPR=1 编译进来时可用, 否则恒为 false。
+
+       [2026-10 第五轮] **默认值 = 序列专家开关** (用户口径, 2026-10-15):
+       序列专家那一支要**保持 128 槽哈希动作**。理由是这个类已经在案的那条账 (上面
+       2026-09 一节): 动作头从 128 槽 (8,192 参数) 涨到 8100 路 (518,400 参数) 之后,
+       在**当前数据量**下实测净亏约 200 Elo, 机制是参数/数据比失衡。换专家 (容量/算力)
+       与换动作空间 (头宽度) 是**两个变量**, 一次只动一个 —— 所以"专家换序列 Transformer"
+       这一支里动作空间按用户口径钉在 128 槽上。
+       (这条口径在文档里也被预告过: docs/expert_search_optimization_plan_2026_10.md §8.4
+       第 2 条写着"掉 200 Elo 的锅在**稠密策略头**、不在状态维数", 所以"对齐状态 + 哈希
+       动作头 + 序列专家"很可能是这一支的正确配置 —— 2026-10-15 用户把它定成了口径。)
+       顺带一条同类事实 (本类结构上也只能这样): 回放池每条经验的合法掩码是
+       **2 x uint64 = 128 位** (Transition::curMask, 见 maskToBits), 128 槽哈希正好
+       逐位装得下; 而 8100 双射里 i >= 64 的动作会被折叠进 bits[1] 的 64 位
+       (i 与 i+64 挤同一位, 见 maskToBits 的 `i & 63`), 那条路本来就没打算当训练口径用。
+       ⚠ 说清它隔离了什么、**没有**隔离什么: 头张量的宽度仍然是 ACTION_DIM = 8100
+       (ALIGNED_REPR=1 ⇒ ACTION_DIM = 90*90, 这一点不因为本成员而改变), 只有**可达
+       槽位**被哈希到 128 —— 所以这隔离的是"动作编码"这个变量, 并**没有**恢复改前表示的
+       参数/数据比 (要那一份就得连表示一起退回 1263, 而那时序列专家装不上)。
+       默认构建 (两个宏都不给) 的默认值**一个字没变** (MOE_EXPERT_SEQ=false ⇒ false);
+       单独 `-DSACAZ_ALIGNED_REPR=1` 的旧对齐构建同样还是 false。
+       **[2026-10-15 修订]** 这条口径改由**界面**显式设置 (`chessboard.cpp` 的
+       AGENT_SACAZ_OLD_MOE 构造点: `#if SACAZ_LEGACY_MOE_EXPERT_SEQ` →
+       `ag->legacyHashAction = true`), 类默认值保留 false —— 理由: 判据/断言是按表示定标的
+       (见 docs/expert_search_optimization_plan_2026_10.md §10.3: "对齐 + 哈希"这一档在
+       `test_sacaz_aligned_seq` 上有 4 条学习动力学断言不成立, 而那 4 条是按双射定标的),
+       把"界面口径"与"类的默认档"分开, 两种配置才都有人盯着。
     */
     bool legacyHashAction = false;
 
@@ -223,6 +350,12 @@ public:
      *                容量最大, 但一个 TB 专家 ~3.2 ms/前向 -> 只能配很小的模拟次数
      *    DenseMoeTb   与 SparseMoeTb **完全相同的参数**, 但 4 个专家全算
      *                这是"等参数不等算力"的对照组: 用来量稀疏路由本身值多少
+     *
+     *  [2026-10 第五轮] 上表后两行的"专家"在 `SACAZ_LEGACY_MOE_EXPERT_SEQ=1` 下换成
+     *  **序列 Transformer** (参数 12.9 M -> 92 K, 每次前向的量级也随之变) —— 骨干的
+     *  **枚举与名字不变** (仍是 SparseMoeTb / DenseMoeTb, 界面类型也不变), 变的是专家,
+     *  所以"报出来的骨干名"跟着开关分支 (见 backboneName 的实现)。
+     *  算力那一行 (3.2 ms/前向) 是 TB 专家的读数, 序列专家下**不适用**。
      * ---------------------------------------------------------------- */
     enum class Backbone {
         Mlp = 0,
@@ -288,6 +421,10 @@ public:
        判据与权重前缀一样是**单一来源**: 实例版本 guiAgentLabel() 只转发到
        guiAgentLabelFor(backbone), 测试用静态版本就能覆盖到**四个**骨干 ——
        不必为了检查 SparseMoeTb 的标签去构造一个 TB 实例 (那一支建网 + 拷贝权重很贵)。
+
+       [2026-10 第五轮] 标签里那句"专家是什么"必须跟着 `SACAZ_LEGACY_MOE_EXPERT_SEQ`
+       分支 (那不是骨干变体, 是专家变体): 序列专家的参数量是 TB 专家的 1/140, 印同一句
+       就等于把两支的账混在一起 —— 与上面那条"读数不许说谎"同一条纪律。
     */
     const char *guiAgentLabel() const;
     /* 同一判据的**静态**形态 (按骨干取标签; 面板与测试不必先建实例) */
@@ -309,6 +446,11 @@ public:
          * Mlp        -> weights/sacaz_old_agent      (AGENT_SACAZ_OLD)
          * SparseMoeTb -> weights/sacaz_old_moe_agent  (AGENT_SACAZ_OLD_MOE)
        无参版本 = Mlp 那一支 (保留给既有调用方与测试)。
+
+       [2026-10 第五轮] 序列专家开关打开时再各分一个 (结构与参数量都变了 ⇒ 名字必须变,
+       见 .cpp 里 defaultWeightPrefix 的说明):
+         * SparseMoeTb -> weights/sacaz_old_moe_seq_agent
+         * DenseMoeTb  -> weights/sacaz_old_dense_seq_agent
     */
     static const char *defaultWeightPrefix();
     static const char *defaultWeightPrefix(Backbone b);
@@ -337,11 +479,72 @@ public:
     static constexpr int MOE_TB_DFF = 315;    /* = d_model/4, 压住 TB 专家的 FFN 开销 */
 
     /*
+       ================================================================
+       [2026-10 第五轮] 编译期开关: 两个 MoE 骨干的专家换成**序列 Transformer**
+       ================================================================
+       用户口径: "把 TB 专家换成序列 transformer, 输入 19x90 特征, 与 PPO agent 对齐。"
+       本类的"TB 专家"就是 `Backbone::SparseMoeTb` / `DenseMoeTb` 这两个骨干的专家 ——
+       打开 `SACAZ_LEGACY_MOE_EXPERT_SEQ=1` 之后它们从
+           TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>
+       换成
+           SeqTransformerExpert<CELLS(90), MOE_SEQ_HEADS(4), MOE_SEQ_BLOCKS(2)>
+       与 PPO 支的 `PPOSeqExpert`、以及 `SACAZMoETbAgent` 的对应支是**同一份实现**
+       (`src/rl/seq_transformer.hpp`) —— 于是"两个 agent 的专家"现在是同一个东西,
+       跨 agent 对照时专家不再是那个变量。
+
+       ⚠⚠ **前提: 必须落在对齐表示上**。序列专家按**格子**切 token (第 t 个 token 的
+       特征是 19 个平面在第 t 格上的取值), 构造时要求 `SeqLen == POS_ROWS*POS_COLS == 90`
+       且 `dIn % SeqLen == 0`; 而改前表示的 `STATE_DIM = 17*90 + 3 = 1263` —— 那 3 个
+       规则标量是**追加的尾巴**、不是第 18 个平面 ⇒ **不满足整除**, 构造时 abort。
+       本类的做法是"开关一开就自带对齐表示" (见 ALIGNED_REPR 的说明), 所以命令行只需要
+       一个宏; 文件顶部有 `#error` + 类里有一条 `static_assert`, 把这条绑定钉成编译期事实。
+
+       开关方式:
+           cmake -S . -B <build> -DSACAZ_LEGACY_MOE_EXPERT_SEQ=1
+
+       **默认构建 (不定义这个宏) 的专家类型、参数形状、权重前缀与全部读数逐位不变。**
+
+       逐条记账 (与 sacazmoetbagent.h 的 MOE_EXPERT_SEQ 那一段同源):
+         * 一个 TB 专家 **12.9 M 参数 / 13.3 M MAC** → 序列专家
+           **91,731 参数 / 9.67 M MAC** (读数见 docs/seq_transformer_design.md §4/§5);
+         * **存量权重全部作废** ⇒ 前缀随之换名 (见 defaultWeightPrefix), 于是"载不到"
+           是**看得见**的, 不会是静默错读 (参数量守卫也会拒绝);
+         * 位置编码走序列专家自己的旋钮 (`moeSeqPosMode()`, 与界面 PPO 支同选 `2d`);
+         * `MOE_TB_HEADS / MOE_TB_DFF` 在这一支下**不生效** (那是 TB 专家的参数),
+           宽度改由构造时的 `expertHidden` 决定 (tokDim; 默认 64, 必须能被
+           `MOE_SEQ_HEADS` 整除 —— 不满足时序列专家自己会 abort);
+         * 动作头口径由用户定在 **128 槽哈希** (见 legacyHashAction 的说明)。
+
+       报告的纪律: 这一支下 `backboneName()` / `guiAgentLabelFor()` / 自检报告的
+       "专家类型"行**都必须跟着分支** —— 报错名字比不报更坏 (参数量、算力、路由读数
+       三样都变了, 而面板上写着 TB)。
+    */
+    static constexpr int MOE_SEQ_HEADS = 4;    /* 与 PPO 支同口径 (dk = tokDim/4) */
+    static constexpr int MOE_SEQ_BLOCKS = 2;   /* Pre-LN 块数 (与 PPO 支相同) */
+    /* 位置编码模式: 与界面 PPO 支一致 —— 可学 2D (10 行 + 9 列) */
+    static const char *moeSeqPosMode() { return "2d"; }
+
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    /*
+       开关选中的那个专家类型。放在类里 (而不是各调用点各 typedef 一次) 的理由:
+       "开关选了什么"是**类的一部分** —— 建网、报告、主参数断言读的必须是同一个类型,
+       抄两份就等于留了两个可能漂移的口径。
+       (参考实现 sacazmoetbagent.cpp 把它写成函数内的局部 typedef, 那是因为那边的类
+       只需要标量; 本类需要它出现在读数里, 所以放这儿。)
+    */
+    typedef RL::SeqTransformerExpert<CELLS, MOE_SEQ_HEADS, MOE_SEQ_BLOCKS> SeqExpert;
+#endif
+
+    /*
      * 一条 off-policy 经验。
      *
      * 局面**不存 1260 个 float** (那是 5 KB/条), 而是存"被占据的格子"的稀疏列表
      * (一局最多 32 个子, 每格一个 uint16 = plane*90+cell)。取用时再展开成 one-hot,
      * 这样 8000 条经验只有 ~6 MB, 而不是 80 MB。
+     * ⚠ [2026-10 第五轮] 下面那个 `pi[ACTION_DIM]` 是**稠密**的, 它跟着表示走:
+     *   改前 (128 槽) 512 B/条 -> 4096 条 ~2 MB; 对齐表示 (序列专家开关自带)
+     *   ACTION_DIM = 8100 -> **32 KB/条 -> 4096 条 ~133 MB**。这是"对齐表示"在本类里的
+     *   真实代价 (与 sparse 的 cells 无关), 开开关前先看一眼内存。
      */
     struct Transition {
         std::vector<std::uint16_t> cells;      /* 当前局面: plane*CELLS + cell */
@@ -422,7 +625,9 @@ public:
     RL::GradValue alpha;      /* 温度 α (标量, 自动调节) */
 
     Backbone backbone;        /* 骨干类型 (构造时定, 之后不要改) */
-    int expertHidden;         /* MLP 专家的隐层宽度 (只用 MlpExpert 骨干时有效) */
+    int expertHidden;         /* 专家隐层宽度: MLP 专家骨干用 (SparseMoeMlp); 序列专家骨干
+                                 下它是 **token 宽度 tokDim** (必须能被 MOE_SEQ_HEADS 整除);
+                                 TB 专家骨干下不使用 (那边用 MOE_TB_HEADS/MOE_TB_DFF) */
     float auxLossCoef;        /* 稀疏 MoE 负载均衡辅助损失的系数 (0 = 关掉) */    int hiddenDim;
     float gamma;
     float learningRateActor;
@@ -864,12 +1069,17 @@ public:
      *       槽位哈希, 而真实走法空间是 8100 个 (from,to) 对 —— 所以在**标准开局**
      *       (确定性参照点) 与**当前局面**上各报一份别名读数。别名是策略精度的
      *       结构性上限, 不是训练量的问题。
+     *       (这两行本身随 ALIGNED_REPR 分支: 对齐表示下是 19 平面 x 90 = 1710 与
+     *       8100 双射 —— 序列专家开关打开时走的就是那一条。)
      *    2. **算法 / 口径**: 双 critic + 目标网 + Polyak 同步周期、最大熵叶子价值
      *       min_i Q_i − α·log π、α / 熵比 / azWeight / c_puct / 模拟数 / 学习率,
      *       以及**终局取真实胜负而不是自举** (这是局末价值目标可信的原因)。
      *    3. **骨干与训练进度**: 参数量、专家数 / topK、MoE 使用直方图与均衡判读
      *       (某专家计数为 0 = 路由坍缩)、learnSteps / 批大小 / epochs / 池 /
      *       叶子评估次数 / 最近一次 critic MSE (NaN = 还没上报)。
+     *       [2026-10] 序列专家开关打开时, 这一节还多一行"专家类型" (序列 Transformer +
+     *       tokDim + 位置编码模式 + 权重前缀), 因为那时"专家到底是什么"是本支最重要的
+     *       事实 —— 开关设了却没生效是本工程记录在案的事故类型。
      *
      *  **只读、可重复、不动棋盘**: 全部走 `chess` 的副本 (`Chess probe(chess)`),
      *  绝不碰 `this->chess` (面板会在对局中途被 GUI 线程调用, 而那一刻搜索线程可能

@@ -3,6 +3,13 @@
 #include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "agentrollout.hpp"
 #include "rl/sparse_moe.hpp"
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+/*
+   [2026-10 第五轮] 只有"专家换成序列 Transformer"的那一支才需要这个头。
+   这样默认构建的**编译面一个字节都没动** (与它的权重/读数逐位不变相配套)。
+*/
+#include "rl/seq_transformer.hpp"
+#endif
 
 #include <cstdio>
 #include <cmath>
@@ -65,10 +72,16 @@ RL::ISparseMoE *findSparseMoe(RL::Net &net)
 
 } // namespace
 
-/* 本类骨干的名字: 稀疏 MoE(TB 专家) / 它的等参数对照组 "稠密" (moeDense) */
+/* 本类骨干的名字: 稀疏 MoE(TB 专家) / 它的等参数对照组 "稠密" (moeDense)
+   [2026-10 第五轮] `SACAZ_MOE_EXPERT_SEQ=1` 的构建里专家换成了序列 Transformer
+   ⇒ 名字必须跟着变 (与 `sacazx::variantName` 那份**逐字一致**, 两处不能各说一套)。 */
 const char *SACAZMoETbAgent::backboneName() const
 {
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    return moeDense ? "稠密MoE(序列Transformer专家,对照)" : "稀疏MoE(序列Transformer专家)";
+#else
     return moeDense ? "稠密MoE(TB专家,对照)" : "稀疏MoE(TB专家)";
+#endif
 }
 
 const char *SACAZMoETbAgent::trunkModeName(TrunkMode m)
@@ -88,7 +101,17 @@ const char *SACAZMoETbAgent::trunkModeName(TrunkMode m)
  * ---------------------------------------------------------------- */
 const char *SACAZMoETbAgent::sharedWeightPrefix()
 {
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    /*
+       [2026-10 第五轮] 专家换成序列 Transformer 之后**结构变了** ⇒ 权重必须换前缀:
+       同一个前缀会让"新的空网"覆盖掉盘上那份 TB 专家的 sacaz_shared_agent*,
+       而参数量守卫只能拒绝"载入", 拦不住"写出时把旧的盖掉"。
+       (与 PPO 支换成 seq 骨干时换 `weights/ppomcts_seq_agent.dat` 是同一条纪律。)
+    */
+    return "weights/sacaz_moe_seq_shared_agent";
+#else
     return "weights/sacaz_shared_agent";
+#endif
 }
 
 /*
@@ -117,6 +140,51 @@ RL::iLayer::sptr makeMoeLayer(int d, bool withGrad, int hidden)
 */
 RL::iLayer::sptr SACAZMoETbAgent::makeTbExpertMoe(bool withGrad, bool dense) const
 {
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    /*
+       [2026-10 第五轮] 用户口径: "sac agent 的 TB 专家使用 seq transformer"。
+
+       这一支把专家换成**真正的序列 Transformer** (`SeqTransformerExpert`, 与 PPO 支
+       `PPOSeqExpert` 同一份实现): 状态按**格子**切成 T=90 个 token, 每个 token 的
+       特征是 19 个平面在这一格上的取值, 跑标准 Pre-LN 编码器 (逐行 softmax + 位置编码),
+       再逐格投影回 19 维散回 1710。
+
+       与 TB 专家的关系 (为什么这**不是**"换个更方便的写法"):
+         * TB 专家收的是 `(d_model × 1)` 单个向量 ⇒ `q·kᵀ` 是 `d_k×d_k` **外积**,
+           混合的是特征维而不是"谁该注意谁", 且 `softmax` 是**全局**归一
+           (初始化时这条支路只占块输出方差的 5.6e-07) —— 见
+           docs/tb_expert_training_2026_10.md §9 的七条判定;
+         * 序列专家把这两件事都修正了, 参数从 **12.9 M → 91,731**、MAC 从
+           **13.3 M → 9.67 M**。
+
+       ⚠ 前提与后果 (逐条写在头文件 MOE_EXPERT_SEQ 的说明里): 必须在**对齐表示**下
+       编译 (头文件顶部有 `#error` 守卫); 存量权重作废且前缀随之更换
+       (见 sharedWeightPrefix); 宽度由 `expertHidden` 决定而不是 MOE_TB_*。
+
+       ⚠ `expertHidden` 必须能被 `MOE_SEQ_HEADS` 整除, 否则序列专家构造时 abort
+       (它自己会把话说清楚, 这里不重复判一次 —— 判两处就会有两份可能漂移的口径)。
+    */
+    typedef RL::SeqTransformerExpert<CELLS, MOE_SEQ_HEADS, MOE_SEQ_BLOCKS> SeqExpert;
+    const int tokDim = (expertHidden > 0) ? expertHidden : 64;
+    RL::iLayer::sptr layer =
+        dense ? makeMoeLayer<SeqExpert, MOE_TB_EXPERTS, MOE_TB_EXPERTS>(STATE_DIM, withGrad, tokDim)
+              : makeMoeLayer<SeqExpert, MOE_TB_EXPERTS, MOE_TB_TOPK>(STATE_DIM, withGrad, tokDim);
+
+    /*
+       位置编码必须显式设上: 序列专家的默认是 `LEARN_1D`(老行为), 而界面 PPO 支
+       选的是可学 2D。**设不上就响亮失败** —— 本工程记过很多次"旋钮设了却没生效"
+       的事故 (SparseMoE 会把这一层转发给每个专家, 只有序列专家响应)。
+    */
+    if (!layer->setPosModeByKey(moeSeqPosMode())) {
+        std::fprintf(stderr,
+                     "[SACAZMoETbAgent] 位置编码模式 \"%s\" 没有被专家接受 —— "
+                     "外层开关 (SACAZ_MOE_EXPERT_SEQ) 与实际建出来的专家类型不一致。\n",
+                     moeSeqPosMode());
+        std::fflush(stderr);
+        std::abort();
+    }
+    return layer;
+#else
     typedef RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF, true>  TbHonor;
     typedef RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF, false> TbLegacy;
     if (tbHonorHeads) {
@@ -125,6 +193,7 @@ RL::iLayer::sptr SACAZMoETbAgent::makeTbExpertMoe(bool withGrad, bool dense) con
     }
     return dense ? makeMoeLayer<TbLegacy, MOE_TB_EXPERTS, MOE_TB_EXPERTS>(STATE_DIM, withGrad, 0)
                  : makeMoeLayer<TbLegacy, MOE_TB_EXPERTS, MOE_TB_TOPK>(STATE_DIM, withGrad, 0);
+#endif
 }
 
 /*
@@ -2953,6 +3022,33 @@ std::string SACAZMoETbAgent::selfCheckReport() const
         }
     }
     {
+        /*
+           [2026-10 第五轮] 先说清"这一支的专家到底是什么" —— 它是**编译期开关**
+           (SACAZ_MOE_EXPERT_SEQ), 而"设了却没生效"是本工程记录在案的事故类型。
+           放在 TB 头数那一段前面, 因为下面那条读数只对 TB 专家有意义。
+        */
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+        std::snprintf(buf, sizeof(buf),
+                      "专家类型: **序列 Transformer** (SeqTransformerExpert<90,%d,%d>, "
+                      "tokDim=%d) | 位置编码: %s | 权重前缀: %s\n",
+                      MOE_SEQ_HEADS, MOE_SEQ_BLOCKS,
+                      (expertHidden > 0) ? expertHidden : 64, moeSeqPosMode(),
+                      sharedWeightPrefix());
+        out += buf;
+        out += "  判读: TB 专家换成序列专家 (用户口径)。下面是 TB 专家的头数读数, "
+               "在序列专家下**不适用** (它的头数由 MOE_SEQ_HEADS 决定且必然整除)。\n";
+#else
+        if (tbHeadsRequested() >= 0) {
+            std::snprintf(buf, sizeof(buf),
+                          "专家类型: TransformerBlock<%d,%d,true> (tbHonorHeads=%s)"
+                          " | 权重前缀: %s\n",
+                          MOE_TB_HEADS, MOE_TB_DFF, tbHonorHeads ? "开" : "关",
+                          sharedWeightPrefix());
+            out += buf;
+        }
+#endif
+    }
+    {
         const int hReq = tbHeadsRequested();
         if (hReq < 0) {
             out += "TB 专家头数: 本骨干没有 TransformerBlock 专家 (Mlp / 稀疏MoE(MLP专家))\n";
@@ -3153,7 +3249,16 @@ std::string SACAZMoETbAgent::selfCheckReport() const
                   huberDelta > 0.0f ? std::to_string(huberDelta).c_str() : "关(纯 MSE)",
                   sparseLeafEval ? "稀疏头(只算合法列)" : "全量(与 59e5233 相同)",
                   (double)rewardScale, (double)valueScale,
-                  legacyHashAction ? "对齐双射 8100" : "128 槽哈希");
+                  /*
+                     [2026-10-15] 这条三目原来**写反了** (只看 legacyHashAction, 漏了
+                     ALIGNED_REPR): "对齐 + 不哈希"印成 128 槽、"对齐 + 哈希"印成双射。
+                     判据与 `stepToActionIdx` 的 `if (!ALIGNED_REPR || legacyHashAction)`
+                     逐字一致。序列专家那一支 (`-DSACAZ_MOE_EXPERT_SEQ=1`) 走"对齐 + 哈希",
+                     所以这里必须印 128 槽 —— 同时把"头张量仍是 8100 宽"一并说清,
+                     免得读者以为参数/数据比也回到了改前表示。
+                  */
+                  (!ALIGNED_REPR || legacyHashAction) ? "128 槽哈希 (头张量仍 8100 列)"
+                                                      : "对齐双射 8100");
     out += buf;
     out += "  这两行就是 AGENT_SACAZ 与 AGENT_SACAZ_OLD 的全部差异 (再加隐层激活);"
            " 两边都保留是为了能在界面上直接对弈比较, 而不是靠两份会漂移的实现\n";

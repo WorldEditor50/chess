@@ -70,11 +70,18 @@ QString agentDisplayName(ChessBoard::AgentType type)
     case ChessBoard::AGENT_SACAZ_OLD_MOE: return QStringLiteral("SAC+AZ-59e5233-MoE");
     case ChessBoard::AGENT_DQNAB:  return QStringLiteral("DQN+AB");
     /*
-       [2026-09 dev-dqnmcts-moetb] DQN+MCTS 的**MoE+TB 专家骨干**那一支 (独立类
+       [2026-09 dev-dqnmcts-moetb] DQN+MCTS 的**MoE 专家骨干**那一支 (独立类
        DQNMCTSMOETbAgent)。名字里必须带上骨干口径 —— 与 AGENT_DQNMCTS 在同一个
        下拉框里, 两者在日志/奖励曲线/比分表上不能同名 (同名 = 读数没法归因)。
+       [2026-10-15] 专家按用户口径换成序列 Transformer ⇒ 名字跟着宏走: 界面构建
+       带 `-DDQNMCTS_MOE_EXPERT_SEQ=1` 时这一支是 seq (表示也换成 19×90),
+       不带宏的构建 (test/bench) 仍是 TB —— 两种构建下这里都不许说谎。
     */
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    case ChessBoard::AGENT_DQNMCTS_MOE: return QStringLiteral("DQN+MCTS (稀疏MoE+序列专家)");
+#else
     case ChessBoard::AGENT_DQNMCTS_MOE: return QStringLiteral("DQN+MCTS (稀疏MoE+TB专家)");
+#endif
     case ChessBoard::AGENT_PPOMCTS_MLP: return QStringLiteral("PPO+MCTS-MLP");
     /*
        [2026-10 第三轮] PPO+MCTS 的 conv2d+ResNet 专家骨干那一支。名字里必须带上骨干口径
@@ -479,6 +486,37 @@ static constexpr int   PPO_MOE_MLP_GATE_HIDDEN = 0;
  * ================================================================
  */
 static const RL::PPO::Backbone PPOMCTS_BACKBONE = RL::PPO::Backbone::SeqExperts;
+
+/*
+ * ================================================================
+ *  [2026-10-15] 用户口径: "把所有 agent 里的 TB 专家换成 seq transformer,
+ *               输入都使用 19x90 特征, 与 ppo agent 对齐"
+ * ================================================================
+ *  上一轮只把 **PPO 那一支** 的默认骨干换成了 seq (`PPOMCTS_BACKBONE` 那一行,
+ *  2026-10-10 用户口径); 本轮把界面里**另外四支 TB 专家骨干**也换掉:
+ *     AGENT_SACAZ_MOE     SACAZMoETbAgent   稀疏 MoE 专家 -> SeqTransformerExpert<90,4,2>,
+ *                                            表示同时切到对齐口径 1710 = 19×90
+ *     AGENT_SACAZ_OLD_MOE SACAZLegacyAgent  同上 (该类不在下拉框里, 但仍是 agent)
+ *     AGENT_DQNMCTS_MOE   DQNMCTSMOETbAgent 同上, 表示 1263 = 17×90+3 -> 1710
+ *     AGENT_DQNAB         DQNABAgent        只换专家 (表示本来就是 19×90 = 1710)
+ *
+ *  怎么做: **不改源码默认值**, 而是给 `chess` (界面) 这个 target 加四个编译宏
+ *  (见 CMakeLists.txt 里 `target_compile_definitions(chess ...)`)。于是:
+ *    * 界面 = 四支 seq + 19×90; 每个开关都**隐含**该 agent 的 19×90 表示
+ *      (序列专家按格子切 token, 要求 dIn % 90 == 0 —— 这是硬前提, 不是偏好);
+ *    * test / bench / train_* 这些 target 不带宏 ⇒ 仍旧跑 TB 那一套,
+ *      既有断言、读数与权重文件一位不动 ("改前"始终可对照);
+ *    * 每支的权重前缀都换了 (sacaz_moe_seq_shared_agent / sacaz_old_moe_seq_agent /
+ *      dqnmcts_moe_seq_agent / dqnab_seq_agent): 结构指纹与参数量都变了,
+ *      **存量 TB 权重按设计载不进来**, 这是看得见的失败, 不是静默错读。
+ *
+ *  ⚠ AGENT_SACAZ_MOE / AGENT_SACAZ_OLD_MOE 的**动作口径**: 用户口径是"保留 128 槽
+ *    哈希动作头" (`legacyHashAction`), 因为那次实测把掉 ~200 Elo 归因在稠密 8100
+ *    策略头。注意实现上动作映射虽退回哈希, 但头张量仍是 `ACTION_DIM = 8100` 宽
+ *    (ACTION_DIM 是编译期常量) —— 详见 sacazmoetbagent.h 里 `legacyHashAction`
+ *    那段说明的边界, 与 docs/expert_search_optimization_plan_2026_10.md §8.4。
+ * ================================================================
+ */
 /*
  * ================================================================
  *  [2026-10 第二轮] AGENT_PPOMCTS 的**位置编码** = 可学 2D (10 行 + 9 列)
@@ -705,8 +743,17 @@ static const char *TMP_WEIGHTS_SACAZ = "weights/_temp_train_sacaz";
    不换的后果与正式前缀那条一样 (共享口径写 _trunk/_actorhead/..., 独立口径写
    _actor/_q1/_q2): 上一次会话留下的 _actor/_q1/_q2 会被新一轮的 loadModel 找不到
    _trunk 而失败 —— 或者在有人补了回退之后被**静默当成共享骨干**读进来。
+
+   [2026-10-15] 本轮 SACAZ_MOE 的专家换成序列 Transformer (`SACAZ_MOE_EXPERT_SEQ=1`,
+   表示同时切到 19×90) ⇒ 临时前缀也必须跟着分: 后台训练的临时文件是"带结构指纹的
+   权重容器", 与正式前缀同一条纪律 —— 两种构建共用同一个临时文件, 就会把 TB 结构的
+   权重留给 seq 结构那一轮去读 (参数量守卫会拒, 但那是"训练中途莫名失败"的形状)。
 */
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe_seq_shared";
+#else
 static const char *TMP_WEIGHTS_SACAZ_MOE = "weights/_temp_train_sacaz_moe_shared";
+#endif
 /* [2026-09 独立类] MoE+MLP 那一支的临时前缀: **必须独立** (与另外几支共用会让后台训练互相覆盖) */
 static const char *TMP_WEIGHTS_SACAZ_MOE_MLP = "weights/_temp_train_sacaz_moe_mlp_shared";
 /*
@@ -716,12 +763,25 @@ static const char *TMP_WEIGHTS_SACAZ_MOE_MLP = "weights/_temp_train_sacaz_moe_ml
 */
 static const char *TMP_WEIGHTS_SACAZ_OLD = "weights/_temp_train_sacaz_old";
 /*
-   还原版的**TB 专家骨干**那一支 (AGENT_SACAZ_OLD_MOE) 的临时前缀。
+   还原版的**专家骨干**那一支 (AGENT_SACAZ_OLD_MOE) 的临时前缀。
    同样必须独立: 它与 AGENT_SACAZ_OLD 是"同一个类、不同骨干", 参数量差不多但结构不同 ——
    共用前缀至少会让"这个临时文件是哪一支的"变成只能靠猜。
+
+   [2026-10-15] 本轮这一支的专家换成序列 Transformer
+   (`SACAZ_LEGACY_MOE_EXPERT_SEQ=1`, 表示同时切到 19×90) ⇒ 临时前缀再分一份:
+   与上面 TMP_WEIGHTS_SACAZ_MOE 同一条理由 (两种构建的权重结构不同, 不能互相覆盖)。
 */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+static const char *TMP_WEIGHTS_SACAZ_OLD_MOE = "weights/_temp_train_sacaz_old_moe_seq";
+#else
 static const char *TMP_WEIGHTS_SACAZ_OLD_MOE = "weights/_temp_train_sacaz_old_moe";
+#endif
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+/* [2026-10-15] 专家换成序列 Transformer ⇒ 独立的临时前缀 (结构不同, 不能与 TB 那一份互覆盖) */
+static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab_seq";
+#else
 static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab";
+#endif
 /*
    [2026-09 dev-dqnmcts-moetb] DQN+MCTS (MoE+TB 专家) 那一支的临时前缀。
    **必须独立**: 它写出的文件名是 `<prefix>_trunk` / `<prefix>_q`, 而 DQN+AB 写的是
@@ -729,7 +789,12 @@ static const char *TMP_WEIGHTS_DQNAB = "weights/_temp_train_dqnab";
    覆盖主干" (同一时刻只有一支在跑, 但上一轮的残留会让本轮 loadModel 读到别的结构),
    与上面 PPO/SAC 那几段是同一条理由。
 */
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+/* [2026-10-15] 专家换成序列 Transformer + 表示切到 19×90 ⇒ 独立的临时前缀 */
+static const char *TMP_WEIGHTS_DQNMCTS_MOE = "weights/_temp_train_dqnmcts_moe_seq";
+#else
 static const char *TMP_WEIGHTS_DQNMCTS_MOE = "weights/_temp_train_dqnmcts_moe";
+#endif
 
 /* 这个 agent 的后台训练临时前缀 (见上面那段注释) */
 static const char *tmpWeightsOf(ChessBoard::AgentType type)
@@ -972,6 +1037,22 @@ static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
         board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f, 64, SACAZ_MOE_AUX,
         shared ? SACAZMoETbAgent::TrunkMode::Shared
                : SACAZMoETbAgent::TrunkMode::Separate);
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    /*
+       [2026-10-15 用户口径] 序列专家那一支**保留 128 槽哈希动作**
+       (依据: docs/sac_regression_2026_09.md 与 conv_resnet_moe_analysis.md §7 把"对齐表示
+        掉约 200 Elo"归因在**稠密 8100 策略头**的宽度上, 而不是状态维数)。
+       它只是动作**索引**口径 (运行时读), 所以构造后设置有效 —— 不是 moeDense 那类
+       建网期参数。⚠ 头张量宽度不受它影响: ACTION_DIM 编译期仍是 8100。
+
+       ⚠ 注意这条口径**只在界面生效**: 类的默认值是 false, 于是
+       `test_sacaz_aligned_seq` 那个变体仍在验证"对齐 + 8100 双射"那一档 ——
+       实测"对齐 + 哈希"会让该测试 4 条**学习动力学**断言不成立 (见
+       docs/expert_search_optimization_plan_2026_10.md §10.3), 那 4 条是按双射定标的。
+       谁要动这条口径, 请先看那一节。
+    */
+    a->legacyHashAction = true;
+#endif
     /*
        ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
        一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
@@ -1068,10 +1149,18 @@ static SACAZLegacyAgent *createSACAZLegacyAgent(Chess &board, ChessBoard::AgentT
            TB 专家骨干: 参数与 AGENT_SACAZ_MOE **逐字相同** (只有类不同)。
            注意本类**没有** learnFromSearch 那条路径, 所以 SACAZAgent 那一支在这里的
            "关掉从搜索学一次" 那行代码在本函数里没有对应物 —— 还原版本来就是只读搜索。
+           [2026-10-15] 专家换成序列 Transformer 时, 同 `createSACAZMoETbAgent`
+           那一条: 界面口径用 128 槽哈希动作 (类默认值保持 false)。
         */
-        return new SACAZLegacyAgent(board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
-                                    SACAZLegacyAgent::Backbone::SparseMoeTb,
-                                    64, SACAZ_MOE_AUX);
+        {
+            SACAZLegacyAgent *ag = new SACAZLegacyAgent(
+                board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f,
+                SACAZLegacyAgent::Backbone::SparseMoeTb, 64, SACAZ_MOE_AUX);
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+            ag->legacyHashAction = true;
+#endif
+            return ag;
+        }
     default:
         return nullptr;      /* 不是这两支 (调用方不该走到这里) */
     }
@@ -5975,8 +6064,16 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     case AGENT_SACAZ_OLD: return SACAZLegacyAgent::defaultWeightPrefix();
     case AGENT_SACAZ_OLD_MOE:
         return SACAZLegacyAgent::defaultWeightPrefix(SACAZLegacyAgent::Backbone::SparseMoeTb);
-    /* DQN+AB: 前缀 -> <prefix>_trunk / _v / _a */
-    case AGENT_DQNAB:  return "weights/dqnab_agent";
+    /*
+       DQN+AB: 前缀 -> <prefix>_trunk / _v / _a。
+       [2026-10-15] 改走**类自己的** `defaultWeightPrefix()` —— 本轮它的骨干换成了
+       序列专家 (`-DDQNAB_MOE_EXPERT_SEQ=1`), 前缀随之变成 `weights/dqnab_seq_agent`;
+       这里如果继续手抄 "weights/dqnab_agent", 启动扫描/退出保存探测的就是 TB 那一份
+       文件名, 而类的存取守卫会拒绝它 ⇒ **界面这一支永远读写不了权重** (正是本文件
+       反复记过的"前缀手抄成两份就会漂移"的形状)。默认构建下这个函数返回的仍是
+       `weights/dqnab_agent`, 与改动前逐字相同。
+    */
+    case AGENT_DQNAB:  return DQNABAgent::defaultWeightPrefix();
     /*
        [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): **前缀** ->
        <prefix>_trunk / <prefix>_q (不是文件名)。

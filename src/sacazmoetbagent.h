@@ -1,6 +1,28 @@
 #ifndef SACAZ_MOETB_AGENT_H
 #define SACAZ_MOETB_AGENT_H
 
+/*
+   [2026-10 第五轮 / 2026-10-15 修订] 编译期开关: 序列 Transformer 专家
+   (`SACAZ_MOE_EXPERT_SEQ=1`)。
+
+   **它隐含"对齐表示"** —— 序列专家按格子切 token, 要求 `dIn % SeqLen == 0`
+   (`SeqLen == POS_ROWS*POS_COLS == 90`), 而默认表示的
+   `STATE_DIM = 17*90 + 3 = 1263` (那 3 个规则标量是**追加的尾巴**) 不满足整除,
+   构造时会 abort。所以本类把两件事绑在一起:
+
+       打开 SACAZ_MOE_EXPERT_SEQ ⇒ 本类的 ALIGNED_REPR 自动为 true (1710 = 19×90)
+
+   (2026-10-15 之前要求同时显式给 `-DSACAZ_ALIGNED_REPR=1`, 并用 `#error` 挡住漏配。
+    现在改成"隐含", 因为界面口径要求这一支**默认就是 19×90 + 序列专家**; 由
+    `CMakeLists.txt` 里 `target_compile_definitions(chess ...)` 的四条宏统一打开 ——
+    源码默认值仍然是"TB + 改前表示", 于是不带宏的 test/bench 构建一位不动。)
+*/
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+#define RL_SACAZ_MOE_SEQ_ON 1
+#else
+#define RL_SACAZ_MOE_SEQ_ON 0
+#endif
+
 #include <vector>
 #include <string>
 #include <deque>
@@ -112,7 +134,7 @@ public:
     static constexpr int CELLS = 90;                  /* 10x9 */
     static constexpr int PIECE_PLANES = 14;           /* 7 类棋子 x {己方, 对方} */
 
-#if defined(SACAZ_ALIGNED_REPR) && SACAZ_ALIGNED_REPR
+#if (defined(SACAZ_ALIGNED_REPR) && SACAZ_ALIGNED_REPR) || RL_SACAZ_MOE_SEQ_ON
     static constexpr bool ALIGNED_REPR = true;
 #else
     static constexpr bool ALIGNED_REPR = false;
@@ -141,6 +163,27 @@ public:
     /*
        运行时消融开关 (只在**对齐**表示下有意义): 把动作退回 128 槽哈希, 用来单独
        隔离"动作空间"这个变量。ALIGNED_REPR=1 编译进来时可用, 否则恒为 false。
+
+       [2026-10-15 用户口径] 序列专家那一支**默认就用 128 槽哈希**
+       (`SACAZ_MOE_EXPERT_SEQ=1` ⇒ 本成员默认 true)。理由与一处必须说清的边界:
+         * `docs/sac_regression_2026_09.md` 与 `conv_resnet_moe_analysis.md` §7 把
+           "对齐表示掉约 200 Elo" 归因于**动作头宽度** (策略头 8,192 -> 518,400),
+           所以口径是"换成对齐状态 + 序列专家, 但动作口径保持原来的 128 槽哈希";
+         * ⚠ 但 `ACTION_DIM` 是编译期常量 (`ALIGNED_REPR ? 8100 : 128`), 所以打开
+           这个成员**并不会**把策略头改回 128 宽 —— 头张量仍是 8100 列, 只是可达
+           槽位被哈希到 128 个 (其余列永远收不到策略目标)。也就是说: 这条开关隔离
+           的是"动作编码"这一个变量, **不是**参数/数据比。
+           真要让头也回到 128 宽, 需要另加一个"对齐表示 + 128 宽头"的编译开关,
+           那是独立的一轮 (见 docs/expert_search_optimization_plan_2026_10.md §8.4 第 2 条)。
+    */
+    /*
+       [2026-10-15] 界面口径 (用户决定): 序列专家那一支**用 128 槽哈希动作**。
+       这条口径由**界面**显式设置 (`chessboard.cpp` 的 createSACAZMoETbAgent:
+       `#if SACAZ_MOE_EXPERT_SEQ` → `a->legacyHashAction = true`), 而**类默认值保持
+       false** —— 于是 `test_sacaz_aligned_seq` 那个变体仍然在验证"对齐表示 + 8100 双射"
+       这一档 (它那 4 条学习动力学断言就是按双射定标的, 见 §10.3)。
+       ⚠ 头张量宽度与这条开关无关: `ACTION_DIM` 是编译期常量, 对齐表示下恒为 8100,
+       打开本开关只是把**可达槽位**哈希到 128 个 —— 它隔离的是动作编码, 不是参数/数据比。
     */
     bool legacyHashAction = false;
 
@@ -390,6 +433,48 @@ public:
     static constexpr int MOE_TB_TOPK = 1;
     static constexpr int MOE_TB_HEADS = 15;   /* d_model/15 = 84 维/头; 头越多越便宜 */
     static constexpr int MOE_TB_DFF = 315;    /* = d_model/4, 压住 TB 专家的 FFN 开销 */
+
+    /*
+       ================================================================
+       [2026-10 第五轮] 用户口径: "sac agent 的 TB 专家使用 seq transformer"
+       ================================================================
+       把本类的专家从 `TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF, true>`
+       换成 `SeqTransformerExpert<CELLS(90), MOE_SEQ_HEADS, MOE_SEQ_BLOCKS>`
+       —— 与 PPO 支的 `PPOSeqExpert` 是**同一份实现** (`src/rl/seq_transformer.hpp`)。
+
+       ⚠⚠ **前提: 必须在"对齐表示"下编译** (`-DSACAZ_ALIGNED_REPR=1`)。
+       序列专家按**格子**切 token, 要求 `dIn % SeqLen == 0` 且
+       `SeqLen == POS_ROWS*POS_COLS == 90`; 而默认表示的
+       `STATE_DIM = 17*90 + 3 = 1263` —— 那 3 个规则标量是**追加的尾巴**、
+       不是第 18 个平面 ⇒ **不满足整除**, 构造时 abort。
+       这不是能靠取整/裁剪绕过去的事, 所以下面用 `#error` 在**编译期**挡住
+       (本工程的纪律: 编译期常量的错必须响亮失败, 不静默降级)。
+
+       开关方式 (与 `SACAZ_ALIGNED_REPR` 完全同一套做法, 且**默认都不开**):
+           cmake -S . -B <build> -DSACAZ_ALIGNED_REPR=1 -DSACAZ_MOE_EXPERT_SEQ=1
+
+       **默认构建的专家类型、权重前缀、数值读数与改动前逐位相同。**
+
+       后果 (逐条记账):
+         * 一个 TB 专家 **12.9 M 参数 / 13.3 M MAC** → 序列专家
+           **91,731 参数 / 9.67 M MAC** (见 docs/seq_transformer_design.md §4/§5);
+         * **存量权重全部作废** ⇒ 前缀随之换成
+           `weights/sacaz_moe_seq_shared_agent` (见 `sharedWeightPrefix()`),
+           于是"载不到"是**看得见**的, 不会是静默错读 (参数量守卫也会拒绝);
+         * 位置编码走序列专家自己的旋钮 (`moeSeqPosMode()`, 与界面 PPO 支同选 `2d`);
+         * `MOE_TB_HEADS / MOE_TB_DFF` 在这一支下**不生效** (那是 TB 专家的参数),
+           宽度改由构造签名里的 `expertHidden` 决定 (tokDim; 默认 64, 必须能被
+           `MOE_SEQ_HEADS` 整除 —— 不满足时序列专家自己会 abort)。
+     */
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    static constexpr bool MOE_EXPERT_SEQ = true;
+#else
+    static constexpr bool MOE_EXPERT_SEQ = false;
+#endif
+    static constexpr int MOE_SEQ_HEADS = 4;    /* 与 PPO 支同口径 (dk = tokDim/4) */
+    static constexpr int MOE_SEQ_BLOCKS = 2;   /* Pre-LN 块数 (与 PPO 支相同) */
+    /* 位置编码模式: 与界面 PPO 支一致 —— 可学 2D (10 行 + 9 列) */
+    static const char *moeSeqPosMode() { return "2d"; }
 
     /*
      * 一条 off-policy 经验。

@@ -3,6 +3,9 @@
 #include "chessstate.h"       /* 规范格 / 规则上下文的公共实现 (只有一份) */
 #include "agentrollout.hpp"   /* rolloutFromCurrent: 探索期收样本 */
 #include "rl/sparse_moe.hpp"  /* SparseMoE / ISparseMoE (头文件只前置声明) */
+#if RL_DQNMCTS_MOE_SEQ_ON
+#include "rl/seq_transformer.hpp"  /* 序列 Transformer 专家 (只有开关打开时才需要) */
+#endif
 
 #include <cstdio>
 #include <cmath>
@@ -50,13 +53,21 @@ double nowMs()
                clock::now().time_since_epoch()).count() / 1e6;
 }
 
-/* 上下文个数必须与 chessstate.h 的那三项一一对应 (顺序见 contextOf) */
-static_assert(DQNMCTSMOETbAgent::CTX_COUNT == 3,
+/* 上下文个数必须与 chessstate.h 的那几项一一对应 (顺序见 contextOf) */
+static_assert(DQNMCTSMOETbAgent::CTX_COUNT == 3 || DQNMCTSMOETbAgent::CTX_COUNT == 5,
               "CTX_COUNT 变了就必须同时改 contextOf 的顺序与注释");
-static_assert(DQNMCTSMOETbAgent::STATE_DIM
-                  == DQNMCTSMOETbAgent::PIECE_PLANES * DQNMCTSMOETbAgent::CELLS
-                         + DQNMCTSMOETbAgent::CTX_COUNT,
-              "STATE_DIM 必须是 14 个棋子平面 + CTX_COUNT 个上下文标量");
+static_assert(!DQNMCTSMOETbAgent::ALIGNED_REPR
+                  || DQNMCTSMOETbAgent::STATE_DIM
+                         == DQNMCTSMOETbAgent::PLANES * DQNMCTSMOETbAgent::CELLS,
+              "对齐表示必须是 19 个整平面 (14 棋子 + 5 上下文)");
+static_assert(DQNMCTSMOETbAgent::ALIGNED_REPR
+                  || DQNMCTSMOETbAgent::STATE_DIM
+                         == DQNMCTSMOETbAgent::PIECE_PLANES * DQNMCTSMOETbAgent::CELLS
+                                + DQNMCTSMOETbAgent::CTX_COUNT,
+              "改前表示必须是 14 个棋子平面 + CTX_COUNT 个上下文标量");
+static_assert(!DQNMCTSMOETbAgent::MOE_EXPERT_SEQ
+                  || (DQNMCTSMOETbAgent::STATE_DIM % DQNMCTSMOETbAgent::CELLS == 0),
+              "序列专家按格子切 token: STATE_DIM 必须是 CELLS(90) 的整数倍");
 
 /*
  *  造稀疏 MoE 层。TopK 是**模板参数**, 所以"稀疏"与"等参数稠密对照"是两个不同的
@@ -76,10 +87,56 @@ RL::iLayer::sptr makeMoeLayer(int d, bool withGrad)
  *  静默降成 3 个 (d_k 从 84 涨到 421), 一个专家前向 6.20 -> 19.06 ms (3.07x),
  *  而且 15 个 head 对象全都分配了、只有 3 个参与前向。本类的 STATE_DIM 与
  *  MOE_TB_HEADS 就是那一对数字, 所以这里必须用 HonorHeads=true。
+ *  (对齐表示下 STATE_DIM = 1710 = 15 x 114, 整除本来就成立, 这个开关不改变结果。)
  *  `dense` 是等参数对照组 (TopK == E)。
+ *
+ *  [2026-10-15] `DQNMCTS_MOE_EXPERT_SEQ=1` 时整支换成**序列 Transformer 专家**
+ *  (见头文件里 MOE_EXPERT_SEQ 的说明): 宽度由 `expertHidden` 决定, 位置编码必须
+ *  显式设上, 设不上就响亮失败 —— 与 SAC 那一支逐条同口径。
+ *
+ *  [2026-10 宽度扫描] `tokDim` 从**编译期常量**改成**参数** (调用方传 `expertHidden`):
+ *  它只影响 `SparseMoE<…>(…, tokDim)` 这一处 (序列专家的每个 Linear 都是按 tokDim 建的,
+ *  头数要求 `tokDim % MOE_SEQ_HEADS == 0` 由专家自己判定并 abort) —— 本文件里
+ *  **没有任何 static_assert / 数组维度**用 MOE_SEQ_TOKDIM, 所以这次参数化是安全的:
+ *  默认值仍是常量 ⇒ 不给参数时建出来的层与改动前逐位相同。
+ *  TB 那一支 (未开开关) 收不到这个参数的效果, 所以显式 `(void)tokDim` 说明"刻意不用"。
  */
-RL::iLayer::sptr makeTbExpertMoe(bool withGrad, bool dense)
+RL::iLayer::sptr makeTbExpertMoe(bool withGrad, bool dense, int tokDim)
 {
+#if RL_DQNMCTS_MOE_SEQ_ON
+    typedef RL::SeqTransformerExpert<DQNMCTSMOETbAgent::CELLS,
+                                     DQNMCTSMOETbAgent::MOE_SEQ_HEADS,
+                                     DQNMCTSMOETbAgent::MOE_SEQ_BLOCKS> SeqExpert;
+    if (tokDim <= 0) {
+        tokDim = DQNMCTSMOETbAgent::MOE_SEQ_TOKDIM;   /* <=0 = 用默认宽度 (与构造签名同一条) */
+    }
+    RL::iLayer::sptr layer =
+        dense ? std::static_pointer_cast<RL::iLayer>(
+                    std::make_shared<RL::SparseMoE<SeqExpert,
+                                                   DQNMCTSMOETbAgent::MOE_TB_EXPERTS,
+                                                   DQNMCTSMOETbAgent::MOE_TB_EXPERTS> >(
+                        DQNMCTSMOETbAgent::STATE_DIM, withGrad, tokDim))
+              : std::static_pointer_cast<RL::iLayer>(
+                    std::make_shared<RL::SparseMoE<SeqExpert,
+                                                   DQNMCTSMOETbAgent::MOE_TB_EXPERTS,
+                                                   DQNMCTSMOETbAgent::MOE_TB_TOPK> >(
+                        DQNMCTSMOETbAgent::STATE_DIM, withGrad, tokDim));
+    /*
+       位置编码必须显式设上: 序列专家的默认是 `LEARN_1D`(老行为), 而界面 PPO 支与
+       SAC 支选的都是可学 2D。**设不上就响亮失败** —— 本工程记过很多次"旋钮设了
+       却没生效"的事故 (SparseMoE 会把这一层转发给每个专家, 只有序列专家响应)。
+    */
+    if (!layer->setPosModeByKey(DQNMCTSMOETbAgent::moeSeqPosMode())) {
+        std::fprintf(stderr,
+                     "[DQNMCTSMOETbAgent] 位置编码模式 \"%s\" 没有被专家接受 —— "
+                     "外层开关 (DQNMCTS_MOE_EXPERT_SEQ) 与实际建出来的专家类型不一致。\n",
+                     DQNMCTSMOETbAgent::moeSeqPosMode());
+        std::fflush(stderr);
+        std::abort();
+    }
+    return layer;
+#else
+    (void)tokDim;   /* TB 专家: 宽度是编译期常量 (MOE_TB_HEADS/DFF), 这个参数对它无效 */
     typedef RL::TransformerBlock<DQNMCTSMOETbAgent::MOE_TB_HEADS,
                                  DQNMCTSMOETbAgent::MOE_TB_DFF, true> TbExpert;
     if (dense) {
@@ -90,6 +147,7 @@ RL::iLayer::sptr makeTbExpertMoe(bool withGrad, bool dense)
     return makeMoeLayer<TbExpert, DQNMCTSMOETbAgent::MOE_TB_EXPERTS,
                         DQNMCTSMOETbAgent::MOE_TB_TOPK>(DQNMCTSMOETbAgent::STATE_DIM,
                                                         withGrad);
+#endif
 }
 
 /*
@@ -210,11 +268,18 @@ DQNMCTSMOETbAgent::DQNMCTSMOETbAgent(Chess &chess_,
                                      float lr,
                                      float eps,
                                      float c_puct_,
-                                     bool denseMoe_)
+                                     bool denseMoe_,
+                                     int expertHidden_)
     : AgentBase(),
       chess(chess_),
       hiddenDim(hiddenDim_ > 0 ? hiddenDim_ : 64),
       denseMoe(denseMoe_),
+      /*
+         [2026-10] 序列专家的 token 宽 —— 与 denseMoe 一样必须在 buildNets() **之前**定
+         (建网在构造函数里; 构造之后再赋值是静默空操作, 见头文件的说明)。
+         <=0 退回 MOE_SEQ_TOKDIM ⇒ 不传这个参数时结构与改动前逐位相同。
+      */
+      expertHidden(expertHidden_ > 0 ? expertHidden_ : MOE_SEQ_TOKDIM),
       gamma(gamma_),
       learningRate(lr),
       batchSize(32),
@@ -284,13 +349,13 @@ void DQNMCTSMOETbAgent::buildNets()
     RL::Net::Layers head2L;      /* 在线 Q2 头 (twinCritic 用; 见头文件说明) */
     RL::Net::Layers trunkT, headT, head2T;
 
-    trunkL.push_back(makeTbExpertMoe(true, denseMoe));
+    trunkL.push_back(makeTbExpertMoe(true, denseMoe, expertHidden));
     trunkL.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, true));
     /* Q 头必须是 Linear (不是 Sigmoid): 象棋奖励含负值, Q 必须能取负 */
     headL.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, true));
     head2L.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, true));
 
-    trunkT.push_back(makeTbExpertMoe(false, denseMoe));
+    trunkT.push_back(makeTbExpertMoe(false, denseMoe, expertHidden));
     trunkT.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, false));
     headT.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, false));
     head2T.push_back(RL::Layer<RL::Linear>::_(h, ACTION_DIM, true, false));
@@ -353,6 +418,10 @@ void DQNMCTSMOETbAgent::buildNets()
 
 const char *DQNMCTSMOETbAgent::backboneName() const
 {
+    if (MOE_EXPERT_SEQ) {
+        return denseMoe ? "稠密MoE(序列Transformer专家) x4 全算 (等参数对照)"
+                        : "稀疏MoE(序列Transformer专家, E=4 top-1)";
+    }
     return denseMoe ? "稠密MoE(TB专家) x4 全算 (等参数对照)"
                     : "稀疏MoE(TB专家, E=4 top-1)";
 }
@@ -431,13 +500,28 @@ void DQNMCTSMOETbAgent::denseToSparse(const RL::Tensor &state,
 }
 
 /*
- *  3 个规则上下文 —— 顺序与数值口径就是 `chessstate.h` 的 CTX_HALFMOVE /
- *  CTX_REPEAT / CTX_CHECK (与 SAC 的"改前表示"、以及 EVABAgent 的 plane 14..16
- *  逐个相同)。这一致性是"两支 agent 的状态同构"的全部内容: 只要有一边换了公式,
- *  对照就不再受控。
+ *  规则上下文 —— **两种布局共用同一份数值**, 数值与顺序一律取自 `chessstate.h`
+ *  (CTX_MATERIAL / CTX_TEMPO / CTX_HALFMOVE / CTX_REPEAT / CTX_CHECK):
+ *
+ *    * 对齐表示 (序列专家开关打开, CTX_COUNT = 5): 与 DQNAB / SAC 对齐表示**同一套**,
+ *      铺成 14..18 五个整平面 —— 序列专家的 token 是"一个格子的全部平面取值",
+ *      所以上下文必须是平面, 不能是尾巴上的标量。
+ *    * 改前表示 (默认, CTX_COUNT = 3): 只带 3 个规则上下文 (无吃子/重复/将军),
+ *      塞在 1260..1262 —— 这是本类原来的口径, 与旧类 / 旧权重逐位一致。
+ *
+ *  为什么这一致性是"两支 agent 的状态同构"的全部内容: 只要有一边换了公式,
+ *  对照就不再受控 (本工程反复记过这一类静默漂移)。
  */
 void DQNMCTSMOETbAgent::contextOf(Chess &c, int color, float out[CTX_COUNT]) const
 {
+    if (ALIGNED_REPR) {
+        double ctx[ChessState::CTX_COUNT];
+        ChessState::contextValues(c, color, ctx);
+        for (int i = 0; i < CTX_COUNT; i++) {
+            out[i] = (float)ctx[i];
+        }
+        return;
+    }
     out[0] = (float)ChessState::halfmovePhase(c);
     out[1] = (float)ChessState::repetitionPhase(c);
     out[2] = (float)ChessState::checkPhase(c, color);
@@ -446,6 +530,13 @@ void DQNMCTSMOETbAgent::contextOf(Chess &c, int color, float out[CTX_COUNT]) con
 void DQNMCTSMOETbAgent::writeContext(RL::Tensor &state, const float ctx[CTX_COUNT]) const
 {
     if (state.size() < (std::size_t)STATE_DIM) {
+        return;
+    }
+    if (ALIGNED_REPR) {
+        /* 铺成整平面 (与 DQNAB 的 encodeComplete 逐位相同) */
+        for (int i = 0; i < CTX_COUNT; i++) {
+            ChessState::fillPlane(&state[0], PIECE_PLANES + i, ctx[i]);
+        }
         return;
     }
     for (int i = 0; i < CTX_COUNT; i++) {
@@ -457,9 +548,19 @@ void DQNMCTSMOETbAgent::readContext(const RL::Tensor &state, float out[CTX_COUNT
 {
     for (int i = 0; i < CTX_COUNT; i++) {
         out[i] = 0.0f;
-        if (state.size() >= (std::size_t)STATE_DIM) {
-            out[i] = state[(std::size_t)(CTX_BASE + i)];
+    }
+    if (state.size() < (std::size_t)STATE_DIM) {
+        return;
+    }
+    if (ALIGNED_REPR) {
+        /* 平面里 90 格的值都相同 (填的就是同一个常数), 取第 0 格即可 */
+        for (int i = 0; i < CTX_COUNT; i++) {
+            out[i] = state[(std::size_t)((PIECE_PLANES + i) * CELLS)];
         }
+        return;
+    }
+    for (int i = 0; i < CTX_COUNT; i++) {
+        out[i] = state[(std::size_t)(CTX_BASE + i)];
     }
 }
 
@@ -2466,9 +2567,17 @@ void DQNMCTSMOETbAgent::warmupFromCurrent(int episodes, int simulations_,
 
 /* ================================================================
  *  权重
- * ================================================================ */
+ * ================================================================
+ *  [2026-10-15] 前缀按**骨干/表示**分: 序列专家开关打开时表示也换了
+ *  (1263 -> 1710), 参数量与结构指纹都不同 ⇒ 必须换前缀, 否则"存量 TB 权重"会
+ *  以"载入失败"以外的形式被误用 (Net::load 的参数量守卫会拒绝, 但按本工程纪律,
+ *  前缀本身就应当分得开 —— 一个骨干一个前缀, 看不出来才是事故)。
+ */
 const char *DQNMCTSMOETbAgent::defaultWeightPrefix()
 {
+    if (MOE_EXPERT_SEQ) {
+        return "weights/dqnmcts_moe_seq_agent";
+    }
     return "weights/dqnmcts_moe_agent";
 }
 
@@ -2557,11 +2666,21 @@ std::string DQNMCTSMOETbAgent::selfCheckReport() const
 
     /* ---- 2. 表示 ---- */
     std::snprintf(buf, sizeof(buf),
-                  "状态 %d 维 = %d 棋子平面 + %d 规则上下文 (无吃子/重复/被将) |"
+                  "状态 %d 维 = %d 棋子平面 + %d 规则上下文 (%s) |"
                   " 动作 %d 槽位 (哈希)\n",
-                  STATE_DIM, PIECE_PLANES, CTX_COUNT, ACTION_DIM);
+                  STATE_DIM, PIECE_PLANES, CTX_COUNT,
+                  ALIGNED_REPR ? "对齐表示: 子力/总手数/无吃子/重复/被将, 铺成 14..18 平面"
+                               : "改前表示: 无吃子/重复/被将, 塞在尾部标量槽",
+                  ACTION_DIM);
     out += buf;
-    out += "规则上下文通道: 3 个 (规范视角, 轮到谁走谁的子在 x 大的一侧)\n";
+    if (ALIGNED_REPR) {
+        out += "专家类型: **序列 Transformer** (SeqTransformerExpert<90,4,2>, 按格子切"
+               " token, 与 PPO 支同一份实现) —— 位置编码 2D, 宽度由 expertHidden 决定\n";
+        out += "权重前缀: " + std::string(defaultWeightPrefix())
+               + " (对齐表示 1263 -> 1710, 存量 TB 权重按设计载不进这一支)\n";
+    } else {
+        out += "规则上下文通道: 3 个 (规范视角, 轮到谁走谁的子在 x 大的一侧)\n";
+    }
 
     /* ---- 3. 动作别名 (只读副本, 绝不碰 this->chess) ---- */
     {

@@ -128,22 +128,36 @@ const AgentChoice kAgents[] = {
        (房子里的惯例: "同算法不同骨干"挨着放, 才能直接选中互相对弈比较)。
        它**不是**上面那一支的运行时开关, 而是一个**独立的 C++ 类**
        (DQNMCTSMOETbAgent, src/dqnmctsmoetbagent.h): 骨干换成稀疏 MoE (E=4 top-1) +
-       TransformerBlock 专家, 表示换成规范视角的 1263 维, 搜索用 PUCT + negamax 符号,
-       学习用 Double DQN + clampTarget/Huber。旧的那一支一位没动, 于是两条可以直接对弈。
-       代价: 一个 TB 专家前向 ~5-6 ms ⇒ 每次走子只给 DQNMCTS_MOE_SIMS = 40 次模拟
-       (约 175 ms/步, 与 SACAZ_MOE_SIMS 同一预算档; 旧类的 200 是 d_model=90 的预算)。
-       **权重文件独立** (weights/dqnmcts_moe_agent_trunk / _q, 旧类是单文件
-       weights/dqnmcts_agent.dat) —— 两者结构不同, 共用一个前缀只会静默互相覆盖。
+       专家, 搜索用 PUCT + negamax 符号, 学习用 Double DQN + clampTarget/Huber。
+       旧的那一支一位没动, 于是两条可以直接对弈。
+
+       [2026-10-15] 专家与表示按用户口径换成了**序列 Transformer + 19×90**
+       (`-DDQNMCTS_MOE_EXPERT_SEQ=1`, 见 src/dqnmctsmoetbagent.h 顶部):
+       表示从 1263 (17×90+3) 变 1710 (19×90), 专家从 TransformerBlock 变
+       SeqTransformerExpert<90,4,2> (9.2 万参数/专家, 与 PPO 支同一份实现)。
+       **权重前缀随之换成 weights/dqnmcts_moe_seq_agent** —— 存量 TB 权重载不进来是
+       设计如此, 不是故障。不带这个宏构建时, 下面那一行的字与权重都还是 TB 的一套
+       (所以这里两行用宏分叉: 面板上的字不许与真实骨干对不上)。
     */
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    { "DQN+MCTS (稀疏MoE+序列专家)", ChessBoard::AGENT_DQNMCTS_MOE },
+#else
     { "DQN+MCTS (稀疏MoE+TB专家)",   ChessBoard::AGENT_DQNMCTS_MOE },
+#endif
     { "EVAB (学会评估的 Alpha-Beta)", ChessBoard::AGENT_EVAB },
     { "SAC+MCTS+AlphaZero (最大熵搜索)", ChessBoard::AGENT_SACAZ },
     /*
-       同一个算法, 骨干换成"稀疏路由 MoE + TransformerBlock 专家" (E=4, top-1)。
-       与上一项相比: 参数量大 ~4 倍 (4 个 TB 专家), 算力只算 1 个专家 —— 实测
+       同一个算法, 骨干换成"稀疏路由 MoE + 专家" (E=4, top-1)。
+       与上一项相比: 参数量大 ~4 倍 (4 个专家), 算力只算 1 个专家 —— 实测
        10.9 ms/模拟 (MLP 骨干 0.07), 所以每次走子只给 16 次模拟 (约 175 ms)。
+       [2026-10-15] 按用户口径专家换成**序列 Transformer** (`-DSACAZ_MOE_EXPERT_SEQ=1`,
+       隐含对齐表示 1710 = 19×90), 权重前缀随之换成 weights/sacaz_moe_seq_shared_agent。
     */
+#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
+    { "SAC+MCTS+AlphaZero (稀疏MoE+序列专家)", ChessBoard::AGENT_SACAZ_MOE },
+#else
     { "SAC+MCTS+AlphaZero (稀疏MoE+TB专家)", ChessBoard::AGENT_SACAZ_MOE },
+#endif
     /*
        [2026-09 独立类] 同算法、骨干换成**稀疏 MoE + MLP 专家** (E=8, top-2) 的那一支,
        也就是独立类 `SACAZMoEMlpAgent`。它以前**只能在 bench 里跑到**; 现在接进下拉框。
@@ -159,12 +173,17 @@ const AgentChoice kAgents[] = {
     */
     /*
        DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
-       网络 (稀疏 MoE + TB 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
+       网络 (稀疏 MoE + 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
        反过来当 TD 目标。与上面几个 agent 的关键差别: 它的"搜索"是**对抗展开**,
        杀棋/战术看得见 (实测一步杀局面 8/8 命中, 而纯 Q-argmax 是 0/8)。
-       每步给 256 个搜索节点 (TB 骨干约 0.8 s/步、2~3 层), 见 DQNAB_NODES。
+       [2026-10-15] 按用户口径专家换成**序列 Transformer** (`-DDQNAB_MOE_EXPERT_SEQ=1`);
+       它的表示本来就是 19×90=1710 (Markov 完备的 5 个规则平面), 所以这次只换专家。
     */
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+    { "DQN+AB (AB+DuelingDQN, 稀疏MoE+序列专家)", ChessBoard::AGENT_DQNAB },
+#else
     { "DQN+AB (AB+DuelingDQN, 稀疏MoE+TB专家)", ChessBoard::AGENT_DQNAB },
+#endif
 };
 
 /*

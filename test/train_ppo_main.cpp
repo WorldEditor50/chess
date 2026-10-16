@@ -75,6 +75,9 @@ struct Cfg {
     float shapingAlpha = 1.0f;
     bool materialReward = true;
     bool truncationBootstrap = true;
+    /* [2026-10 第五轮] ★Z1 先验缓存 (默认开) 与 R-2 混合池材质补齐 (默认关) */
+    bool azPriorCache = true;
+    bool mixedMaterialDelta = false;
     bool rootNoise = true;
     bool verbose = true;
     /*
@@ -183,6 +186,10 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--no-shaping") { g_cfg.potentialShaping = false; }
         else if (k == "--no-material-reward") { g_cfg.materialReward = false; }
         else if (k == "--no-bootstrap") { g_cfg.truncationBootstrap = false; }
+        /* [2026-10 第五轮] ★Z1: 切回"每次展开都重算"的改动前口径 (A/B 的对照臂) */
+        else if (k == "--no-az-cache") { g_cfg.azPriorCache = false; }
+        /* [2026-10 第五轮] R-2: 混合对局里补齐"对手那一手造成的材质变化" */
+        else if (k == "--mixed-material-delta") { g_cfg.mixedMaterialDelta = true; }
         else if (k == "--no-root-noise") { g_cfg.rootNoise = false; }
         else if (k == "--learn-per-episode") { g_cfg.learnPerEpisode = std::atoi(v.c_str()); }
         else if (k == "--clamp") { g_cfg.clampValue = (float)std::atof(v.c_str()); }
@@ -220,6 +227,7 @@ bool parseArgs(int argc, char **argv)
                 "                 [--temp-root=F] [--temp-final=F]\n"
                 "                 [--no-shaping] [--shaping-alpha=F] [--no-material-reward]\n"
                 "                 [--no-bootstrap] [--no-root-noise] [--quiet]\n"
+                "                 [--no-az-cache] [--mixed-material-delta]\n"
                 "                 [--learn-per-episode=K] 每局几次批学习 (默认 1; 见头文件)\n"
                 "                 [--clamp=F] [--clip-eps=F] [--entropy=F]\n"
                 "                 [--aux-coef=F]          MoE 辅助损失系数 (默认 0.1)\n"
@@ -331,6 +339,18 @@ int main(int argc, char **argv)
     ag.shapingAlpha = g_cfg.shapingAlpha;
     ag.materialRewardEnabled = g_cfg.materialReward;
     ag.truncationBootstrap = g_cfg.truncationBootstrap;
+    /*
+       [2026-10 第五轮] ★Z1 的 A/B 开关: `--no-az-cache` 切回"每次展开都重算父节点策略"
+       的改动前口径。两臂在同一 seed / 同一局面下的决策与访问分布应当**逐位相同**
+       (缓存只省算力, 不改行为) —— 这既是验收, 也是"两棵源码树两个二进制"之外
+       唯一能在**同一个二进制**里做的配对 (开关本身不影响任何权重/数值口径)。
+    */
+    ag.setAzPriorCache(g_cfg.azPriorCache);
+    /*
+       [2026-10 第五轮] R-2: 混合对局里把"对手那一手造成的学习方材质变化"折进回报。
+       只在 `--opponents=mixed` 时才有对手, 纯自对弈不受影响。
+    */
+    ag.mixedOpponentMaterialDelta = g_cfg.mixedMaterialDelta;
     ag.rootNoise = g_cfg.rootNoise;
     ag.openingPlies = g_cfg.opening;
     ag.openingSeed = g_cfg.seed;
@@ -384,6 +404,9 @@ int main(int argc, char **argv)
                 g_cfg.potentialShaping ? "开" : "关", (double)g_cfg.shapingAlpha,
                 g_cfg.materialReward ? "开" : "关",
                 g_cfg.truncationBootstrap ? "开" : "关");
+    std::printf("  [2026-10 第五轮] 先验缓存(★Z1) %s | 混合池材质补齐(R-2) %s\n",
+                g_cfg.azPriorCache ? "开" : "关",
+                g_cfg.mixedMaterialDelta ? "开" : "关");
     std::printf("  I/O    : 每局 0 次权重往返 (GUI 路径是 3 趟 x ~555 MB)\n");
     /*
        [2026-10 第四轮] 混合对手池: **建网之后、训练之前**打开一次 (对手实例绑定在

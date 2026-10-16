@@ -1,6 +1,33 @@
 #ifndef DQNAB_AGENT_H
 #define DQNAB_AGENT_H
 
+/*
+   ============================================================================
+   [2026-10 第五轮] 编译期守卫 + 说明: 序列 Transformer 专家 (DQNAB_MOE_EXPERT_SEQ=1)
+   ============================================================================
+   用户口径: "把各 agent 的 TB 专家换成序列 transformer"。
+
+   本类 (DQN+AB) 的做法与 `SACAZMoETbAgent` 那一支**完全同一套**: 用编译期开关把
+   骨干里的专家从 `RL::TransformerBlock<16,360>` 换成
+   `RL::SeqTransformerExpert<90,4,2>` —— 与界面 PPO 支是**同一份实现**
+   (`src/rl/seq_transformer.hpp`), 输入就是本类现有的 19x90 = 1710 维平面优先编码
+   (由 `ChessState::encodeComplete` 写出, 无需改编码)。
+
+   开关方式 (默认**不开**, 与 PPO 支 / SACAZ 支同一手法):
+       cmake -S . -B <build> -DCMAKE_CXX_FLAGS="-DDQNAB_MOE_EXPERT_SEQ=1"
+   未定义 (= 0) 的构建: 专家仍是 `TransformerBlock<16,360>`, 网络结构/参数量/权重前缀
+   与**全部读数**与改动前逐位相同 ("默认路径一位不动")。
+
+   为什么这一段守卫写在文件最前面 (而不是等运行时 abort): 序列专家按**格子**切 token,
+   它是靠 `dIn / SeqLen` 反推平面数的, 所以要求 `dIn % SeqLen == 0` 且
+   `SeqLen == POS_ROWS*POS_COLS == 90`。本类的
+   `STATE_DIM = PLANES(19) * CELLS(90) = 1710` 天然满足, 于是这个条件是一件
+   **编译期事实**, 就地用 `static_assert` 钉住 (见类里那一组断言) —— 写成运行时检查
+   只会在"哪天换了表示"时才炸, 而且是在用户的棋局跑到一半时炸。本工程的纪律:
+   编译期常量的错必须响亮失败 (参见 seq_transformer.hpp 构造函数里那两处 abort)。
+   ============================================================================
+*/
+
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -16,6 +43,14 @@
 #include "rl/net.hpp"
 #include "rl/parameter.hpp"
 #include "rl/transformer.hpp"
+/*
+   序列 Transformer 专家 (真正的 Transformer: 按格子切 token / 逐行 softmax / 位置嵌入)。
+   **只在开关打开时 include** —— 默认构建里这一支一个符号都不参与编译, 于是"关掉开关 =
+   与改动前同一份代码"这件事不靠人守纪律, 而是编译期事实。
+*/
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+#include "rl/seq_transformer.hpp"
+#endif
 
 namespace RL {
 class ISparseMoE;
@@ -94,6 +129,11 @@ class ISparseMoE;
  *   训练侧: `Planned` 的标签在采集时算 (每条样本一次 `1+k` 次前向), 于是**批更新里
  *   没有搜索**, 只有 forward+backward —— 这是让 3.6 ms/前向的骨干也能训得动的关键取舍。
  *
+ *   ⚠ 上面这些毫秒数都是 **TB 专家**的实测值。开关 `DQNAB_MOE_EXPERT_SEQ=1` 的构建里
+ *   专家是序列 Transformer (每专家 91,731 参数 / 前向 ≈ 9.7 M MAC, 见
+ *   src/rl/seq_transformer.hpp §参数与代价), 它比 TB 专家**便宜**, 所以那些数字在这一支
+ *   下**不适用** —— 要报这一支的 ms/步, 只能现量 (本工程不拿另一支的读数顶替)。
+ *
  * ---------------------------------------------------------------------------
  * 6. 为什么**不做**势能塑形 (PBRS)
  * ---------------------------------------------------------------------------
@@ -140,15 +180,105 @@ public:
     /* ---- 动作: 双射, 无碰撞 ---- */
     static constexpr int ACTION_DIM     = CELLS * CELLS;       /* 8100 */
 
-    /* ---- 骨干: 稀疏 MoE + TransformerBlock 专家 (默认, 与 RL::PPO 的 PPOExpert 同配置) ---- */
+    /* ---- 骨干: 稀疏 MoE + 专家 (默认 TB; 开关打开时这一支的专家换成序列 Transformer) ---- */
     static constexpr int MOE_TB_HEADS   = 16;
     static constexpr int MOE_TB_DFF     = 360;
     static constexpr int MOE_EXPERTS    = 4;
     static constexpr int MOE_TOPK       = 1;
     using TBExpert = RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>;
 
+    /*
+       ================================================================
+       [2026-10 第五轮] 编译期开关: 专家 = 序列 Transformer (DQNAB_MOE_EXPERT_SEQ)
+       ================================================================
+       开 (`-DDQNAB_MOE_EXPERT_SEQ=1`): `Backbone::SparseMoeTb` 这一支的专家**被换掉**,
+       换成 `SeqTransformerExpert<CELLS(90), 4, 2>`。为什么这不是"顺手换个写法":
+         * 旧 TB 专家收的是 `(d_model x 1)` **单个向量** ⇒ `q·kᵀ` 是 `d_k×d_k` 的
+           **外积**, 混合的是特征维而不是"哪个格子该注意哪个格子"; 而它的 softmax 是
+           `util.hpp` 那个对**整张张量**求和的全局 softmax ⇒ 每行只分到 1/d_k 的质量
+           (实测初始化时这条支路只占块输出方差的 5.6e-07, 等于死的 —— 见
+           docs/tb_expert_training_2026_10.md §9);
+         * 序列专家按**格子**切 90 个 token (每个 token = 19 个平面在这一格上的取值)、
+           **逐行** softmax、带可学位置嵌入, 参数从每专家 12.9 M 降到 **91,731**。
+       关 (未定义, 默认): 专家仍是 `TransformerBlock<16,360>`, 结构与读数逐位同改动前。
+
+       ⚠ 三个后果 (逐条记账, 与 SACAZ 支切 seq 骨干时同一口径):
+         1. **存量权重不兼容** ⇒ 前缀换成 `weights/dqnab_seq_agent`
+            (见 `defaultWeightPrefix()`): 一个骨干一个前缀, 免得"新的空网把旧的盖掉"
+            (载入那一侧有 `Net::load` 的参数结构守卫, 但写出那一侧没有守卫, 所以
+            `saveModel/loadModel` 在开关打开时**直接拒绝** TB 那一份前缀, 见
+            `canUseWeightPrefix`)。
+         2. `MOE_TB_HEADS / MOE_TB_DFF` 在这一支下**不生效** —— 那是 TB 专家的参数;
+            宽度改由构造参数 `expertHidden` (默认 `MOE_SEQ_TOKDIM = 64`) 决定。
+         3. 位置编码走序列专家自己的旋钮 (`moeSeqPosMode()`, 与界面 PPO 支同选 `2d`);
+            **设不上就 abort** —— 本工程记过很多次"旋钮设了却没生效"的事故, 而
+            "专家类型不是序列专家"恰好是那种不报错、只是变差的失效。
+
+       ⚠ 前置条件 (`STATE_DIM % CELLS == 0` 且 `CELLS == 90`) 由下面那组 static_assert
+         在**编译期**钉住: 本类 1710 = 19 x 90 满足, 换表示时若不满足会当场编译失败。
+    */
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+    static constexpr bool MOE_EXPERT_SEQ = true;
+#else
+    static constexpr bool MOE_EXPERT_SEQ = false;
+#endif
+    static constexpr int MOE_SEQ_HEADS  = 4;    /* 与 PPO 支同口径 (dk = tokDim/4) */
+    static constexpr int MOE_SEQ_BLOCKS = 2;    /* Pre-LN 块数 (与 PPO 支相同) */
+    static constexpr int MOE_SEQ_TOKDIM = 64;   /* token 宽 = 序列专家的 tokDim (与 PPO 支同值) */
+    /* 位置编码模式: 与界面 PPO 支一致 —— 可学 2D (10 行 + 9 列) */
+    static const char *moeSeqPosMode() { return "2d"; }
+    /* 编译期守卫: 序列专家构造时会 abort 的那两条前置条件, 在这里先变成编译错误 */
+    static_assert(STATE_DIM % CELLS == 0,
+                  "DQNAB_MOE_EXPERT_SEQ=1: 序列专家按格子切 token, 要求 STATE_DIM 能被 CELLS(90) 整除 "
+                  "(本类 STATE_DIM = PLANES*CELLS 恒成立; 换个表示就要在这里重新对一遍)");
+    static_assert(CELLS == 90,
+                  "DQNAB_MOE_EXPERT_SEQ=1: 序列专家的 SeqLen 必须是 10 行 x 9 列 = 90 "
+                  "(POS_ROWS*POS_COLS), 与 canonicalCell(x,y)=x*9+y 对齐");
+    static_assert(MOE_SEQ_TOKDIM % MOE_SEQ_HEADS == 0,
+                  "DQNAB_MOE_EXPERT_SEQ=1: tokDim 必须能被 MOE_SEQ_HEADS 整除");
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+    /*
+       序列专家类型。**只在开关打开时存在**: 它依赖 rl/seq_transformer.hpp, 而那个头文件
+       也只在这一支里被 include (见文件顶部)。
+    */
+    using SeqExpert = RL::SeqTransformerExpert<CELLS, MOE_SEQ_HEADS, MOE_SEQ_BLOCKS>;
+#endif
+
+    /*
+       骨干枚举。
+       **取值与含义一位不动** (`SparseMoeTb = 0` / `Mlp` / `Count`): 骨干是构造参数, 取值一旦
+       漂移, 任何按整数传过骨干的地方都会**静默换支** —— 本工程对"静默换支"的纪律是绝不接受
+       (同"一个骨干一个权重前缀")。
+       ⚠ [2026-10 第五轮] 刻意**不新增**枚举值 (例如 `SparseMoeSeq`) —— 与 `SACAZMoETbAgent`
+         的 `makeTbExpertMoe()` 取同一形态: **同一个骨干身份, 专家类型由编译宏决定**。
+         理由是可数的: `src/chessboard.cpp` 里有 **7 处构造点**显式传
+         `DQNABAgent::Backbone::SparseMoeTb` —— 6 处 `new DQNABAgent(...)` (L1476 预加载 /
+         L2890 兜底重建 / L4451 / L4804 / L6231 / L7281) + 1 处后台训练 clone 的栈上构造
+         (L7689)。若改成"新增一个枚举值 + 各处按开关挑值", 就得在那 7 处各加一次 `#if`
+         —— 漏掉任何一处就是"界面上一半 agent 用序列专家、一半还在用 TB"的**静默不一致**
+         (而它在权重往返上看不出来: 两种结构各自自洽)。按现在的做法, 调用点**一行都不用改**,
+         界面那一支只要构建时带上 `-DDQNAB_MOE_EXPERT_SEQ=1` 就整支换过来。
+       ⇒ 所以 `SparseMoeTb` 这个名字在开关打开的构建里指的是"同一支骨干 (MoE + 专家),
+         只是专家换成了序列 Transformer"; 名字由 `backboneName()` 按开关给出, 读数不撒谎。
+    */
     enum class Backbone { SparseMoeTb = 0, Mlp, Count };
     static const char *backboneName(Backbone b);
+    /*
+       本结构应当使用的权重前缀 (**单一来源**, 与 `SACAZLegacyAgent::defaultWeightPrefix` /
+       `DQNMCTSMOETbAgent::defaultWeightPrefix` 同一手法)。
+       为什么必须按骨干分前缀: TB 专家与序列专家是**两种结构** (每专家 12.9 M vs 91,731
+       参数), 共用一个前缀的后果是"新的空网把盘上那份旧权重盖掉" —— 载入那一侧有
+       `Net::load` 的参数结构守卫会拒绝, 但写出那一侧没有守卫, 所以只能靠前缀分开
+       (同 SACAZ 支换 seq 骨干时换 `weights/sacaz_moe_seq_shared_agent` 的理由)。
+       ⚠ `saveModel / loadModel` 收的是**调用方给的前缀** (界面走
+       `ChessBoard::defaultWeightPath(AGENT_DQNAB)`, src/chessboard.cpp:5979), 所以这一支
+       真正用上序列前缀需要把那一行改成 `DQNABAgent::defaultWeightPrefix()` (一行;
+       `weightFilesOf()` 的扫描表与退出保存都是从它推出来的, 不用改第二处) ——
+       本轮只改这两个文件, **没碰它**。在它落地之前, 开关打开而调用方仍传 TB 那一份前缀时
+       `saveModel / loadModel` 会**当场拒绝并按失败返回** (见 `canUseWeightPrefix`):
+       宁可看得见的失败, 也不要"把盘上那份 TB 权重静默盖掉"。
+    */
+    static const char *defaultWeightPrefix();
 
     enum class LeafEval   { Value = 0, MaxQ };
     enum class TargetMode { Planned = 0, OneStepDouble };
@@ -179,10 +309,20 @@ public:
     /* ---- 配置 (构造后可改) ---- */
     Chess &chess;                  /* 与其它 agent 一样: 直接引用棋盘, 搜索用 moveForward/moveBack 试走 */
     /*
-       骨干**在构造时定** (它决定网络结构, 见构造函数的最后一个参数);
+       骨干**在构造时定** (它决定网络结构, 见构造函数最后那两个参数);
        构造之后再改这个字段不会重建网络, 只会让诊断字符串与实际结构不符。
+       ⚠ 最后两个参数 (`backbone_` / `expertHidden_`) 都是**结构**参数, 必须走构造函数。
     */
     Backbone backbone = Backbone::SparseMoeTb;
+    /*
+       序列专家的 token 宽 (= `SeqTransformerExpert` 的 tokDim)。**只对序列专家生效**:
+       TB 专家的宽度是另一组编译期常量 (`MOE_TB_HEADS` / `MOE_TB_DFF`), MLP 骨干与它无关。
+       它与 `backbone` 一样**在构造时定** (构造参数 `expertHidden_`): 构造之后再改这个
+       字段不会重建网络, 只会让自检读数与实际结构不符 (同上面 backbone 那条说明)。
+       默认 64 = 界面 PPO 支的口径; 必须能被 `MOE_SEQ_HEADS`(4) 整除 —— 不满足时序列
+       专家自己会 abort 并把话说清楚, 这里不重复判一次 (判两处就会有两份会漂移的口径)。
+    */
+    int expertHidden = MOE_SEQ_TOKDIM;
     LeafEval leafEval = LeafEval::Value;
     TargetMode targetMode = TargetMode::Planned;
 
@@ -227,11 +367,20 @@ public:
     bool encodeRulePlanes = true;
 
 public:
+    /*
+       最后两个参数是**结构**参数 (与 hiddenDim/gamma/lr 那种超参不同, 它们决定网络形状):
+         backbone_      : 骨干 (见枚举)。开关 DQNAB_MOE_EXPERT_SEQ=1 的构建里,
+                          `SparseMoeTb` 的专家已经是序列 Transformer (见文件顶部);
+         expertHidden_  : **只对序列专家生效**的 token 宽 (<=0 时取 MOE_SEQ_TOKDIM)。
+                          加在最后且带默认值 ⇒ 现有调用点 (界面/测试/bench 都是 5 个实参)
+                          一字不改, 默认构建的结构与今天逐位相同。
+    */
     explicit DQNABAgent(Chess &chess_,
                            int hiddenDim_ = 64,
                            float gamma_ = 0.99f,
                            float lr = 0.001f,
-                           Backbone backbone_ = Backbone::SparseMoeTb);
+                           Backbone backbone_ = Backbone::SparseMoeTb,
+                           int expertHidden_ = MOE_SEQ_TOKDIM);
 
     /* ---------------- AgentBase ---------------- */
     Step getBestMove(int color) override;
@@ -283,6 +432,15 @@ public:
     void encodeState(RL::Tensor &state);
     static int canonicalCell(int x, int y, int color);
     static int actionIdxOf(const Step &s, int color);
+    /*
+       [2026-10] 与 `DQNMCTSMOETbAgent` / PPO / SAC 四支**同名同义**的那个出口
+       (行为克隆的胶水层 src/bcagent.hpp 与 src/bcdqnagent.hpp 的鸭子类型契约要求它):
+       "这个着法在 `color` 的规范视角下是哪个动作下标"。
+       纯转发给 `actionIdxOf` (静态、无副作用、公式只有一份) ⇒ **不改变任何既有行为**;
+       加它是因为 BC 的两层 (造样本 / 算读数) 都按名字调这个成员函数, 而两支 agent
+       各写一份公式正是本工程反复记过的"两份会漂移的口径"。
+    */
+    int stepToActionIdx(const Step &s, int color) const { return actionIdxOf(s, color); }
     /* 只生成合法着法 (搜索热路径用, 不分配 8100 维掩码) */
     void legalMoves(int color, std::vector<Step*> &steps, std::vector<int> &indices);
     void getLegalActions(int color, std::vector<Step*> &steps,
@@ -512,6 +670,15 @@ private:
     /* ---- 目标网: 与在线网同构, withGrad=false ---- */
     RL::Net m_trunkT, m_vHeadT, m_aHeadT;
     RL::Net buildTrunk(bool withGrad) const;
+    /*
+       [2026-10] 造"MoE + 序列 Transformer 专家"那一层 —— 开关打开时 `Backbone::SparseMoeTb`
+       这一支的专家就是它 (与 SAC 支的 makeTbExpertMoe 同一形态: 骨干身份不变, 专家类型由
+       宏决定)。返回 `iLayer::sptr` 而不是具体类型, 是因为具体类型要 rl/sparse_moe.hpp
+       —— 那只需要在 .cpp 里, 头文件不必多暴露一层。
+    */
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+    RL::iLayer::sptr makeSeqExpertMoe(bool withGrad) const;
+#endif
     RL::Net buildValueHead(bool withGrad) const;
     RL::Net buildAdvantageHead(bool withGrad) const;
     void copyOnlineToTarget();
@@ -545,6 +712,26 @@ private:
 
     void applyGradients(float lr);
     void resetMoeBatchStats();
+
+#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+    /*
+       权重前缀的**准入检查** (saveModel / loadModel 进门第一件事, 见实现里的说明)。
+       两件事一起做:
+         1. 记下这次**实际用的**前缀 —— 自检面板报的是它, 不是"应该用的"那一个 (读数不许撒谎);
+         2. 开关打开时**不允许碰 TB 那一份前缀** (`weights/dqnab_agent`, 与
+            src/chessboard.cpp:5979 的 `defaultWeightPath(AGENT_DQNAB)` 逐字相同):
+            那是另一个结构 (TB 专家) 的文件。载入它会被 `Net::load` 的参数结构守卫拒绝
+            (还算看得见), 但**写出**它会把盘上那份 TB 权重直接盖掉 —— 写出侧没有守卫,
+            所以只能在这里当场拦住 (返回 false = 调用方看得见的"失败", 退出保存会把它
+            打进日志; 而不是"报一句就继续写")。
+       返回 false = 拒绝这次存取 (一个字节都不动)。自定义前缀 (测试的 `test_dqnab_tmp`、
+       后台训练的 `weights/_temp_train_dqnab`) **不受影响** —— 那些是同一进程内自己写自己读
+       的临时文件, 没有"两个结构共用一份文件"的风险。
+       只在开关打开时存在 ⇒ 默认构建的成员布局与所有行为一位不动。
+    */
+    bool canUseWeightPrefix(const std::string &prefix);
+    std::string m_lastWeightPrefix;
+#endif
 
     /* ---- 手工锚 / 门控 (实现见 dqnabagent.cpp 的 "手工评估锚" 一节) ---- */
     struct Probe { RL::Tensor state; float target = 0.0f; };

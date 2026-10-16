@@ -112,6 +112,24 @@ static double maxAbsDiff(const RL::Tensor &a, const RL::Tensor &b)
     return m;
 }
 
+/*
+   上下文第 i 个信道在状态里的**期望落点** (白盒断言: 这里独立写一遍布局, 与 .cpp 的
+   writeContext 成对 —— 两边不一致时就该红)。
+
+   两种编译配置的布局不同 (见 src/dqnmctsmoetbagent.h 顶部):
+     改前 (TB, 1263)        : 3 个标量挤在尾部  CTX_BASE + i            (1260..1262)
+     对齐 (序列专家, 1710)  : 5 个标量各一个整平面 (PIECE_PLANES + i)*90 (平面 14..18,
+                              平面内 90 格同值)
+*/
+static float ctxAt(const RL::Tensor &s, int i)
+{
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    return s[(DQNMCTSMOETbAgent::PIECE_PLANES + i) * DQNMCTSMOETbAgent::CELLS];
+#else
+    return s[DQNMCTSMOETbAgent::CTX_BASE + i];
+#endif
+}
+
 int main()
 {
     std::printf("============================================================\n");
@@ -130,26 +148,57 @@ int main()
 
     /* ============================================================
      *  [1] 构造 / 骨干指纹
+     *
+     *  [2026-10-15] 这一段带 `#if` 分叉: 同一个测试文件现在有两种编译配置 ——
+     *    * 默认 (TB 专家 + 改前表示 1263) = `test_dqnmcts_moe`
+     *    * `-DDQNMCTS_MOE_EXPERT_SEQ=1` (序列专家 + 对齐表示 19×90 = 1710)
+     *      = `test_dqnmcts_moe_seq` (界面 `chess` 用的就是这一套)
+     *  两种配置的**形状读数本来就不同**, 所以断言必须按配置分开写死 —— 用同一个
+     *  期望值去测两种配置, 只会得到"改一条就红一片"的假报警。
      * ============================================================ */
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    std::printf("\n[1] 骨干指纹 (稀疏 MoE + 序列 Transformer 专家, 对齐表示 19x90)\n");
+#else
     std::printf("\n[1] 骨干指纹 (稀疏 MoE + TB 专家)\n");
+#endif
     CHECK_EQ(DQNMCTSMOETbAgent::CELLS, 90, "CELLS = 10x9");
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    CHECK_EQ(DQNMCTSMOETbAgent::CTX_COUNT, 5, "对齐表示: 上下文 5 个 (子力/总手数/无吃子/重复/被将)");
+    CHECK_EQ(DQNMCTSMOETbAgent::CTX_BASE, 1260, "上下文平面起点 = 14 平面 x 90");
+    CHECK_EQ(DQNMCTSMOETbAgent::STATE_DIM, 1710, "STATE_DIM = 19 x 90 = 1710");
+    CHECK_EQ(DQNMCTSMOETbAgent::STATE_DIM % DQNMCTSMOETbAgent::CELLS, 0,
+             "序列专家按格子切 token: 必须能被 90 整除");
+#else
     CHECK_EQ(DQNMCTSMOETbAgent::CTX_COUNT, 3, "规则上下文 3 个");
     CHECK_EQ(DQNMCTSMOETbAgent::CTX_BASE, 1260, "上下文标量的起点 = 14 平面 x 90");
     CHECK_EQ(DQNMCTSMOETbAgent::STATE_DIM, 1263, "STATE_DIM = 1260 + 3");
+#endif
     CHECK_EQ(DQNMCTSMOETbAgent::ACTION_DIM, 128, "动作仍是 128 槽哈希 (SAC 默认口径)");
     CHECK_EQ(ag.moeExpertCount(), 4, "稀疏 MoE 有 4 个专家");
     CHECK_EQ(ag.moeTopK(), 1, "top-1 路由");
     CHECK(!ag.moeDenseNow(), "不是稠密对照 (TopK != E)");
     CHECK(strstr(ag.backboneName(), "\u7a00\u758f") != nullptr, "骨干名写着稀疏");
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+    /* 序列专家: 头数/头宽由它自己的模板参数决定 (MOE_SEQ_HEADS=4, tokDim=64 -> d_k=16) */
+    CHECK(strstr(ag.backboneName(), "\u5e8f\u5217") != nullptr, "骨干名写着序列 (不是 TB)");
+    CHECK_EQ(ag.tbHeadsRequested(), 4, "序列专家的请求头数 = MOE_SEQ_HEADS(4)");
+    CHECK_EQ(ag.tbHeadsUsed(), 4, "实际用了 4 个头");
+    CHECK_EQ(ag.tbHeadDim(), 16, "d_k = tokDim(64)/4 = 16");
+    CHECK_EQ(ag.tbAttnElements(), 4LL * 90 * 90,
+             "注意力元素 = 头数 x T x T = 4 x 90 x 90 (真正按 token 的注意力)");
+    CHECK(ag.trunkParamCount() < 2000000LL,
+             "序列专家的骨干比 TB 小一个数量级 (91,731 参数/专家)");
+#else
     CHECK_EQ(ag.tbHeadsRequested(), 15, "请求 15 个注意力头");
     CHECK_EQ(ag.tbHeadsUsed(), 15,
              "**实际用了 15 个** (HonorHeads 修复; 老规则会静默降成 3)");
     CHECK_EQ(ag.tbHeadDim(), 84, "d_k = 1263/15 = 84");
     CHECK_EQ(ag.tbHeadsAllocated(), 15, "分配出来的 head 对象 = 15 (没有死张量)");
     CHECK_EQ(ag.tbAttnElements(), 105840LL, "注意力元素 = 15 x 84 x 84");
+    CHECK(ag.trunkParamCount() > 20000000LL, "骨干参数量在千万级");
+#endif
     CHECK(strstr(ag.hiddenActivationName(), "tanh") != nullptr,
           "隐层激活是 Layer<Tanh> (不是 TanhNorm<Sigmoid>)");
-    CHECK(ag.trunkParamCount() > 20000000LL, "骨干参数量在千万级");
     CHECK(ag.headParamCount() > 0, "输出头有参数");
     CHECK_EQ(ag.uniqueParamCount(), ag.trunkParamCount() + ag.headParamCount(),
              "唯一参数量 = 骨干 + 头 (视图不重复计)");
@@ -174,12 +223,35 @@ int main()
         CHECK_EQ(nzRed, 32, "开局: 棋子区恰好 32 个非零格");
         CHECK(maxAbsDiff(red, blk) < 1e-12,
               "开局左右对称 ⇒ 红黑两个视角的编码逐元素相同");
-        CHECK(std::fabs((double)red[DQNMCTSMOETbAgent::CTX_BASE + 0]) < 1e-6,
-              "上下文[0] 无吃子进度 = 0");
-        CHECK(std::fabs((double)red[DQNMCTSMOETbAgent::CTX_BASE + 1]) < 1e-6,
-              "上下文[1] 重复次数 = 0");
-        CHECK(std::fabs((double)red[DQNMCTSMOETbAgent::CTX_BASE + 2]) < 1e-6,
-              "上下文[2] 被将 = 0");
+        /*
+           [2026-10-15] 上下文**不能写死原始槽位、也不能写死下标**: 两种配置既换了落点,
+           也换了**通道个数与顺序** ——
+             改前 (1263, 3 个): 下标 0/1/2 = 无吃子 / 重复 / 被将 (挤在 CTX_BASE..1262);
+             对齐 (1710, 5 个): 下标 0..4 = 子力 / 总手数 / 无吃子 / 重复 / 被将
+                                 (各占一个整平面 14..18)
+           `ctxAt()` 负责落点, 下面用 CTX_IDX_* 这两个"按配置定义的通道号"取顺序 ——
+           与 `chessstate.h` 的 CTX_MATERIAL/TEMPO/HALFMOVE/REPEAT/CHECK 一一对应。
+        */
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+        const int CTX_IDX_MATERIAL = 0;   /* 子力阶段 (开局满子 = 1) */
+        const int CTX_IDX_HALFMOVE = 2;   /* 无吃子进度 */
+        const int CTX_IDX_REPEAT   = 3;
+        const int CTX_IDX_CHECK    = 4;
+#else
+        const int CTX_IDX_HALFMOVE = 0;   /* 改前表示只有 3 个, 无吃子在第一个 */
+        const int CTX_IDX_REPEAT   = 1;
+        const int CTX_IDX_CHECK    = 2;
+#endif
+        CHECK(std::fabs((double)ctxAt(red, CTX_IDX_HALFMOVE)) < 1e-6,
+              "开局: 无吃子进度 = 0");
+        CHECK(std::fabs((double)ctxAt(red, CTX_IDX_REPEAT)) < 1e-6,
+              "开局: 重复次数 = 0");
+        CHECK(std::fabs((double)ctxAt(red, CTX_IDX_CHECK)) < 1e-6,
+              "开局: 无将军 = 0");
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+        CHECK(std::fabs((double)ctxAt(red, CTX_IDX_MATERIAL) - 1.0) < 1e-6,
+              "对齐表示: 开局子力阶段 = 1.0 (满子)");
+#endif
 
         /* 走一手红炮: "无吃子进度"这个通道必须跟着棋盘变 */
         std::vector<Step*> mv;
@@ -189,7 +261,7 @@ int main()
         double dummy = 0.0;
         chess.moveForward(&first, dummy);
         ag.encodeStateFor(Stone::COLOR_BLACK, blk);
-        CHECK(blk[DQNMCTSMOETbAgent::CTX_BASE + 0] > 0.0f,
+        CHECK(ctxAt(blk, CTX_IDX_HALFMOVE) > 0.0f,
               "走了一手之后无吃子进度 > 0 (这个通道真的连在棋盘上)");
         chess.moveBack(&first, dummy);
 

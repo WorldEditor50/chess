@@ -13,10 +13,38 @@
 
 #include "chess.h"
 #include "aiagent.h"
+#include "chessstate.h"
 #include "rl/net.hpp"
 #include "rl/layer.h"
 #include "rl/loss.h"
 #include "rl/util.hpp"
+
+/*
+   ================================================================
+   [2026-10-15] 用户口径: "把所有 agent 里的 TB 专家换成 seq transformer,
+                 输入都使用 19x90 特征, 与 ppo agent 对齐"
+   ================================================================
+   本类原来的专家是 `SparseMoE<TransformerBlock<15,315>,4,1>`, 输入是"14 个棋子平面 +
+   3 个上下文**标量**"= 1263 —— 这个维数喂不进序列专家: 序列专家按**格子**切 token,
+   要求 `dIn % SeqLen == 0` 且 `SeqLen == POS_ROWS*POS_COLS == 90`, 而
+   1263 = 17*90 + 3 (那 3 个标量是**追加的尾巴**, 不是第 18 个平面) 不满足整除。
+
+   ⇒ 打开 `-DDQNMCTS_MOE_EXPERT_SEQ=1` 时, 本类**同时**把表示换成对齐口径
+   (19 个平面 = 14 棋子 + 5 个上下文**平面**, 与 DQNAB / SAC 的对齐表示同一套
+   `ChessState` 口径), 于是 `STATE_DIM = 19*90 = 1710`, 整除成立。
+   这与 SAC 那一支 (`SACAZ_MOE_EXPERT_SEQ` 隐含 `SACAZ_ALIGNED_REPR`) 是同一套做法。
+
+   **默认 (宏不开) 的表示、专家、权重前缀与数值读数一位不动** —— 它仍是 1263 的
+   "改前表示", 存量权重照旧能载入 (本工程的纪律: 换骨干/换维数必须换前缀, 见
+   `defaultWeightPrefix()`)。开关的代价与验收记录见
+   `docs/expert_search_optimization_plan_2026_10.md` §8 与
+   `docs/encoding_optimization_plan_2026_10.md` §1.1/§1.4。
+*/
+#if defined(DQNMCTS_MOE_EXPERT_SEQ) && DQNMCTS_MOE_EXPERT_SEQ
+#define RL_DQNMCTS_MOE_SEQ_ON 1
+#else
+#define RL_DQNMCTS_MOE_SEQ_ON 0
+#endif
 
 /* 稀疏 MoE 只需要指针/引用 (定义在 rl/sparse_moe.hpp, 由 .cpp 包含) */
 namespace RL {
@@ -50,6 +78,9 @@ class MoERouteProbe;
  *     **稠密** `MOE<16,16>`(16 个专家全算). 实测 (`bench_moe`): 同参数下稀疏路由
  *     **3.8x** 快 (9.918 vs 37.675 ms/sim). 旧类那一支的稠密 MoE 从来没有"按需路由"
  *     的机会, 它每次叶子估值都把 16 个专家 + 1 个独立 TransformerBlock 全算一遍。
+ *     **[2026-10-15] 专家本身现在可以是"序列 Transformer"** —— 见文件顶部与
+ *     `MOE_EXPERT_SEQ` 的说明: `-DDQNMCTS_MOE_EXPERT_SEQ=1` 时这一支的专家换成
+ *     `SeqTransformerExpert<90,4,2>` 且表示同时对齐到 19×90 (与 DQNAB / PPO 同形)。
  *  2. **TB 专家的头数口径** (`HonorHeads=true`, 见 rl/attention.hpp 的第三模板参数)。
  *     SAC 那边实测的静默降级: `d_model = 1263 = 3 x 421`(421 是素数) 而老的
  *     "头数必须整除 d_model" 规则把请求的 15 个头降成 **3** 个、d_k 从 84 涨到 421,
@@ -120,7 +151,7 @@ class MoERouteProbe;
  *     `auxLossCoef=0.1` 是 SAC 那边实测选出来的 (0 会让专家坍缩: 8 个专家里 3 个
  *     从不被选中; 0.5 以上开始盖过真正的策略梯度)。
  * 13. **稀疏回放表示**: 一条经验只存"被占据的格子" (`plane*90+cell`, uint16) 与
- *     3 个上下文标量 + 下一局面的合法槽位位图 (2×uint64), 而不是 1263×2 个 float。
+ *     上下文 (3 或 5 个) + 下一局面的合法槽位位图 (2×uint64), 而不是 STATE_DIM×2 个 float。
  *     1263 维稠密存法 ≈ 10 KB/条, 稀疏 ≈ 100 B/条 (旧类存的是 90 维稠密, 更小,
  *     但它同时丢掉了走子方与全部规则上下文)。
  *     上下文**必须随身携带**: 不存它, 展开时重建出来的状态就是"裸棋盘", 编码静默退回。
@@ -195,9 +226,25 @@ public:
      */
     static constexpr int CELLS = 90;                        /* 10 行 x 9 列 */
     static constexpr int PIECE_PLANES = 14;                 /* 7 类棋子 x {己方, 对方} */
-    static constexpr int CTX_COUNT = 3;                     /* 无吃子 / 重复 / 被将 */
-    static constexpr int CTX_BASE = PIECE_PLANES * CELLS;   /* 1260: 上下文标量的起点 */
-    static constexpr int STATE_DIM = CTX_BASE + CTX_COUNT;  /* 1263 */
+    /*
+       ---- 两种上下文布局 (与 SAC 那一支的"改前/对齐"是同一对口径) ----
+
+       改前 (默认, RL_DQNMCTS_MOE_SEQ_ON == 0):
+           3 个上下文**标量**挤在棋子区之后的尾巴上 -> CTX_COUNT=3, 1260..1262, 共 1263。
+
+       对齐 (序列专家开关打开时): 5 个上下文**铺成整平面** (与 DQNAB / SAC 对齐表示
+       逐位相同, 数值全部取自 `chessstate.h`, 顺序 = CTX_MATERIAL / CTX_TEMPO /
+       CTX_HALFMOVE / CTX_REPEAT / CTX_CHECK) -> 14..18 平面, 共 19*90 = 1710。
+       为什么非换成平面不可: 序列专家的 token 是"一个格子的全部平面取值", 标量尾巴
+       没法落进任何一个格子的 token 里 (见文件顶部的说明)。
+    */
+    static constexpr bool ALIGNED_REPR = (RL_DQNMCTS_MOE_SEQ_ON != 0);
+    static constexpr int CTX_COUNT = ALIGNED_REPR ? 5 : 3;
+    static constexpr int PLANES = PIECE_PLANES + CTX_COUNT;   /* 19 或 17 */
+    static constexpr int CTX_BASE = PIECE_PLANES * CELLS;     /* 1260: 棋子区之后的基址 */
+    /* 对齐: 上下文占满 5 个平面; 改前: 上下文只占尾部 3 个标量槽 */
+    static constexpr int STATE_DIM = ALIGNED_REPR ? (PLANES * CELLS)
+                                                 : (CTX_BASE + CTX_COUNT);
     /*
      *  动作: 与 SAC 默认口径**逐字同一个** 128 槽哈希 (见 .cpp 的 stepToActionIdx)。
      *  已知局限: 同局面的不同着法会撞进同一个槽位 (实测标准开局 44 -> 39 槽),
@@ -225,6 +272,56 @@ public:
     static constexpr int MOE_TB_HEADS = 15;
     static constexpr int MOE_TB_DFF = 315;
 
+    /*
+       ---- [2026-10-15] 序列 Transformer 专家 (开关 = `-DDQNMCTS_MOE_EXPERT_SEQ=1`) ----
+       与 PPO 支的 `PPOSeqExpert`、以及 SAC 那一支的 SeqExpert 是**同一份实现**
+       (`src/rl/seq_transformer.hpp`): 状态按格子切成 T=90 个 token, 每个 token 是
+       19 个平面在该格上的取值, 跑标准 Pre-LN 编码器, 再逐格投影回 19 维散回 1710。
+
+       与 TB 专家的关系 (为什么这不是"换个更方便的写法"): TB 专家收的是 `(d_model × 1)`
+       单向量 ⇒ `q·kᵀ` 是 `d_k × d_k` **外积**、`softmax` 是**全局**归一, 结构上不是
+       attention; 序列专家把 token 轴和逐行 softmax 都补上了 (七条判定见
+       `docs/tb_expert_training_2026_10.md` §9)。
+
+       ⚠ `MOE_TB_HEADS / MOE_TB_DFF` 在这一支下**不生效** (那是 TB 专家的参数),
+       宽度改由构造签名里的 `expertHidden` 决定 (tokDim, 默认 64, 必须能被
+       `MOE_SEQ_HEADS` 整除 —— 不满足时序列专家自己 abort)。
+    */
+#if RL_DQNMCTS_MOE_SEQ_ON
+    static constexpr bool MOE_EXPERT_SEQ = true;
+#else
+    static constexpr bool MOE_EXPERT_SEQ = false;
+#endif
+    static constexpr int MOE_SEQ_HEADS = 4;    /* 与 PPO 支同口径 (dk = tokDim/4) */
+    static constexpr int MOE_SEQ_BLOCKS = 2;   /* Pre-LN 块数 (与 PPO 支相同) */
+    /*
+       token 宽度 (每个格子的特征维) —— 与 PPO 支的 `expertHidden` 默认值 64 同口径。
+       [2026-10] **它现在是运行时旋钮** (构造签名末尾的 `expertHidden_`, 默认 = 这个常量):
+       与 `denseMoe` 一样是**结构**参数, 所以只能走构造函数 —— 建网发生在构造函数里,
+       构造之后再赋值是**静默空操作** (本工程栽过两次: `legacyNet` / `moeDense`)。
+       为什么必须能扫: 行为克隆的宽度扫描 (`train_bc_dqn --expert=`) 要的是
+       "同一份数据/同一个老师/同一个 seed, 只换专家宽度" —— 编译期常量做不到。
+       默认值 = 常量 ⇒ **不传时建出来的网络与改动前逐位相同** (同一层构造顺序、
+       同一个 tokDim) —— 7 个既有构造点一个都不用改, 既有读数一位不变。
+       ⚠ 必须能被 `MOE_SEQ_HEADS` 整除 (64/4 = 16) —— 否则序列专家自己 abort
+       (它是唯一知道这条约束的地方, 这里不重复判一次: 判两处就会有两份会漂移的口径)。
+    */
+    static constexpr int MOE_SEQ_TOKDIM = 64;
+    /* 位置编码模式: 与界面 PPO 支一致 —— 可学 2D (10 行 + 9 列) */
+    static const char *moeSeqPosMode() { return "2d"; }
+
+    /*
+       ---- 编译期前提 ----
+       序列专家按格子切 token ⇒ `STATE_DIM` 必须是 `CELLS` 的整数倍。
+       对齐表示下 19*90 = 1710 ✓; 改前表示 1263 ✗ —— 所以这两个开关**必须成对**,
+       这里用 static_assert 在编译期把它钉死 (而不是等构造时 abort)。
+    */
+    static_assert(!MOE_EXPERT_SEQ || (STATE_DIM % CELLS == 0),
+                  "DQNMCTS_MOE_EXPERT_SEQ=1 要求对齐表示 (STATE_DIM = 19*90 = 1710): "
+                  "序列专家按格子切 token, 而改前表示的 1263 = 17*90+3 不满足整除。"
+                  "两个开关在本类里是绑定的 (ALIGNED_REPR 由 SEQ 开关推导), 出现这条 "
+                  "断言说明有人把 ALIGNED_REPR 的推导改坏了。");
+
     /* 本类骨干的**名字** (自检面板第一行要能回答"我是哪一支") */
     const char *backboneName() const;
     /*
@@ -238,7 +335,7 @@ public:
     /* ----------------------------------------------------------------
      *  一条 off-policy 经验
      * ----------------------------------------------------------------
-     *  局面**不存 1263 个 float** (那是 5 KB/条), 而是存"被占据的格子"的稀疏列表
+     *  局面**不存 STATE_DIM 个 float** (那是 5 KB/条), 而是存"被占据的格子"的稀疏列表
      *  (一局最多 32 个子, 每格一个 uint16 = plane*CELLS+cell)。取用时再展开成
      *  one-hot。上下文 3 个标量**必须随身带** —— 它们不是"某个格子上的 1", 进不了
      *  稀疏格列表; 不存它们, 展开时重建出来的就是"裸棋盘"(静默失效)。
@@ -253,8 +350,8 @@ public:
     struct Sample {
         std::vector<std::uint16_t> cells;      /* 当前局面: plane*CELLS + cell */
         std::vector<std::uint16_t> nextCells;  /* 下一局面 (同一编码) */
-        float ctx[CTX_COUNT] = {};             /* 当前局面的 3 个上下文 */
-        float nextCtx[CTX_COUNT] = {};         /* 下一局面的 3 个上下文 */
+        float ctx[CTX_COUNT] = {};             /* 当前局面的上下文 (3 或 5 个) */
+        float nextCtx[CTX_COUNT] = {};         /* 下一局面的上下文 */
         std::uint64_t curMask[2] = { 0, 0 };   /* 当前局面合法槽位位图 (诊断用) */
         std::uint64_t nextMask[2] = { 0, 0 };  /* 下一局面合法槽位位图 */
         int action = 0;                        /* 实际走的动作索引 */
@@ -364,6 +461,12 @@ public:
     /* ---- 结构回显 (只读; 建网参数的真实取值) ---- */
     int hiddenDim;
     bool denseMoe;
+    /*
+       [2026-10] 序列专家的 token 宽 **在构造时定的真实取值** (默认 = MOE_SEQ_TOKDIM)。
+       只在 `MOE_EXPERT_SEQ` 打开时影响结构 (TB 专家用的是 MOE_TB_HEADS/MOE_TB_DFF);
+       对 TB 那一支它只是一个如实回显的数, 不参与建网。
+    */
+    int expertHidden;
 
     /* ---- 学习口径 ---- */
     float gamma;
@@ -498,13 +601,21 @@ public:
     long long m_lastDecisionFromBack = -1;
 
 public:
+    /*
+       ⚠ 最后那个参数是**结构**参数 (与 gamma/lr/eps 那种超参不同, 它决定网络形状):
+         `expertHidden_` = 序列专家的 token 宽 (只在 `DQNMCTS_MOE_EXPERT_SEQ=1` 这一支
+         生效, 见 MOE_SEQ_TOKDIM 的注释)。**加在末尾且带默认值** ⇒ 既有 7 个构造点
+         (界面 4 处 + 训练 clone + 兜底重建 + 测试/bench) 一字不改, 默认构建的结构
+         与改动前逐位相同。<=0 时退回 MOE_SEQ_TOKDIM。
+    */
     DQNMCTSMOETbAgent(Chess &chess_,
                       int hiddenDim = 64,
                       float gamma_ = 0.99f,
                       float lr = 0.001f,
                       float eps = 1.0f,
                       float c_puct_ = 1.5f,
-                      bool denseMoe = false);
+                      bool denseMoe = false,
+                      int expertHidden_ = MOE_SEQ_TOKDIM);
 
     ~DQNMCTSMOETbAgent() = default;
 
@@ -731,7 +842,7 @@ private:
     static void bitSetTo(std::uint64_t bits[2], int idx);
     static bool bitsEmpty(const std::uint64_t bits[2]);
 
-    /* 搜索/训练复用的缓冲区 (避免每次模拟都分配 1263 维张量) */
+    /* 搜索/训练复用的缓冲区 (避免每次模拟都分配 STATE_DIM 维张量) */
     RL::Tensor m_stateBuf;
     RL::Tensor m_nextBuf;
     RL::Tensor m_maskBuf;

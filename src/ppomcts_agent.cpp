@@ -393,6 +393,26 @@ float PPOMCTSAgent::potentialOf(int colorToMove)
 }
 
 /* ------------------------------------------------------------------
+ *  materialOfColor: 某一方**非将**棋子的价值合计 (R-2 用, 2026-10 第五轮)
+ *
+ *  口径与 ChessState::materialPhase 逐条一致: 跳过 `TYPE_JIANG` (将的价值就是
+ *  "被吃" = 终局本身, 由 ±REWARD_TERMINAL 承担), 子力价值取 `Stone::value`
+ *  (与 computeReward 里 `victim->value` 的同一份来源 —— 两处口径必须同源)。
+ * ------------------------------------------------------------------ */
+double PPOMCTSAgent::materialOfColor(int color)
+{
+    double sum = 0.0;
+    for (int i = 0; i < 32; i++) {
+        Stone *s = chess.stones[i];
+        if (s == nullptr || !s->alive) continue;
+        if (s->color != color) continue;
+        if (s->type == Stone::TYPE_JIANG) continue;
+        sum += (double)s->value;
+    }
+    return sum;
+}
+
+/* ------------------------------------------------------------------
  *  applyPotentialShaping: 把势能塑形原地写进轨迹 (Phase 2, 见头文件)
  *
  *  相邻两步共享同一个局面, 所以 Φ_before(i) = Φ_after(i-1) = trajectory[i-1].potential,
@@ -449,31 +469,61 @@ int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
                                      std::vector<float> &probs,
                                      float &priorOut)
 {
-    const AZNode &node = nodes[nodeID];
+    AZNode &node = nodes[(std::size_t)nodeID];
 
-    legalIdx.clear();
-    legalIdx.reserve(node.untriedActionIndices.size() + node.childIDs.size());
-    for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
-        legalIdx.push_back(node.untriedActionIndices[i]);
-    }
-    for (std::size_t i = 0; i < node.childIDs.size(); i++) {
-        legalIdx.push_back(nodes[(std::size_t)node.childIDs[i]].parentAction);
-    }
+    /*
+       ---- ★Z1 (2026-10 第五轮): 先验缓存 ----
+       这一段原来**每次调用**都做一次完整骨干前向 (下面那个 actionMasked / action)。
+       而它每次展开一个孩子就被调用一次 ⇒ 同一个节点有几个合法着法就被重算几次
+       (根节点在 1600 模拟里 ~40 次)。缓存的条件与安全性论证见 `AZNode` 的字段注释:
 
-    if (sparsePolicyHead) {
-        ppo.actionMasked(parentState, legalIdx, probs);
-    } else {
-        /*
-           R1 之前的对照口径 (A/B 用, 见头文件 sparsePolicyHead): 全量策略前向, 先验
-           直接取 p_full(a) —— 合法集上的质量 Z 没有被除掉。这是**逐字复现**改动前的
-           搜索行为, 所以 "sparsePolicyHead=true/false" 的配对差就是 R1 的全部影响。
-        */
-        RL::Tensor &full = ppo.action(parentState);
-        probs.resize(legalIdx.size());
-        for (std::size_t i = 0; i < legalIdx.size(); i++) {
-            const int a = legalIdx[i];
-            probs[i] = (a >= 0 && a < ppo.actionDim) ? full[(std::size_t)a] : 0.0f;
+         * 节点的局面与完整合法集在创建时固定;
+         * 先验是"局面 + 完整合法集"的确定性函数 (稀疏 softmax 的分母就是这个集合);
+         * 集合不变式: `untried ∪ 已展开孩子的 parentAction` **恒等于**完整合法集
+           (untried 只在"挑走一个并把它变成孩子"这一步被 erase, 见三处调用点的成对写法)
+           ⇒ 首次调用时算出来的那一份, 与后续每次重算的结果**逐位相同**。
+
+       于是默认 (azPriorCache=true) 走缓存, 只是把重复的前向省掉;
+       `azPriorCache=false` 切回逐步重算 —— 两臂的决策与访问分布应逐位相同,
+       那正是这一项"只省算力、不改行为"的验收方式。
+    */
+    if (!azPriorCache || !node.priorCached) {
+        legalIdx.clear();
+        legalIdx.reserve(node.untriedActionIndices.size() + node.childIDs.size());
+        for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
+            legalIdx.push_back(node.untriedActionIndices[i]);
         }
+        for (std::size_t i = 0; i < node.childIDs.size(); i++) {
+            legalIdx.push_back(nodes[(std::size_t)node.childIDs[i]].parentAction);
+        }
+
+        if (sparsePolicyHead) {
+            ppo.actionMasked(parentState, legalIdx, probs);
+        } else {
+            /*
+               R1 之前的对照口径 (A/B 用, 见头文件 sparsePolicyHead): 全量策略前向, 先验
+               直接取 p_full(a) —— 合法集上的质量 Z 没有被除掉。这是**逐字复现**改动前的
+               搜索行为, 所以 "sparsePolicyHead=true/false" 的配对差就是 R1 的全部影响。
+            */
+            RL::Tensor &full = ppo.action(parentState);
+            probs.resize(legalIdx.size());
+            for (std::size_t i = 0; i < legalIdx.size(); i++) {
+                const int a = legalIdx[i];
+                probs[i] = (a >= 0 && a < ppo.actionDim) ? full[(std::size_t)a] : 0.0f;
+            }
+        }
+
+        if (azPriorCache) {
+            node.priorActionIndices = legalIdx;
+            node.priorValues        = probs;
+            node.priorCached        = true;
+            m_priorCacheMisses++;      /* "这个节点真的做了一次前向" */
+        }
+    } else {
+        /* 命中: 直接把缓存搬进出参 (保持 legalIdx/probs 的出参口径不变) */
+        legalIdx = node.priorActionIndices;
+        probs    = node.priorValues;
+        m_priorCacheHits++;
     }
 
     /*
@@ -494,14 +544,25 @@ int PPOMCTSAgent::pickUntriedByPrior(int nodeID, const RL::Tensor &parentState,
     }
 
     /*
-        probs 与 legalIdx 一一对应, 而 legalIdx 的**前 untried.size() 项**就是
-        untriedActionIndices 本身 (上面按这个顺序填的) —— 于是"挑最大"和"查选中动作
-        的概率"都是直接下标访问, 不需要再查表。
+       取"某个动作的先验" —— **必须按动作下标查, 不能按下标对齐取**:
+       未命中时 legalIdx 的前 `untried.size()` 项确实就是 untried (旧代码依赖这一点),
+       但**命中缓存**时 legalIdx 的顺序是"首次展开时"的顺序, 那个对齐关系不再成立。
+       按动作下标查表对两条路径给出同一批数值 (缓存里的集合包含所有 untried 动作),
+       而查找是 O(|合法集|) 的线性扫 (中局约 40 项) —— 代价可忽略。
     */
+    const auto priorOfAction = [&](int action) -> float {
+        for (std::size_t k = 0; k < legalIdx.size(); k++) {
+            if (legalIdx[k] == action) {
+                return (k < probs.size()) ? probs[k] : 0.0f;
+            }
+        }
+        return 0.0f;
+    };
+
     int best = 0;
     float bestP = -1.0f;
     for (std::size_t i = 0; i < node.untriedActionIndices.size(); i++) {
-        const float p = (i < probs.size()) ? probs[i] : 0.0f;
+        const float p = priorOfAction(node.untriedActionIndices[i]);
         if (p > bestP) {
             bestP = p;
             best = (int)i;
@@ -1245,10 +1306,12 @@ std::string PPOMCTSAgent::selfCheckReport() const
     }
 
     std::snprintf(buf, sizeof(buf),
-                  "奖励 (PBRS): 势能塑形=%s alpha=%.2f | 显式材质奖励=%s | 截断自举=%s\n",
+                  "奖励 (PBRS): 势能塑形=%s alpha=%.2f | 显式材质奖励=%s | 截断自举=%s"
+                  " | 混合池材质补齐=%s\n",
                   potentialShaping ? "开" : "关", (double)shapingAlpha,
                   materialRewardEnabled ? "开" : "关",
-                  truncationBootstrap ? "开" : "关");
+                  truncationBootstrap ? "开" : "关",
+                  mixedOpponentMaterialDelta ? "开" : "关");
     out += buf;
     if (!potentialShaping || shapingAlpha <= 0.0f) {
         out += "  判读: 塑形关闭或 α=0 -> 价值目标只剩 材质 + gamma*maxQ 这条基线"
@@ -1259,6 +1322,13 @@ std::string PPOMCTSAgent::selfCheckReport() const
     } else {
         out += "  判读: 材质只由 Φ 承担 (标准做法), 显式项只剩每步代价; 任意 α 都是状态"
                "函数, 保持策略不变性, 可退火\n";
+    }
+    if (mixedOpponentMaterialDelta) {
+        out += "  判读: 混合池材质补齐=开 -> 对手那一手造成的**学习方**材质变化已折进上一手"
+               "的奖励, 且势能重测到对手应完之后 (奖励与势能同区间); 纯自对弈不受影响\n";
+    } else if (m_mixedOpponents) {
+        out += "  判读: 混合池开着而材质补齐=关 -> 学习方回报里**缺了\"对手吃我的子\"**这一项"
+               " (对手的手不进轨迹), 稠密回报系统性偏高; 这是 A/B 的对照臂\n";
     }
 
     std::snprintf(buf, sizeof(buf),
@@ -1289,6 +1359,62 @@ std::string PPOMCTSAgent::selfCheckReport() const
     } else {
         out += "  判读: 落子到达的局面就是上一棵树的孩子 (自对弈里 100% 可达), 统计与"
                "先验跨 ply 继续用 -> 等模拟数下 π 目标更尖\n";
+    }
+
+    /*
+       ---- ★Z1: 节点先验缓存 (2026-10 第五轮) ----
+       "未命中"就是**真的做了一次骨干前向的节点数** (≈ 被展开过的节点数 D),
+       "命中"就是被省掉的重复前向次数。一次决策的骨干前向数从 2N 降到 N + D
+       (N = 模拟次数) ⇒ 这个比值就是那一项收益的读数, 不必靠猜。
+    */
+    const long long cacheHits   = azPriorCacheHits();
+    const long long cacheMisses = azPriorCacheMisses();
+    std::snprintf(buf, sizeof(buf),
+                  "先验缓存 (★Z1): %s | 命中 %lld / 未命中 %lld (未命中 ≈ 被展开过的节点数)\n",
+                  azPriorCache ? "开" : "关", cacheHits, cacheMisses);
+    out += buf;
+    if (!azPriorCache) {
+        out += "  判读: 关 -> 每次展开都重算该节点的策略前向 (改动前口径, 这是 A/B 的对照臂)\n";
+    } else if (cacheHits + cacheMisses == 0) {
+        out += "  判读: 还没搜索过 (计数为零 = 没跑, 不是没生效)\n";
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "  判读: 命中率 %.1f%% -> 每次模拟的骨干前向从 2 次降到 1 + D/N 次"
+                      " (D=%lld, N=模拟次数); 决策应与 azPriorCache=false 逐位相同\n",
+                      (double)cacheHits * 100.0 / (double)(cacheHits + cacheMisses),
+                      cacheMisses);
+        out += buf;
+    }
+
+    /*
+       ---- R-5: critic 目标的夹断读数 (2026-10 第五轮) ----
+       为什么必须印出来: 势能塑形把单步上界从 0.35 抬到 ~2.34, 而 `clampValue` 默认 2.0
+       ⇒ 目标完全可能被夹成常数 (被夹的样本 = 该样本的价值目标不再是真实回报)。
+       计数器一直在 `RL::PPO::criticDiag` 里, 但**自检面板此前没有读它**
+       (rl/ppo.h 的注释写着"GUI 自检 读 criticDiag()", 实际没有) ⇒ 这里补上。
+    */
+    {
+        const RL::PPO::CriticDiag &cd = ppo.criticDiag;
+        const double clampPct = (cd.total > 0)
+                                    ? (double)cd.clamped * 100.0 / (double)cd.total
+                                    : 0.0;
+        const double targetMean = (cd.total > 0) ? cd.targetAbsSum / (double)cd.total : 0.0;
+        const double valueMean  = (cd.total > 0) ? cd.valueAbsSum / (double)cd.total : 0.0;
+        std::snprintf(buf, sizeof(buf),
+                      "critic 目标: clampValue=%.2f | 夹断 %lld/%lld (%.2f%%) |"
+                      " |target| 均值 %.3f 最大 %.3f | |V| 均值 %.3f\n",
+                      (double)ppo.clampValue, cd.clamped, cd.total, clampPct,
+                      targetMean, cd.targetAbsMax, valueMean);
+        out += buf;
+        if (cd.total == 0) {
+            out += "  判读: 还没有训练样本 (计数为零 = 没跑)\n";
+        } else if (clampPct > 1.0) {
+            out += "  判读: 目标被夹的比例 >1% -> 这些样本的价值目标被换成了常数,"
+                   " critic 学不到区分度; 要么抬 clampValue, 要么降 shapingAlpha"
+                   " (塑形后 |r'| 上界约 2.34, 已越过默认的 2.0)\n";
+        } else {
+            out += "  判读: 夹断比例很低 -> clampValue 与当前奖励量级匹配\n";
+        }
     }
 
     /* ---- MoE 规模与专家负载 (容量 ≠ 棋力) ---- */
@@ -2335,9 +2461,36 @@ void PPOMCTSAgent::trainSelfPlay(int episodes, int simulations,
                                    && chess.isLegalMove(currentColor, &oppStep);
                 Steps::instance().put(oppLegal);
                 if (oppOk) {
+                    /*
+                       [2026-10 第五轮] R-2: 对手这一手造成的**学习方材质变化**要折进
+                       学习方上一手的奖励 —— 否则"被吃"在这一支里没有任何即时惩罚
+                       (对手的手不进轨迹 ⇒ 纯自对弈里那条 negamax 号翻转的抵账不存在)。
+                       默认 (mixedOpponentMaterialDelta=false) 一行都不执行 ⇒ 与改动前
+                       逐位相同。推导与它所修的那条偏差见头文件同名成员的说明。
+                    */
+                    const int learnerColor = (currentColor == Stone::COLOR_RED)
+                                                 ? Stone::COLOR_BLACK
+                                                 : Stone::COLOR_RED;
+                    const double learnerMatBefore =
+                        mixedOpponentMaterialDelta ? materialOfColor(learnerColor) : 0.0;
+
                     double dummy = 0.0;
                     chess.moveForward(&oppStep, dummy);
                     op.plies++;
+
+                    if (mixedOpponentMaterialDelta && !trajectory.empty()) {
+                        const double delta =
+                            materialOfColor(learnerColor) - learnerMatBefore;
+                        trajectory.back().reward +=
+                            (float)(REWARD_MATERIAL_COEF * delta);
+                        /*
+                           势能也重测到"对手应完"之后的局面: 这样
+                           `applyPotentialShaping` 给上一手加的 Φ(s_i)+γΦ(s_{i+1})
+                           覆盖的区间与上面那条奖励**是同一个区间**
+                           (两次学习方决策之间), 配对关系不被对手那一手撕开。
+                        */
+                        trajectory.back().potential = potentialOf(chess.sideToMove);
+                    }
                     if (oppStep.nextId != Stone::ID_NONE) {
                         if (currentColor == Stone::COLOR_RED) { capRed++; } else { capBlack++; }
                     }

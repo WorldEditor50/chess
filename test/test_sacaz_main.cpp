@@ -1300,18 +1300,27 @@ static void testTbExpertAgent()
     const int action = legalIdx[0];
 
     /* 用**同一个局面**造一池经验; hasSearch=false -> 只训 critic 与软 Q 项 */
-    auto fillPool = [&](float reward, bool done, bool hasSearch, int target) {
+    /*
+       [2026-10 hash 口径] 造池这件事现在有**两个口径**要跑 (8100 双射 / 128 槽哈希, 见
+       (a) 里那段 `[hash 口径]` 的注释), 而两者的差别只有三个量: 掩码位图 / 池里记的动作
+       槽位 / legalCount。
+       所以把这三个量当参数传进来 —— 池的构造**只有这一份实现**。两个口径各写一份的话,
+       迟早会漂移成"两个不同的实验", 那样印出来的差异就归因不到口径头上。
+       下面那个 `fillPool` 保持原来的签名 (默认口径 = 双射), 既有调用点一个字都不用动。
+    */
+    auto fillPoolFor = [&](float reward, bool done, bool hasSearch, int target,
+                           int act, const std::uint64_t *maskBits, int legalCount) {
         agent.memories.clear();
         for (int i = 0; i < 48; i++) {
             typename std::decay<decltype(agent)>::type::Transition tr;
             tr.cells = cells;
             tr.nextCells = cells;
-            tr.curMask[0] = bits[0];
-            tr.curMask[1] = bits[1];
-            tr.nextMask[0] = bits[0];
-            tr.nextMask[1] = bits[1];
-            tr.action = action;
-            tr.legalCount = (int)legalIdx.size();
+            tr.curMask[0] = maskBits[0];
+            tr.curMask[1] = maskBits[1];
+            tr.nextMask[0] = maskBits[0];
+            tr.nextMask[1] = maskBits[1];
+            tr.action = act;
+            tr.legalCount = legalCount;
             tr.reward = reward;
             tr.done = done;
             tr.hasSearch = hasSearch;
@@ -1321,6 +1330,40 @@ static void testTbExpertAgent()
             agent.memories.push_back(tr);
         }
     };
+    auto fillPool = [&](float reward, bool done, bool hasSearch, int target) {
+        fillPoolFor(reward, done, hasSearch, target, action, bits, (int)legalIdx.size());
+    };
+
+    /*
+       ----------------------------------------------------------------
+       (a) 的两个口径共用的轨迹测量原语 (2026-10)
+       ----------------------------------------------------------------
+       `Traj` + `runTrajOn`: 轨迹统计 (均值/峰值/终点)。原来它定义在 (a) 那个块里,
+       现在提到函数作用域 —— 因为 (a) 里 hash 口径那三趟要跑**同一套**测量, 只是换掩码与
+       目标槽位。`state` 两个口径共用 (状态编码与动作口径无关), 所以只传掩码与槽位。
+       `azIters` 同理提到这里 (两个口径步数必须一样, 否则读数不可比)。
+       ----------------------------------------------------------------
+    */
+    struct Traj { double mean, peak, last; };
+    auto runTrajOn = [&](auto &a, const RL::Tensor &policyMask, int tgt, int iters) {
+        RL::Tensor p(SACAZAgent::ACTION_DIM, 1);
+        a.policy(state, policyMask, p);
+        Traj t;
+        t.peak = p[tgt];
+        t.last = p[tgt];
+        double sum = 0.0;
+        for (int it = 0; it < iters; it++) {
+            a.learnBatch(4);
+            a.policy(state, policyMask, p);
+            const double v = p[tgt];
+            sum += v;
+            t.peak = std::fmax(t.peak, v);
+            t.last = v;
+        }
+        t.mean = sum / (double)iters;
+        return t;
+    };
+    const int azIters = 40;   /* 临时: 找阈值 */
 
     /* ================= (a) 策略改得动吗: AZ 监督项 (配对 A/B) =================
        这条**不能**写成"跑固定步数后 π(目标) 必须比一开始高" —— 试过, 是**假失败**,
@@ -1351,19 +1394,271 @@ static void testTbExpertAgent()
     const int target = legalIdx[legalIdx.size() / 2];
     const double uniform = 1.0 / (double)legalIdx.size();
     double azMean = 0.0, azPeak = 0.0, ctrlMean = 0.0, ctrlPeak = 0.0;
+    /*
+       [2026-10 hash 口径] 哈希那一档的读数。它们在这里先声明, 因为测量发生在下面那个块里,
+       而**对照表印在 (a) 的断言之后** (那时 bijection 的 azMean/azPeak/ctrlMean/err0/err1
+       才有值) —— 两个口径的读数只有这样才印得成一张表。`ALIGNED_REPR=false` 的构建里
+       它们保持初值且谁也不读 (整段被 `if` 关掉)。
+    */
+    double hashAzMean = 0.0, hashAzPeak = 0.0, hashCtrlMean = 0.0;
+    double hashErr0 = 0.0, hashErr1 = 0.0, hashUniformByMove = 0.0, hashUniformBySlot = 0.0;
+    int hashTarget = -1, hashAction = -1, hashSlots = 0;
+    bool hashMoved = false;
     {
+        /*
+           [2026-10 hash 口径] agent 的五个网络 -> 某个副本 agent 的拷贝清单 (Net 的拷贝语义是
+           **浅拷贝**: 共享层指针, 深拷贝只能走 copyTo)。下面 hash 段与 (a) 那一次都用它:
+           漏掉一个网络, "这个副本此刻与 agent 逐位同权重"这句话就变成假的, 而读数
+           **不会报错, 只会偏** —— 所以清单只留一份。
+        */
+        auto copyAgentTo = [&](auto &dst) {
+            agent.actor.copyTo(dst.actor);
+            agent.q1.copyTo(dst.q1);
+            agent.q2.copyTo(dst.q2);
+            agent.q1.copyTo(dst.q1Target);
+            agent.q2.copyTo(dst.q2Target);
+        };
+
+        /*
+           ================================================================
+            [hash 口径 —— 界面实际在跑的那一档]  (2026-10 补的覆盖缺口)
+           ================================================================
+           为什么必须补这一段: 界面 (`chess` target) 里这一支跑的是
+           **对齐表示 + 128 槽哈希动作** —— `chessboard.cpp` 的构造点
+           `#if SACAZ_MOE_EXPERT_SEQ` → `a->legacyHashAction = true`。
+           而下面 (a)/(b) 那 4 条学习动力学断言是按 **8100 双射** 定标的:
+           `docs/expert_search_optimization_plan_2026_10.md` §10.3 第 1 条记着 —— 同一份
+           代码在"对齐 + 128 槽哈希"下这 4 条**不成立** (472 条断言 4 项失败),
+           在双射下 472 条断言 0 失败。在那之前 "界面跑的那一档" **只有界面自己在跑**
+           (界面只做构建通过), 于是它与每一条测试读数悄悄分叉也没人知道。
+           这一段把两个口径放进**同一个二进制、同一个起点**, 把差异变成一条**永久印出来
+           的读数**, 而不是一个没人复测的分叉。
+
+           为什么可以"设一个运行时成员"来做这件事 (这不算绕过测试):
+             * `legacyHashAction` 是 **public 运行时成员**, 只在 `stepToActionIdx()`
+               (动作索引时刻) 被读 —— 构造之后再赋值与界面的做法**逐字相同**;
+             * ⚠ 但它**不改头张量宽度**: `ACTION_DIM` 是编译期常量, 对齐表示下恒为 8100,
+               打开它只是把**可达槽位**哈希到 128 个 (其余 7972 列永远收不到策略目标)。
+               所以哈希口径必须**重建**合法集 / 掩码 / π 目标 —— 只有 `getLegalActions`
+               那条路会走到 `stepToActionIdx` (self-play 那条路走不到本段的测量)。
+               **只把标志打开而沿用双射口径的掩码与 π 目标, 读数会一位不变** ——
+               那量到的是"开关没生效", 不是"口径的差别"。
+             * 反过来, 本段的三趟测量**都只走 `learnBatch` + `policy` + `qValues`**,
+               它们读的是经验池里存下的掩码位图与动作槽位, **不读这个标志**。
+               所以标志在下面只用来生成哈希掩码, 生成完立刻还原。
+
+           为什么三趟测量各用**新建的副本 agent** (而不是 `agent`, 也不是 (a) 那个 `ctrl`):
+             1. `agent` 在本段之后还要被 (a) 训 40 批、(b) 再训 30 批, 它的**冷起点**是既有
+                断言的前提 (见 (a) 上面那段"顺序上的一个硬约束")。在它身上多训一次就等于
+                **悄悄改掉既有断言的定标起点** —— 绝对不行。
+             2. 也**不能**拿 (a) 的 `ctrl` 来跑这三趟: 那是一段 `learnBatch` 会改到的东西,
+                而 `copyTo` **只搬五个网络的权重**, 不搬 `alpha` (它有自己的优化器)、
+                不搬优化器动量/累积量、也不搬"学到第几步/目标网同步计数"。所以在 ctrl 身上
+                多训几批之后, 即使再 copyTo 一次把网络权重拉回冷副本, ctrl 也已经**不是**
+                一个干净的对照组了 —— 那会**悄悄改掉 (a) 对照组那条读数** (实测差异可见:
+                0.02516 vs 干净的 0.02327)。
+             3. 所以三趟各自 `new` 一个副本 (新建 ⇒ alpha / 优化器 / 计数器全是初值),
+                再用 `copyAgentTo()` 把五个网络搬成 agent 此刻的冷权重: 三趟都落在**同一个
+                起点**上, 与 (a)/(b) 的读数**逐项可比** (只差动作口径这一个变量)。
+                `agent` 与后面那个 `ctrl` 全程**一次都没被本段训练过** ⇒ 既有读数与断言
+                的前提一位不动。内存也仍然是两个 agent (本段的副本用完即销毁, 与 (a) 同一个
+                峰值; (a) 的 ctrl 在本段之后才构造)。
+             4. 为什么可以确信"本段不会靠 RNG 污染后面的读数": 本节的经验池是 48 条**完全
+                相同**的记录, `learnBatch` 里那次 `pick` 抽到哪条都一样 (批内容与抽取顺序
+                无关); 另一条 RNG 支路是 α 的 Gumbel 扰动, 而 `alphaGumbelSigma` 默认为 0
+                (那条根本不执行)。所以本节协议的结果只是权重与超参的函数, 与 RNG 流无关。
+                **实测复核**: 本段三趟的读数与 2026-10-15 那份"整份测试都跑哈希口径"的
+                存档日志 (`build/.../test_sacaz_aligned_seq.out.txt`) **逐位相同** ——
+                而那份日志跑到同一趟测量时消耗掉的 RNG 次数与本段并不相同, 这本身就是
+                "本协议与 RNG 流无关"的一条直接证据。
+             5. ⚠ **本段要多消耗 RNG** (三趟合计 110 批 `learnBatch`, 每批 4 次抽样) ——
+                于是后面那些**靠随机初始化 / 随机探索**的读数 ((b2) 那个新 agent、(c) 的
+                路由直方图与耗时、(17)(B) 的新 agent) 的具体数字会与改动前不同。它们是
+                "随机权重 / 随机探索的函数", 本来就不是定值, 而断言都是定性或同进程配对的 ——
+                实测仍然全过。真正要守住的是 (a)/(b) 那两节的读数 (它们量在**同一份冷权重**
+                上, 与 RNG 无关): 已用**改动前的二进制**在同一配置下对照实测, 逐位相同 ——
+                  (a) 带监督项 0.12948 / 0.68094 / 0.47841, 对照组 0.02442 / 0.05429 / 0.03659;
+                  (b) Q 0.53929 -> 0.50939, |误差| 0.03929 -> 0.00939。
+
+           三趟的顺序按 (a)/(b) 的语义排:
+             ① hash 监督臂 —— 等价于 (a) 里"带监督项"那一趟;
+             ② hash 的 (b) —— Q 朝 y ≡ 0.5 走, 接在 ① 的状态后面 (与 (b) 接在 (a) 后面同理);
+             ③ hash 对照臂 —— azWeight=0 且 hasSearch=false, 另起一个新建副本 (同一份冷权重)。
+
+           断言口径 (**不重复 (a)/(b) 的动力学断言**): 这里只断言"两个口径都必须成立"的
+           不变量 —— 掩码/归一化 (非法列 π 恰好 0, 合法集 Σπ = 1) 与"数字有限/在范围内"。
+           那 4 条动力学读数**只印不断**, 并在 (a)/(b) 的断言之后印成一张对照表, 明确标注
+           "阈值按 8100 双射定标" (§10.3 第 1 条)。要改这些判据必须先在两个口径上各量一遍
+           并说明理由, 而不是把阈值放宽到两个口径都能过。
+           ⚠ §10.3 记的"哈希口径下这 4 条不成立"量的是**序列专家**那一支
+           (`test_sacaz_aligned_seq` = 界面口径), 也就是本变体: TB 专家那一支
+           (`test_sacaz_aligned`) 在同一哈希口径下 4 条**都成立** (实测) —— 所以这张对照表
+           必须按构建各自读, 别把一句结论套到所有构建上。
+           只在 `ALIGNED_REPR` 下才跑 (见下面那行 `if`): 改前表示本来就是 128 槽哈希
+           (`!ALIGNED_REPR || legacyHashAction`), 那里 (a)/(b) 量的已经是这个口径。
+           ================================================================
+        */
+        if (SACAZAgent::ALIGNED_REPR) {
+            /* ---- 1. 哈希口径的合法集 / 掩码 / π 目标 (必须重建, 理由见上) ---- */
+            std::vector<Step*> hlegal;
+            std::vector<int> hidx;
+            RL::Tensor hmask(SACAZAgent::ACTION_DIM, 1);
+            const bool savedHashFlag = agent.legacyHashAction;   /* 类默认 false */
+            agent.legacyHashAction = true;                       /* 界面就是这么设的 */
+            agent.getLegalActions(Stone::COLOR_RED, hlegal, hidx, hmask);
+            agent.legacyHashAction = savedHashFlag;              /* 只在上面那一行有用 */
+            Steps::instance().put(hlegal);
+            std::uint64_t hbits[2] = { 0, 0 };
+            SACAZAgent::maskToBits(hmask, hbits);
+
+            int hSlots = 0;
+            for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+                if (hmask[a] > 0.5f) { hSlots++; }
+            }
+            /*
+               同一着法、两种编码: `Chess::sample` 按棋子 id 顺序枚举 (确定性), 所以
+               `hidx[k]` 与 `legalIdx[k]` 是**同一个着法**的两个槽位 (棋盘在这两次调用
+               之间没动过)。`hidx` 里会出现重复 —— 两个互不相同的着法哈希到同一槽位,
+               那正是 128 槽口径的结构性代价 (梯度被平均), 也是 §10.3 那条读数的机制。
+            */
+            hashTarget = hidx[hidx.size() / 2];
+            hashAction = hidx[0];
+            hashSlots = hSlots;
+            hashUniformByMove = 1.0 / (double)hidx.size();
+            hashUniformBySlot = 1.0 / (double)hSlots;
+            std::printf("      [hash 口径 = 界面口径: 对齐表示 + 128 槽哈希]\n");
+            std::printf("      口径: legacyHashAction=1, ACTION_DIM=%d (头张量宽度**不**随它变),"
+                        " 可达槽位 = %d 个\n", SACAZAgent::ACTION_DIM, hSlots);
+            std::printf("      编码: 合法着法 %d 条 -> %d 个槽位 (碰撞 %d 次); 均匀(按着法) = %.5f,"
+                        " 均匀(按槽位) = %.5f (双射口径的均匀 = %.5f)\n",
+                        (int)hidx.size(), hSlots, (int)(hidx.size() - (std::size_t)hSlots),
+                        hashUniformByMove, hashUniformBySlot, uniform);
+            CHECK(hidx.size() == legalIdx.size(),
+                  "哈希只改编码: 合法着法的条数与双射口径相同");
+            CHECK(hSlots > 0 && hSlots <= SACAZAgent::LEGACY_ACTION_DIM,
+                  "哈希口径的可达槽位落在 (0, LEGACY_ACTION_DIM] 内");
+
+            /*
+               ---- 2. ① hash 监督臂 + ② hash 的 (b): 两趟用**同一个新建副本** ----
+               ② 必须接在 ① 之后 (与 (b) 接在 (a) 后面的道理一样), 所以这两趟共用一个对象。
+               `azWeight` 取 `agent` 的值 (而不是写死 1.0): 两个 agent 的构造参数一模一样,
+               这里要的是"只差动作口径", 所以任何旋钮都不许各写一套。
+            */
+            {
+                SACAZMoETbAgent hAg(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
+                hAg.batchSize = 4;
+                hAg.azWeight = agent.azWeight;
+                copyAgentTo(hAg);
+
+                /* ① hash 监督臂: 与 (a) 的"带监督项"那一趟同协议 (同起点、同步数) */
+                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hbits, (int)hidx.size());
+                hAg.memories = agent.memories;       /* 同一批经验 (哈希掩码 + one-hot π) */
+                const Traj hAz = runTrajOn(hAg, hmask, hashTarget, azIters);
+                hashAzMean = hAz.mean;
+                hashAzPeak = hAz.peak;
+                std::printf("      hash 监督臂: 均值 %.5f  峰值 %.5f  终点 %.5f\n",
+                            hAz.mean, hAz.peak, hAz.last);
+
+                /* 掩码 / 归一化不变量: 与 (a) 那个 `agent.policy(state, mask, pi)` 检查同构 */
+                RL::Tensor hpi(SACAZAgent::ACTION_DIM, 1);
+                hAg.policy(state, hmask, hpi);
+                double hSumLegal = 0.0;
+                int hIllegalNonZero = 0;
+                bool hPiSane = true;
+                for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+                    if (!std::isfinite(hpi[a]) || hpi[a] < 0.0f || hpi[a] > 1.0f) {
+                        hPiSane = false;
+                    }
+                    if (hmask[a] > 0.5f) {
+                        hSumLegal += (double)hpi[a];
+                    } else if (hpi[a] != 0.0f) {
+                        hIllegalNonZero++;
+                    }
+                }
+                std::printf("      hash 口径: 合法集 Σπ = %.9f, 非法列非零 = %d,"
+                            " π 全有限且在 [0,1] = %d\n",
+                            hSumLegal, hIllegalNonZero, (int)hPiSane);
+                CHECK(std::fabs(hSumLegal - 1.0) < 1e-5,
+                      "hash 口径: 合法集上 Σπ = 1 (掩码归一没有坏)");
+                CHECK(hIllegalNonZero == 0, "hash 口径: 非法列 π 恰好为 0");
+                CHECK(hPiSane, "hash 口径: π 全部是有限值且落在 [0,1] 内");
+
+                /* ② hash 的 (b): Q 朝 y ≡ 0.5 走 (接在 ① 之后) */
+                fillPoolFor(0.5f, true, false, -1, hashAction, hbits, (int)hidx.size());
+                hAg.memories = agent.memories;
+                hAg.azWeight = 0.0f;         /* hasSearch=false, AZ 项本来就不参与 */
+                RL::Tensor hq1(SACAZAgent::ACTION_DIM, 1), hq2(SACAZAgent::ACTION_DIM, 1);
+                hAg.qValues(state, hq1, hq2);
+                const float hq0 = hq1[hashAction];
+                const float herr0 = std::fabs(hq0 - 0.5f);
+                /*
+                   与 (b) 逐字同一口径: 临时把 critic lr 压到 3e-5 —— 量的是**收敛方向**,
+                   而 lr=0.003 下量到的是振荡的相位 (见 (b) 那段隔离实验)。
+                */
+                hAg.learningRateCritic = 3e-05f;
+                float hLoss = 0.0f;
+                for (int it = 0; it < 30; it++) { hLoss = hAg.learnBatch(4); }
+                hAg.qValues(state, hq1, hq2);
+                const float hq1v = hq1[hashAction];
+                const float herr1 = std::fabs(hq1v - 0.5f);
+                hashErr0 = herr0;
+                hashErr1 = herr1;
+                hashMoved = (hq1v != hq0);
+                std::printf("      hash 口径的 (b): Q(s,a): %.5f -> %.5f (目标 0.5),"
+                            " |误差| %.5f -> %.5f (比值 %.3f), loss %.6f\n",
+                            (double)hq0, (double)hq1v, (double)herr0, (double)herr1,
+                            (double)(herr1 / herr0), (double)hLoss);
+                CHECK(std::isfinite((double)hLoss), "hash 口径: 批平均 loss 是有限值");
+                CHECK(hAg.getAlpha() >= 0.02f && hAg.getAlpha() <= 5.0f,
+                      "hash 口径: alpha 仍在自动调节的夹逼范围内 (没有发散)");
+
+                hAg.qValues(state, hq1, hq2);
+                bool hQFinite = true;
+                double hQMax = 0.0;
+                for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
+                    if (!std::isfinite(hq1[a]) || !std::isfinite(hq2[a])) { hQFinite = false; }
+                    hQMax = std::fmax(hQMax, std::fabs((double)hq1[a]));
+                    hQMax = std::fmax(hQMax, std::fabs((double)hq2[a]));
+                }
+                std::printf("      hash 口径: |Q|max = %.4f, Q 全有限 = %d\n",
+                            hQMax, (int)hQFinite);
+                CHECK(hQFinite, "hash 口径: Q 全部是有限值 (无 NaN/inf)");
+                CHECK(hQMax < 1e6, "hash 口径: Q 没有爆掉");
+            }
+
+            /* ---- 3. ③ hash 对照臂: 另一个新建副本 (同一份冷权重) + azWeight=0 且 hasSearch=false ---- */
+            {
+                SACAZMoETbAgent hCt(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
+                hCt.batchSize = 4;
+                copyAgentTo(hCt);
+                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hbits, (int)hidx.size());
+                hCt.memories = agent.memories;
+                hCt.azWeight = 0.0f;
+                for (std::size_t i = 0; i < hCt.memories.size(); i++) {
+                    hCt.memories[i].hasSearch = false;
+                }
+                const Traj hCtTraj = runTrajOn(hCt, hmask, hashTarget, azIters);
+                hashCtrlMean = hCtTraj.mean;
+                std::printf("      hash 对照臂: 均值 %.5f  峰值 %.5f  终点 %.5f\n",
+                            hCtTraj.mean, hCtTraj.peak, hCtTraj.last);
+            }
+
+            /* agent.legacyHashAction 的用途到此结束: 它本来就只在 getLegalActions 里被读 */
+            agent.legacyHashAction = savedHashFlag;
+        }
+
         /*
            对照组 agent **只在这一块里活着**: 一个 TB 专家 agent 是五个网络 ≈ 1.6 GB,
            两个同时存在已经到顶 —— 不能让它跟后面的 (c)/(d) 一起活着。
+           [2026-10] 它挪到 hash 口径那一段**之后**才构造, 有两个理由:
+             * 内存峰值: hash 段自己也要一个副本 agent, 两者错开就仍然只有两个同时活着;
+             * 干净: 这一段 hash 测量一次都没碰过它 (见上面那段长注释的 2.), 它从构造开始
+               就是一份**没有被多训过几批**的冷副本 —— alpha / 优化器 / 计数器全在初值上。
         */
         SACAZMoETbAgent ctrl(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
         ctrl.batchSize = 4;
         /* 五个网络全部 copyTo (Net 的拷贝语义是**浅拷贝**: 共享层指针, 深拷贝只能走 copyTo) */
-        agent.actor.copyTo(ctrl.actor);
-        agent.q1.copyTo(ctrl.q1);
-        agent.q2.copyTo(ctrl.q2);
-        agent.q1.copyTo(ctrl.q1Target);
-        agent.q2.copyTo(ctrl.q2Target);
+        copyAgentTo(ctrl);
 
         fillPool(0.0f, true, true, target);       /* agent: π_MCTS = one-hot(target) */
         ctrl.memories = agent.memories;           /* 同一批经验 */
@@ -1383,28 +1678,13 @@ static void testTbExpertAgent()
             ctrl.memories[i].hasSearch = false;   /* 只差这一个开关 */
         }
 
-        struct Traj { double mean, peak, last; };
-        auto runTraj = [&](auto &a, int iters) {
-            RL::Tensor p(SACAZAgent::ACTION_DIM, 1);
-            a.policy(state, mask, p);
-            Traj t;
-            t.peak = p[target];
-            t.last = p[target];
-            double sum = 0.0;
-            for (int it = 0; it < iters; it++) {
-                a.learnBatch(4);
-                a.policy(state, mask, p);
-                const double v = p[target];
-                sum += v;
-                t.peak = std::fmax(t.peak, v);
-                t.last = v;
-            }
-            t.mean = sum / (double)iters;
-            return t;
-        };
-        const int azIters = 40;   /* 临时: 找阈值 */
-        const Traj az = runTraj(agent, azIters);
-        const Traj ct = runTraj(ctrl, azIters);
+        /*
+           轨迹统计与步数走**函数作用域的那一份** (`runTrajOn` / `azIters`, 见上面的注释):
+           上面 hash 口径那三趟用的是同一个 lambda, 所以两个口径的读数不可能因为"实现漂移"
+           而不可比 —— 这里只把"用哪个掩码、量哪个槽位"传进去。
+        */
+        const Traj az = runTrajOn(agent, mask, target, azIters);
+        const Traj ct = runTrajOn(ctrl, mask, target, azIters);
         azMean = az.mean;    azPeak = az.peak;
         ctrlMean = ct.mean;  ctrlPeak = ct.peak;
         std::printf("      均匀 = %.5f; %d 次 learnBatch(4)\n", uniform, azIters);
@@ -1566,6 +1846,59 @@ static void testTbExpertAgent()
           "alpha 仍在自动调节的夹逼范围内 (没有发散)");
 
     agent.learningRateCritic = savedCriticLr;   /* 还原 (c)/(d) 的口径 */
+
+    /*
+       ================================================================
+        两个动作口径的对照表 (2026-10) —— **只印不断**
+       ================================================================
+       上面那 4 条断言量的都是"对齐表示 + **8100 双射**"这一档 (类的默认档), 而同一次运行里
+       界面口径 ("对齐表示 + **128 槽哈希**, 见 `chessboard.cpp` 的 `legacyHashAction = true`)
+       的同一组读数已经在 (a) 里量好了 —— **同一份冷权重、同一批经验、同一步数**, 只差
+       动作编码这一个变量 (见 (a) 里那段 `[hash 口径]` 的长注释)。这里把两者印成一张表:
+       于是"界面口径与测试口径分叉"这件事**每次跑测试都落在 stdout 上**, 不靠谁去重测。
+
+       为什么哈希那一列**不做断言** (诚实项):
+       `docs/expert_search_optimization_plan_2026_10.md` §10.3 第 1 条记着, 同一份代码在
+       "对齐 + **序列专家** + 128 槽哈希" 下这 4 条**都不成立** (472 条断言 4 项失败) ——
+       而**界面跑的正是这一档** (`SACAZ_MOE_EXPERT_SEQ=1`), 所以不能把它当"没事"。
+       但两个口径**都是"对"的配置** (哈希是用户定下的界面口径, 不是回归), 阈值又是按双射
+       定标的 (均匀 = 1/44), 把它套到哈希口径上会把"用户选的配置"判成红灯 —— 那是**判据
+       没覆盖这个口径**, 不是模型坏了。所以这里只印读数 + 明确标注哪几条在哈希下不成立;
+       要改判据必须两个口径各量一遍并说明理由, 而不是把阈值放宽到都能过。
+       ⚠ 而且这句话**只对序列专家那一支成立**: TB 专家那一支 (`test_sacaz_aligned`)
+       在同一哈希口径下这 4 条**都成立** (实测 7.69x / 0.798 / 7.69x / 0.66702 -> 0.65454)
+       —— 分叉的是"对齐 + 序列专家 + 哈希"这个**组合**, 不是"哈希"这两个字。
+       ================================================================
+    */
+    if (SACAZAgent::ALIGNED_REPR) {
+        const char *ok  = "成立";
+        const char *bad = "**不成立**";
+        std::printf("\n      口径对照 (两者同一起点/同一协议, 阈值按 8100 双射定标):\n");
+        std::printf("        口径                   azMean    azPeak   ctrlMean  azMean/对照  azMean/均匀\n");
+        std::printf("        双射 8100 (类默认档)   %.5f   %.5f   %.5f    %6.2fx     %6.2fx\n",
+                    azMean, azPeak, ctrlMean,
+                    (ctrlMean > 0.0) ? (azMean / ctrlMean) : 0.0, azMean / uniform);
+        std::printf("        hash 128  (界面口径)   %.5f   %.5f   %.5f    %6.2fx     %6.2fx\n",
+                    hashAzMean, hashAzPeak, hashCtrlMean,
+                    (hashCtrlMean > 0.0) ? (hashAzMean / hashCtrlMean) : 0.0,
+                    hashAzMean / hashUniformByMove);
+        std::printf("        ① azMean > 3x均匀 (%.5f): 双射 %s | hash %s\n",
+                    (double)(3.0 * uniform),
+                    (azMean > 3.0 * uniform) ? ok : bad,
+                    (hashAzMean > 3.0 * hashUniformByMove) ? ok : bad);
+        std::printf("        ② azPeak > 0.3:         双射 %s | hash %s\n",
+                    (azPeak > 0.3) ? ok : bad, (hashAzPeak > 0.3) ? ok : bad);
+        std::printf("        ③ azMean > 3x对照组:    双射 %s | hash %s\n",
+                    (azMean > 3.0 * ctrlMean) ? ok : bad,
+                    (hashAzMean > 3.0 * hashCtrlMean) ? ok : bad);
+        std::printf("        ④ |误差| 下降 (Q 朝目标): 双射 %s (%.5f -> %.5f) |"
+                    " hash %s (%.5f -> %.5f, Q 被更新过 = %d)\n",
+                    (err1 < err0) ? ok : bad, (double)err0, (double)err1,
+                    (hashErr1 < hashErr0) ? ok : bad, hashErr0, hashErr1, (int)hashMoved);
+        std::printf("        哈希口径的编码: 可达槽位 %d 个 (碰撞 %d 次), 均匀(按着法) %.5f,"
+                    " 均匀(按槽位) %.5f\n",
+                    hashSlots, (int)legalIdx.size() - hashSlots, hashUniformByMove, hashUniformBySlot);
+    }
 
     /*
        ================ (b2) 隔离对照: 同一协议在**全新 agent** 上 ================

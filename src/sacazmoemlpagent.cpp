@@ -2988,7 +2988,12 @@ std::string SACAZMoEMlpAgent::selfCheckReport() const
                   huberDelta > 0.0f ? std::to_string(huberDelta).c_str() : "关(纯 MSE)",
                   sparseLeafEval ? "稀疏头(只算合法列)" : "全量(与 59e5233 相同)",
                   (double)rewardScale, (double)valueScale,
-                  legacyHashAction ? "对齐双射 8100" : "128 槽哈希");
+                  /*
+                     [2026-10-15] 同 `sacazagent.cpp` 那处: 这条三目原来只看了
+                     `legacyHashAction`, 漏了 `ALIGNED_REPR` ⇒ 对齐那两档的读数印反。
+                     判据与 `stepToActionIdx` 逐字一致 (改前表示或显式哈希才走 128 槽)。
+                  */
+                  (!ALIGNED_REPR || legacyHashAction) ? "128 槽哈希" : "对齐双射 8100");
     out += buf;
     out += "  这两行就是 AGENT_SACAZ 与 AGENT_SACAZ_OLD 的全部差异 (再加隐层激活);"
            " 两边都保留是为了能在界面上直接对弈比较, 而不是靠两份会漂移的实现\n";

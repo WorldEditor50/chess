@@ -2811,7 +2811,13 @@ std::string SACAZAgent::selfCheckReport() const
                   huberDelta > 0.0f ? std::to_string(huberDelta).c_str() : "关(纯 MSE)",
                   sparseLeafEval ? "稀疏头(只算合法列)" : "全量(与 59e5233 相同)",
                   (double)rewardScale, (double)valueScale,
-                  legacyHashAction ? "对齐双射 8100" : "128 槽哈希");
+                  /*
+                     [2026-10-15] 这条三目原来**写反了**: 它只看 `legacyHashAction`, 没看
+                     `ALIGNED_REPR`, 于是"对齐 + 不哈希"(= 双射) 那一档印成"128 槽哈希"、
+                     "对齐 + 哈希"印成"对齐双射 8100"。判据与 `stepToActionIdx` 逐字一致:
+                     只有"改前表示"或"显式打开 legacyHashAction"才走哈希。
+                  */
+                  (!ALIGNED_REPR || legacyHashAction) ? "128 槽哈希" : "对齐双射 8100");
     out += buf;
     out += "  这两行就是 AGENT_SACAZ 与 AGENT_SACAZ_OLD 的全部差异 (再加隐层激活);"
            " 两边都保留是为了能在界面上直接对弈比较, 而不是靠两份会漂移的实现\n";

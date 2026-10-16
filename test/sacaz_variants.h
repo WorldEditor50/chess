@@ -78,11 +78,20 @@ inline const char *variantKey(Variant v)
 /* 变体的中文名 —— 与各 `backboneName()` 的返回值一致 (报告里两处不能各说一套) */
 inline const char *variantName(Variant v)
 {
+    /*
+       [2026-10 第五轮] `tb` / `dense-tb` 这两个变体对应的**类**没变
+       (`SACAZMoETbAgent`), 但在 `SACAZ_MOE_EXPERT_SEQ=1` 的构建里它的**专家**
+       是序列 Transformer —— 名字必须跟着变, 否则报告里会写"TB 专家"而实际跑的是
+       另一张网 (这正是本工程反复记过的"设了却没生效"类事故)。
+    */
+    const bool seqExpert = SACAZMoETbAgent::MOE_EXPERT_SEQ;
     switch (v) {
     case Variant::Mlp:       return "MLP";
     case Variant::MoeMlp:    return "稀疏MoE(MLP专家)";
-    case Variant::MoeTb:     return "稀疏MoE(TB专家)";
-    case Variant::DenseMoeTb: return "稠密MoE(TB专家,对照)";
+    case Variant::MoeTb:     return seqExpert ? "稀疏MoE(序列Transformer专家)"
+                                              : "稀疏MoE(TB专家)";
+    case Variant::DenseMoeTb: return seqExpert ? "稠密MoE(序列Transformer专家,对照)"
+                                               : "稠密MoE(TB专家,对照)";
     }
     return "?";
 }

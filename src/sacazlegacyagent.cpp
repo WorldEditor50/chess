@@ -3,6 +3,16 @@
 #include "chessstate.h"   /* 完备 Markov 状态的公共实现 (规则上下文/规范格/动作双射) */
 #include "agentrollout.hpp"
 #include "rl/sparse_moe.hpp"
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+/*
+   [2026-10 第五轮] 只有"专家换成序列 Transformer"的那一支才需要这个头 —— 与
+   sacazmoetbagent.cpp 里那条同名 include 同一个纪律: 默认构建的编译面一个字节都没动
+   (与它的权重/读数逐位不变相配套)。
+   (头文件里已有一条同样的 include, 那是为了让类里的 `SeqExpert` typedef 成立; 这里再写
+   一次是为了让"这一段依赖谁"在使用点可见 —— 有 include guard, 不会重复展开。)
+*/
+#include "rl/seq_transformer.hpp"
+#endif
 
 #include <cstdio>
 #include <cmath>
@@ -63,15 +73,84 @@ RL::ISparseMoE *findSparseMoe(RL::Net &net)
     return nullptr;
 }
 
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+/*
+   一个 SparseMoE 层 -> iLayer::sptr 的小工厂 (与 sacazmoetbagent.cpp 的同名帮手同源,
+   理由也一样)。
+
+   为什么要它: 稀疏/稠密两种 TopK 是两个**不同的模板实例** (TopK 是模板参数), 而它们的
+   共同基类 ISparseMoE 不是 shared_ptr 能直接 covariant 转换的类型 —— 显式
+   static_pointer_cast 一次, 两个骨干的调用点就不必各写一份几乎相同的 make_shared。
+
+   ⚠ 只在序列专家那一支里存在: `Expert` 是 `SACAZLegacyAgent::SeqExpert`, 而那个 typedef
+   本身只在开关打开时存在 (见头文件) —— 所以整个助手跟着守卫走, 默认构建里不该出现它。
+*/
+template<typename Expert, int E, int K>
+RL::iLayer::sptr makeMoeLayer(int d, bool withGrad, int hidden)
+{
+    return std::static_pointer_cast<RL::iLayer>(
+        std::make_shared<RL::SparseMoE<Expert, E, K> >(d, withGrad, hidden));
+}
+
+/*
+   造"序列 Transformer 专家"那一层 (模板参数 K = topK: 稀疏骨干用 MOE_TB_TOPK,
+   稠密对照骨干用 MOE_TB_EXPERTS ⇒ "等参数不等算力" 那条对照关系保持不变)。
+
+   tokDim 的来源与参考实现 (sacazmoetbagent.cpp 的 makeTbExpertMoe) 逐字同口径:
+   `expertHidden > 0 ? expertHidden : 64`。本类构造函数已经把 expertHidden 夹成
+   ">0, 否则 64", 这里照抄同一个写法, 是为了两边的参数形状与读数能逐字对照。
+   宽度必须能被 MOE_SEQ_HEADS 整除, 不满足时序列专家**自己**会 abort (它会把话说清楚),
+   这里不重复判一次 —— 判两处就会有两份可能漂移的口径。
+*/
+template<int K>
+RL::iLayer::sptr makeSeqExpertMoe(int dIn, bool withGrad, int expertHidden)
+{
+    typedef SACAZLegacyAgent::SeqExpert Expert;
+    const int tokDim = (expertHidden > 0) ? expertHidden : 64;
+    RL::iLayer::sptr layer =
+        makeMoeLayer<Expert, SACAZLegacyAgent::MOE_TB_EXPERTS, K>(dIn, withGrad, tokDim);
+
+    /*
+       位置编码必须**显式**设上: 序列专家的默认是 `LEARN_1D` (老行为), 而界面 PPO 支选的
+       是可学 2D —— 既然这一支的卖点就是"与 PPO 支同一个专家", 位置编码就不能各说一套。
+       **设不上就响亮失败**: 返回 false 说明"外层开关说自己是序列专家, 但实际建出来的专家
+       不认这个键", 也就是配置与实现不一致; 继续跑下去只会得到一份"看起来在训练、其实
+       用的是老位置编码"的权重 (本工程记过多次"旋钮设了却没生效"的事故)。
+       (SparseMoE 会把这个键转发给每个专家, 只有序列专家响应它。)
+    */
+    if (!layer->setPosModeByKey(SACAZLegacyAgent::moeSeqPosMode())) {
+        std::fprintf(stderr,
+                     "[SACAZLegacyAgent] 位置编码模式 \"%s\" 没有被专家接受 —— "
+                     "外层开关 (SACAZ_LEGACY_MOE_EXPERT_SEQ) 与实际建出来的专家类型不一致。\n",
+                     SACAZLegacyAgent::moeSeqPosMode());
+        std::fflush(stderr);
+        std::abort();
+    }
+    return layer;
+}
+#endif
+
 } // namespace
 
 const char *SACAZLegacyAgent::backboneName(Backbone b)
 {
+    /*
+       [2026-10 第五轮] `SACAZ_LEGACY_MOE_EXPERT_SEQ=1` 的构建里, 两个 TB 骨干的专家换成了
+       序列 Transformer ⇒ **名字必须跟着变**。理由是"读数不许说谎": 一个 TB 专家 12.9 M
+       参数, 序列专家 91,731 (1/140), 前向的算力量级也不同 —— 印同一个名字会让
+       "哪一支更强"这种结论直接被记到错的那本账上 (自检面板/测试都读这一处)。
+       默认构建 (开关关) 的四个字符串**一字未改**。
+    */
     switch (b) {
     case Backbone::Mlp:          return "MLP";
     case Backbone::SparseMoeMlp: return "稀疏MoE(MLP专家)";
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    case Backbone::SparseMoeTb:  return "稀疏MoE(序列Transformer专家)";
+    case Backbone::DenseMoeTb:   return "稠密MoE(序列Transformer专家,对照)";
+#else
     case Backbone::SparseMoeTb:  return "稀疏MoE(TB专家)";
     case Backbone::DenseMoeTb:   return "稠密MoE(TB专家,对照)";
+#endif
     default:                     return "?";
     }
 }
@@ -83,7 +162,9 @@ const char *SACAZLegacyAgent::backboneName(Backbone b)
    **logits**, 不是概率。
    两个结构上的注意点:
      * 稀疏 MoE 层是"同维进出"的 (专家的输入输出必须同维才能做门控加权和),
-       所以后面必须再接一层 Tanh(d_model -> h) 把 1260 维压到 h 维, 再进 Linear 头。
+       所以后面必须再接一层 Tanh(d_model -> h) 把 STATE_DIM 维压到 h 维, 再进 Linear 头。
+       (d_model = STATE_DIM: 改前 1263 / 对齐 1710; 专家的**内部**宽度与它无关 ——
+       TB 专家用 MOE_TB_HEADS/MOE_TB_DFF, 序列专家用 expertHidden, MLP 专家也用 expertHidden。)
      * 专家权重由 SparseMoE 的构造函数调用 scaleExpertInit 缩放; 其余普通层由
        scaleLayerInit 缩放 (两者的依据都是 1/sqrt(fan_in))。
 */
@@ -112,16 +193,32 @@ RL::Net SACAZLegacyAgent::buildNet(bool withGrad) const
         layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     case Backbone::SparseMoeTb:
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+        /*
+           [2026-10 第五轮] 用户口径: "把 TB 专家换成序列 transformer, 输入 19x90 特征,
+           与 PPO agent 对齐"。这一支的专家 = `SeqExpert`
+           (SeqTransformerExpert<90,4,2>, 与 PPO 支同一份实现), 稀疏路由不变 (E=4, top-1)。
+           前提与后果逐条写在头文件 MOE_EXPERT_SEQ 那一段 (必须对齐表示 / 换权重前缀 /
+           宽度改由 expertHidden 决定); 位置编码在助手函数里设上, 设不上当场 abort。
+        */
+        layers.push_back(makeSeqExpertMoe<MOE_TB_TOPK>(STATE_DIM, withGrad, expertHidden));
+#else
         layers.push_back(std::make_shared<RL::SparseMoE<RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>,
                                                         MOE_TB_EXPERTS,
                                                         MOE_TB_TOPK> >(STATE_DIM, withGrad, 0));
+#endif
         layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     case Backbone::DenseMoeTb:
         /* TopK == NumExperts => 门控照旧, 但四个专家全算 (等参数不等算力的对照) */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+        /* 同上, 只把 TopK 换成专家数 —— 对照关系 (同参数 / 不同算力) 在序列专家下同样成立 */
+        layers.push_back(makeSeqExpertMoe<MOE_TB_EXPERTS>(STATE_DIM, withGrad, expertHidden));
+#else
         layers.push_back(std::make_shared<RL::SparseMoE<RL::TransformerBlock<MOE_TB_HEADS, MOE_TB_DFF>,
                                                         MOE_TB_EXPERTS,
                                                         MOE_TB_EXPERTS> >(STATE_DIM, withGrad, 0));
+#endif
         layers.push_back(RL::Layer<RL::Tanh>::_(STATE_DIM, h, true, withGrad));
         break;
     default:
@@ -194,6 +291,11 @@ const char *SACAZLegacyAgent::hiddenActivationName() const
  * 拿它的读数当界面读数用。
  * 判据只有这一处: 实例版本 guiAgentLabel() 只是转发到 guiAgentLabelFor(backbone),
  * 所以测试可以对**四个**骨干全查一遍, 而不用构造一个 TB 实例 (建网 + 拷贝权重很贵)。
+ *
+ * [2026-10 第五轮] 序列专家开关打开时, 骨干名与标签里的"专家是什么"跟着换
+ * (SparseMoeTb / DenseMoeTb 两个分支各自 #if): 骨干**枚举**不变 (仍是这两个骨干, 界面
+ * 类型也不变), 变的是专家 —— 而面板第一行要同时回答"是哪一支"与"它的专家是什么",
+ * 所以后半句必须分支。
  */
 const char *SACAZLegacyAgent::guiAgentLabel() const
 {
@@ -208,7 +310,12 @@ const char *SACAZLegacyAgent::guiAgentLabelFor(Backbone b)
         return "SAC+AZ-59e5233 (AGENT_SACAZ_OLD, 行为还原版)";
     case Backbone::SparseMoeTb:
         /* 界面类型 AGENT_SACAZ_OLD_MOE (与 AGENT_SACAZ_MOE 同骨干) */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+        /* 口径一字不改, 变的只有专家 —— 标签里必须写出这一点, 否则与 TB 那一支混账 */
+        return "SAC+AZ-59e5233-MoE (AGENT_SACAZ_OLD_MOE, 还原口径 + 稀疏MoE/序列Transformer专家)";
+#else
         return "SAC+AZ-59e5233-MoE (AGENT_SACAZ_OLD_MOE, 还原口径 + 稀疏MoE/TB专家)";
+#endif
     case Backbone::SparseMoeMlp:
         /*
            不是界面类型: 这一支只在 test/bench 里构造 (test_sacaz [14] 就是它 ——
@@ -217,7 +324,12 @@ const char *SACAZLegacyAgent::guiAgentLabelFor(Backbone b)
         return "SAC+AZ-59e5233-MoE-MLP (非界面骨干: 稀疏MoE(MLP专家), 只在 test/bench 构造)";
     case Backbone::DenseMoeTb:
         /* 不是界面类型: "等参数不等算力"的对照组, 也只在 test/bench 构造 */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+        return "SAC+AZ-59e5233-DenseTB (非界面骨干: 稠密MoE(序列Transformer专家)对照,"
+               " 只在 test/bench 构造)";
+#else
         return "SAC+AZ-59e5233-DenseTB (非界面骨干: 稠密MoE(TB专家)对照, 只在 test/bench 构造)";
+#endif
     default:
         /* 兜底也保留 59e5233: 以后再加骨干时, "身份丢失"不会以这种方式静默发生 */
         return "SAC+AZ-59e5233-? (未知骨干; 口径仍是 59e5233 还原版)";
@@ -232,6 +344,8 @@ const char *SACAZLegacyAgent::guiAgentLabelFor(Backbone b)
  * [2026-09] 按**骨干**再分一次: 本类现在服务两个界面类型 (Mlp 与 SparseMoeTb), 它们的
  * 参数量不同、训练口径相同但权重不能互换 —— 一个骨干一个前缀, 免得"这份文件是哪一支的"
  * 只能靠猜。界面只用前两个; 另外两个是 bench 里的对照骨干。
+ * [2026-10 第五轮] 专家换序列 Transformer 时再各换一个名字 (结构变了 ⇒ 名字必须变),
+ * 逐条见下面函数体里的说明与头文件的 MOE_EXPERT_SEQ 那一段。
  */
 const char *SACAZLegacyAgent::defaultWeightPrefix()
 {
@@ -240,11 +354,30 @@ const char *SACAZLegacyAgent::defaultWeightPrefix()
 
 const char *SACAZLegacyAgent::defaultWeightPrefix(Backbone b)
 {
+    /*
+       [2026-10 第五轮] 序列专家开关打开时, 两个"TB 骨干"的专家换成序列 Transformer ⇒
+       **结构与参数量都变了** (一个专家 12.9 M -> 91,731) ⇒ 权重必须换前缀:
+         * 结构指纹/参数量守卫只能拒绝**载入**, 拦不住"写出时把旧的盖掉" —— 共用一个前缀会
+           让新的空网覆盖盘上那份 TB 专家的权重 (PPO 支换成 seq 骨干时踩过同一条, 所以
+           那边的做法也是换名: weights/ppomcts_seq_agent.dat);
+         * 反过来, 换了名字之后"载不到"是**看得见**的 (自检报告第一段就印本实例的前缀),
+           不会是静默错读成 TB 专家的那一份。
+       一个骨干一个前缀是本类的纪律 (见头文件), 所以两个 seq 变体各自再分一个。
+       默认构建下这四个字符串**一字未改**。
+    */
     switch (b) {
     case Backbone::Mlp:          return "weights/sacaz_old_agent";
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    case Backbone::SparseMoeTb:  return "weights/sacaz_old_moe_seq_agent";
+#else
     case Backbone::SparseMoeTb:  return "weights/sacaz_old_moe_agent";
+#endif
     case Backbone::SparseMoeMlp: return "weights/sacaz_old_moemlp_agent";
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    case Backbone::DenseMoeTb:   return "weights/sacaz_old_dense_seq_agent";
+#else
     case Backbone::DenseMoeTb:   return "weights/sacaz_old_densetb_agent";
+#endif
     default:                     return "weights/sacaz_old_agent";
     }
 }
@@ -382,10 +515,15 @@ std::string SACAZLegacyAgent::getName() const
 }
 
 /* ============================================================
- *  状态编码: 规范视角 19 平面 (14 棋子 + 5 规则/阶段上下文)
- *  **与 PPOMCTSAgent 逐位同口径** —— 同一份 chessstate.h 的 CTX_* 顺序、
- *  同一个 canonicalCell 镜像、同一个 STATE_DIM=1710。下面有一条
- *  static_assert 把"两边维度一致"钉成编译期事实。
+ *  状态编码 (规范视角), **平面优先**布局: 下标 = plane * CELLS + cell
+ *    对齐表示: 19 平面 (14 棋子 + 5 规则/阶段上下文) = STATE_DIM 1710,
+ *              与 PPOMCTSAgent 逐位同口径 (CTX_* 顺序 / canonicalCell 镜像同一份);
+ *    改前表示: 同一份 14 个棋子平面, 上下文只占尾部 3 个标量槽 = STATE_DIM 1263。
+ *  两种表示共用下面这份**格子编码**, 差别只在"上下文放哪儿" —— 那一段在
+ *  writeContext / readContext 里分支 (见那里的说明)。
+ *  (备注: 这里原来还写着"下面有一条 static_assert 把两边维度一致钉成编译期事实" —— 那条
+ *   断言现在不存在了, 理由见 contextOf 上面那段: CTX_COUNT 依赖表示开关, 而 static_assert
+ *   在编译期无条件求值, 于是在改前表示下必然失败。一致性改由 test_sacaz 的运行期断言盯。)
  * ============================================================ */
 void SACAZLegacyAgent::encodeSparse(int color, std::vector<std::uint16_t> &cells) const
 {
@@ -583,7 +721,11 @@ int SACAZLegacyAgent::stepToActionIdx(const Step &s, int color) const
          * 对齐      : `canonicalCell(from)*90 + canonicalCell(to)` —— 与 PPOMCTS 同一公式。
        注意改前那一条**不用规范镜像**: 它是按"棋子 id + 目标格"哈希的, 而 id 与颜色相关
        (红黑棋子 id 不同段)。这是原实现的口径, 照抄才能复现它的棋力。
-       `legacyHashAction` 只在对齐表示下生效 (用来单独隔离动作空间这个变量)。
+       `legacyHashAction` 只在对齐表示下生效 (用来单独隔离动作空间这个变量); 它的默认值
+       跟着编译期开关走 —— 序列专家那一支 (SACAZ_LEGACY_MOE_EXPERT_SEQ=1) 默认 **true**
+       (用户口径: 那一支保持 128 槽), 见头文件里该成员的说明。
+       这个条件就是上面 buildNet 之外**动作编码的单一来源**: 自检报告判"实际用的是哪一套"
+       时照抄它 (`hashAction`), 不许另写一套。
     */
     if (!ALIGNED_REPR || legacyHashAction) {
         const unsigned long long h = (unsigned long long)s.id * 37ULL
@@ -1012,8 +1154,10 @@ Step SACAZLegacyAgent::selectMove(int color, int simulations_, float temp, RL::T
                    空间是 128 槽, 全量 Q 只要算 128 列 —— 本类**没有那条路径**, 永远走
                    全量: 少一个变量, 也少一条与训练路径不同的代码 (两个口径之间任何一点
                    差异都会被放大成棋力差)。
-                   (对齐表示 SACAZ_ALIGNED_REPR=1 下这条全量路径会慢, 那是刻意的:
-                   本类的意义是"行为还原", 不是"跑得快"。)
+                   (对齐表示 SACAZ_ALIGNED_REPR=1 —— 或本类的 SACAZ_LEGACY_MOE_EXPERT_SEQ=1,
+                   它自带对齐表示 —— 下这条全量路径会慢, 那是刻意的: 本类的意义是"行为
+                   还原", 不是"跑得快"。注意头张量宽度在那一档仍是 8100, 只是可达槽位被
+                   哈希到 128。)
                 */
                 pi.zero();
                 policy(m_stateBuf, mask, pi);
@@ -1707,11 +1851,14 @@ Step SACAZLegacyAgent::getBestMove(int color)
  *
  *  具体到这个 agent, 有四条读数最值得看:
  *
- *   (1) **本实例是哪个骨干**。这一个类同时被两个界面 agent 类型构造 —
- *       AGENT_SACAZ (Mlp) 与 AGENT_SACAZ_MOE (SparseMoeTb) —— 两块面板的数字会差
- *       很多 (参数量、有没有路由、每次前向 3 ms 级的 TB 专家开销)。所以第一行先报
+ *   (1) **本实例是哪个骨干, 以及它的专家是什么**。这一个类同时被两个界面 agent 类型
+ *       构造 — AGENT_SACAZ_OLD (Mlp) 与 AGENT_SACAZ_OLD_MOE (SparseMoeTb) —— 两块面板的
+ *       数字会差很多 (参数量、有没有路由、每次前向 ms 级的专家开销)。所以第一行先报
  *       backboneName(backbone) 与它对应的界面类型, 否则"同名的两个 agent 读数不同"
  *       会被记到错的账上。
+ *       [2026-10 第五轮] 专家本身也成了一个变量 (TB 12.9 M/个 vs 序列 Transformer
+ *       91,731/个, 由 SACAZ_LEGACY_MOE_EXPERT_SEQ 选), 所以第 4 节还要多一行"专家类型"
+ *       —— 那时"每次前向 ms 级的专家开销"是 TB 专家的读数, 序列专家下不适用。
  *
  *   (2) **规则上下文可观测 / 动作层有别名** —— 一好一坏, 都写在同一节里。
  *       好的一面: 14 个棋子平面之后跟着 3 个标量槽 (无吃子进度 / 重复
@@ -1808,9 +1955,11 @@ std::string SACAZLegacyAgent::selfCheckReport() const
     /*
        ---- 0. 本实例是**哪一支** (必须放最前面) ----
        本类服务**两个**界面类型 (AGENT_SACAZ_OLD = MLP 骨干 / AGENT_SACAZ_OLD_MOE =
-       稀疏 MoE+TB 专家骨干), 而它们与 AGENT_SACAZ / AGENT_SACAZ_MOE 在面板上的读数长得
-       很像 (同一表示、同样的口径、参数量也接近) —— 不把"界面类型 + 骨干"写在第一行,
-       读者会把四支的读数记到同一本账上。
+       稀疏 MoE 骨干, 专家是 TB 或序列 Transformer —— 由 SACAZ_LEGACY_MOE_EXPERT_SEQ 选),
+       而它们与 AGENT_SACAZ / AGENT_SACAZ_MOE 在面板上的读数长得很像 (同一表示、同样的口径、
+       参数量也接近) —— 不把"界面类型 + 骨干"写在第一行, 读者会把四支的读数记到同一本账上。
+       下一行这两句**都是开关感知的** (guiAgentLabel / backboneName 各自分支), 所以
+       "专家是什么"和"是哪一支"一起印在第一行, 不需要读者自己去对宏。
        第二段是**本类最要紧的一句**: 它的口径全部硬编码, 而且**刻意保留**了 59e5233 的
        两个"看着像坏掉"的读数 (目标网移动率只有 2~4%、|Q| 会漂到 5.6)。不写出来,
        看面板的人第一反应会是"这个模型坏了", 然后去"修"它 —— 那正是这一支最不希望
@@ -1844,7 +1993,21 @@ std::string SACAZLegacyAgent::selfCheckReport() const
     /* ---- 1. 表示层: 状态编码 ----
        这一节的两行**必须随 SACAZ_ALIGNED_REPR 分支**: 默认构建是 1263 维 / 128 槽,
        而面板原来写死了"与 PPOMCTS 同口径 / 8100 双射" —— 那是一句在默认构建下
-       不成立的话, 面板说谎比不说更坏 (用户口径: SAC 回退 1263/128, PPO 才用 8100)。 */
+       不成立的话, 面板说谎比不说更坏 (用户口径: SAC 回退 1263/128, PPO 才用 8100)。
+       [2026-10 第五轮] 而"动作层同口径"这半句还得再看**动作编码**选的是哪一套 (见下面
+       hashAction): 对齐表示 + 128 槽哈希这一档 (序列专家开关的默认口径) 状态是对齐的、
+       动作层**不是** —— 照旧念"8100 双射"就是让面板说谎。 */
+    /*
+       **动作编码的实际口径** = 与 `stepToActionIdx` **同一个条件**
+       (`!ALIGNED_REPR || legacyHashAction`)。为什么在这里算一次而不是各处重写:
+       第 1 节的"与 PPOMCTS 同口径"、第 2 节的动作公式与别名判据, 三处说的必须是同一件事。
+       为什么不能只按 ALIGNED_REPR 判: 对齐表示 + 128 槽消融那一档会把**自己的正常行为**
+       报成"**回归!**" (假警报), 而序列专家开关那一支的默认值正是 legacyHashAction=true
+       ⇒ 那个假警报会直接变成默认读数。
+       ⚠ 默认构建下 legacyHashAction 恒为 false, 所以 `hashAction == !ALIGNED_REPR` ——
+       下面所有分支在开关关闭时的输出与改动前**逐字一致**。
+    */
+    const bool hashAction = (!ALIGNED_REPR || legacyHashAction);
     if (ALIGNED_REPR) {
         std::snprintf(buf, sizeof(buf),
                       "状态 %d 维 = %d 平面 x %d 格 = %d 棋子平面 (CTX_BASE=%d)"
@@ -1853,12 +2016,22 @@ std::string SACAZLegacyAgent::selfCheckReport() const
                       PLANE_MATERIAL, PLANE_TEMPO, PLANE_HALFMOVE, PLANE_REPEAT,
                       PLANE_CHECK);
         out += buf;
-        std::snprintf(buf, sizeof(buf),
-                      "**与 PPOMCTSAgent 逐位同口径** (2026-09 对齐): 同一个 STATE_DIM=%d、"
-                      "同一份 chessstate.h 的 CTX_* 顺序、同一个规范镜像、同一个 8100 双射"
-                      "动作空间 -> 两个 agent 的差别只剩算法本身\n",
-                      STATE_DIM);
-        out += buf;
+        if (hashAction) {
+            std::snprintf(buf, sizeof(buf),
+                          "**状态与 PPOMCTSAgent 逐位同口径** (2026-09 对齐): 同一个"
+                          " STATE_DIM=%d、同一份 chessstate.h 的 CTX_* 顺序、同一个规范"
+                          " 镜像; **动作层不同** —— 本支按用户口径保留 %d 槽哈希"
+                          " (legacyHashAction), 所以两个 agent 的差别是算法 + 动作编码\n",
+                          STATE_DIM, LEGACY_ACTION_DIM);
+            out += buf;
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "**与 PPOMCTSAgent 逐位同口径** (2026-09 对齐): 同一个 STATE_DIM=%d、"
+                          "同一份 chessstate.h 的 CTX_* 顺序、同一个规范镜像、同一个 8100 双射"
+                          "动作空间 -> 两个 agent 的差别只剩算法本身\n",
+                          STATE_DIM);
+            out += buf;
+        }
         std::snprintf(buf, sizeof(buf),
                       "规则/阶段上下文: 5 个 (子力阶段 / 总手数 / 无吃子进度 / 重复次数 / 被将)"
                       " -> 三次重复 / 自然限着 / 将军都是 V(s) 的输入 (可观测)\n");
@@ -1890,20 +2063,37 @@ std::string SACAZLegacyAgent::selfCheckReport() const
     out += buf;
 
     /* ---- 2. 动作层: 双射 / 哈希 + **不变量**读数 (标准开局 / 当前局面) ----
-       对齐表示下"别名"应当恒为 0 (回归指示器); 改前表示下它是**结构性上限**
+       判据是**实际用的是哪一套** (hashAction, 与 stepToActionIdx 同条件), 不是"表示对没对齐":
+       对齐 + 双射下"别名"应当恒为 0 (回归指示器); 用哈希时它是**结构性上限**
        (两个不同着法共用一槽 -> 策略头收到两者梯度的平均), 见 docs 的 13.83 vs 0.43。 */
-    if (ALIGNED_REPR) {
+    if (!hashAction) {
         std::snprintf(buf, sizeof(buf),
                       "动作 %d = 双射 canonicalCell(from)*%d + canonicalCell(to)"
                       " (与 PPOMCTS 同一公式, 无碰撞; 曾是 128 槽哈希)\n",
                       ACTION_DIM, CELLS);
         out += buf;
     } else {
-        std::snprintf(buf, sizeof(buf),
-                      "动作 %d = **%d 槽哈希别名空间** (改动前表示; 真实着法空间是 %d 个"
-                      " (from,to) 对 -> 别名是策略精度的结构性上限, 不是训练量的问题)\n",
-                      ACTION_DIM, ACTION_DIM, ALIGNED_ACTION_DIM);
-        out += buf;
+        if (!ALIGNED_REPR) {
+            /* 默认构建: 这一行与改动前**逐字相同** */
+            std::snprintf(buf, sizeof(buf),
+                          "动作 %d = **%d 槽哈希别名空间** (改动前表示; 真实着法空间是 %d 个"
+                          " (from,to) 对 -> 别名是策略精度的结构性上限, 不是训练量的问题)\n",
+                          ACTION_DIM, ACTION_DIM, ALIGNED_ACTION_DIM);
+            out += buf;
+        } else {
+            /*
+               对齐表示 + 保留哈希 (序列专家开关的默认口径)。这一档**必须**把"头张量宽度"与
+               "可达槽位数"分开说: 两个数都印出来才对得上账, 而只印 ACTION_DIM = 8100 会让
+               人以为动作空间是 8100 路 (那正是这一支刻意避开的东西)。
+            */
+            std::snprintf(buf, sizeof(buf),
+                          "动作张量 %d 列 (对齐表示), 但**可达槽位只有 %d 个**"
+                          " (legacyHashAction: 用户口径 —— 序列专家这一支保持 128 槽哈希)"
+                          " | 真实着法空间是 %d 个 (from,to) 对 -> 别名是策略精度的"
+                          "结构性上限, 不是训练量的问题\n",
+                          ACTION_DIM, LEGACY_ACTION_DIM, ALIGNED_ACTION_DIM);
+            out += buf;
+        }
     }
 
     int initLegal = 0, initSlots = 0, initWorst = 0;
@@ -1926,17 +2116,17 @@ std::string SACAZLegacyAgent::selfCheckReport() const
         Steps::instance().put(legal);
     }
     /*
-       判据字符串随表示变: 对齐表示下 slotCount==legalCount 是**恒等式**, 不成立就是
-       索引公式/规范镜像写错 (回归); 改前表示下挤掉几个是**正常现象**, 那里只看数值。
+       判据字符串随**动作编码**变 (hashAction): 用双射时 slotCount==legalCount 是**恒等式**,
+       不成立就是索引公式/规范镜像写错 (回归); 用哈希时挤掉几个是**正常现象**, 只看数值。
     */
-    const char *badInit = ALIGNED_REPR
-                              ? ((initLegal == initSlots && initWorst <= 1)
-                                     ? "[不变量成立]" : "**回归!**")
-                              : "[结构性上限读数, 不是回归]";
-    const char *badCur = ALIGNED_REPR
-                             ? ((curLegal == curSlots && curWorst <= 1)
-                                    ? "[不变量成立]" : "**回归!**")
-                             : "[结构性上限读数, 不是回归]";
+    const char *badInit = hashAction
+                              ? "[结构性上限读数, 不是回归]"
+                              : ((initLegal == initSlots && initWorst <= 1) ? "[不变量成立]"
+                                                                           : "**回归!**");
+    const char *badCur = hashAction
+                             ? "[结构性上限读数, 不是回归]"
+                             : ((curLegal == curSlots && curWorst <= 1) ? "[不变量成立]"
+                                                                       : "**回归!**");
     std::snprintf(buf, sizeof(buf),
                   "动作别名(标准开局): %d 个合法着法 -> %d 个槽位, 挤掉 %d 个"
                   " (最挤槽位 %d 个着法) %s\n",
@@ -1947,13 +2137,17 @@ std::string SACAZLegacyAgent::selfCheckReport() const
                   " (最挤槽位 %d 个着法) %s\n",
                   curLegal, curSlots, curLegal - curSlots, curWorst, badCur);
     out += buf;
-    if (ALIGNED_REPR) {
+    if (!hashAction) {
         out += "  为什么这项现在是回归指示器: 128 槽哈希时代它量的是**结构性上限**"
                "(两个不同着法共用一列 -> 策略头收到两者梯度的平均); 换成双射后"
                " slotCount==legalCount 是恒等式, 一旦不成立就是索引公式或规范镜像写错了\n";
-    } else {
+    } else if (!ALIGNED_REPR) {
         out += "  改前表示下这一项**不是缺陷**: 槽位比合法着法多时可能无碰撞, 着法变多时"
                "必然开始挤 —— 它是策略精度的上限读数 (上面那两行就是当前局面的实际值)\n";
+    } else {
+        out += "  对齐表示 + 128 槽哈希 (用户口径: 序列专家这一支保持 128 槽): 挤掉槽位是"
+               "**预期行为**, 不是回归; 换成双射之后这一项才会变成恒等式 (那时 slotCount"
+               " < legalCount 才是写错了)\n";
     }
 
     /* ---- 3. 算法 / 口径 ---- */
@@ -1993,11 +2187,23 @@ std::string SACAZLegacyAgent::selfCheckReport() const
        (见头文件), 差别就是下面这一行。不印出来, "两个 SAC 谁强"就没法归因。
        本类的这一行全部是**常数**: 没有值域约束、没有塑形、没有稀疏头、不从搜索学。
     */
+    /*
+       [2026-10 第五轮] 这一处的三目原本是**反的** (`legacyHashAction ? "对齐双射 8100"
+       : "128 槽哈希"`) —— 默认构建下歪打正着 (两个宏都不给时 legacyHashAction=false,
+       印出来的恰好是"128 槽哈希"), 但对齐表示下就变成了"实际用双射、面板说哈希";
+       序列专家开关那一支 (对齐 + 保留 128 槽) 更会印成"对齐双射 8100", 与真实动作空间相反。
+       现在按**实际编码**判 (hashAction, 与 stepToActionIdx 同一个条件):
+         * 默认构建 → 仍是 "128 槽哈希", 与改动前**一字不差**;
+         * 对齐 + 双射 → "对齐双射 8100" (顺手把那条假读数修对);
+         * 序列专家那一支 → "128 槽哈希 (对齐表示下按用户口径保留)"。
+    */
     std::snprintf(buf, sizeof(buf),
                   "口径(全是硬编码, 本类没有对应成员): critic 目标**不夹** + 纯 MSE |"
                   " 叶子估值=全量(每片叶子算全量 Q) | 即时奖励=材质x0.1+每步代价 (无塑形) |"
                   " 终局=引擎真值 ±1/0 (无塑形) | 不从自己的搜索学 | 动作空间=%s\n",
-                  legacyHashAction ? "对齐双射 8100" : "128 槽哈希");
+                  hashAction ? (ALIGNED_REPR ? "128 槽哈希 (对齐表示下按用户口径保留)"
+                                             : "128 槽哈希")
+                             : "对齐双射 8100");
     out += buf;
     out += "  本类刻意不含奖励塑形、不含任何 critic 值域约束 (目标钳位 / Huber 分段 /"
            " 搜索叶子缩放 / 熵项开关也都没有) —— 59e5233 就是这样; 加了就说明被污染了\n";
@@ -2013,11 +2219,39 @@ std::string SACAZLegacyAgent::selfCheckReport() const
            "估计, 这是它局末价值目标可信的原因 (PPOMCTS 那边终局仍用网络值)\n";
 
     /* ---- 4. 骨干 / MoE ---- */
+#if defined(SACAZ_LEGACY_MOE_EXPERT_SEQ) && SACAZ_LEGACY_MOE_EXPERT_SEQ
+    /*
+       [2026-10 第五轮] 关键词变了: `expertHidden` 在**这一支**下不是"只有 MLP 专家骨干用"
+       的隐层宽度, 而是序列专家的 **tokDim** (token 宽度, 必须能被 MOE_SEQ_HEADS 整除)。
+       所以这一行必须跟着开关分支 —— 照默认那一句印出来就是让面板说谎, 而"专家到底是什么"
+       恰好是本支唯一那个实验变量。
+       下面那行"专家类型"是**读实现** (编译期常量 + 构造时实际用的宽度 + 位置编码旋钮),
+       不是回显某个 bool: 本工程记录过"开关设了却没生效"的事故, 参考实现
+       (sacazmoetbagent.cpp) 把同一条读数当作护栏, 本类照抄同一个口径。
+    */
+    std::snprintf(buf, sizeof(buf),
+                  "骨干结构: hiddenDim=%d | 序列专家 tokDim=%d (expertHidden; 必须能被"
+                  " MOE_SEQ_HEADS=%d 整除) | auxLossCoef=%.3f\n",
+                  hiddenDim, expertHidden, MOE_SEQ_HEADS, (double)auxLossCoef);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "专家类型: **序列 Transformer** (SeqTransformerExpert<%d,%d,%d>, tokDim=%d)"
+                  " | 位置编码: %s | 输入 %d 维 = %d 平面 x %d 格 (与 PPO 支同一份实现)"
+                  " | 权重前缀: %s\n",
+                  CELLS, MOE_SEQ_HEADS, MOE_SEQ_BLOCKS, expertHidden, moeSeqPosMode(),
+                  STATE_DIM, PLANES, CELLS, defaultWeightPrefix(backbone));
+    out += buf;
+    out += "  判读: 专家从 TransformerBlock (12.9 M 参数/个) 换成序列专家 (91,731 参数/个)"
+           " ⇒ MOE_TB_HEADS / MOE_TB_DFF 在这一支下**不生效**;\n";
+    out += "  位置编码模式由 moeSeqPosMode() 给出 (建网时设不上会当场 abort), 所以这一行"
+           "报的是**实际生效**的口径\n";
+#else
     std::snprintf(buf, sizeof(buf),
                   "骨干结构: hiddenDim=%d | 专家隐层 expertHidden=%d (只有 MLP 专家骨干用)"
                   " | auxLossCoef=%.3f\n",
                   hiddenDim, expertHidden, (double)auxLossCoef);
     out += buf;
+#endif
     const int experts = moeExpertCount();
     if (experts <= 0) {
         std::snprintf(buf, sizeof(buf),
@@ -2076,8 +2310,10 @@ std::string SACAZLegacyAgent::selfCheckReport() const
         }
     }
 
-    /* 参数量: Net::paramCount() 各层求和 (MoE/TransformerBlock 也实现了它, 所以这里
-       报的是真实总数, 不是"只算 Linear" 的旧口径)。目标网只前向, 单独列出来。 */
+    /* 参数量: Net::paramCount() 各层求和 (MoE 层与它的**专家** —— TransformerBlock 或
+       序列 Transformer —— 都实现了它, 所以这里报的是真实总数, 不是"只算 Linear" 的旧
+       口径)。目标网只前向, 单独列出来。
+       读数本身随专家自动变: 序列专家那一支下一个专家 ~92 K, 而不是 TB 的 12.9 M。 */
     std::snprintf(buf, sizeof(buf),
                   "参数量: actor %lld | q1 %lld | q2 %lld | 目标网合计 %lld (只前向) |"
                   " alpha 1\n",
