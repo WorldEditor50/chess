@@ -43,6 +43,14 @@
 
 #include "abagent.h"
 #include "bcagent.hpp"
+/*
+   [2026-10] Q 类 agent (DQN+AB / DQN+MCTS) 的 BC 重载**必须在这里就可见**:
+   `BC::evaluate` / `BC::update` 在 `run()` 里是**限定名的依赖调用**
+   (`BC::evaluate(agent, ...)`), 而依赖名只在**模板定义点**做名字查找 ——
+   晚包含 (例如只在 .cpp 里) 就会编不过, 或者更糟: 退到 `template<class SACLike>`
+   那个重载上去 (它要 `ag.policy(...)`, Q agent 没有 ⇒ 实例化期才报错)。
+*/
+#include "bcdqnagent.hpp"
 #include "chess.h"
 
 namespace BCRun {
@@ -487,6 +495,73 @@ std::string caliperFor(SACLike &ag, const Result &r)
                                    : "actor (q1/q2 一个字节不动)",
                   r.samplesUsed, r.updates, r.targetMissed,
                   (r.targetMissed > 0) ? "  <-- 造样本那一层的视角/索引算错了" : "");
+    return std::string(buf);
+}
+
+/*
+ * ============================================================
+ *  [2026-10] Q 类 agent 的口径自检 (DQN+AB / DQN+MCTS)
+ * ============================================================
+ *  为什么必须各写一份 (而不是复用 SAC 那个模板): 那一段会打印"只更新策略路径 /
+ *  共享骨干"这类话 —— 对 Q agent **一句都不成立** (它们没有策略头, BC 改的必然是
+ *  **主干 + 那个 Q/优势头**)。报告不许撒谎, 所以这里把真话说全:
+ *    * 改了什么: DQNAB = 主干 (MoE/Square-Tanh) + A 头; DQNMCTS = trunk + qHead;
+ *    * **没改什么**: DQNAB 的 V 头 (逐批校验和验过, 见 src/bcdqnagent.hpp);
+ *      DQNMCTS 的 q2 头 / 目标网;
+ *    * 边界: 监督的是 "Q 隐含的合法列先验", 不是真实决策策略 (根搜索值 / PUCT),
+ *      而且 CE 的绝对值与 PPO/SAC 的 BC **不可比** (logits 是值头, 量纲不同)。
+ */
+inline std::string caliperFor(DQNABAgent &ag, const Result &r)
+{
+    char buf[1600];
+    std::snprintf(buf, sizeof(buf),
+                  "\n[5] 口径自检 (DQN+AB, dueling 双头): π = 合法列上 softmax(Q / T), T = %.1f\n"
+                  "    监督对象: **Q 隐含的合法列先验** —— 不是 agent 的真实决策策略\n"
+                  "              (DQNAB 决策走根搜索值 softmax(v_a/T); 本口径只看根节点 Q 的排序)\n"
+                  "    BC 必然改主干 (m_trunk: 稀疏MoE + Tanh) 与 A 头 (m_aHead);"
+                  " **V 头 (m_vHead) 一个字节不动**\n"
+                  "      —— 依据 Q_i = V + A_i − mean_legal(A) 且 Σ(π−t)=0 ⇒ dL/dV ≡ 0;\n"
+                  "         本工具每批首尾各取一次 V 头权重校验和, 不一致**当场 abort** (见 src/bcdqnagent.hpp)\n"
+                  "    目标网 (m_trunkT/m_vHeadT/m_aHeadT) 与回放池: 一个字节不动\n"
+                  "    MoE 负载均衡辅助损失: **刻意不加** (加了就不是纯 CE 梯度了; 代价 = BC 期间路由无均衡回路)\n"
+                  "    参与更新的样本 %lld 条 (共 %lld 个批); **目标落空被丢弃 %lld 条**%s\n"
+                  "    V 头校验通过 %lld 个批; Σπ(合法列) != 1 的样本 %lld 条 (必须是 0)\n"
+                  "    本口径读过的样本 (evaluate + update 累计): %lld\n"
+                  "    广度: hidden=%d, expert(tokDim)=%d, 骨干=%s, 值门控%s\n"
+                  "    ⚠ CE 的绝对值与 PPO/SAC 的 BC **不可比** (这里的 logits 是值头, 量纲由 TD loss 定);\n"
+                  "       成立的只有「同 teacher / 同数据 / 同 seed 下换宽度」的相对比较\n",
+                  BC::DQN_BC_TEMP, r.samplesUsed, r.updates, r.targetMissed,
+                  (r.targetMissed > 0) ? "  <-- 造样本那一层的视角/索引算错了" : "",
+                  BC::Dqn::vHeadGuarded, BC::Dqn::piMassWarn, BC::Dqn::samples,
+                  ag.hiddenDim, ag.expertHidden,
+                  DQNABAgent::MOE_EXPERT_SEQ ? "稀疏MoE(序列Transformer专家)" : "稀疏MoE(TB专家)",
+                  ag.valueGateEnabled ? "开 (只作用于 learnBatch, 本路径不经过)" : "关");
+    return std::string(buf);
+}
+
+inline std::string caliperFor(DQNMCTSMOETbAgent &ag, const Result &r)
+{
+    char buf[1600];
+    std::snprintf(buf, sizeof(buf),
+                  "\n[5] 口径自检 (DQN+MCTS, PUCT): π = 合法**槽位**上 softmax(Q / T), T = %.1f\n"
+                  "    监督对象: **Q 隐含的合法列先验** —— 不是 agent 的真实决策策略 (真实决策走 PUCT + priors)\n"
+                  "    BC 必然改 trunk (稀疏MoE + Tanh) 与 qHead (Q 头); q2 头 / 目标网 / 回放池一个字节不动\n"
+                  "      ⚠ qNet 是 trunk+qHead 的**视图**: 对它再调一次 RMSProp 等于学习率翻倍, 本路径一次都不调\n"
+                  "    MoE 负载均衡辅助损失: **刻意不加** (加了就不是纯 CE 梯度了; 代价 = BC 期间路由无均衡回路)\n"
+                  "    参与更新的样本 %lld 条 (共 %lld 个批); **目标落空被丢弃 %lld 条**%s\n"
+                  "    Σπ(合法槽位) != 1 的样本 %lld 条 (必须是 0)\n"
+                  "    本口径读过的样本 (evaluate + update 累计): %lld\n"
+                  "    动作空间: %d 个**哈希槽** (有别名) ⇒ top-1/CE 的分母是**槽位数**, 不是着法数;\n"
+                  "              别名槽在 π 里只算一次 (整段运行累计并掉 %lld 次; 这一项不是错误)\n"
+                  "    广度: hidden=%d, expert(tokDim)=%d, 骨干=%s, twinCritic=%s\n"
+                  "    ⚠ CE 的绝对值与 PPO/SAC 的 BC **不可比** (这里的 logits 是值头, 量纲由 TD loss 定);\n"
+                  "       成立的只有「同 teacher / 同数据 / 同 seed 下换宽度」的相对比较\n",
+                  BC::DQN_BC_TEMP, r.samplesUsed, r.updates, r.targetMissed,
+                  (r.targetMissed > 0) ? "  <-- 造样本那一层的视角/索引算错了" : "",
+                  BC::Dqn::piMassWarn, BC::Dqn::samples,
+                  DQNMCTSMOETbAgent::ACTION_DIM, BC::Dqn::aliasDropped,
+                  ag.hiddenDim, ag.expertHidden, ag.backboneName(),
+                  ag.twinCritic ? "开" : "关");
     return std::string(buf);
 }
 

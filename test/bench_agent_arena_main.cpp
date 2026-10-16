@@ -159,6 +159,18 @@ struct Cfg {
     float dropoutPpoA = -1.0f, dropoutPpoB = -1.0f;
     int expertPpoA = 0, expertPpoB = 0;
     /*
+       [2026-10 超参搜索] **每侧**的头部瓶颈宽度 (= `PPOMCTSAgent` 构造的第 1 个参数,
+       也就是成员 `hiddenDim`: 专家之后、输出头之前那一层的宽度)。
+       为什么需要它: `--expert-ppo-a/b` 管的是**专家内部**的 token 宽度, 而"骨干之后的
+       瓶颈"是另一个旋钮 —— 两者要一起扫才能回答"哪一档最好", 而 `buildAgent` 对 A/B
+       是同一段代码, 只有一个全局值时两边就只能同宽 (与 `--backbone-ppo-a/-b` 同一个
+       理由: 对照必须**一边一档、其余全同**)。
+       0 = 不设置 = 默认 64 ⇒ 不传参数时行为与改动前**逐位相同**。
+       ⚠ 必须与训练该权重文件时的宽度一致 (权重形状是 `Tanh(STATE_DIM->h)` 与
+         `Softmax(h->ACTION_DIM)`), 不匹配会被 `Net::load` 的参数量守卫拒绝。
+    */
+    int hiddenPpoA = 0, hiddenPpoB = 0;
+    /*
        [2026-10] 两个"让读数可比"的开关 (默认**关** ⇒ 不传参数时行为与改动前逐位相同)。
        为什么需要它们: 本工具的每一局开局是"用共享的 `RL::Random` 随机走 opening 手"
        (randomOpening), 而 `RL::Random` 同时被 agent 自己的搜索消耗 ⇒ **各臂看到的开局
@@ -322,6 +334,7 @@ struct Agent {
     std::string posKeyUsed;
     float expertDropoutUsed = 0.0f;
     int tokenDimUsed = 0;
+    int headDimUsed = 0;      /* [2026-10] PPO 头部瓶颈宽度 (实际生效值; 非 PPO 为 0) */
     std::unique_ptr<sacazx::AnySac> sac;   /* [2026-09 独立类] 任意骨干的 SAC+AZ */
     std::unique_ptr<PPOMCTSAgent> ppo;
     std::unique_ptr<MCTS> mcts;
@@ -667,7 +680,8 @@ static void probeAgent(Agent &ag, int samples, int sims, ProbeStat &out)
  *  Agent 构造
  * ============================================================ */
 static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbonePpo,
-                       const std::string &posKey, float dropoutP, int expertHidden)
+                       const std::string &posKey, float dropoutP, int expertHidden,
+                       int headHidden)
 {
     ag.kind = kind;
     switch (kind) {
@@ -719,7 +733,14 @@ static void buildAgent(Agent &ag, Kind kind, Chess &c, const std::string &backbo
             std::exit(1);
         }
         const int tokDim = (expertHidden > 0) ? expertHidden : 64;
-        ag.ppo.reset(new PPOMCTSAgent(c, 64, 0.99f, 0.001f, 1.414f, tokDim, 0.1f, true, bb));
+        /*
+           [2026-10 超参搜索] 头部瓶颈宽度: 0 = 不设置 = 默认 64 (行为与改动前逐位相同)。
+           ⚠ 这两个数**都是权重形状的一部分** (`Tanh(STATE_DIM->h)` / `Softmax(h->8100)`),
+           所以 `--load-*` 必须与训练时的宽度一致, 否则被 `Net::load` 的参数量守卫拒绝。
+        */
+        const int headDim = (headHidden > 0) ? headHidden : 64;
+        ag.ppo.reset(new PPOMCTSAgent(c, headDim, 0.99f, 0.001f, 1.414f, tokDim, 0.1f, true, bb));
+        ag.headDimUsed = headDim;
         /*
            [2026-10] 序列专家的两个旋钮。**构造之后、载入权重之前**调用 —— 位置编码模式是
            权重文件自描述的一部分 (`SeqPosEnc::read` 会比对标记), 2d/rope 与 1d 的参数量也
@@ -816,6 +837,11 @@ static void parseArgs(int argc, char **argv)
         else if (const char *v = val("--dropout-ppo-b")) { g_cfg.dropoutPpoB = (float)std::atof(v); }
         else if (const char *v = val("--expert-ppo-a")) { g_cfg.expertPpoA = std::atoi(v); }
         else if (const char *v = val("--expert-ppo-b")) { g_cfg.expertPpoB = std::atoi(v); }
+        /*
+           [2026-10 超参搜索] 头部瓶颈宽度 (见 Cfg 里 hiddenPpoA/B 的说明)。0 = 默认 64。
+        */
+        else if (const char *v = val("--hidden-ppo-a")) { g_cfg.hiddenPpoA = std::atoi(v); }
+        else if (const char *v = val("--hidden-ppo-b")) { g_cfg.hiddenPpoB = std::atoi(v); }
         else if (std::strcmp(a, "--paired-openings") == 0
                  || std::strcmp(a, "--paired-openings=1") == 0) { g_cfg.pairedOpenings = true; }
         else if (std::strcmp(a, "--seed-mcts-rng") == 0
@@ -896,9 +922,9 @@ int main(int argc, char **argv)
     const double tBuild0 = nowMs();
     Agent A, B;
     buildAgent(A, ka, board, g_cfg.backbonePpoA,
-               g_cfg.posPpoA, g_cfg.dropoutPpoA, g_cfg.expertPpoA);
+               g_cfg.posPpoA, g_cfg.dropoutPpoA, g_cfg.expertPpoA, g_cfg.hiddenPpoA);
     buildAgent(B, kb, board, g_cfg.backbonePpoB,
-               g_cfg.posPpoB, g_cfg.dropoutPpoB, g_cfg.expertPpoB);
+               g_cfg.posPpoB, g_cfg.dropoutPpoB, g_cfg.expertPpoB, g_cfg.hiddenPpoB);
     const double tBuild1 = nowMs();
 
     /*
@@ -941,12 +967,14 @@ int main(int argc, char **argv)
         }
         /* [2026-10] 序列骨干的"实际生效"读数: 位置编码 / token 宽度 / dropout */
         if (!A.posKeyUsed.empty()) {
-            std::printf("A 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f\n",
-                        A.posKeyUsed.c_str(), A.tokenDimUsed, (double)A.expertDropoutUsed);
+            std::printf("A 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f  头部瓶颈=%d\n",
+                        A.posKeyUsed.c_str(), A.tokenDimUsed, (double)A.expertDropoutUsed,
+                        A.headDimUsed);
         }
         if (!B.posKeyUsed.empty()) {
-            std::printf("B 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f\n",
-                        B.posKeyUsed.c_str(), B.tokenDimUsed, (double)B.expertDropoutUsed);
+            std::printf("B 序列  : 位置编码=%s  token宽度=%d  dropout=%.3f  头部瓶颈=%d\n",
+                        B.posKeyUsed.c_str(), B.tokenDimUsed, (double)B.expertDropoutUsed,
+                        B.headDimUsed);
         }
         std::printf("构建耗时: %.2f s\n", (tBuild1 - tBuild0) / 1000.0);
         if (!g_cfg.book.empty()) {
@@ -1174,10 +1202,12 @@ int main(int argc, char **argv)
                             /* [2026-10] 追加在**末尾**: 上面 29 列的序号一位不动,
                                既有解析脚本 (按列号取) 不受影响 */
                             "a_pos,b_pos,a_token_dim,b_token_dim,a_dropout,b_dropout,"
+                            /* [2026-10 超参搜索] 再追加两列 (同样加在**末尾**) */
+                            "a_head_dim,b_head_dim,"
                             "a_material_diff_avg\n");
             std::fprintf(f, "match,%s,%s,%d,%d,%d,%d,%u,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.2f,%s,"
                             "%.3f,%.3f,%d,%d,%lld,%lld,%lld,%lld,%s,%s,%.1f,"
-                            "%s,%s,%d,%d,%.3f,%.3f,%.3f\n",
+                            "%s,%s,%d,%d,%.3f,%.3f,%d,%d,%.3f\n",
                          g_cfg.aName.c_str(), g_cfg.bName.c_str(),
                          st.n(), g_cfg.sims, g_cfg.maxPlies, g_cfg.openingPlies, g_cfg.seed,
                          st.wins, st.losses, st.draws, st.broken, rate, lo, hi,
@@ -1191,6 +1221,7 @@ int main(int argc, char **argv)
                          B.posKeyUsed.empty() ? "-" : B.posKeyUsed.c_str(),
                          A.tokenDimUsed, B.tokenDimUsed,
                          (double)A.expertDropoutUsed, (double)B.expertDropoutUsed,
+                         A.headDimUsed, B.headDimUsed,
                          st.n() > 0 ? aMatDiffAcc / (double)st.n() : 0.0);
             std::fclose(f);
             if (!g_cfg.quiet) { std::printf("  CSV       : %s\n", g_cfg.csvPath.c_str()); }

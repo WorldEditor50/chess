@@ -189,6 +189,64 @@ target_compile_options(CHESS_CORE PRIVATE
 # 否则改了 src/*.h 之后库不会重编 —— 那是最坏的一种"快": 编得快但二进制是旧的。
 set_property(SOURCE ${CHESS_CORE_SOURCES} APPEND PROPERTY OBJECT_DEPENDS ${APP_HEADER_DEPS})
 
+# ============================================================================
+# CHESS_CORE_SEQ - 同一份游戏层源码 + 四个"专家换成序列 Transformer"宏 (2026-10-16 修)
+# ============================================================================
+# 为什么必须有这个库 (这是一次**真实发生过的静默失效**, 不是假想):
+#   `target_compile_definitions(chess PRIVATE SACAZ_MOE_EXPERT_SEQ=1 ...)` 只作用于
+#   **chess target 自己的源文件** (APP_SOURCES = main/mainwindow/thinkingindicator/...),
+#   而真正**建 agent** 的 `chessboard.cpp` 与四个 agent 的 .cpp (dqnabagent /
+#   sacazmoetbagent / sacazlegacyagent / dqnmctsmoetbagent) 都在 `CHESS_CORE` 里 ——
+#   它们**不是** chess 的源文件 ⇒ 那四个宏**从来没有到达建 agent 的那几个 TU**。
+#   症状极具欺骗性: 下拉框上的字写着"稀疏MoE+序列专家"(那几行字在 mainwindow.cpp
+#   里, 它吃到了宏), 而**实际建出来的是 TB 专家** (类内部与 chessboard.cpp 都没吃到宏);
+#   `chessboard.cpp` 里 `a->legacyHashAction = true` 那一行同样被整段编掉。
+#   定位手段 (两条, 都不需要跑程序):
+#     * `grep -A1 'CHESS_CORE.dir.*chessboard.cpp.obj' build.ninja` ⇒ DEFINES 里**没有**
+#       那四个宏, 而 `chess.dir/...` 的目标行有;
+#     * 各 agent 的 `.obj` 也是 CHESS_CORE 的。
+#   这与本工程记录过多次的"设了却没生效"是同一类事故; 修法就是让**建 agent 的那几个
+#   TU** 也吃到宏。
+#
+# 做法: 游戏层编**两份**。
+#   * `CHESS_CORE`     —— 不带宏, 继续给 test_* / bench_* / train_* 用 (既有断言、
+#                        读数与权重文件因此一位不动, "改前"永远可以对照);
+#   * `CHESS_CORE_SEQ` —— 带那四个宏, **只有界面 `chess` 链它**。
+# 代价: 游戏层多编一遍 (~19 个 TU)。这是 CHESS_CORE 那段注释里"编译速度 vs 正确性"
+# 的取舍: 宁可多编一次, 也不要一个"界面显示 A、实际跑 B"的构建。
+# ⚠ 两个库**不能同时链进同一个目标**: 同名 agent 类的两套目标文件会撞 (ODR/重复符号)。
+# ============================================================================
+add_library(CHESS_CORE_SEQ STATIC ${CHESS_CORE_SOURCES})
+target_include_directories(CHESS_CORE_SEQ PUBLIC ${SRC_DIR})
+target_link_libraries(CHESS_CORE_SEQ PUBLIC
+    RL_CORE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Sql)
+set_target_properties(CHESS_CORE_SEQ PROPERTIES
+    AUTOMOC ON
+    AUTOUIC OFF
+    AUTORCC OFF)
+target_compile_options(CHESS_CORE_SEQ PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+# 那四个宏的实际落点 (与下面 `chess` 目标上那一份**必须逐字同源**: 界面的源文件与
+# 游戏层的源文件要看到同一套开关, 否则又会分叉出"字是一套、行为另一套")。
+#
+# ⚠ **PUBLIC 而不是 PRIVATE** —— 这一条不是风格, 是必须的:
+#   `STATE_DIM` / `ACTION_DIM` / 专家类型都是**编译期**成员, 于是**每一个 include
+#   这些 agent 头文件的 TU 都必须看到同一套宏**, 否则同一个类在两个 TU 里是不同的
+#   定义 (不同维数、不同成员布局) —— 那是 ODR 违反, 而且症状是"运行时莫名其妙"。
+#   PRIVATE 时踩到过: 本库带宏、而 `test_gui_seq_wiring` (include 了同样的头) 不带宏,
+#   它的 `static_assert(SACAZMoETbAgent::STATE_DIM == 1710)` **当场编译失败** ——
+#   那次失败正是这个隐患的报警器。PUBLIC 让 `chess` 与任何链它的目标自动继承。
+target_compile_definitions(CHESS_CORE_SEQ PUBLIC
+    SACAZ_MOE_EXPERT_SEQ=1
+    SACAZ_LEGACY_MOE_EXPERT_SEQ=1
+    DQNMCTS_MOE_EXPERT_SEQ=1
+    DQNAB_MOE_EXPERT_SEQ=1)
+# 头依赖的 workaround: 上面 `set_property(SOURCE ${CHESS_CORE_SOURCES} ...)` 已经按
+# **源文件**挂过 OBJECT_DEPENDS (它是源文件属性, 两个库共用同一批源文件 ⇒ 自动生效),
+# 所以这里不重复调用 chess_add_header_deps (它定义在本段之后, 这里也还不存在)。
+
 # ---------------------------------------------------------------------------
 # 同一个 workaround 必须应用到**每一个**目标, 不只是 RL_CORE 和 chess。
 # 漏掉测试目标时症状不明显但很恶劣: 改了 src/chess.h / src/stone.h 之后
@@ -360,6 +418,42 @@ add_executable(chess ${APP_SOURCES})
 
 chess_add_header_deps(chess)
 
+# =====================================================================
+# [2026-10-15] 用户口径: "把所有 agent 里的 TB 专家换成 seq transformer,
+#              输入都使用 19x90 特征, 与 ppo agent 对齐"
+# ---------------------------------------------------------------------
+# 界面 (chess.exe) 里**四支 TB 专家骨干**全部换成真正的序列 Transformer 专家:
+#   * AGENT_SACAZ_MOE     -> SACAZMoETbAgent      (SACAZ_MOE_EXPERT_SEQ)
+#   * AGENT_SACAZ_OLD_MOE -> SACAZLegacyAgent     (SACAZ_LEGACY_MOE_EXPERT_SEQ)
+#   * AGENT_DQNMCTS_MOE   -> DQNMCTSMOETbAgent    (DQNMCTS_MOE_EXPERT_SEQ)
+#   * AGENT_DQNAB         -> DQNABAgent           (DQNAB_MOE_EXPERT_SEQ)
+# (PPO 那一支早就是 seq —— `chessboard.cpp` 的 PPOMCTS_BACKBONE = SeqExperts。)
+#
+# 每个开关都**隐含**该 agent 的 19x90 表示 (序列专家按格子切 token, 要求
+# dIn % 90 == 0): SAC 两支自动切到对齐表示 (1710), DQNMCTS_MOE 从 1263 切到 1710,
+# DQNAB 本来就是 1710。改维数/改骨干 ⇒ 每支各有自己的新权重前缀, 存量 TB 权重
+# 按设计载不进来 (不会静默错读)。
+#
+# **这些宏只作用于界面这一支**: 其它 target (test_sacaz / test_dqnmcts_moe /
+# bench_* / test_dqnab ...) 不带这些宏, 于是它们仍然在跑 TB 那一套 —— 既有读数、
+# 断言和权重文件一位不动, "改前"因此始终可以对照。
+#
+# ⚠ [2026-10-16 修] 上面这段"只作用于界面"曾经是**不成立的**: 这些宏只加在 `chess`
+#   自己的源文件上, 而建 agent 的 chessboard.cpp / 四个 agent 的 .cpp 都在 CHESS_CORE
+#   里 ⇒ 界面实际跑的还是 TB 专家 (而下拉框的字是"序列专家")。现在游戏层编两份
+#   (CHESS_CORE 不带宏给 test/bench, CHESS_CORE_SEQ 带宏只给 `chess`), 详见
+#   CHESS_CORE_SEQ 那一段的说明与定位手段。
+# =====================================================================
+# **这些宏必须同时出现在两个地方** (2026-10-16 修, 见 CHESS_CORE_SEQ 那一段的完整说明):
+#   * `chess`            —— 它自己的源文件 (mainwindow.cpp 的**下拉框标签**) 要跟着分叉;
+#   * `CHESS_CORE_SEQ`   —— 真正**建 agent** 的 chessboard.cpp 与四个 agent 的 .cpp。
+# 以前只有前者, 于是界面上的字是"序列专家"而实际建出来的是 **TB 专家** (静默失效)。
+target_compile_definitions(chess PRIVATE
+    SACAZ_MOE_EXPERT_SEQ=1
+    SACAZ_LEGACY_MOE_EXPERT_SEQ=1
+    DQNMCTS_MOE_EXPERT_SEQ=1
+    DQNAB_MOE_EXPERT_SEQ=1)
+
 # Qt's code generators are needed by this target only.
 set_target_properties(chess PROPERTIES
     AUTOMOC ON
@@ -367,7 +461,7 @@ set_target_properties(chess PROPERTIES
     AUTORCC ON)
 
 target_link_libraries(chess PRIVATE
-    CHESS_CORE
+    CHESS_CORE_SEQ
     RL_CORE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Sql)
@@ -845,6 +939,29 @@ if(CHESS_BUILD_TESTS)
     add_test(NAME test_dqnab COMMAND test_dqnab)
     set_tests_properties(test_dqnab PROPERTIES TIMEOUT 900)
 
+    # ------------------------------------------- 【2026-10-15】(用户口径) 序列专家变体
+    # 同一份源码 + `DQNAB_MOE_EXPERT_SEQ=1`: `SparseMoeTb` 那一支的专家换成序列
+    # Transformer (表示本来就是 19×90 = 1710, 所以这一次只换专家, 不动编码/动作空间)。
+    # 界面 `chess` 目标用的就是这一套; 默认构建 (test_dqnab) 一位不动, 于是可对照。
+    add_executable(test_dqnab_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_dqnab_main.cpp
+        ${SRC_DIR}/dqnabagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_compile_definitions(test_dqnab_seq PRIVATE DQNAB_MOE_EXPERT_SEQ=1)
+    target_include_directories(test_dqnab_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(test_dqnab_seq PRIVATE RL_CORE)
+    target_compile_options(test_dqnab_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_dqnab_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_dqnab_seq)
+    add_test(NAME test_dqnab_seq COMMAND test_dqnab_seq)
+    set_tests_properties(test_dqnab_seq PROPERTIES TIMEOUT 900)
+
     # ------------------------------------------- DQN+MCTS (稀疏MoE+TB专家)
     # [2026-09 dev-dqnmcts-moetb] 新 agent: 独立类 DQNMCTSMOETbAgent —— 稀疏 MoE
     # (E=4 top-1) + TransformerBlock 专家骨干, 规范视角 1263 维表示, PUCT(negamax 符号),
@@ -874,6 +991,34 @@ if(CHESS_BUILD_TESTS)
     chess_add_header_deps(test_dqnmcts_moe)
     add_test(NAME test_dqnmcts_moe COMMAND test_dqnmcts_moe)
     set_tests_properties(test_dqnmcts_moe PROPERTIES TIMEOUT 900)
+
+    # ------------------------------------------- 【2026-10-15】(用户口径) 序列专家变体
+    # "把所有 agent 里的 TB 专家换成 seq transformer, 输入都使用 19x90 特征, 与 ppo agent
+    #  对齐" —— 界面 (`chess` 目标) 用的就是这一套, 这里给它一份**断言级**的对照二进制:
+    # **同一份源码** + `DQNMCTS_MOE_EXPERT_SEQ=1` (它隐含该 agent 的 19×90 表示:
+    # 1263 = 17×90+3 -> 1710 = 19×90, 见 src/dqnmctsmoetbagent.h 顶部)。
+    #
+    # 专家类型与 STATE_DIM 都是编译期常量 (SparseMoE 的模板参数), 所以"改前 (TB/1263)"与
+    # "改后 (seq/1710)"**只能各是一个可执行文件** —— 默认构建 (test_dqnmcts_moe) 一位不动,
+    # 于是"改前"始终可以对照 (与 test_sacaz_aligned_seq 同一套做法)。
+    add_executable(test_dqnmcts_moe_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_dqnmcts_moe_main.cpp
+        ${SRC_DIR}/dqnmctsmoetbagent.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp)
+    target_compile_definitions(test_dqnmcts_moe_seq PRIVATE DQNMCTS_MOE_EXPERT_SEQ=1)
+    target_include_directories(test_dqnmcts_moe_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(test_dqnmcts_moe_seq PRIVATE RL_CORE)
+    target_compile_options(test_dqnmcts_moe_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_dqnmcts_moe_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_dqnmcts_moe_seq)
+    add_test(NAME test_dqnmcts_moe_seq COMMAND test_dqnmcts_moe_seq)
+    set_tests_properties(test_dqnmcts_moe_seq PROPERTIES TIMEOUT 900)
 
     # ------------------------------------------- DQN+MCTS (MoE+TB 专家) 实测工具
     # **不进 ctest** (与 bench_dqnab_vs_ab / bench_sacaz_vs_ab 同一理由): 它跑真实对局
@@ -1298,6 +1443,35 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_sac_mcts_min_aligned)
 
+    # 同上, 再把专家换成**序列 Transformer** (用户口径: "sac agent 的 TB 专家使用
+    # seq transformer")。用途是**端到端冒烟**: 真的建网 (E=4 top-1, 每个专家 91,731
+    # 参数) → 对局 → 训练 → 存权重, 一条路走通; 单元断言那一路见 test_sacaz_aligned_seq。
+    add_executable(bench_sac_mcts_min_aligned_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_sac_mcts_min_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
+    target_compile_definitions(bench_sac_mcts_min_aligned_seq PRIVATE
+        SACAZ_ALIGNED_REPR=1 SACAZ_MOE_EXPERT_SEQ=1)
+    target_include_directories(bench_sac_mcts_min_aligned_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_sac_mcts_min_aligned_seq PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_sac_mcts_min_aligned_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_sac_mcts_min_aligned_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(bench_sac_mcts_min_aligned_seq)
+
     # ------------------------------------------- 策略头梯度不变量探针
     # 量"非法动作的头部权重是否逐位不变" —— 掩码 softmax 的契约 (dz 在非法列恒为 0)。
     # test_sacaz [11] 钉的是同一条; 这个探针用来**定位**它为什么坏 (熵项/裁剪/动作空间)。
@@ -1629,6 +1803,114 @@ if(CHESS_BUILD_TESTS)
         AUTOUIC OFF)
     chess_add_header_deps(train_bc)
 
+    # ------------- train_bc 的「SAC + 序列 Transformer 专家」变体 (2026-10 超参搜索)
+    # 为什么**另开一个目标**而不是给 train_bc 加个开关:
+    #   `SACAZ_MOE_EXPERT_SEQ` 与 `SACAZ_ALIGNED_REPR` 都是**编译期**开关 (前者是
+    #   `SparseMoE<Expert,…>` 的模板参数, 后者决定 STATE_DIM / ACTION_DIM), 而
+    #   `CHESS_CORE` 是在**不带宏**的口径下编出来的 ⇒ 这一支必须自己编那几个 agent
+    #   源文件 (与 `bench_sac_mcts_min_aligned_seq` / `test_sacaz_aligned_seq` 同一个做法)。
+    # 用途: 用**同一套 BC 口径** (AB 老师 + 留出 CE/top-1) 扫序列专家的两个宽度 ——
+    #   `--expert=` = 专家的 token 宽度 tokDim (必须是 `MOE_SEQ_HEADS=4` 的倍数),
+    #   `--hidden=` = 骨干之后那一层瓶颈的宽度。
+    #   cmake --build <build> --target train_bc_sacaz_seq
+    #   <build>/train_bc_sacaz_seq --agent=sac-moe --shared=1 --expert=64 --hidden=64 ^
+    #        --positions=300 --depth=4 --soft=1 --soft-depths=4 --epochs=8 --batch=64 ^
+    #        --lr=0.002 --seed=20240901 --holdout=5
+    add_executable(train_bc_sacaz_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/train_bc_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp
+        ${SRC_DIR}/ppo_train_opponents.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazmoetbagent.cpp
+        ${SRC_DIR}/sacazmoemlpagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp)
+    target_compile_definitions(train_bc_sacaz_seq PRIVATE
+        SACAZ_ALIGNED_REPR=1 SACAZ_MOE_EXPERT_SEQ=1)
+    target_include_directories(train_bc_sacaz_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(train_bc_sacaz_seq PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(train_bc_sacaz_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(train_bc_sacaz_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(train_bc_sacaz_seq)
+
+    # ------- train_bc_dqn: 两个 **Q 类 agent** (DQN+AB / DQN+MCTS) 的 BC 宽度扫描 -------
+    # 背景 (为什么要有这个工具): 这两支在此之前**没有任何 BC 路径** —— 于是"专家宽度
+    # (tokDim) / 骨干瓶颈宽度 (hidden) 取多少"只能靠 RL 胜率回答, 而胜率是对局级噪声。
+    # 本工具给出一个廉价代理读数: 同一份数据/同一个老师/同一个 seed 下, 留出 CE / top-1
+    # 对宽度的单调性 (口径与边界写在 src/bcdqnagent.hpp 的文件头 + 报告里)。
+    #
+    # 为什么**另开一个目标** (与 train_bc_sacaz_seq 同一条理由, 不能链 CHESS_CORE):
+    #   `DQNAB_MOE_EXPERT_SEQ` / `DQNMCTS_MOE_EXPERT_SEQ` 决定**专家类型** (SparseMoE 的
+    #   模板实参) 与 `STATE_DIM` (后者决定对齐表示), 都是编译期量; 而 CHESS_CORE 是在
+    #   **不带宏**的口径下编出来的 ⇒ 这一支必须自己编那两个 agent 的 .cpp 并带宏。
+    #   两个宏在**同一个二进制**里同时开 ⇒ 一条命令扫两支 (这才是本工具的目的)。
+    #
+    # ⚠ 不链 CHESS_CORE: 它里面的同名 agent 目标文件是**另一个结构** (TB 专家/1263 维),
+    #   链进来会与这里的 .cpp 目标文件重名冲突。
+    #   cmake --build <build> --target train_bc_dqn
+    #   <build>/train_bc_dqn --agent=dqnab --positions=300 --depth=4 --epochs=8 --batch=64 ^
+    #        --lr=0.002 --holdout=5 --hidden=64 --expert=64 --seed=20240901
+    #   <build>/train_bc_dqn --agent=dqnmcts-moe <同上> --soft=1 --soft-depths=4
+    add_executable(train_bc_dqn
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/train_bc_dqn_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/dqnabagent.cpp
+        ${SRC_DIR}/dqnmctsmoetbagent.cpp)
+    target_compile_definitions(train_bc_dqn PRIVATE
+        DQNAB_MOE_EXPERT_SEQ=1 DQNMCTS_MOE_EXPERT_SEQ=1)
+    target_include_directories(train_bc_dqn PRIVATE ${SRC_DIR})
+    target_link_libraries(train_bc_dqn PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(train_bc_dqn PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(train_bc_dqn PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(train_bc_dqn)
+
+    # ------ test_gui_seq_wiring: 钉住"界面那一支的专家真的是序列 Transformer" ------
+    # 它是 2026-10-16 那次事故 (四个宏只加在 `chess` 自己的源文件上, 而建 agent 的
+    # chessboard.cpp / 四个 agent 的 .cpp 都在 CHESS_CORE 里 ⇒ 界面显示"序列专家"、
+    # 实际跑 TB 专家) 的**回归测试**。链 `CHESS_CORE_SEQ` (= 界面那一份), 断言的是
+    # 编译期维数 + 权重前缀 + 主干参数量 (TB 28.8 M vs 序列 0.46 M)。
+    #   cmake --build <build> --target test_gui_seq_wiring && <build>/test_gui_seq_wiring
+    add_executable(test_gui_seq_wiring
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/gui_seq_wiring_main.cpp)
+    target_include_directories(test_gui_seq_wiring PRIVATE ${SRC_DIR})
+    target_link_libraries(test_gui_seq_wiring PRIVATE
+        CHESS_CORE_SEQ
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Widgets
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_gui_seq_wiring PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_gui_seq_wiring PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_gui_seq_wiring)
+    add_test(NAME test_gui_seq_wiring COMMAND test_gui_seq_wiring)
+
     # ------------------- 行为克隆 (BC) 的回归测试 (进 ctest)
     # 盯的是"BC 的口径与承诺", 而不是棋力:
     #   [1] 掩码交叉熵的解析梯度 == π − t (与 maskedSoftmaxBackward 的等价形式对照)
@@ -1895,6 +2177,38 @@ if(CHESS_BUILD_TESTS)
         AUTOUIC OFF
         AUTORCC OFF)
     chess_add_header_deps(test_sacaz_aligned)
+
+    # ------------------------------------------- 【2026-10 第五轮】(用户口径)
+    # "sac agent 的 TB 专家使用 seq transformer"。
+    # **同一份源码** + `SACAZ_ALIGNED_REPR=1` + `SACAZ_MOE_EXPERT_SEQ=1` —— 两个宏都必须在:
+    # 序列专家按格子切 token, 要求 dIn % 90 == 0, 而默认表示的 1263 = 17*90+3 不满足
+    # (头文件顶部有 `#error` 守卫, 配错了在编译期就报)。
+    # 专家是**模板参数**, 所以只能另开一个二进制; 默认构建 (TB 专家) 一位都不动。
+    add_executable(test_sacaz_aligned_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sacaz_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/sacazagent.cpp
+    ${SRC_DIR}/sacazmoetbagent.cpp
+    ${SRC_DIR}/sacazmoemlpagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_compile_definitions(test_sacaz_aligned_seq PRIVATE
+        SACAZ_ALIGNED_REPR=1 SACAZ_MOE_EXPERT_SEQ=1)
+    target_include_directories(test_sacaz_aligned_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(test_sacaz_aligned_seq PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(test_sacaz_aligned_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(test_sacaz_aligned_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    chess_add_header_deps(test_sacaz_aligned_seq)
     add_executable(test_sacaz
         ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sacaz_main.cpp
         ${SRC_DIR}/chess.cpp
