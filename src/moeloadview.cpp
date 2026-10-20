@@ -347,6 +347,10 @@ void MoeLoadView::updateAccessibility()
         /* 类型对, 但常驻实例还没建出来 (SAC+AZ-MoE 是懒建网的) —— 这与"这个 agent
            根本没有 MoE 读数"是两件事, 必须分开报 (实测: 刚选中那一刻就读到过它) */
         d = QStringLiteral("state=noinstance experts=0");
+    } else if (!m_snap.applicable && m_snap.moeFree) {
+        /* [2026-10-17] 结构上就没有 MoE (无 MoE 的深卷积主干那一支)。
+           与 noinstance 分开报: 前者等一等就有读数，这一支**永远不会有**。 */
+        d = QStringLiteral("state=nomoe agents=0");
     } else if (!m_snap.applicable) {
         d = QStringLiteral("state=na agents=0");
     } else {
@@ -481,7 +485,24 @@ void MoeLoadView::paintEvent(QPaintEvent *event)
         const QString who = m_snap.agentName.empty()
                                 ? QStringLiteral("当前 agent")
                                 : QString::fromStdString(m_snap.agentName);
-        if (m_snap.capable) {
+        if (m_snap.moeFree) {
+            /*
+               [2026-10-17] **结构上就没有 MoE** 的那一支 (换上新类之后的
+               "PPO+MCTS (深卷积残差,无MoE)")。
+               为什么必须有这一支提示: 以前这里只有"懒建"与"选错了 agent"两种说法,
+               而结构上没有 MoE 的 agent 会落进"懒建"那一段 —— 于是面板叫用户
+               "让它先走一步就会出现读数", 用户走了也不会有, 结论自然是"这控件坏了"
+               (用户就是这么报的: "MOE负载的显示似乎没蓝色柱条")。
+               文案要说的三件事: ①这一支本来就没有 MoE; ②所以本面板不适用(不是故障);
+               ③想看 MoE 负载该换哪一个。
+            */
+            p.drawText(QRect(pad, y, w - 2 * pad, lineH * 3),
+                       Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                       QStringLiteral("「%1」**没有 MoE 层** —— 它的主干是一份卷积残差，\n"
+                                      "没有门控/专家，所以本面板对它不适用（不是故障）。\n"
+                                      "想看 MoE 负载请换一个带“稀疏MoE”字样的 agent。")
+                           .arg(who));
+        } else if (m_snap.capable) {
             /*
                类型对、实例还没建 —— SAC+AZ-MoE 的常驻网络是**懒建**的 (第一次决策/
                预热时才建网)。实测: 在界面上刚选中它那一刻, 这里读到过这个状态。

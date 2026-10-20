@@ -1,5 +1,6 @@
 #include "chessboard.h"
 #include "bcagent.hpp"      /* 行为克隆的 agent 胶水层 (sampleFrom / update; 2026-10) */
+#include "rl/bc_auto.hpp"   /* 连败自动克隆的**纯判据** (2026-10-16; test_bc_auto 钉住) */
 #include "rl/cpuinfo.hpp"
 #include "rl/diag.h"        /* 价值评估曲线的口径: zFromGameResult / valueDiagOf (2026-10) */
 /*
@@ -18,6 +19,7 @@
 #include "sacazlegacyagent.h"
 #include "sacazmoetbagent.h"   /* AGENT_SACAZ_MOE = 稀疏 MoE + TB 专家 (独立类) */
 #include "sacazmoemlpagent.h"  /* AGENT_SACAZ_MOE_MLP = 稀疏 MoE + MLP 专家 (独立类) */
+#include "ppomctsconvagent.h"  /* AGENT_PPOMCTS_CONV = 独立类: 无 MoE 的深 ConvResNet (2026-10-17) */
 #include <QDebug>
 #include <QDir>
 #include <QFile>        /* 冻结快照的清理 (releaseFrozenOpponent) 与审计比对 */
@@ -87,7 +89,7 @@ QString agentDisplayName(ChessBoard::AgentType type)
        [2026-10 第三轮] PPO+MCTS 的 conv2d+ResNet 专家骨干那一支。名字里必须带上骨干口径
        —— 三支 PPO 在同一个下拉框里, 日志/奖励曲线/比分表上不能同名 (同名 = 读数没法归因)。
     */
-    case ChessBoard::AGENT_PPOMCTS_CONV: return QStringLiteral("PPO+MCTS (卷积残差)");
+    case ChessBoard::AGENT_PPOMCTS_CONV: return QStringLiteral("PPO+MCTS (深卷积残差,无MoE)");
     /*
        [2026-10 第四轮] **混合对手池** (它不是一支网): 这一方每一局抽一个真 agent
        (MCTS 50% + AB-L1..L4 各 12.5%) 来下这一局。名字里写清它是池子, 否则
@@ -510,11 +512,15 @@ static const RL::PPO::Backbone PPOMCTS_BACKBONE = RL::PPO::Backbone::SeqExperts;
  *      dqnmcts_moe_seq_agent / dqnab_seq_agent): 结构指纹与参数量都变了,
  *      **存量 TB 权重按设计载不进来**, 这是看得见的失败, 不是静默错读。
  *
- *  ⚠ AGENT_SACAZ_MOE / AGENT_SACAZ_OLD_MOE 的**动作口径**: 用户口径是"保留 128 槽
- *    哈希动作头" (`legacyHashAction`), 因为那次实测把掉 ~200 Elo 归因在稠密 8100
- *    策略头。注意实现上动作映射虽退回哈希, 但头张量仍是 `ACTION_DIM = 8100` 宽
- *    (ACTION_DIM 是编译期常量) —— 详见 sacazmoetbagent.h 里 `legacyHashAction`
- *    那段说明的边界, 与 docs/expert_search_optimization_plan_2026_10.md §8.4。
+ *  [2026-10-16 用户口径] AGENT_SACAZ_MOE / AGENT_SACAZ_OLD_MOE 的**动作口径**:
+ *    用户口径从"保留 128 槽哈希动作头"改为**与 PPO 对齐** —— 策略输出的就是同一个
+ *    8100 双射 (canonicalCell(from)*90 + to) 上、合法集归一化的分布, 于是"算法对照"
+ *    这一层才成立 (此前两个 agent 的输出空间不同构)。头张量宽度本来就是 8100
+ *    (ACTION_DIM 是编译期常量), 所以这一改**不加参数**; 上一轮"掉 ~200 Elo 归因于
+ *    稠密 8100 头"那条账 (docs/expert_search_optimization_plan_2026_10.md §8.4 /
+ *    docs/sac_regression_2026_09.md) 量的是"对齐表示 + 稠密头"整档, 本轮的棋力
+ *    **没有实测**, 需重训后复核。详见 sacazmoetbagent.h 里 `legacyHashAction`
+ *    那段说明 (那个消融开关仍然保留, 类默认值仍是 false)。
  * ================================================================
  */
 /*
@@ -578,30 +584,37 @@ static PPOMCTSAgent *makePpomctsAgent(Chess &env)
 }
 /*
  * ================================================================
- *  [2026-10 第三轮] **AGENT_PPOMCTS_CONV** (骨干 = conv2d + ResNet 专家)
+ *  [2026-10-17 用户口径] **AGENT_PPOMCTS_CONV = 单独类的 PPO+MCTS+ConvResNet (无 MoE)**
  * ================================================================
- *  与 AGENT_PPOMCTS / AGENT_PPOMCTS_MLP 是**同一个类、不同 Backbone** (算法/搜索/训练/
- *  自检一份代码), 只有第 9 个构造参数不同 —— 与 mlp 那一支同一手法, 所以三支能在界面上
- *  直接对弈比较。
+ *  用户: "使用单独类实现 PPO + MCTS + ConvResNet agent, 不使用 MOE, ConvResNet 加深网络,
+ *         代替 chess 程序现有 ConvResNetExpert 对应的 agent"。
  *
- *  为什么参数只有这一处: 这一支在 chessboard.cpp 里被构造 **7 次** (预加载、工厂、
- *  决策兜底、按需建网、后台兜底建网、后台训练 clone …), 手抄参数迟早就漏一处, 而
- *  "漏掉"的表现是"训练用的那一支"与"决策用的那一支"结构不一致 —— 这件事在权重往返上
- *  **看不出来** (与 PPOMCTS_BACKBONE / applyPpoBalance 同一条纪律: 结构只允许有一个来源)。
+ *  所以这个界面槽位现在构造的是**独立类** `PPOMCTSConvAgent` (`src/ppomctsconvagent.h`):
+ *    * 主干 = 一份 `ConvResNetExpert` 直接当层用 (**没有 MoE / 门控 / 负载均衡**);
+ *    * 加深 = 6 个残差块 (`PPOMCTSConvAgent::CONV_BLOCKS`, MoE 版是 4);
+ *    * 通道数 = 32 (`RL::PPO_CONV_CHANNELS`), 输入 23 通道 (19 平面 + 4 坐标/区域)。
+ *  依据: ①用户口径; ②本仓库 2026-10-16 的 E=1 vs E=4 消融
+ *  (`bench_gate_moe --experts=1|4`) 在**同等前向算力**下 4 个专家没有降低误差
+ *  (XOR 任务上反而更差约 30%) ⇒ "conv 之后上 MoE" 的前提在本工程的数据量下不成立;
+ *  ③`docs/conv_resnet_moe_analysis.md` §5 的原始建议就是"先别上 MoE"。
  *
- *  ⚠ 第 6 个参数 (expertHidden) 在 conv 专家里的语义是**通道数**, 所以必须传
- *    `RL::PPO_CONV_CHANNELS` (=32)。传成别处的 64 会改变 conv1/各块的权重形状,
- *    `Net::load` 的参数量守卫会让每一轮载入都失败。
- *  ⚠ **没有位置编码旋钮**: `setExpertPosMode` 对 conv 骨干返回 false (只有 seq 骨干有
- *    1d/2d/rope), 所以这里刻意**不调** applyPpomctsPosMode —— 调了会当场 qFatal。
- *  ⚠ 均衡/门控接线仍由调用方在构造后立刻 applyPpoBalance (与另外两支一致)。
+ *  ⚠ MoE 版**没有被删**: `RL::PPO::Backbone::ConvExperts` 仍在 (bench/train 工具与
+ *    `docs/conv_resnet_agent_2026_10.md` 的读数要靠它对照), 只是界面这个槽位换成了无 MoE 的类。
+ *  ⚠ 权重前缀随之换名 (见 defaultWeightPath): 结构完全不同 (少 3 份专家 + 门控),
+ *    共用前缀就是给"载错权重"留门。存量 `weights/ppomcts_conv_agent*` 从此不被读取,
+ *    想对照旧读数请走 bench/train 工具 (它们仍能建 MoE 版)。
+ *  ⚠ **没有位置编码旋钮**: `setExpertPosMode` 对 conv 骨干返回 false, 所以这里刻意
+ *    不调 applyPpomctsPosMode —— 调了会当场 qFatal。
+ *  ⚠ 均衡/门控接线**不适用本支** (没有门控): 构造后不再 applyPpoBalance。
  * ================================================================
  */
 static PPOMCTSAgent *makePpomctsConvAgent(Chess &env)
 {
-    return new PPOMCTSAgent(env, 64, 0.99f, 0.001f, 1.414f,
-                            RL::PPO_CONV_CHANNELS, 0.1f, true,
-                            RL::PPO::Backbone::ConvExperts);
+    return new PPOMCTSConvAgent(env, /*hiddenDim=*/64, 0.99f, 0.001f, 1.414f,
+                                PPOMCTSConvAgent::CONV_CHANNELS,
+                                PPOMCTSConvAgent::CONV_BLOCKS,
+                                /*withGrad=*/true,
+                                PPOMCTSConvAgent::CONV_COORD_PLANES);
 }
 /*
  * DQN+AB (AB 当 DQN 的 planning head) 的一次决策预算。
@@ -1037,22 +1050,37 @@ static SACAZMoETbAgent *createSACAZMoETbAgent(Chess &board, bool shared,
         board, SACAZ_HIDDEN, 0.99f, 0.001f, 1.5f, 64, SACAZ_MOE_AUX,
         shared ? SACAZMoETbAgent::TrunkMode::Shared
                : SACAZMoETbAgent::TrunkMode::Separate);
-#if defined(SACAZ_MOE_EXPERT_SEQ) && SACAZ_MOE_EXPERT_SEQ
     /*
-       [2026-10-15 用户口径] 序列专家那一支**保留 128 槽哈希动作**
-       (依据: docs/sac_regression_2026_09.md 与 conv_resnet_moe_analysis.md §7 把"对齐表示
-        掉约 200 Elo"归因在**稠密 8100 策略头**的宽度上, 而不是状态维数)。
-       它只是动作**索引**口径 (运行时读), 所以构造后设置有效 —— 不是 moeDense 那类
-       建网期参数。⚠ 头张量宽度不受它影响: ACTION_DIM 编译期仍是 8100。
+       ---- [2026-10-16 用户口径] 动作输出**与 PPO 对齐** ----
+       用户口径: "sac agent 对齐 ppo agent 输出"。
 
-       ⚠ 注意这条口径**只在界面生效**: 类的默认值是 false, 于是
-       `test_sacaz_aligned_seq` 那个变体仍在验证"对齐 + 8100 双射"那一档 ——
-       实测"对齐 + 哈希"会让该测试 4 条**学习动力学**断言不成立 (见
-       docs/expert_search_optimization_plan_2026_10.md §10.3), 那 4 条是按双射定标的。
-       谁要动这条口径, 请先看那一节。
+       上一轮 (2026-10-15) 的口径是"序列专家那一支保留 128 槽哈希动作", 于是 SAC 的
+       **输入** (19×90 = 1710, 对齐表示) 与 PPO 同构、而**输出**不同构: PPO 的策略是
+       8100 双射上的合法集掩码分布, SAC 则把同一局面的着法哈希到 128 个槽位
+       (实测同局面平均挤掉 5.16 个着法)。两个 agent 的输出空间不同构 ⇒ "算法对照"
+       那一层没法解释 (见 sacazagent.cpp 的 stepToActionIdx 与 docs/agents_design.md §11)。
+
+       本次改成**同类输出口径**: 不打开 `legacyHashAction` (保持类默认 false), 于是
+       `stepToActionIdx` 走 `canonicalCell(from)*90 + canonicalCell(to)` —— 与
+       PPOMCTSAgent **逐字同一个公式/同一个 8100 双射**, 策略也是同一套
+       "合法集上归一化的掩码 softmax" (policy / policySparse / sparseLeaf 都按 legalIdx)。
+
+       代价与边界 (必须和这条口径一起读, 否则下一步会误读):
+         * **不增加任何参数**: `ACTION_DIM` 是编译期常量 (对齐表示下恒为 8100), 头张量
+           本来就是 8100 宽 —— 这一改只改"可达槽位", 不改参数/数据比。上一轮"掉约
+           200 Elo 归因于动作头宽度"那条账 (docs/sac_regression_2026_09.md /
+           conv_resnet_moe_analysis.md §7) 量的是**对齐表示 + 稠密 8100 头**这一整档,
+           所以本轮这一改的棋力**没有实测**: 它是用户口径变更, 需重训后复核。
+         * **盘上没有 seq 口径的 SAC 权重** (只有 `_temp_train_sacaz_moe_shared_*` 这类
+           临时文件, 且是 10-12 的 TB 口径), 所以这一改没有作废任何模型;
+           但要训练/对局就得重新训练 (`train_bc_sacaz_seq` 等)。
+         * 128 槽哈希**没有删掉**: 它仍是类上的运行时消融开关 (`legacyHashAction=true`
+           可单独隔离"动作空间"这个变量), `test_sacaz_aligned_seq` 验证的正是对齐 +
+           双射那一档 —— 界面现在与那条测试同口径了, 不再分叉。
+         * 历史记录: 实测"对齐 + 哈希"会让 `test_sacaz_aligned_seq` 的 4 条学习动力学
+           断言不成立 (见 docs/expert_search_optimization_plan_2026_10.md §10.3),
+           那 4 条是按双射定标的 —— 这也是选双射而非哈希的一条独立佐证。
     */
-    a->legacyHashAction = true;
-#endif
     /*
        ---- 这个变体**不**开"从搜索学一次" (2026-09 用户口径) ----
        一次 learnBatch(32) 在稀疏 MoE+TB 骨干上实测 **228 ms/样本**(见 test_sacaz [12d]),
@@ -1151,6 +1179,12 @@ static SACAZLegacyAgent *createSACAZLegacyAgent(Chess &board, ChessBoard::AgentT
            "关掉从搜索学一次" 那行代码在本函数里没有对应物 —— 还原版本来就是只读搜索。
            [2026-10-15] 专家换成序列 Transformer 时, 同 `createSACAZMoETbAgent`
            那一条: 界面口径用 128 槽哈希动作 (类默认值保持 false)。
+
+           [2026-10-16 用户口径] **本支(还原版 SAC+AZ-OLD-MoE)不动** —— "SAC legacy
+           不修改": 动作口径仍按 2026-10-15 的口径钉在 128 槽哈希上, 与上面
+           `createSACAZMoETbAgent` 那一段(已改为与 PPO 对齐的双射)**刻意不同口径**。
+           这是用户明确要求的例外, 不是漏改: 对照两支的进展时, 这一支代表"哈希动作 +
+           序列专家"那一档, 主支代表"双射动作 + 序列专家"那一档。
         */
         {
             SACAZLegacyAgent *ag = new SACAZLegacyAgent(
@@ -1243,7 +1277,13 @@ static const ChessBoard::AgentType kWeightAgents[] = {
     ChessBoard::AGENT_DQNMCTS,
     ChessBoard::AGENT_PPOMCTS,
     ChessBoard::AGENT_SACAZ,
-    ChessBoard::AGENT_DQNAB,
+    /*
+       [2026-10-16 用户口径] **AGENT_DQNAB 移出这张表** —— 与 mainwindow.cpp 下拉框那
+       一条同步 (两处必须同时改, 见那边的完整说明: 评估结论是"设计不合理", 动作是
+       "移出产品面但保留代码")。它是列表里最重的一支, 不再为它读盘 + 建网。
+       类 / 权重前缀 / test_dqnab / bench_dqnab_vs_ab / train_bc_dqn --agent=dqnab
+       全都留着; 要恢复就是这里加回枚举 + 下面那段加载代码 (两处都要)。
+    */
     ChessBoard::AGENT_SACAZ_MOE,
   /*
      [2026-09 独立类] MoE + MLP 专家那一支: 排在 TB 那一组之后。
@@ -1311,7 +1351,8 @@ PGEagent *ChessBoard::m_sfPG = nullptr;
 DQNAgent *ChessBoard::m_sfDQN = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTS = nullptr;
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTSMLP = nullptr;
-/* conv2d+ResNet 专家骨干那一支 (AGENT_PPOMCTS_CONV): 同一个类, 不同 Backbone */
+/* [2026-10-17] AGENT_PPOMCTS_CONV = **独立类** PPOMCTSConvAgent (无 MoE 的深卷积主干);
+   它派生自 PPOMCTSAgent, 所以这里的指针类型不用改 (复用搜索/训练/自检一份代码) */
 PPOMCTSAgent *ChessBoard::m_sfPPOMCTSConv = nullptr;
 DQNMCTSAgent *ChessBoard::m_sfDQNMCTS = nullptr;
 EVABAgent *ChessBoard::m_sfEVAB = nullptr;
@@ -1513,13 +1554,13 @@ void ChessBoard::startupLoad()
            ⚠ 构造必须走 makePpomctsConvAgent: 第 6 个参数在 conv 专家里是**通道数**,
            手抄成 64 会让结构指纹对不上 (表现是每一轮载入都失败)。
         */
-        emit busyMessage(QStringLiteral("正在载入 PPO+MCTS (卷积残差) 权重…"));
+        emit busyMessage(QStringLiteral("正在载入 PPO+MCTS (深卷积残差,无MoE) 权重…"));
         if (m_sfPPOMCTSConv == nullptr) {
             m_sfPPOMCTSConv = makePpomctsConvAgent(env);
             applyPpoBalance(*m_sfPPOMCTSConv);
         }
         m_sfPPOMCTSConv->loadModel(s_weightPaths[AGENT_PPOMCTS_CONV]);
-        logLoad("PPO+MCTS (卷积残差)");
+        logLoad("PPO+MCTS (深卷积残差,无MoE)");
     }
     if (s_weightPaths.count(AGENT_DQNAB)) {
         emit busyMessage(QStringLiteral("正在载入 DQN+AB 权重… (主干 146 MB + 两个头)"));
@@ -2523,7 +2564,8 @@ void ChessBoard::setDynamicRewardEnabled(bool on)
  *    AGENT_PPOMCTS   : PPO+MCTS AlphaZero风格 (**1600 次模拟**, 见 PPO_SIMS ——
  *                      2026-10 第二轮与 MLP 专家对齐; 这一行原文写"80"、后来写"400",
  *                      都与当时的常量不符, 一并改正)
- *    AGENT_PPOMCTS_CONV : 同一个算法, 骨干 = 稀疏 MoE + conv2d+ResNet 专家
+ *    AGENT_PPOMCTS_CONV : 同一个算法, 骨干 = **无 MoE 的深 ConvResNet** (独立类
+ *                      `PPOMCTSConvAgent`, 6 个残差块; 2026-10-17 起替代原 MoE 版)
  *                      (**同 1600 次模拟** —— 它的每模拟代价与 seq 同量级)
  *    AGENT_DQNMCTS   : DQN+MCTS (默认 200 次迭代, 见 DQNMCTS_ITERATIONS)
  *    AGENT_EVAB      : EVAB - 学会评估的 Alpha-Beta (见 docs/agent_evab_design.md)
@@ -3708,12 +3750,14 @@ bool ChessBoard::getMoeLoad(AgentType type, MoeLoadSnapshot &out) const
         }
         break;
     /*
-       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支同样是稀疏 MoE (E=4 top-1),
-       `PPOMCTSAgent::moeUsage/Split` 对它一样成立 —— 不接的话表现与上面 PPO 那一支
-       当初一样: "选到它就什么都不显示" (用户报过"负载均衡状态控件并没有显示")。
+       [2026-10 第三轮] 稀疏 MoE + conv 专家那一支的读数。**⚠ [2026-10-17 起] 这个槽位
+       已换成独立类 `PPOMCTSConvAgent`（无 MoE 的深卷积主干）**，所以：
+         * 实例还没有 -> capable=true, applicable=false（懒建，与以前一样）；
+         * 实例在、但 `moeExpertCount() == 0` -> **moeFree=true**：判定为"这一支结构上
+           没有 MoE"，而不是"懒建" —— 后者会让面板叫用户"先走一步"，而走了也不会出现读数
+           （用户就是据此报的"MoE 负载的显示似乎没蓝色柱条"）。
     */
     case AGENT_PPOMCTS_CONV:
-        out.capable = true;
         if (m_sfPPOMCTSConv != nullptr) {
             out.experts = m_sfPPOMCTSConv->moeExpertCount();
             out.topK = m_sfPPOMCTSConv->moeTopK();
@@ -3721,7 +3765,15 @@ bool ChessBoard::getMoeLoad(AgentType type, MoeLoadSnapshot &out) const
             m_sfPPOMCTSConv->moeUsageSplit(out.train, out.infer);
             out.splitReady = !out.train.empty();
             out.applicable = (out.experts > 0);
-            m_liveMoeProbe.store(m_sfPPOMCTSConv->moeRouteProbe(), std::memory_order_release);
+            if (out.applicable) {
+                out.capable = true;
+                m_liveMoeProbe.store(m_sfPPOMCTSConv->moeRouteProbe(), std::memory_order_release);
+            } else {
+                /* 结构上没有 MoE: 不登记探针, 也不把自己标成 capable (那是懒建的口径) */
+                out.moeFree = true;
+            }
+        } else {
+            out.capable = true;   /* 实例还没建: 这一种才该说"先走一步" */
         }
         break;
     default:
@@ -5084,6 +5136,17 @@ QString ChessBoard::MatchStats::detail() const
         d += QStringLiteral("\n  后台训练: 本模式下跳过了 %1 轮 (不写主 agent 权重)")
                  .arg(bgRoundsSkippedByMode);
     }
+    /*
+       ---- [2026-10-16 用户口径] 连败自动克隆的本场记录 ----
+       必须印: "没触发"与"触发过且已还原"在比分上长得一模一样, 而前者说明这一场
+       输得还不算惨、后者说明本场**中途换过老师** —— 逐局明细里那几行 [BC-AUTO]
+       只是流水, 这里给的是结论行。
+    */
+    if (autoBcEngages > 0) {
+        d += QStringLiteral("\n  连败自动克隆: 本场触发 %1 次 (首次触发时已连败 %2 局; "
+                            "老师 = AB 深度 4, 胜一局或本场结束时还原)")
+                 .arg(autoBcEngages).arg(autoBcStreakAtEngage);
+    }
     if (!learnsSomething) {
         d += QStringLiteral("\n  注: 本场**不能**当作棋力结论 —— 只有固定参照物 +"
                             " 对照口径下的比分才可归因 (见 docs/agents_design.md §10.3"
@@ -5571,6 +5634,31 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
         }
     } playDivertGuard{this};
     /*
+       ---- [2026-10-16 用户口径] 连败自动克隆: 本场归零 + **任何退出路径都还原** ----
+       用户口径: "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4 直到胜一局"。
+       归零的理由与上面两条计数归零相同: 报告里的数必须是**本场**的。
+       RAII 还原是硬要求而不是讲究: 自动克隆临时改写的是 `m_bcTeacherDepth`, 而人机那条路
+       (`bcSampleForHumanTurn`) 只看 `> 0` —— 漏还原就等于那个自动打开的 4 **静默漏进
+       人机对局** (另一个作用域), 且没有任何报错。中止 / 提前 return / 正常结束三条路
+       都要走到这里, 所以用守卫而不是在函数末尾补一行 (与上面的 FrozenGuard 同一手法)。
+       `m_bcAutoRestoreDepth` 在**开场**就记下用户的下拉框值 —— 触发时不再读, 因为触发
+       那一刻下拉框可能已经被用户动过了。
+    */
+    m_bcAutoStreak.store(0);
+    m_bcAutoActive.store(false);
+    m_bcAutoRestoreDepth.store(m_bcTeacherDepth.load());
+    m_bcAutoEngagedCount.store(0);
+    struct AutoBcGuard {
+        ChessBoard *self;
+        ~AutoBcGuard()
+        {
+            /* 只有"自动开着的"才还原: 用户自己的选择不该被这里覆盖 */
+            if (self->m_bcAutoActive.exchange(false)) {
+                self->m_bcTeacherDepth.store(self->m_bcAutoRestoreDepth.load());
+            }
+        }
+    } autoBcGuard{this};
+    /*
        计数归零: 报告里的"B 方用快照走了几手"必须是**本场**的数 ——
        不归零的话, 一场没有快照的对局会带上上一场留下的数字 (那是假的读数)。
     */
@@ -5902,12 +5990,16 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
                            .arg(g + 1)
                            .arg(aIsRed ? st.agentA : st.agentB,
                                 aIsRed ? st.agentB : st.agentA);
-        if (res == Chess::RESULT_DRAW) {
+        /* [2026-10-16] 本局结果要先**提升到外面**: 连败自动克隆那一段 (下面) 要用它,
+           而它原来只在 else 分支里可见 —— 在那里重算一遍就是第二份胜负规则。 */
+        const bool aDraw = (res == Chess::RESULT_DRAW);
+        bool aWon = false;
+        if (aDraw) {
             line += QStringLiteral("和棋");
             st.draws++;
         } else {
             const bool redWon = (res == Chess::RESULT_RED_WIN);
-            const bool aWon = (redWon == aIsRed);
+            aWon = (redWon == aIsRed);
             line += aWon ? QStringLiteral("%1 胜").arg(st.agentA)
                          : QStringLiteral("%1 胜").arg(st.agentB);
             if (aWon) {
@@ -5917,6 +6009,14 @@ ChessBoard::MatchStats ChessBoard::matchAgents(AgentType typeA, AgentType typeB,
             }
         }
         st.games++;
+        /*
+           ---- [2026-10-16 用户口径] 连败 -> 自动行为克隆 (模仿 AB 深度 4) ----
+           位置就是"一局结束、胜负已知"的唯一一处 (与 valueDiagOnGameEnd / st.games 同一个
+           语义点), 且在**任何锁之外**: 自动克隆触发时要调 bcResetMatchStats (它碰 m_bcBuf,
+           只有局间安全), 而 playMatchGame 内部是每手都持锁的热路径。
+           实现与全部口径 (谁算"负"、和棋怎么办、怎么还原) 见 autoBcOnGameEnd。
+        */
+        autoBcOnGameEnd(typeA, typeB, aWon, aDraw, st);
         /*
            每局明细里带上"本局环境奖励": 这条曲线的意义是"模型下完一局拿到了多少
            奖励", 所以它同时也是逐局明细的一部分 (界面上的列表直接用它)。
@@ -6023,12 +6123,16 @@ std::string ChessBoard::defaultWeightPath(AgentType agentType)
     case AGENT_PPOMCTS:   return "weights/ppomcts_seq_agent.dat";
     case AGENT_PPOMCTS_MLP: return "weights/ppomcts_mlp_agent.dat";
     /*
-       [2026-10 第三轮] conv2d+ResNet 专家骨干那一支: **前缀独立**, 理由是权重格式不同 ——
-       conv 的参数是 `conv1(w,b) / 每块(w,b) / head(w,b)` 一串卷积张量, 与 tb/mlp/seq 三种
-       的参数量与写序都对不上 (结构指纹会拒绝交叉载入, 但共用前缀至少会让"这份权重是哪
-       一支的"变成只能靠猜, 并且后训练的那一支会**静默覆盖**另一支的同名文件)。
+       [2026-10-17 用户口径] **AGENT_PPOMCTS_CONV 换成独立类** (`PPOMCTSConvAgent`:
+       无 MoE 的深 ConvResNet, 6 个残差块)。前缀**必须随结构换名** —— 新结构少 3 份专家
+       与门控, 参数总量与张量写序都变了; 共用 `ppomcts_conv_agent` 会让
+       "载入旧 MoE 权重" 变成一次**看起来像文件损坏**的失败, 而不是一句"这不是我这一支的权重"。
+       因此:
+         * 存量 `weights/ppomcts_conv_agent.dat_*` (MoE 版, 6.9 MB) **不再被读取**,
+           但文件保留 —— bench/train 工具仍能建 MoE 版做对照;
+         * 本支从空网起步 (`ppomcts_conv_dense_agent`), 想有强度必须自己训/BC。
     */
-    case AGENT_PPOMCTS_CONV: return "weights/ppomcts_conv_agent.dat";
+    case AGENT_PPOMCTS_CONV: return "weights/ppomcts_conv_dense_agent.dat";
     case AGENT_DQNMCTS:   return "weights/dqnmcts_agent.dat";
     case AGENT_EVAB:      return "weights/evab_agent.dat";
     /* SAC+AZ 系: 前缀 -> <prefix>_actor / _q1 / _q2 (共享口径那一支是 _trunk + 三个头) */
@@ -6940,6 +7044,125 @@ void ChessBoard::bcFinishMatchReport(MatchStats &st)
 }
 
 /* ============================================================================
+ *  autoBcOnGameEnd - 连败 -> 自动行为克隆 (模仿 AB 深度 4)   [2026-10-16 用户口径]
+ * ============================================================================
+ * 用户口径: "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4 直到胜一局"。
+ *
+ * 每一条口径都写在这里, 因为每一条都**可以被读成另一件事**:
+ *
+ *  1. **谁在"负"**: A 方 = 学习者 (与 playMatchGame 的 A/B 约定同一份)。B 方的负
+ *     不算 —— 否则"A 赢了对方"也会触发克隆 (把功能做反了, 而且读数看不出来)。
+ *  2. **怎么数**: 负 +1、胜清零、**和棋也清零**(和棋不是负, 连败就此打断)。
+ *     即触发条件 = "连续 N 局既没和也没胜"。
+ *  3. **只在训练对局** (`MATCH_TRAIN`): 评估 / 只对弈的契约是"权重不变"(见每手
+ *     `bcOn` 那一行 gate), 而 BC 是学习 ⇒ 那些模式下**连计数都不做**, 免得报告里
+ *     留下一个"本可以触发"的状态 (读数必须自带前提)。
+ *  4. **触发后**: 老师深度临时改成 `AB_DEPTH` (= 4, 界面上那一档 Alpha-Beta;
+ *     与 mixed_opponents.hpp 的 `matchAbLevelOfDepth(4)` 是同一个映射 —— 当年正是
+ *     这条映射写错, 让"AB-L4"落到 SAC+AZ-MoE 那一档上)。**学生不变**, 仍由
+ *     `bcSupported` 按 A/B 实测类型决定。
+ *  5. **撤销**: 胜一局 -> 还原用户下拉框的值并关掉; 整场结束 (含中止) 由 matchAgents
+ *     里的 RAII 守卫还原。漏还原 = 那个 4 静默漏进人机对局 (另一个作用域)。
+ *  6. **报告**: 触发那一刻重设本场汇总 (学生标签写"自动: …", 老师写 AB-4 的名字)。
+ *     不重设的话报告会印出"学生=(未记录) 老师=(未记录)"而与 `teacher-depth=4` 自相矛盾
+ *     (学生/老师是**开场**那一刻认出来的, 那会儿本场根本没在克隆)。
+ *     代价: samples/updates 从**触发那一刻**重新计数 —— 所以报告里明写"自动启用后",
+ *     否则"本场只更新了 40 次"会被读成"整场只更新了 40 次"。
+ *  7. **线程**: 只在对局线程的局间调用 (不持棋盘锁 / agent 锁) —— 它内部会调
+ *     bcResetMatchStats, 而那一位会碰 m_bcBuf, 只有局间安全。
+ * ============================================================================ */
+void ChessBoard::autoBcOnGameEnd(AgentType typeA, AgentType typeB, bool aWon, bool aDraw,
+                                 MatchStats &st)
+{
+    /* 3) 模式闸门 */
+    if (m_matchMode.load() != MATCH_TRAIN) {
+        return;
+    }
+
+    const int threshold = (m_bcAutoThreshold.load() > 0) ? m_bcAutoThreshold.load() : 1;
+    const bool hasStudent = bcSupported(typeA);
+
+    /*
+       判据在**纯函数**里 (`src/rl/bc_auto.hpp`) —— 那样 `test_bc_auto` 才能把
+       "胜 / 负 / 和 × 阈值前后 × 有无学生"逐条钉住, 而不需要在这里跑一整场对局。
+       本函数只做三件有副作用的事: 把状态落回成员、改老师深度、发信号/写报告。
+    */
+    RL::BcAuto::State in;
+    in.streak = m_bcAutoStreak.load();
+    in.active = m_bcAutoActive.load();
+    const RL::BcAuto::Decision d =
+        RL::BcAuto::advance(in, threshold, aWon, aDraw, hasStudent);
+
+    m_bcAutoStreak.store(d.streak);
+    if (d.active != in.active) {
+        m_bcAutoActive.store(d.active);
+    }
+
+    switch (d.step) {
+    case RL::BcAuto::Step::Disengage: {
+        /* 5) 胜一局: 关掉自动克隆, 还原用户的选择 (判据已在 advance 里做了) */
+        const int restore = m_bcAutoRestoreDepth.load();
+        m_bcTeacherDepth.store(restore);
+        const QString restored = (restore > 0) ? bcTeacherName(restore)
+                                               : QStringLiteral("关");
+        st.log += QStringLiteral("  [BC-AUTO] 连败后胜一局 -> 自动克隆结束, 老师还原为 %1\n")
+                      .arg(restored);
+        emit bcProgress(QStringLiteral(
+            "[BC-AUTO] 胜一局 -> 自动克隆结束, 老师深度还原为 %1").arg(restored));
+        return;
+    }
+    case RL::BcAuto::Step::Engage: {
+        /* ---- 武装 ---- */
+        /* 还原目标 = 触发这一刻的下拉框值 (对局中控件是禁用的, 所以它 == 开场那个值;
+           但如果将来放开禁用, 这里记的是"用户现在要的", 比开场快照更对)。 */
+        m_bcAutoRestoreDepth.store(m_bcTeacherDepth.load());
+        m_bcTeacherDepth.store(AB_DEPTH);
+        m_bcAutoEngagedCount.fetch_add(1);
+
+        /* 6) 本场汇总重设: 标签从此不再"未记录" */
+        const QString studentLabel =
+            bcSupported(typeB)
+                ? QStringLiteral("自动: %1 + %2 (连败触发, 两侧都在克隆)")
+                      .arg(agentDisplayName(typeA), agentDisplayName(typeB))
+                : QStringLiteral("自动: %1 (连败触发)").arg(agentDisplayName(typeA));
+        bcResetMatchStats(studentLabel, bcTeacherName(AB_DEPTH));
+
+        if (st.autoBcEngages == 0) {
+            st.autoBcStreakAtEngage = d.streak;
+        }
+        st.autoBcEngages++;
+
+        const QString note = QStringLiteral(
+            "[BC-AUTO] A 方连败 %1 局 -> 自动启用行为克隆 (老师 = %2, 深度 %3), "
+            "下一局起生效; 胜一局即结束")
+            .arg(d.streak).arg(bcTeacherName(AB_DEPTH)).arg(AB_DEPTH);
+        st.log += QStringLiteral("  ") + note + QStringLiteral("\n");
+        emit bcProgress(note);
+        /* 界面用这一条补建 BC 曲线 (线原本只在开场按下拉框武装, 场中才开老师会画不出点) */
+        emit bcAutoEngaged(AB_DEPTH);
+        return;
+    }
+    case RL::BcAuto::Step::CountLoss: {
+        /*
+           学生闸门: 没到 BC 路径的 agent (纯搜索 / 没有策略头) 点了也没用。
+           "没用"必须说出来 —— 静默的判据就是下一次的误读。只在**刚好到阈值**那一次说。
+        */
+        if (!hasStudent && d.streak == threshold) {
+            st.log += QStringLiteral("  [BC-AUTO] A 方已连败 %1 局, 但 %2 没有行为克隆路径 -> 未启用\n")
+                          .arg(d.streak).arg(agentDisplayName(typeA));
+            emit bcProgress(QStringLiteral(
+                "[BC-AUTO] A 方已连败 %1 局, 但 %2 没有行为克隆路径 -> 未启用自动克隆")
+                .arg(d.streak).arg(agentDisplayName(typeA)));
+        }
+        return;
+    }
+    case RL::BcAuto::Step::None:
+    default:
+        return;
+    }
+}
+
+/* ============================================================================
  *  ---- [2026-10] 价值评估 (EV/校准): 从每手的 V(s) 到一条曲线 ----
  * ============================================================================
  *
@@ -7592,7 +7815,7 @@ void ChessBoard::backgroundTrainLoop()
                                                        getMixedOpponentAbDepth());
                 }
                 if (!clone->loadModel(tmpWeights)) {
-                    qWarning() << "[train] PPO+MCTS (卷积残差) clone 载入种子权重失败, 本轮丢弃"
+                    qWarning() << "[train] PPO+MCTS (深卷积残差,无MoE) clone 载入种子权重失败, 本轮丢弃"
                                << "(临时文件与当前网络架构不匹配? 路径" << tmpWeights << ")";
                     break;
                 }
@@ -7604,7 +7827,7 @@ void ChessBoard::backgroundTrainLoop()
                                      roundMaxMoves, false);
                 roundLoss = clone->getLastTrainLoss();
                 if (!clone->saveModel(tmpWeights)) {
-                    qWarning() << "[train] PPO+MCTS (卷积残差) 训练权重写回失败, 本轮丢弃";
+                    qWarning() << "[train] PPO+MCTS (深卷积残差,无MoE) 训练权重写回失败, 本轮丢弃";
                     break;
                 }
                 roundApplied = true;
@@ -7849,7 +8072,7 @@ void ChessBoard::backgroundTrainLoop()
             /* [2026-10 第三轮] conv 骨干那一支: 从**自己的**临时前缀同步回**自己的**实例 */
             case AGENT_PPOMCTS_CONV:
                 if (m_sfPPOMCTSConv && !m_sfPPOMCTSConv->loadModel(tmpWeights)) {
-                    qWarning() << "[train] PPO+MCTS (卷积残差) 权重同步回主 agent 失败";
+                    qWarning() << "[train] PPO+MCTS (深卷积残差,无MoE) 权重同步回主 agent 失败";
                 }
                 break;
             case AGENT_DQNMCTS:
@@ -7990,8 +8213,9 @@ int ChessBoard::saveAllInstantiatedAgentsOnExit()
                               /* [2026-09 dev-dqnmcts-moetb] 独立类, 正式前缀
                                  weights/dqnmcts_moe_agent_* (与旧类的单文件不同) */
                               AGENT_DQNMCTS_MOE,
-                              /* [2026-10 第三轮] conv 骨干那一支: 正式前缀
-                                 weights/ppomcts_conv_agent.dat_actor / _critic */
+                              /* [2026-10-17 用户口径] conv 骨干那一支已换成**独立类**
+                                 (PPOMCTSConvAgent: 无 MoE 的深卷积主干), 正式前缀
+                                 weights/ppomcts_conv_dense_agent.dat_actor / _critic */
                               AGENT_PPOMCTS_CONV };
     /*
        ⚠ [2026-10] 表里这四个 (PG / DQN / AGENT_SACAZ_OLD / AGENT_SACAZ_OLD_MOE)

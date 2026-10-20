@@ -263,20 +263,25 @@ public:
         AGENT_DQNMCTS_MOE,
         /*
            ================================================================
-           PPO+MCTS+AlphaZero 的**第三个骨干**: 稀疏 MoE + **conv2d + ResNet 专家**
-           (ConvExperts, E=4 top-1) —— 界面类型 AGENT_PPOMCTS_CONV。
+           PPO+MCTS+AlphaZero 的**第三个骨干**: **无 MoE 的深 ConvResNet**
+           (`Backbone::ConvDense`, 独立类 `PPOMCTSConvAgent`) —— 界面类型 AGENT_PPOMCTS_CONV。
            ================================================================
-           与 AGENT_PPOMCTS / AGENT_PPOMCTS_MLP 的关系就是那两个之间的关系:
-           **算法、搜索、训练、自检是同一份代码** (同一个 PPOMCTSAgent 类, 只是构造时传的
-           Backbone 不同), 所以三支能在界面上直接对弈比较, 而不是三份会漂移的实现。
+           [2026-10-17 用户口径] 这个槽位原来跑的是"稀疏 MoE + conv2d+ResNet 专家
+           (ConvExperts, E=4 top-1)", 现在换成**单独类 + 无 MoE + 加深**:
+           用户口径 "使用单独类实现 PPO + MCTS + ConvResNet agent, 不使用 MOE,
+           ConvResNet 加深网络, 代替 chess 程序现有 ConvResNetExpert 对应的 agent"。
+           搜索/训练/自检仍然复用 `PPOMCTSAgent` 一份代码 (新类是它的派生类), 所以三支
+           依然能在界面上直接对弈比较, 而不是三份会漂移的实现。
              * 骨干把状态**当成图像**看: 19 通道 x 10 行 x 9 列 + 4 个坐标/区域通道,
-               3x3 卷积 + 4 个残差块 + 1x1 头 (见 src/rl/conv_resnet.hpp);
-             * 每专家 44,275 参数 / 每次前向 3.97 M MAC ⇒ actor **819,948** 参数,
-               实测 0.123 ns/MAC (与 seq 专家同一量级) ⇒ 模拟预算沿用 PPO_SIMS,
-               **不新增预算常量**;
-             * **权重文件独立** (`weights/ppomcts_conv_agent.dat`): conv 的参数结构与
-               tb/mlp/seq 三种都不同, 结构指纹会拒绝交叉载入 —— 但名字上分开才不用猜
-               "这份权重是哪一支的"(共用前缀 = 后训练的那一支静默覆盖另一支)。
+               3x3 卷积 + **6 个残差块** (MoE 版是 4) + 1x1 头 (见 src/rl/conv_resnet.hpp);
+             * **没有门控/专家集合/负载均衡/辅助损失** —— 一份主干就是全部容量;
+               依据见 `docs/conv_resnet_moe_analysis.md` §0.b/§0.c 的实测;
+             * 坐标/区域通道是**运行时开关** (`PPOMCTSConvAgent::CONV_COORD_PLANES` /
+               构造参数 `coordPlanes`), 供消融 (23 vs 19 通道);
+             * **权重前缀更换** (`weights/ppomcts_conv_dense_agent.dat`): 新结构少 3 份专家
+               与门控, 参数总量与写序都变了 —— 与 MoE 版共用前缀等于给"载错权重"留门;
+             * MoE 版**没有删**: `Backbone::ConvExperts` 仍在, bench/train 工具与
+               `docs/conv_resnet_agent_2026_10.md` 的读数仍靠它对照。
            ⚠ 这一支**没有位置编码旋钮** (`setExpertPosMode` 对 conv 骨干返回 false,
              只有 seq 骨干有 1d/2d/rope), 所以它的构造点**刻意不调** applyPpomctsPosMode。
            **必须追加在枚举末尾**: 这些值会经 GUI 下拉框的 userData 传出去
@@ -433,6 +438,17 @@ public:
         };
         std::vector<PoolStat> poolStats;   /* 空 = 本场没有用池子 */
         int poolGames = 0;                 /* == Σ poolStats[*].games */
+        /*
+           ================================================================
+           [2026-10-16 用户口径] 连败 -> 自动行为克隆的**本场记录**
+           ================================================================
+           用户口径: "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4 直到胜一局"。
+           这两个数回答的是"本场到底触发过没有、触发时已经连败几局" —— 只靠日志行
+           不够: 报告是用户事后唯一会翻的地方, 而"没有触发"与"触发了但已还原"在比分上
+           长得一模一样。
+        */
+        int autoBcEngages = 0;        /* 本场自动启用的次数 (0 = 没触发) */
+        int autoBcStreakAtEngage = 0; /* 第一次触发那一局的连败数 (阈值) */
         QString frozenNote;
         bool frozenToSnapshot = false;      /* 真的用了开场快照实例 */
         bool frozenAuditDone = false;       /* 做了逐字节审计 */
@@ -750,6 +766,17 @@ public:
         */
         bool capable = false;       /* 这个 agent **类型**有已接线的 MoE 读数吗 */
         bool applicable = false;    /* 实例在、而且真的读到了专家数 */
+        /*
+           [2026-10-17 用户报的现象] **这一支在设计上就没有 MoE** —— 与 `capable`
+           (类型有读数但实例懒建) 是**两种完全不同的"没有柱条"**, 必须分开。
+           用户实测报的正是这条: 界面选中新换上的"PPO+MCTS (深卷积残差,无MoE)"之后,
+           MoE 负载面板一片空白, 而面板当时给的话是"有稀疏 MoE, 但实例还没建出来 ——
+           让它先走一步就会出现读数"。那句话对**懒建**成立, 对这一支是错的:
+           走了也不会有 MoE 读数 (它的主干是一份卷积, 没有门控)。
+           为什么"懒建"与"设计上没有"必须区分: 前者让用户去等, 后者让用户去换 agent ——
+           提示说错了, 用户下一步就做错。
+        */
+        bool moeFree = false;       /* 这一支**结构上**没有 MoE (不是懒建, 也不是没接线) */
         bool splitReady = false;    /* 训练侧/推理侧分开的计数可用吗 */
         /*
            agent 的显示名 (如 "SAC+AZ-MoE")。**必须带上**: 控件在"不适用"时如果只写
@@ -946,6 +973,16 @@ signals:
      * 它的生命周期就是**这一场对局**, 而这一场的收尾由 matchFinished 那条既有路径报告。
      */
     void bcProgress(const QString &line);
+    /*
+     * ---- [2026-10-16 用户口径] 连败自动克隆"刚被触发" ----
+     * 与 bcProgress 分开的理由: 界面在收到这一条时必须做一件 bcProgress 做不到的事 ——
+     * **补建 BC 曲线的两条线**。线是在每场开始时按"下拉框 ≠ 关 且 有学生"武装的
+     * (`armBcChartSeries`), 而自动克隆是在**场中**才打开老师的, 那时线还没建 ⇒
+     * `CurveChart::addPoint` 会**静默 return** ⇒ "明明在克隆, 曲线一直空着"
+     * (本工程刚为这个静默付过一次账)。所以触发时刻必须有独立的一条信号。
+     * `teacherDepth` = 自动克隆实际用的老师深度 (= AB_DEPTH, 界面上那一档 Alpha-Beta)。
+     */
+    void bcAutoEngaged(int teacherDepth);
     /*
      * ---- [2026-10] BC 保真度采样 (给"行为克隆"那条曲线) ----
      *
@@ -1583,6 +1620,17 @@ public:
      */
     bool isBcSoftTarget() const { return m_bcSoftTarget.load(); }
     void setBcSoftTarget(bool on) { m_bcSoftTarget.store(on); }
+    /*
+       [2026-10-16 用户口径] 连败自动克隆的阈值与状态 (默认 5; 见 m_bcAutoStreak 的说明)。
+
+       为什么把阈值做成可写: 它是"多久算输惨了"这一个**判据**, 而与棋力无关 ——
+       写死的话, 想验证"触发之后到底有没有用"就只能改代码重编 (本工程反复吃过
+       "判据不可注入 ⇒ 只能靠改源码做实验"的亏)。默认值仍是用户口径的 5, 一个字没变。
+    */
+    int bcAutoLossThreshold() const { return m_bcAutoThreshold.load(); }
+    void setBcAutoLossThreshold(int n) { m_bcAutoThreshold.store(n > 0 ? n : 1); }
+    bool isBcAutoCloningActive() const { return m_bcAutoActive.load(); }
+    int bcAutoEngagedCount() const { return m_bcAutoEngagedCount.load(); }
     /* 深度 -> 显示名 (唯一来源: 界面下拉框、对局报告、面板全都用这一份) */
     static QString bcTeacherName(int depth);
     /*
@@ -1948,6 +1996,29 @@ private:
     QString m_bcMatchAgent;
     QString m_bcMatchTeacher;
     /*
+       ==================================================================
+       [2026-10-16 用户口径] 连败 -> 自动行为克隆 (模仿 AB 深度 4)
+       ==================================================================
+       用户口径: "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4 直到胜一局"。
+
+       为什么用"临时改写 m_bcTeacherDepth"而不是另立一条 BC 通道:
+         * 每手的 gate (`bcOn` 那一行) **本来就每手重读** m_bcTeacherDepth, 所以局间
+           改它, 下一局第一手就生效 —— 不需要在 playMatchGame 的热路径里加分支;
+         * 学生/老师的判定 (bcSupported / bcHasStudent)、样本缓冲、批更新、报告全部
+           复用既有那一套 —— 另开一条路就是第二份实现, 两份迟早分叉。
+       反过来说, 这也意味着**必须还原**: `bcSampleForHumanTurn` 只看 m_bcTeacherDepth > 0,
+       所以自动打开的 4 如果漏还原, 会静默漏进**人机对局** (那是另一个作用域)。
+       所以: 胜一局还原、整场结束(含中止)也由 RAII 守卫还原。
+
+       ⚠ 与 m_bcTeacherDepth 同一把"谁写"的纪律: 只有对弈线程在局间写, GUI 线程读;
+         这里用 atomic 的理由与 m_bcTeacherDepth 完全相同。
+    */
+    std::atomic<int> m_bcAutoStreak{0};        /* A 方(学习者)当前连续负了几局 */
+    std::atomic<int> m_bcAutoThreshold{5};     /* 触发阈值 (用户口径 = 5) */
+    std::atomic<bool> m_bcAutoActive{false};   /* 自动克隆是否正在生效 */
+    std::atomic<int> m_bcAutoRestoreDepth{0};  /* 触发时保存的"用户下拉框值" (还原目标) */
+    std::atomic<int> m_bcAutoEngagedCount{0};  /* 本场触发次数 (报告用) */
+    /*
      * 人机那条路的"一局一次"归零标志 (2026-10): 人机没有"场"的概念, 而读数必须是
      * **这一局**的累计 ⇒ 第一次采样时归零 (compare-exchange, 只有第一次为真),
      * 终局/重开 (setHumanGameInProgress(false)) 时清掉。
@@ -1998,6 +2069,15 @@ private:
     /* 局末: 把本局的 (V, mover) 折算成 (V, z) 进滚动窗口, 窗口够大就发一次读数 */
     void valueDiagOnGameEnd(int result, int gameNo);
     void bcFinishMatchReport(MatchStats &st);
+    /*
+       [2026-10-16 用户口径] 连败自动克隆的**局间钩子** (每局结束、结果已知时调一次)。
+
+       只在 matchAgents 的对局循环里调 (= 局边界、**不持**棋盘锁与 agent 锁) ——
+       它内部会调 bcResetMatchStats, 而那一位会碰 m_bcBuf, 只有局间安全。
+       aWon/aDraw 是**A 方(学习者)视角**的本局结果 (A 的胜负口径见 playMatchGame)。
+    */
+    void autoBcOnGameEnd(AgentType typeA, AgentType typeB, bool aWon, bool aDraw,
+                         MatchStats &st);
     /*
        atomic: 置位/清位在 GUI 线程 (start/stop), 而读取在训练线程的循环条件、
        以及暂停闸门的 wait 谓词里 —— 一个普通 bool 被两条线程读写是数据竞争

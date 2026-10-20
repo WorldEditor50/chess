@@ -16,6 +16,7 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTextCursor>      /* BC 的进度行要追加到自检视图末尾 (2026-10) */
+#include <QSignalBlocker>   /* 连败自动克隆: 同步下拉框显示而不触发回调 (2026-10-16) */
 #include <QTabWidget>       /* "训练损失 / 行为克隆"两个 tab (2026-10 用户口径) */
 #include <QLabel>           /* BC 曲线下面的读数行 (代码里建) */
 #include <QVBoxLayout>      /* tab 页的布局 */
@@ -113,15 +114,22 @@ const AgentChoice kAgents[] = {
     */
     { "PPO+MCTS (AlphaZero, 稀疏MoE+MLP专家)", ChessBoard::AGENT_PPOMCTS_MLP },
     /*
-       [2026-10 第三轮] PPO+MCTS 的**第三个骨干**: 稀疏 MoE + **conv2d + ResNet 专家**
-       (E=4 top-1)。把状态当图像看 (19 通道 x 10 行 x 9 列 + 4 个坐标/区域通道) ——
-       与前两支是"同一份实现 + 不同 Backbone", 所以挨着放才能直接选中互相对弈比较。
-       它的每专家容量最小 (44,275 参数 / 3.97 M MAC), 但实测 0.123 ns/MAC, 一次模拟与
-       seq 同量级, 所以模拟预算同样是 PPO_SIMS(1600)。**权重文件独立**
-       (weights/ppomcts_conv_agent.dat_actor/_critic): conv 的参数结构与 tb/mlp/seq 都不同,
-       共用一个前缀只会让两边静默互相覆盖。
+       [2026-10-17 用户口径] PPO+MCTS 的**第三个骨干**: **无 MoE 的深 ConvResNet**
+       (`Backbone::ConvDense`, 独立类 `PPOMCTSConvAgent`)。
+       它替代了 2026-10-15 那一版"稀疏 MoE + conv2d+ResNet 专家 (E=4 top-1)":
+         * 用户口径: "使用单独类实现 PPO + MCTS + ConvResNet agent, 不使用 MOE,
+                      ConvResNet 加深网络, 代替 chess 程序现有 ConvResNetExpert 对应的 agent";
+         * 结构: 一份主干 (23 通道 -> 6 个残差块, 比 MoE 版的 4 块深) -> Tanh(h) -> 头;
+           没有门控/专家集合/负载均衡, 也没有辅助损失;
+         * 依据: 本仓库 2026-10-16 的 E=1 vs E=4 消融 (`bench_gate_moe --experts=1|4`)
+           在等算力下 4 专家没有降低误差 (XOR 任务上反而更差), 与 `docs/conv_resnet_moe_analysis.md`
+           §5 的原始建议一致;
+         * 权重前缀随之换成 `weights/ppomcts_conv_dense_agent.dat_actor/_critic`
+           (结构不同 ⇒ 与 MoE 版不能共用前缀)。存量 `ppomcts_conv_agent*` 不再被读取。
+       ⚠ MoE 版**没有删**: `Backbone::ConvExperts` 仍在, bench/train 工具与
+         `docs/conv_resnet_agent_2026_10.md` 的读数仍靠它对照。
     */
-    { "PPO+MCTS (卷积残差)",         ChessBoard::AGENT_PPOMCTS_CONV },
+    { "PPO+MCTS (深卷积残差,无MoE)",  ChessBoard::AGENT_PPOMCTS_CONV },
     { "DQN+MCTS (AlphaZero)",        ChessBoard::AGENT_DQNMCTS },
     /*
        [2026-09 dev-dqnmcts-moetb] **同一个算法, 另一个骨干** —— 与上面那一项成对排列
@@ -172,18 +180,33 @@ const AgentChoice kAgents[] = {
         `test_sacaz` [14] 节与 `bench_sacaz_vs_ab --legacy` 仍在用它们。)
     */
     /*
-       DQN+AB: **把 Alpha-Beta 当成 DQN 的 planning head**。
-       网络 (稀疏 MoE + 专家 + Dueling 双头) 给 AB 排序与叶子值, AB 的展开结果
-       反过来当 TD 目标。与上面几个 agent 的关键差别: 它的"搜索"是**对抗展开**,
-       杀棋/战术看得见 (实测一步杀局面 8/8 命中, 而纯 Q-argmax 是 0/8)。
-       [2026-10-15] 按用户口径专家换成**序列 Transformer** (`-DDQNAB_MOE_EXPERT_SEQ=1`);
-       它的表示本来就是 19×90=1710 (Markov 完备的 5 个规则平面), 所以这次只换专家。
+       ================================================================
+       [2026-10-16 用户口径] 下拉框移除 **DQN+AB**
+       ================================================================
+       用户口径 (第 3 项评估的结论落地): "评估 DQN+AB 设计是否合理, 合理就改 MLP 专家,
+       不合理就删除" —— **评估结论: 设计不合理** (证据见 docs/agent_dqnab_design.md
+       与本次评估记录), 而且"改 MLP 专家"打在非瓶颈上 (更便宜的专家换来的是搜索深度,
+       而"更深搜索"这一条单变量实测反而更差 12.5%->0%)。所以按"不再作为产品面"处理。
+
+       采取的动作与上面 PG / DQN / SAC 还原版那一条**完全相同** (本工程既有做法):
+       只把这个下拉框条目与启动预加载摘掉, **类 / 权重前缀 / bench / 测试全都留着** ——
+       `test_dqnab`、`test_dqnab_seq`、`bench_dqnab_vs_ab`、`train_bc_dqn --agent=dqnab`
+       仍可跑, 它的 115 条机制断言与 AB 对局台架也还在 (想复现评估结论时唯一的入口)。
+         * 省下的是启动成本: 它是列表里最重的一支 (GUI 预算 256 次网络前向 ≈ 0.8 s/手,
+           后台训练一轮权重往返的 `_temp_train_dqnab_trunk` 是 276 MB 量级);
+         * 省掉的**能力** (诚实记一笔): 界面上再也选不到"AB 当 planning head"这一支,
+           也就没有"Q-learning + AB 搜索 vs Q-learning + PUCT"的直接对弈 —— 那条对比
+           现在只能走 bench_dqnab_vs_ab / bench_match_modes。
+       想恢复: 把下面那两行取消注释 **并且** 加回 chessboard.cpp 的 kWeightAgents
+       (两处都要 —— 只加前者会"能选中但没预热", 只加后者会"预热了但选不到")。
+
+       原条目 (保留原文备查):
+         #if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
+             { "DQN+AB (AB+DuelingDQN, 稀疏MoE+序列专家)", ChessBoard::AGENT_DQNAB },
+         #else
+             { "DQN+AB (AB+DuelingDQN, 稀疏MoE+TB专家)", ChessBoard::AGENT_DQNAB },
+         #endif
     */
-#if defined(DQNAB_MOE_EXPERT_SEQ) && DQNAB_MOE_EXPERT_SEQ
-    { "DQN+AB (AB+DuelingDQN, 稀疏MoE+序列专家)", ChessBoard::AGENT_DQNAB },
-#else
-    { "DQN+AB (AB+DuelingDQN, 稀疏MoE+TB专家)", ChessBoard::AGENT_DQNAB },
-#endif
 };
 
 /*
@@ -231,7 +254,7 @@ bool agentIsTrainable(ChessBoard::AgentType type)
     /* [2026-09 dev-dqnmcts-moetb] DQN+MCTS (稀疏MoE+TB专家): 有参数可存 (主干 + Q 头) */
     case ChessBoard::AGENT_DQNMCTS_MOE:
     case ChessBoard::AGENT_PPOMCTS_MLP:
-    /* [2026-10 第三轮] conv 骨干那一支同样有参数可存 (actor + critic 两个文件) */
+    /* [2026-10-17] conv 骨干那一支 (独立类、无 MoE) 同样有参数可存 (actor + critic 两个文件) */
     case ChessBoard::AGENT_PPOMCTS_CONV:
         return true;
     default:
@@ -309,9 +332,15 @@ MainWindow::MainWindow(QWidget *parent)
                          ui->selfCheckView->insertPlainText(line + QStringLiteral("\n"));
                          ui->selfCheckView->moveCursor(QTextCursor::End);
                      });
+    /*
+       [2026-10-16 用户口径] 连败自动克隆刚被触发 -> 界面补建曲线 + 同步下拉框显示。
+       单独一条信号 (而不是塞进 bcProgress 的文本里让界面去 parse): 界面要做的是
+       "建两条线"这种**动作**, 从日志文本反推动作是本工程反复吃过亏的做法。
+    */
+    QObject::connect(ui->gameWidget, &ChessBoard::bcAutoEngaged, this,
+                     &MainWindow::onBcAutoEngaged);
     QObject::connect(ui->matchAComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-                     this, [this](int) { updateBcMatchControlsEnabled(); });
-    QObject::connect(ui->matchBComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     this, [this](int) { updateBcMatchControlsEnabled(); });    QObject::connect(ui->matchBComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
                      this, [this](int) { updateBcMatchControlsEnabled(); });
     /*
        "对战AI" 那一支也要接: 人机对战时**学生就是它** (老师来自 BC 下拉框, 与"对面"
@@ -1364,6 +1393,48 @@ void MainWindow::onBcTeacherChanged(int index)
 }
 
 /*
+ * ============================================================================
+ *  onBcAutoEngaged - 连败自动克隆刚被触发 (棋盘侧的决定)   [2026-10-16 用户口径]
+ * ============================================================================
+ *
+ * 用户口径: "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4 直到胜一局"。
+ * 触发判据与还原全在棋盘那一侧 (`ChessBoard::autoBcOnGameEnd`); 本函数只做三件
+ * **界面才做得到**的事, 缺一条就留下一个看不见的缺口:
+ *
+ *   1. **补建"行为克隆"曲线的两条线** —— 线是每场开始按 `老师下拉框 ≠ 关` 武装的
+ *      (`armBcChartSeries`), 而自动克隆是**场中**才把老师打开的; 那时线还没建, 而
+ *      `CurveChart::addPoint` 在序列不存在时**静默 return** ⇒ 表现就是
+ *      "面板有 samples/updates, 曲线一直空着"(本工程为这个静默刚付过一次账)。
+ *      判据仍然用 `bcHasStudent(A, B)` —— 与开场那一处是同一份实现。
+ *   2. **同步下拉框显示**, 并且**必须挡住信号**: `onBcTeacherChanged` 会把深度再写回
+ *      棋盘一次, 而这一次的意义是"棋盘侧替你改了、现在告诉你" —— 写回去就有两个真源。
+ *   3. **在自检面板写清"这不是你选的"**: 否则用户只会看到克隆突然开始 + 下拉框自己
+ *      变了, 会以为程序改了他的设置 (而它确实是, 只是有理由: 连败 5 局)。
+ */
+void MainWindow::onBcAutoEngaged(int teacherDepth)
+{
+    armBcChartSeries(ChessBoard::bcHasStudent(m_matchTypeA, m_matchTypeB), teacherDepth,
+                     /*humanMode=*/false);
+    if (m_bcTeacherCombo != nullptr) {
+        const QSignalBlocker blocker(m_bcTeacherCombo);
+        const int idx = m_bcTeacherCombo->findData(teacherDepth);
+        if (idx >= 0) {
+            m_bcTeacherCombo->setCurrentIndex(idx);
+        }
+    }
+    const QString name = ChessBoard::bcTeacherName(teacherDepth);
+    if (ui->selfCheckView != nullptr) {
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+        ui->selfCheckView->insertPlainText(
+            QStringLiteral("[BC-AUTO] 连败触发: 自动启用行为克隆, 老师 = %1 (深度 %1 那一档; "
+                           "胜一局或本场结束时还原 —— 下拉框显示随之改成 %1, 但这不是你选的)\n")
+                .arg(name, name));
+        ui->selfCheckView->moveCursor(QTextCursor::End);
+    }
+    qInfo().noquote() << QStringLiteral("[BC-AUTO] 连败触发自动克隆, 老师 = %1").arg(name);
+}
+
+/*
  * onBcSoftToggled - "软目标 (多深度一致)" 复选框 (2026-10)
  *
  * 分工与 onBcTeacherChanged 一样: 只把勾选交给棋盘 + 在面板留一行, **不在这里判断
@@ -2220,9 +2291,14 @@ void MainWindow::selfCheckWorkerLoop()
                没有实例 ⇒ 只会印 "(没有实例/没有自检项: 该 agent 尚未被创建)"。 */
             ChessBoard::AGENT_PPOMCTS,   ChessBoard::AGENT_DQNMCTS,
             ChessBoard::AGENT_EVAB,      ChessBoard::AGENT_SACAZ,
-            ChessBoard::AGENT_SACAZ_MOE, ChessBoard::AGENT_DQNAB,
+            /* [2026-10-16 用户口径] DQN+AB **已从下拉框与 kWeightAgents 移除** (评估
+               结论: 设计不合理; 见 populateAgentComboBox 里那一段的完整记录)。它不再
+               被启动预加载 ⇒ 这里列出来只会印 "(没有实例/没有自检项)", 所以同样删掉。
+               类与它的 115 条机制断言 (test_dqnab / test_dqnab_seq) 都还在。 */
+            ChessBoard::AGENT_SACAZ_MOE,
             ChessBoard::AGENT_PPOMCTS_MLP,
-            /* [2026-10 第三轮] conv 骨干那一支: 它的骨干读数 (图像口径/通道数/块数/参数量)
+            /* [2026-10-17 用户口径] conv 骨干那一支现在是**独立类** (无 MoE 的深卷积主干,
+               6 个残差块): 它的结构读数 (图像口径/通道数/块数/参数量/坐标通道开没开)
                只能从这里看见, 所以在"全部模型自检"里也要有它一格 */
             ChessBoard::AGENT_PPOMCTS_CONV,
             /* [2026-10] SAC 59e5233 还原版两支同样删除 (同上: 不再预加载, 列出来只是噪声)。

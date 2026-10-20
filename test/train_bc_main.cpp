@@ -104,10 +104,29 @@ struct Cfg {
     int reportEvery = 1;
     int hidden = 64;
     int expert = 64;
+    /*
+       [2026-10-17] 只对 `--agent=ppo-convd` (无 MoE 的深卷积主干) 生效的两个旋钮:
+         convBlocks      : 残差块数 (默认 = RL::PPO::PPO_CONV_DENSE_BLOCKS = 6, 比 MoE 版的 4 深);
+         convCoordPlanes : 是否拼 4 个零参数坐标/区域通道 (默认 1 = 23 通道, 0 = 19 通道)。
+       `--coord-planes=0` 就是 `docs/conv_resnet_moe_analysis.md` §6.1 那条
+       "坐标/区域平面必须加" 假设的消融臂。
+    */
+    int convBlocks = 0;
+    bool convCoordPlanes = true;
     /* PPO: false = 全量 8100 维口径 (对照臂, 与 bench_ppo_distill 的旧口径同源) */
     bool masked = true;
     /* SAC: 共享骨干口径 (一个骨干 + 三个头) —— 界面的 SAC+AZ-MoE 那一支用它 */
     bool sharedTrunk = false;
+    /*
+       [2026-10-16] SAC 的**动作编码口径** (只在对齐表示下有区别):
+         false = 对齐双射 8100 (`canonicalCell(from)*90 + to`, 与 PPOMCTSAgent 同一公式);
+         true  = 退回 128 槽哈希 (`legacyHashAction`, 界面 2026-10-15 那一轮的口径)。
+       为什么要这个开关: 界面那一支的动作口径从"保留 128 槽哈希"改成"与 PPO 对齐"是
+       **用户口径变更**, 而它的棋力**从未实测** —— 唯一便宜的判别标准是本工程一直在用的
+       BC 留出 CE (同 teacher / 同数据 / 同 seed, 只差动作编码这一个变量)。
+       不传 = 双射 (= 界面现役口径), 读数与改动前逐位相同。
+    */
+    bool hashAction = false;
     /*
        [2026-10] 梯度裁剪口径 (只对 PPO 这条线生效; 见 rl/optimize.h 的 GradClipMode)。
        默认 = 老行为 (逐张量单位范数归一), 所以不给参数时读数与改动前逐位相同。
@@ -171,6 +190,14 @@ bool parseArgs(int argc, char **argv)
         else if (k == "--soft-depths") { g_cfg.bc.softDepths = std::atoi(v.c_str()); }
         else if (k == "--soft-linear") { g_cfg.bc.softLinearWeight = (std::atoi(v.c_str()) != 0); }
         else if (k == "--shared")  { g_cfg.sharedTrunk = (std::atoi(v.c_str()) != 0); }
+        /* [2026-10-17] 无 MoE 深卷积主干的两个旋钮 (只对 --agent=ppo-convd 生效) */
+        else if (k == "--conv-blocks")   { g_cfg.convBlocks = std::atoi(v.c_str()); }
+        else if (k == "--coord-planes")  { g_cfg.convCoordPlanes = (std::atoi(v.c_str()) != 0); }
+        /*
+           [2026-10-16] `--hash-action=1` = SAC 退回 128 槽哈希 (只对 SAC 三支有意义;
+           非 SAC 的 agent 会**响亮失败**, 见 main 里的检查)。默认 0 = 对齐双射。
+        */
+        else if (k == "--hash-action") { g_cfg.hashAction = (std::atoi(v.c_str()) != 0); }
         /*
            [2026-10] 梯度裁剪口径 (PPO 这条线; 见 rl/optimize.h 的 GradClipMode):
              --grad-clip=legacy|global|none   (默认 legacy = 老行为, 逐位不变)
@@ -285,7 +312,8 @@ int main(int argc, char *argv[])
 
     /* ---- 造 agent (与界面 / 既有 bench 同一套形状参数) ---- */
     if (g_cfg.agent == "ppo" || g_cfg.agent == "ppo-mlp" || g_cfg.agent == "ppo-layer"
-        || g_cfg.agent == "ppo-seq" || g_cfg.agent == "ppo-conv") {
+        || g_cfg.agent == "ppo-seq" || g_cfg.agent == "ppo-conv"
+        || g_cfg.agent == "ppo-convd" || g_cfg.agent == "ppo-convseq") {
         RL::PPO::Backbone bb = RL::PPO::Backbone::MlpExperts;
         const char *label = "PPO+MCTS (MLP 专家)";
         if (g_cfg.agent == "ppo") {
@@ -304,9 +332,28 @@ int main(int argc, char *argv[])
                `--expert=` 在这一支里的语义是**主干通道数** (默认 32)。 */
             bb = RL::PPO::Backbone::ConvExperts;
             label = "PPO+MCTS (conv2d+ResNet专家)";
+        } else if (g_cfg.agent == "ppo-convd") {            /*
+               [2026-10-17 用户口径] **无 MoE 的深卷积主干** (与界面 AGENT_PPOMCTS_CONV
+               现在构造的是同一支: `PPOMCTSConvAgent`)。`--expert=` 仍是通道数,
+               深度与坐标通道分别由 `--conv-blocks` / `--coord-planes` 给 ——
+               后者就是 `docs/conv_resnet_moe_analysis.md` §6.1 那条
+               "坐标/区域平面必须加" 假设的消融开关。
+            */
+            bb = RL::PPO::Backbone::ConvDense;
+            label = "PPO+MCTS (conv2d+ResNet主干,无MoE)";
+        } else if (g_cfg.agent == "ppo-convseq") {
+            /*
+               [2026-10-17 用户提问] "使用 conv+resnet 提取特征再传给 seq transformer 专家
+               是否会更好" —— 这一支就是它的实验臂: `ConvResNetExpert` + `PPOSeqExpert`
+               两层串联 (见 rl/ppo.h 的 Backbone::ConvThenSeq)。
+               与 `ppo-convd` 的唯一差别就是**多了一段注意力**, 所以两臂的读数可直接比。
+            */
+            bb = RL::PPO::Backbone::ConvThenSeq;
+            label = "PPO+MCTS (conv提特征+序列Transformer)";
         }
         PPOMCTSAgent agent(env, g_cfg.hidden, 0.99f, 0.001f, 1.414f,
-                           g_cfg.expert, 0.1f, true, bb);
+                           g_cfg.expert, 0.1f, true, bb,
+                           g_cfg.convBlocks, g_cfg.convCoordPlanes);
         agent.ppo.maskedTrainHead = g_cfg.masked;
         /* 梯度裁剪口径 (默认 legacy = 老行为; 解析失败直接退出, 不静默降级) */
         {
@@ -373,6 +420,11 @@ int main(int argc, char *argv[])
         SACAZMoETbAgent agent(env, g_cfg.hidden, 0.99f, 0.001f, 1.5f, g_cfg.expert, 0.1f,
                               g_cfg.sharedTrunk ? SACAZMoETbAgent::TrunkMode::Shared
                                                 : SACAZMoETbAgent::TrunkMode::Separate);
+        /* [2026-10-16] 动作编码口径 (默认 = 界面现役的对齐双射; --hash-action=1 退回 128 槽) */
+        agent.legacyHashAction = g_cfg.hashAction;
+        std::printf("[BC] 动作口径 = %s (legacyHashAction=%d, ACTION_DIM=%d)\n",
+                    g_cfg.hashAction ? "128 槽哈希" : "对齐双射 8100",
+                    (int)g_cfg.hashAction, (int)SACAZMoETbAgent::ACTION_DIM);
         if (!loadOrFail(agent)) { return 2; }
         return runBc(agent, "SAC+AZ-MoE (TB 专家)", agent.backboneName());
     }

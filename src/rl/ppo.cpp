@@ -61,8 +61,26 @@ std::vector<RL::ISparseMoE*> sparseMoeLayers(RL::Net &net)
    内存与构造时间约 1/4), 而这条路径必须在两种骨干下都能用。
 */
 std::shared_ptr<RL::iLayer> makeMoeLayer(int stateDim, bool withGrad, int expertHidden,
-                                         RL::PPO::Backbone backbone)
+                                         RL::PPO::Backbone backbone,
+                                         int convBlocks, bool convCoordPlanes)
 {
+    /*
+       [2026-10-17 用户口径] **无 MoE 的深卷积主干**: 直接把 `ConvResNetExpert` 当一层
+       返回 —— 它就是 `iLayer`, 所以这条路径连"门控/专家集合/负载均衡"都不存在,
+       后面的 `Tanh(h)` 与输出头与其它骨干**逐字相同**。
+       为什么可以这么写: 工厂的返回类型本来就是 `shared_ptr<iLayer>`, MoE 只是其中一种
+       实现; "骨干差异只在这一个函数里" 这条纪律因此仍然成立 (见函数上方的注释)。
+       两块参数:
+         * `expertHidden` 在这里是**通道数** (与 ConvExperts 同语义, 默认 32);
+         * `convBlocks` 是**残差块数** (0 = PPO_CONV_DENSE_BLOCKS = 6, 比 ConvExperts 的 4 深);
+         * `convCoordPlanes` = 是否拼 23 通道 (true) 还是 19 通道 (false)。
+    */
+    if (backbone == RL::PPO::Backbone::ConvDense) {
+        const int ch = (expertHidden > 0) ? expertHidden : RL::PPO_CONV_CHANNELS;
+        const int blk = (convBlocks > 0) ? convBlocks : RL::PPO::PPO_CONV_DENSE_BLOCKS;
+        return std::make_shared<RL::ConvResNetExpert>(stateDim, ch, blk, withGrad,
+                                                      convCoordPlanes);
+    }
     if (backbone == RL::PPO::Backbone::MlpExperts) {
         return std::make_shared<RL::SparseMoE<RL::MlpExpert,
                                               RL::PPO_MOE_MLP_EXPERTS,
@@ -113,6 +131,8 @@ const char *RL::PPO::backboneName(Backbone b)
     case Backbone::LayerExperts: return "稀疏MoE(廉价专家,无MHA)";
     case Backbone::SeqExperts:   return "稀疏MoE(序列Transformer专家)";
     case Backbone::ConvExperts:  return "稀疏MoE(conv2d+ResNet专家)";
+    case Backbone::ConvDense:    return "conv2d+ResNet 主干 (无 MoE, 深)";
+    case Backbone::ConvThenSeq:  return "conv2d+ResNet 提特征 -> 序列Transformer";
     }
     return "?";
 }
@@ -126,6 +146,8 @@ const char *RL::PPO::backboneKey(Backbone b)
     case Backbone::LayerExperts: return "layer";
     case Backbone::SeqExperts:   return "seq";
     case Backbone::ConvExperts:  return "conv";
+    case Backbone::ConvDense:    return "conv-dense";
+    case Backbone::ConvThenSeq:  return "conv-seq";
     }
     return "?";
 }
@@ -148,15 +170,24 @@ bool RL::PPO::parseBackbone(const char *s, Backbone &out)
     if (v == "conv" || v == "conv-resnet" || v == "resnet" || v == "cnn") {
         out = Backbone::ConvExperts; return true;
     }
+    /* [2026-10-17] 无 MoE 的深卷积主干 (与上面 conv 那条**不同**: 那条是 MoE 专家) */
+    if (v == "conv-dense" || v == "convdense" || v == "conv-plain" || v == "cnn-dense") {
+        out = Backbone::ConvDense; return true;
+    }
+    /* [2026-10-17] conv+ResNet 提特征 -> 序列 Transformer (两层串联, 见 ppo.h 的说明) */
+    if (v == "conv-seq" || v == "convseq" || v == "conv-then-seq") {
+        out = Backbone::ConvThenSeq; return true;
+    }
     return false;
 }
 
 RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
              int expertHidden_, float moeAuxCoef_, bool withGrad,
-             Backbone backbone_)
+             Backbone backbone_, int convBlocks_, bool convCoordPlanes_)
     :stateDim(stateDim_), actionDim(actionDim_),
      expertHidden(expertHidden_ > 0 ? expertHidden_ : 64),
      backbone(backbone_),
+     convBlocks(convBlocks_), convCoordPlanes(convCoordPlanes_),
      gamma(0.99f), exploringRate(1.0f),
      moeAuxCoef(moeAuxCoef_), learningSteps(0)
 {
@@ -185,15 +216,35 @@ RL::PPO::PPO(int stateDim_, int hiddenDim, int actionDim_,
        所以它的网络应该是这个形态 (N 个 worker 省下的内存很可观: TB 专家下
        worker 从 ~600 MB 降到 ~150 MB)。
     */
+    /*
+       [2026-10-17] 骨干入链的**唯一一处**: 绝大多数骨干是"一层" (MoE 或单个 conv 主干),
+       而 `ConvThenSeq` 是"两层串联" (conv 提特征 -> 序列注意力)。写成 lambda 是为了让
+       actor 与 critic 两条链**不可能**分叉 —— 这个函数里"两份形状必须一致"是硬约束
+       (worker/copyTo/权重往返都依赖它)。
+       ConvThenSeq 的两个量: conv 通道数固定 `RL::PPO_CONV_CHANNELS`(32),
+       序列的 token 宽度取 `expertHidden` (与 SeqExperts 骨干同语义)。
+    */
+    auto pushBackbone = [&](Net::Layers &L) {
+        if (backbone == Backbone::ConvThenSeq) {
+            const int blocks = (convBlocks > 0) ? convBlocks : PPO_CONV_DENSE_BLOCKS;
+            L.push_back(std::make_shared<RL::ConvResNetExpert>(
+                stateDim, RL::PPO_CONV_CHANNELS, blocks, withGrad, convCoordPlanes));
+            L.push_back(std::make_shared<RL::PPOSeqExpert>(stateDim, expertHidden, withGrad));
+            return;
+        }
+        L.push_back(makeMoeLayer(stateDim, withGrad, expertHidden, backbone,
+                                 convBlocks, convCoordPlanes));
+    };
+
     Net::Layers actorLayers;
-    actorLayers.push_back(makeMoeLayer(stateDim, withGrad, expertHidden, backbone));
+    pushBackbone(actorLayers);
     actorLayers.push_back(Layer<Tanh>::_(stateDim, hiddenDim, true, withGrad));
     actorLayers.push_back(Layer<Softmax>::_(hiddenDim, actionDim, true, withGrad));
     actorP = Net(actorLayers);
 
     /* Critic: 同样的骨干 + Linear(1) 标量价值头 */
     Net::Layers criticLayers;
-    criticLayers.push_back(makeMoeLayer(stateDim, withGrad, expertHidden, backbone));
+    pushBackbone(criticLayers);
     criticLayers.push_back(Layer<Tanh>::_(stateDim, hiddenDim, true, withGrad));
     criticLayers.push_back(Layer<Linear>::_(hiddenDim, 1, true, withGrad));
     critic = Net(criticLayers);

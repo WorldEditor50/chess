@@ -26,6 +26,7 @@
 #include <vector>
 #include <string>
 #include <deque>
+#include <bitset>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -164,26 +165,28 @@ public:
        运行时消融开关 (只在**对齐**表示下有意义): 把动作退回 128 槽哈希, 用来单独
        隔离"动作空间"这个变量。ALIGNED_REPR=1 编译进来时可用, 否则恒为 false。
 
-       [2026-10-15 用户口径] 序列专家那一支**默认就用 128 槽哈希**
-       (`SACAZ_MOE_EXPERT_SEQ=1` ⇒ 本成员默认 true)。理由与一处必须说清的边界:
-         * `docs/sac_regression_2026_09.md` 与 `conv_resnet_moe_analysis.md` §7 把
-           "对齐表示掉约 200 Elo" 归因于**动作头宽度** (策略头 8,192 -> 518,400),
-           所以口径是"换成对齐状态 + 序列专家, 但动作口径保持原来的 128 槽哈希";
-         * ⚠ 但 `ACTION_DIM` 是编译期常量 (`ALIGNED_REPR ? 8100 : 128`), 所以打开
-           这个成员**并不会**把策略头改回 128 宽 —— 头张量仍是 8100 列, 只是可达
-           槽位被哈希到 128 个 (其余列永远收不到策略目标)。也就是说: 这条开关隔离
-           的是"动作编码"这一个变量, **不是**参数/数据比。
-           真要让头也回到 128 宽, 需要另加一个"对齐表示 + 128 宽头"的编译开关,
-           那是独立的一轮 (见 docs/expert_search_optimization_plan_2026_10.md §8.4 第 2 条)。
-    */
-    /*
-       [2026-10-15] 界面口径 (用户决定): 序列专家那一支**用 128 槽哈希动作**。
-       这条口径由**界面**显式设置 (`chessboard.cpp` 的 createSACAZMoETbAgent:
-       `#if SACAZ_MOE_EXPERT_SEQ` → `a->legacyHashAction = true`), 而**类默认值保持
-       false** —— 于是 `test_sacaz_aligned_seq` 那个变体仍然在验证"对齐表示 + 8100 双射"
-       这一档 (它那 4 条学习动力学断言就是按双射定标的, 见 §10.3)。
-       ⚠ 头张量宽度与这条开关无关: `ACTION_DIM` 是编译期常量, 对齐表示下恒为 8100,
-       打开本开关只是把**可达槽位**哈希到 128 个 —— 它隔离的是动作编码, 不是参数/数据比。
+       ---- [2026-10-16 用户口径] 界面这一支的口径改成了 **与 PPO 对齐** ----
+       用户口径: "sac agent 对齐 ppo agent 输出"。
+         * **现役口径 (2026-10-16 起)**: 本成员保持 **false** —— `stepToActionIdx` 走
+           `canonicalCell(from)*90 + canonicalCell(to)`, 与 `PPOMCTSAgent` **逐字同一个**
+           8100 双射; 策略也是同一套"合法集上归一化的掩码 softmax"。于是两支 agent 的
+           **输入 (19×90) 与输出 (8100 合法双射) 都同构**, "算法对照"这一层才成立。
+         * 上一轮 (2026-10-15) 的口径是"序列专家那一支保留 128 槽哈希", 依据是
+           `docs/sac_regression_2026_09.md` / `conv_resnet_moe_analysis.md` §7 把
+           "对齐表示掉约 200 Elo" 归因在**动作头宽度** (8,192 -> 518,400)。但那条账量的
+           是"对齐表示 + 稠密 8100 头"**整档**, 而且 `ACTION_DIM` 是编译期常量 ——
+           在序列专家构建下头张量**本来就是** 8100 宽, 所以本开关隔离的只是"动作编码",
+           从不是参数/数据比。本轮因此可以只改编码、不加任何参数。
+           ⚠ 代价要读清: **双射这一档的棋力本轮没有实测** (只有结构/CE 证据), 属用户
+           口径变更, 需重训后复核; 盘上也没有 seq 口径的 SAC 权重, 所以没有作废旧模型。
+         * 128 槽哈希**没有删掉**: 它是一个合法的消融口径 (置 true 即可单独隔离动作空间),
+           本类与 `test_sacaz_aligned_seq` 都还用得上 —— 那条变体验证的正是"对齐 + 双射"
+           这一档 (它那 4 条学习动力学断言按双射定标, 见 §10.3)。
+           `SACAZLegacyAgent`(还原版) 按用户口径"**不修改**", 仍是 128 槽哈希 ——
+           两支**刻意不同口径**, 不是漏改。
+         * ⚠ 配套修正 (同一天): 回放掩码原来存 2 x uint64 + `i & 63` 折叠, 只在 128 槽下
+           忠实; 双射下必须逐位忠实, 所以 `Transition::curMask/nextMask` 换成了
+           `std::bitset<ACTION_DIM>` —— 详见那里, 以及 `maskToBits` 的说明。
     */
     bool legacyHashAction = false;
 
@@ -500,12 +503,28 @@ public:
         float nextCtx[CTX_COUNT] = {};
         float pi[ACTION_DIM];                  /* 策略目标 (MCTS 访问分布) */
         /*
-           合法走法掩码: 8100 位 -> 两个 uint64 (`mask[0]` = 动作 0..63)。
-           为什么不是 128 个 bool: 回放池里条目数上万, 128B/条只是为掩码就多占几 MB,
-           而位图只要 16B (与改动前 128 槽时用 16B 位图的成本完全一样)。
+           合法走法掩码 —— **一个动作一位, 必须逐位忠实**。
+
+           [2026-10-16 修] 这里原来是 `std::uint64_t curMask[2]` (2 x 64 = 128 位), 配合
+           `maskToBits` 的 `bits[(i < 64) ? 0 : 1] |= 1 << (i & 63)`。那套编码在
+           **128 槽哈希**口径下是忠实的 (动作下标恒 < 128), 但在**对齐双射 8100** 下会把
+           i 与 i+64k 折进同一位: 8100 位的掩码被折成 128 位, `bitsToMask` 再把它
+           **放大回 8100 列** —— "合法集"于是变成一个比真合法集大得多的集合,
+           `maskedSoftmax` 的分母与 `softValueFrom` 的求和都被污染。这不是精度问题,
+           是**口径错**, 而且从读数上看不出来 (损失照常下降)。
+           界面这一支从 2026-10-16 起按用户口径走双射 (见 chessboard.cpp 的
+           `createSACAZMoETbAgent`), 所以这一条必须先修好, 否则"对齐 PPO 输出"
+           只对齐了动作下标公式、没对齐掩码语义。
+
+           为什么用 `std::bitset<ACTION_DIM>` 而不是 `std::vector<int>` / `RL::Tensor`:
+             * 位图是定长、可默认构造、可整体赋值 (pending -> Transition 那条搬运就是
+               一条 `=`, 见 onTrans);
+             * 1016 B/条 —— 与同结构里的 `float pi[8100]` (32.4 KB/条) 相比只占 3%,
+               所以"位图更省内存"这条理由在双射口径下不再成立 (128 槽时它是 16 B)。
+             * `bitset::test(i)` 仍是逐位常数时间, `bitsToMask` 的循环形态一个字没变。
         */
-        std::uint64_t curMask[2] = { 0, 0 };   /* 当前局面合法走法掩码 (策略损失要用) */
-        std::uint64_t nextMask[2] = { 0, 0 };  /* 下一局面合法走法掩码 (软备份要用) */
+        std::bitset<ACTION_DIM> curMask;     /* 当前局面合法走法掩码 (策略损失要用) */
+        std::bitset<ACTION_DIM> nextMask;    /* 下一局面合法走法掩码 (软备份要用) */
         int action = 0;                        /* 实际走的动作索引 */
         int legalCount = 1;                    /* 当前局面合法走法数 (目标熵用) */
         float reward = 0.0f;
@@ -1323,7 +1342,7 @@ private:
     RL::Tensor m_q1, m_q2;    /* critic 输出副本 */
     /* pick 回调算出来的掩码, 供紧接其后的 onTrans 复用 (同一步之内有效) */
     int m_pendingLegalCount = 1;
-    std::uint64_t m_pendingMask[2] = { 0, 0 };
+    std::bitset<ACTION_DIM> m_pendingMask;   /* [2026-10-16] 见 Transition::curMask 的说明 */
 
 public:
     /* ----------------------------------------------------------------
@@ -1387,9 +1406,15 @@ public:
      */
     static void maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tensor &g,
                                       RL::Tensor &dz);
-    /* 合法掩码 <-> 位图 (8100 位 = 2 x uint64; `bits[0]` 是动作 0..63) */
-    static void maskToBits(const RL::Tensor &mask, std::uint64_t bits[2]);
-    static void bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask);
+    /*
+       合法掩码 <-> 位图。**一个动作一位, 不折叠** ——
+       [2026-10-16] 旧版是 `std::uint64_t bits[2]` + `bits[i] |= 1 << (i & 63)`,
+       在 8100 双射下会把不同动作折进同一位 (见 Transition::curMask 的完整说明)。
+       `std::bitset<ACTION_DIM>` 在 128 槽口径下是 16 B、在双射口径下是 1016 B —— 两种
+       表示都**逐位忠实**, 所以调用点一个都不用改 (签名改了, 语义变强了)。
+    */
+    static void maskToBits(const RL::Tensor &mask, std::bitset<ACTION_DIM> &bits);
+    static void bitsToMask(const std::bitset<ACTION_DIM> &bits, RL::Tensor &mask);
 
     /* ----------------------------------------------------------------
      *  网络前向 / 软价值

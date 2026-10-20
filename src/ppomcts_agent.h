@@ -1033,7 +1033,15 @@ public:
                     可以在界面上直接对弈比较, 而不必维护两份会漂移的实现。
                     默认值是现役骨干, 所以既有调用方 (测试/bench/train_ppo) 行为不变。
                  */
-                 RL::PPO::Backbone backbone_ = RL::PPO::Backbone::TbExperts);
+                 RL::PPO::Backbone backbone_ = RL::PPO::Backbone::TbExperts,
+                 /*
+                    [2026-10-17] **只对 Backbone::ConvDense 生效** (见 rl/ppo.h 的同名参数):
+                      convBlocks_      : 残差块数 (0 = PPO_CONV_DENSE_BLOCKS = 6, 比 ConvExperts 的 4 深);
+                      convCoordPlanes_ : 是否拼 4 个零参数坐标/区域通道 (true = 23 通道)。
+                    两者都带默认值, 所以既有调用方 (测试/bench/train_ppo) 行为逐位不变。
+                 */
+                 int convBlocks_ = 0,
+                 bool convCoordPlanes_ = true);
 
     ~PPOMCTSAgent() = default;
 

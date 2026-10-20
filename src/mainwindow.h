@@ -102,6 +102,19 @@ private:
      */
     void onBcSoftToggled(bool on);
     /*
+     * [2026-10-16 用户口径] 连败自动克隆刚被触发 (棋盘侧 emit `bcAutoEngaged`)。
+     *
+     * 三件事, 缺一条就会留下一个"看不见的缺口":
+     *   1. **补建 BC 曲线的线** —— 线原本只在每场开始按"下拉框 ≠ 关"武装, 而自动克隆
+     *      是**场中**才把老师打开的; 不补建的话 `CurveChart::addPoint` 静默 return,
+     *      表现就是"面板有 samples/updates, 曲线一直空着"(本工程为这个静默付过一次账);
+     *   2. 把**下拉框显示**同步到自动值 (用 QSignalBlocker 挡住回调 —— 那是棋盘侧的决定,
+     *      不能让界面再把它写回去);
+     *   3. 在自检面板留一行, 说明"是连败触发的, 不是你选的" —— 否则用户会以为程序
+     *      自己改了他的设置。
+     */
+    void onBcAutoEngaged(int teacherDepth);
+    /*
      * "行为克隆"那张曲线上**该不该有线**的唯一实现, 两种模式共用:
      *   * Agent 对 Agent: 每场开始 (`matchStarted` -> `resetMetricsForMatch`);
      *   * 人机对弈: 每局开始 (`humanGameStarted` -> 玩家落下本局第一子)。

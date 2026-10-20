@@ -1151,23 +1151,19 @@ void SACAZMoETbAgent::maskedSoftmaxBackward(const RL::Tensor &pi, const RL::Tens
     }
 }
 
-void SACAZMoETbAgent::maskToBits(const RL::Tensor &mask, std::uint64_t bits[2])
+void SACAZMoETbAgent::maskToBits(const RL::Tensor &mask, std::bitset<ACTION_DIM> &bits)
 {
-    bits[0] = 0;
-    bits[1] = 0;
+    bits.reset();
     for (int i = 0; i < ACTION_DIM; i++) {
-        if (mask[i] > 0.5f) {
-            bits[(i < 64) ? 0 : 1] |= (std::uint64_t(1) << (i & 63));
-        }
+        if (mask[i] > 0.5f) { bits.set((std::size_t)i); }
     }
 }
 
-void SACAZMoETbAgent::bitsToMask(const std::uint64_t bits[2], RL::Tensor &mask)
+void SACAZMoETbAgent::bitsToMask(const std::bitset<ACTION_DIM> &bits, RL::Tensor &mask)
 {
     mask.zero();
     for (int i = 0; i < ACTION_DIM; i++) {
-        const std::uint64_t bit = (bits[(i < 64) ? 0 : 1] >> (i & 63)) & 1ULL;
-        mask[i] = bit ? 1.0f : 0.0f;
+        mask[i] = bits.test((std::size_t)i) ? 1.0f : 0.0f;
     }
 }
 
@@ -2695,8 +2691,7 @@ bool SACAZMoETbAgent::exploreAndTrain(int color, int rolloutSteps, const Opponen
             readContext(nextState, tr.nextCtx);
             tr.action = actionIdx;
             tr.legalCount = m_pendingLegalCount;
-            tr.curMask[0] = m_pendingMask[0];
-            tr.curMask[1] = m_pendingMask[1];
+            tr.curMask = m_pendingMask;   /* [2026-10-16] bitset: 整体赋值, 不再按 [0]/[1] 搬 */
             tr.reward = reward;
             tr.done = done;
             tr.hasSearch = false;   /* 策略目标不来自搜索 */
@@ -3250,12 +3245,14 @@ std::string SACAZMoETbAgent::selfCheckReport() const
                   sparseLeafEval ? "稀疏头(只算合法列)" : "全量(与 59e5233 相同)",
                   (double)rewardScale, (double)valueScale,
                   /*
-                     [2026-10-15] 这条三目原来**写反了** (只看 legacyHashAction, 漏了
-                     ALIGNED_REPR): "对齐 + 不哈希"印成 128 槽、"对齐 + 哈希"印成双射。
-                     判据与 `stepToActionIdx` 的 `if (!ALIGNED_REPR || legacyHashAction)`
-                     逐字一致。序列专家那一支 (`-DSACAZ_MOE_EXPERT_SEQ=1`) 走"对齐 + 哈希",
-                     所以这里必须印 128 槽 —— 同时把"头张量仍是 8100 宽"一并说清,
-                     免得读者以为参数/数据比也回到了改前表示。
+                     [2026-10-16 用户口径] 界面这一支的口径改成了**与 PPO 对齐**:
+                     `chessboard.cpp` 的 `createSACAZMoETbAgent` 不再打开
+                     `legacyHashAction` (用户: "sac agent 对齐 ppo agent 输出"),
+                     所以它现在印 "对齐双射 8100", 与 PPOMCTSAgent 同一个公式/同一套
+                     合法集掩码。判据与 `stepToActionIdx` 逐字一致, 不许另写一套
+                     (本行此前就因为"只看 legacyHashAction、漏了 ALIGNED_REPR"印反过一次)。
+                     128 槽那一档仍是合法的消融口径 (legacyHashAction=true), 那时这里
+                     会印回 "128 槽哈希" —— 并顺便说清"头张量仍 8100 宽"。
                   */
                   (!ALIGNED_REPR || legacyHashAction) ? "128 槽哈希 (头张量仍 8100 列)"
                                                       : "对齐双射 8100");

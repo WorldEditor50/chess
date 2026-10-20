@@ -1294,9 +1294,6 @@ static void testTbExpertAgent()
     agent.encodeSparse(Stone::COLOR_RED, cells);
     RL::Tensor state(SACAZAgent::STATE_DIM, 1);
     SACAZAgent::expandSparse(cells, state);
-    std::uint64_t bits[2] = { 0, 0 };
-    SACAZAgent::maskToBits(mask, bits);
-
     const int action = legalIdx[0];
 
     /* 用**同一个局面**造一池经验; hasSearch=false -> 只训 critic 与软 Q 项 */
@@ -1308,17 +1305,27 @@ static void testTbExpertAgent()
        迟早会漂移成"两个不同的实验", 那样印出来的差异就归因不到口径头上。
        下面那个 `fillPool` 保持原来的签名 (默认口径 = 双射), 既有调用点一个字都不用动。
     */
+    /*
+       [2026-10-16 修] 掩码**必须走类自己的 `maskToBits`**, 不能写 `tr.curMask[0] = bits[0]`:
+       MoE 那一支的 `Transition::curMask/nextMask` 已经从 `std::uint64_t[2]` 换成
+       `std::bitset<ACTION_DIM>` (见 sacazmoetbagent.h), 而 `bitset::operator[](0)` 返回的是
+       **代理引用** —— `tr.curMask[0] = bits[0]` 照样编译、照样有读数, 但只写**第 0 位**
+       (uint64 -> bool 隐式转换)。后果是经验池里的合法集只剩 1~2 列: 目标列上的 π 恒为 0、
+       轨迹均值贴地, 于是 (a) 那三条"训练确实把 π 推离均匀"以**看着像新 bug** 的方式红掉;
+       而更弱的断言则**静默通过** —— 后者比红更危险 (本仓库反复吃过的同一类账:
+       签名改了, 调用点因为隐式转换继续编译)。
+       所以参数从 `bits[2]` 换成**掩码张量本身**: 两个口径各有一份张量, 类型差异交给类。
+    */
     auto fillPoolFor = [&](float reward, bool done, bool hasSearch, int target,
-                           int act, const std::uint64_t *maskBits, int legalCount) {
+                           int act, const RL::Tensor &maskT, int legalCount) {
         agent.memories.clear();
         for (int i = 0; i < 48; i++) {
             typename std::decay<decltype(agent)>::type::Transition tr;
             tr.cells = cells;
             tr.nextCells = cells;
-            tr.curMask[0] = maskBits[0];
-            tr.curMask[1] = maskBits[1];
-            tr.nextMask[0] = maskBits[0];
-            tr.nextMask[1] = maskBits[1];
+            /* 按**这个类自己的**掩码类型写 (SACAZAgent: uint64[2] / MoE: bitset<ACTION_DIM>) */
+            std::decay_t<decltype(agent)>::maskToBits(maskT, tr.curMask);
+            std::decay_t<decltype(agent)>::maskToBits(maskT, tr.nextMask);
             tr.action = act;
             tr.legalCount = legalCount;
             tr.reward = reward;
@@ -1331,7 +1338,7 @@ static void testTbExpertAgent()
         }
     };
     auto fillPool = [&](float reward, bool done, bool hasSearch, int target) {
-        fillPoolFor(reward, done, hasSearch, target, action, bits, (int)legalIdx.size());
+        fillPoolFor(reward, done, hasSearch, target, action, mask, (int)legalIdx.size());
     };
 
     /*
@@ -1508,8 +1515,7 @@ static void testTbExpertAgent()
             agent.getLegalActions(Stone::COLOR_RED, hlegal, hidx, hmask);
             agent.legacyHashAction = savedHashFlag;              /* 只在上面那一行有用 */
             Steps::instance().put(hlegal);
-            std::uint64_t hbits[2] = { 0, 0 };
-            SACAZAgent::maskToBits(hmask, hbits);
+
 
             int hSlots = 0;
             for (int a = 0; a < SACAZAgent::ACTION_DIM; a++) {
@@ -1551,7 +1557,7 @@ static void testTbExpertAgent()
                 copyAgentTo(hAg);
 
                 /* ① hash 监督臂: 与 (a) 的"带监督项"那一趟同协议 (同起点、同步数) */
-                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hbits, (int)hidx.size());
+                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hmask, (int)hidx.size());
                 hAg.memories = agent.memories;       /* 同一批经验 (哈希掩码 + one-hot π) */
                 const Traj hAz = runTrajOn(hAg, hmask, hashTarget, azIters);
                 hashAzMean = hAz.mean;
@@ -1584,7 +1590,7 @@ static void testTbExpertAgent()
                 CHECK(hPiSane, "hash 口径: π 全部是有限值且落在 [0,1] 内");
 
                 /* ② hash 的 (b): Q 朝 y ≡ 0.5 走 (接在 ① 之后) */
-                fillPoolFor(0.5f, true, false, -1, hashAction, hbits, (int)hidx.size());
+                fillPoolFor(0.5f, true, false, -1, hashAction, hmask, (int)hidx.size());
                 hAg.memories = agent.memories;
                 hAg.azWeight = 0.0f;         /* hasSearch=false, AZ 项本来就不参与 */
                 RL::Tensor hq1(SACAZAgent::ACTION_DIM, 1), hq2(SACAZAgent::ACTION_DIM, 1);
@@ -1631,7 +1637,7 @@ static void testTbExpertAgent()
                 SACAZMoETbAgent hCt(c, 64, 0.99f, 0.003f, 1.5f, 64, 0.1f);
                 hCt.batchSize = 4;
                 copyAgentTo(hCt);
-                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hbits, (int)hidx.size());
+                fillPoolFor(0.0f, true, true, hashTarget, hashAction, hmask, (int)hidx.size());
                 hCt.memories = agent.memories;
                 hCt.azWeight = 0.0f;
                 for (std::size_t i = 0; i < hCt.memories.size(); i++) {
@@ -1934,8 +1940,7 @@ static void testTbExpertAgent()
         fresh.encodeSparse(Stone::COLOR_RED, fcells);
         RL::Tensor fstate(SACAZAgent::STATE_DIM, 1);
         SACAZAgent::expandSparse(fcells, fstate);
-        std::uint64_t fbits[2] = { 0, 0 };
-        SACAZAgent::maskToBits(fmask, fbits);
+
         const int faction = fidx[0];
 
         fresh.memories.clear();
@@ -1943,8 +1948,8 @@ static void testTbExpertAgent()
             typename std::decay<decltype(fresh)>::type::Transition tr;
             tr.cells = fcells;
             tr.nextCells = fcells;
-            tr.curMask[0] = fbits[0]; tr.curMask[1] = fbits[1];
-            tr.nextMask[0] = fbits[0]; tr.nextMask[1] = fbits[1];
+            std::decay_t<decltype(fresh)>::maskToBits(fmask, tr.curMask);
+            std::decay_t<decltype(fresh)>::maskToBits(fmask, tr.nextMask);
             tr.action = faction;
             tr.legalCount = (int)fidx.size();
             tr.reward = 0.5f;
@@ -3177,17 +3182,14 @@ static void testSharedTrunkAndTbHeads()
             std::vector<int> legalIdx;
             sep.getLegalActions(Stone::COLOR_RED, legal, legalIdx, mask);
             Steps::instance().put(legal);
-            std::uint64_t bits[2] = { 0, 0 };
-            SACAZAgent::maskToBits(mask, bits);
+
             sep.memories.clear();
             for (int i = 0; i < 16; i++) {
             typename std::decay<decltype(sep)>::type::Transition tr;
                 tr.cells = cells;
                 tr.nextCells = cells;
-                tr.curMask[0] = bits[0];
-                tr.curMask[1] = bits[1];
-                tr.nextMask[0] = bits[0];
-                tr.nextMask[1] = bits[1];
+                std::decay_t<decltype(sep)>::maskToBits(mask, tr.curMask);
+                std::decay_t<decltype(sep)>::maskToBits(mask, tr.nextMask);
                 tr.action = legalIdx[0];
                 tr.legalCount = (int)legalIdx.size();
                 tr.reward = 0.5f;
@@ -3355,17 +3357,14 @@ static void testSharedTrunkAndTbHeads()
             /* ---- 代价对比 ---- */
             std::vector<std::uint16_t> cells2;
             sh.encodeSparse(Stone::COLOR_RED, cells2);
-            std::uint64_t bits[2] = { 0, 0 };
-            SACAZAgent::maskToBits(mask, bits);
+
             sh.memories.clear();
             for (int i = 0; i < 16; i++) {
             typename std::decay<decltype(sh)>::type::Transition tr;
                 tr.cells = cells2;
                 tr.nextCells = cells2;
-                tr.curMask[0] = bits[0];
-                tr.curMask[1] = bits[1];
-                tr.nextMask[0] = bits[0];
-                tr.nextMask[1] = bits[1];
+                std::decay_t<decltype(sep)>::maskToBits(mask, tr.curMask);
+                std::decay_t<decltype(sep)>::maskToBits(mask, tr.nextMask);
                 tr.action = legalIdx[0];
                 tr.legalCount = (int)legalIdx.size();
                 tr.reward = 0.5f;

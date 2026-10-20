@@ -1197,3 +1197,48 @@ build\...\train_bc.exe --agent=ppo-mlp --positions=4000 --depth=3 --epochs=8 ^
 存下来的权重（本机实测体积）：`bc_ppo_mlp_d3_actor` 13.1 MB + `_critic` 10.3 MB；
 `bc_sac_d3_actor/_q1/_q2` 各 0.50 MB。界面可以直接选中对应 agent 载入
 （PPO+MCTS 的 MLP 专家那一支 / SAC+AZ）。
+
+---
+
+<a name="s11"></a>
+## 11. 连败自动克隆（2026-10-16 用户口径）
+
+用户口径：**"在对弈训练中如果连续负 5 局就启用行为克隆模仿 ab agent-4 直到胜一局"**。
+
+实现位置与判据（全部在 `src/chessboard.cpp`，**没有**新的 BC 通道 —— 复用的是 §6.5
+那一套学生/老师/缓冲/批更新/报告）：
+
+| 项 | 取值 / 位置 |
+|---|---|
+| 钩子 | `ChessBoard::autoBcOnGameEnd(...)`，在 `matchAgents` 的对局循环里、`st.games++` 之后（= 一局结束、胜负已知；**不持**棋盘锁与 agent 锁） |
+| 谁算"负" | **A 方 = 学习者**（与 `playMatchGame` 的 A/B 约定同一份）。B 方的负**不算** |
+| 计数 | 负 +1、胜清零、**和棋也清零**（和棋不是负 ⇒ 连败打断） |
+| 阈值 | `m_bcAutoThreshold`，默认 **5**（`setBcAutoLossThreshold` 可注入，便于做实验） |
+| 模式 | 只在 `MATCH_TRAIN`；评估/只对弈模式下**连计数都不做**（它们的契约是"权重不变"） |
+| 触发动作 | 老师深度**临时**改成 `AB_DEPTH`(=4，界面上那一档 Alpha-Beta)；学生不变（仍由 `bcSupported` 决定） |
+| 撤销 | 胜一局 ⇒ 还原用户下拉框的值；**整场结束/中止**也由 `matchAgents` 里的 RAII 守卫还原 |
+| 报告 | 触发时重设本场汇总（标签写"自动: …"、老师写 AB-4 的名字）；`st.log` 留 `[BC-AUTO]` 行；`detail()` 留一行结论 |
+| 界面 | 新信号 `bcAutoEngaged(int)` ⇒ `MainWindow::onBcAutoEngaged` **补建 BC 曲线的两条线**（否则 `CurveChart::addPoint` 静默 return）+ 用 `QSignalBlocker` 同步下拉框显示 + 面板写清"这不是你选的" |
+
+**四条必须一起读的边界**：
+
+1. **还原不是讲究、是硬要求**：自动克隆改写的是 `m_bcTeacherDepth`，而人机那条路
+   (`bcSampleForHumanTurn`) 只看 `> 0` —— 漏还原 = 那个 4 会**静默漏进人机对局**。
+   所以三条退出路径（正常结束 / 中止 / 提前 return）都由 RAII 守卫覆盖。
+2. **汇总从触发那一刻重新计数**：触发前本场可能"根本没在克隆"（标签是空的），不重设
+   就会印出"学生=(未记录) 老师=(未记录)"而与 `teacher-depth=4` 自相矛盾。代价是
+   samples/updates 只统计"自动启用后"，所以报告里明写。
+3. **和棋清零**是按"连续负"的字面读法；若想成"连续不赢"，把 `bc_auto.hpp` 里 `aDraw`
+   分支那一处改掉即可 —— 但这会显著提高触发频率（默认值保持前者）。
+4. **没有学生就没有触发**：A 方若是纯搜索（AB / MCTS / 混合池），触发点会**明说**
+   "A 方已连败 N 局, 但没有行为克隆路径 -> 未启用"，不静默。
+
+**判据被抽成了纯函数，并有测试**（2026-10-16 晚补）：`src/rl/bc_auto.hpp` 的
+`RL::BcAuto::advance(State, threshold, aWon, aDraw, hasStudent) -> Decision`；
+`ChessBoard::autoBcOnGameEnd` 只负责把结果落回成员、改老师深度、发信号/写报告。
+`test/test_bc_auto_main.cpp`（进 ctest，**21 条断言 / 0 失败 / 0.06 s**）逐条钉住：
+阈值前不触发、第 5 局触发、阈值可注入（3，以及 `<=0` 夹成 1）、和棋清零但**不关**、
+胜一局还原、无学生不触发而计数照涨、开着时不重复触发、关掉后能**再次**触发、
+纯函数同输入同输出且不改入参。
+**为什么必须抽出来**：判据留在 `autoBcOnGameEnd` 里就要起一整场对局才跑得到，那些边界
+在测试里一条都不存在 —— "判据不可注入 ⇒ 只能改源码做实验"这一课本工程已付过几次账。

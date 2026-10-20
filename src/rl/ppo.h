@@ -348,13 +348,39 @@ public:
         MlpExperts,      /* MlpExpert 专家, E=8 top-2 (便宜 ~25x, 容量小 ~21x) */
         LayerExperts,    /* Layer<Gelu> 专家 (无 MHA), E=4 top-1 —— 见文件顶部那一节 */
         SeqExperts,      /* SeqTransformerExpert: **真正的**序列 Transformer, E=4 top-1 */
-        ConvExperts      /* [2026-10 第三轮] ConvResNetExpert: 棋盘图像 + 卷积残差, E=4 top-1 */
+        ConvExperts,     /* [2026-10 第三轮] ConvResNetExpert: 棋盘图像 + 卷积残差, E=4 top-1 */
+        /*
+           [2026-10-17 用户口径] (用户: "使用单独类实现 PPO + MCTS + ConvResNet agent,
+           不使用 MOE, ConvResNet 加深网络, 代替 chess 程序现有 ConvResNetExpert 对应的 agent")
+           **无 MoE 的深卷积主干**: 整条 `ConvResNetExpert` 直接当**一层**用 (它本来就是
+           `iLayer`), 前面没有门控、没有专家集合、也没有负载均衡 —— 于是
+           ① 算力 = 一个网络(不是 k 个专家), ② 参数不再被 E 倍放大,
+           ③ 深度由 `convBlocks` 决定 (`PPO_CONV_DENSE_BLOCKS` = 6, 比 ConvExperts 的 4 更深),
+           ④ 空间归纳偏置**只有一份**, 不存在"每个专家各学一套空间特征"的分裂。
+           旁证: 本仓库 2026-10-16 的 E=1 vs E=4 消融 (`bench_gate_moe --experts=1|4`)
+           在同等前向算力下 4 个专家**没有**降低误差 (XOR 任务上反而更差约 30%)。
+        */
+        ConvDense,
+        /*
+           [2026-10-17] **conv+ResNet 提特征 -> 序列 Transformer**: 用户问
+           "使用 conv+resnet 提取特征再传给 seq transformer 专家是否会更好"。
+           实现上**不写新的复合层**: `Net` 本身就是一条链, 于是这条骨干 = 链里先后放
+           两个**已验证的层** ——
+             ① `ConvResNetExpert` (23 通道图像 -> 19x90 特征, C 通道, convBlocks 个残差块);
+             ② `PPOSeqExpert` (把 1710 看成 90 个 token x 19 维, 做多头注意力)。
+           好处: 前向/反向/稀疏头/权重读写/copyTo/参数统计**全部复用**既有实现,
+           不需要一个新的 iLayer 子类 (复合层最容易在 backward 链式那一步出错)。
+           它与 `ConvDense` 的差别**只有一个变量**: 多了一段注意力 —— 这正是要 A/B 的那件事。
+        */
+        ConvThenSeq
     };
     static const char *backboneName(Backbone b);
     /* 骨干名 (供工具/测试做参数与文件名用; 与界面显示名分开) */
     static const char *backboneKey(Backbone b);
     /* 解析 `tb` / `mlp` / `layer` (大小写不敏感); 失败返回 false 且不改 out */
     static bool parseBackbone(const char *s, Backbone &out);
+    /* ConvDense 的默认深度 (残差块数): 比 ConvExperts 的 4 深, 见上面那段口径 */
+    static constexpr int PPO_CONV_DENSE_BLOCKS = 6;
 
     PPO(){}
     explicit PPO(int stateDim, int hiddenDim, int actionDim,
@@ -367,7 +393,19 @@ public:
                  bool withGrad = true,
                  /* 骨干 (见上面的 Backbone)。**默认值 = 现役的 TB 专家**, 所以所有
                     既有调用方 (agent / 测试 / bench / train_ppo) 行为逐位不变。 */
-                 Backbone backbone = Backbone::TbExperts);
+                 Backbone backbone = Backbone::TbExperts,
+                 /*
+                    [2026-10-17] **只对 Backbone::ConvDense 生效**的两个旋钮:
+                      convBlocks      : 残差块数 (0 = PPO_CONV_DENSE_BLOCKS);
+                      convCoordPlanes : 是否拼 4 个零参数坐标/区域通道 (行 ramp / 列 ramp /
+                                        河界 / 九宫)。默认 true = 与 ConvExperts 同口径;
+                                        设 false 就得到 19 通道那一档 —— 这是
+                                        `docs/conv_resnet_moe_analysis.md` §6.1 那条
+                                        "坐标平面必须加" 假设**唯一**的消融入口。
+                    两个参数都**不改变既有骨干的行为** (其它骨干根本不读它们)。
+                 */
+                 int convBlocks = 0,
+                 bool convCoordPlanes = true);
     virtual ~PPO(){}
 
     /* Forward - returns policy (Softmax) probabilities */
@@ -790,6 +828,15 @@ public:
     int expertHidden;      /* MLP 专家的隐层宽度 (只有 MlpExperts 骨干用它) */
     /* 本实例的骨干 (构造时定, 之后不要改: 网络结构已经按它建好了) */
     Backbone backbone = Backbone::TbExperts;
+    /*
+       [2026-10-17] 只有 Backbone::ConvDense 读这两个 (见构造函数那段说明):
+         convBlocks      : 残差块数 (0 = PPO_CONV_DENSE_BLOCKS = 6);
+         convCoordPlanes : 是否拼 4 个零参数坐标/区域通道 (true = 23 通道, false = 19)。
+       它们是**构造期**量 (网络已经建好之后再改没有意义), 但都带默认值, 于是
+       "不传" 与改动前逐位相同。
+    */
+    int convBlocks = 0;
+    bool convCoordPlanes = true;
     float gamma;
     float exploringRate;
     /* 负载均衡辅助损失系数, <=0 关闭。与 SACAZAgent 的默认值一致 (0.1) */

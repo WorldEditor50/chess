@@ -132,6 +132,36 @@ int main()
           "SACAZMoETbAgent 自称**序列**专家 (骨干名里带'序列')");
 
     /* ========================================================================
+     *  [3b] 动作输出**与 PPO 同构**: 8100 双射 (2026-10-16 用户口径)
+     * ========================================================================
+     * 用户口径: "sac agent 对齐 ppo agent 输出"。表示 (19×90) 上一轮已经对齐了, 这一轮
+     * 对齐的是**输出空间**: 界面那一支不再打开 `legacyHashAction`, 于是
+     * `stepToActionIdx` 走 `canonicalCell(from)*90 + canonicalCell(to)` —— 与
+     * `PPOMCTSAgent` 同一个 8100 双射 + 同一套合法集掩码 softmax。
+     *
+     * 为什么用**自检报告里的那句话**当判据: 它是本工程"实际用的是哪一套编码"的唯一
+     * 可读证据 (与 `stepToActionIdx` 的判据逐字同源)。直接读私有成员做不到, 而另写一条
+     * "猜"的逻辑正是当年那条三目印反的原因 (只看 legacyHashAction、漏了 ALIGNED_REPR)。
+     */
+    std::printf("\n--- [3b] SAC+AZ-MoE 的动作输出 = 与 PPO 同一个 8100 双射 ---\n");
+    {
+        const std::string rep = sac.selfCheckReport();
+        const bool bijective = rep.find("对齐双射 8100") != std::string::npos;
+        std::printf("     自检报告里的动作口径: %s\n",
+                    bijective ? "对齐双射 8100" : "(不是双射 —— 检查 legacyHashAction)");
+        check(bijective,
+              "SAC+AZ-MoE 的动作口径 = 对齐双射 8100 (界面口径与 PPO 同构)");
+        /*
+           掩码的**逐位忠实性**同时被下面这条钉住: 掩码容器从 2 x uint64 (128 位, 会
+           把 i 与 i+64k 折进同一位) 换成了 `std::bitset<ACTION_DIM>`。8100 位只能
+           用 8100 位装 —— 这条断言是"没退回折叠版"的第一道门 (第二道在
+           test_sacaz_aligned_seq 的学习动力学断言里)。
+        */
+        check(SACAZMoETbAgent::ACTION_DIM == 8100,
+              "SAC+AZ-MoE 的动作空间大小 == 8100 (与 PPOMCTS 同一个动作空间)");
+    }
+
+    /* ========================================================================
      *  [4] 运行时旋钮 expertHidden 真的改结构 (32 < 64 < 128)
      * ======================================================================== */
     std::printf("\n--- [4] expertHidden (token 宽) 是**活的**运行时旋钮 ---\n");

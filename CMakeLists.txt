@@ -1542,6 +1542,44 @@ if(CHESS_BUILD_TESTS)
         AUTORCC OFF)
     chess_add_header_deps(bench_agent_arena)
 
+    # ------------------------------------------- [2026-10-17] 对齐 + seq 专家的 arena
+    # 为什么需要这个**变体目标** (而不是给上面那个加参数): 动作编码口径
+    # (128 槽哈希 / 8100 双射) 只在 `SACAZ_ALIGNED_REPR=1` 的构建里有区别 ——
+    # 默认构建是 128 槽表示, `legacyHashAction` 恒被 `!ALIGNED_REPR` 短路, 于是
+    # "双射 vs 哈希"的棋力对局在那个二进制里**根本无法表达**。
+    # 宏与 `test_sacaz_aligned_seq` (界面口径) 逐字相同, 于是这支 arena 与界面
+    # 跑的是同一套结构; 专家用 seq (便宜: 465k 参数), 于是对局能在分钟级跑完。
+    # 用法 (实验 c):
+    #   bench_agent_arena_seq --mode=match --a=sac --b=ab --backbone-sac=tb ^
+    #       --games=24 --opening=8 --paired-openings --load-a=weights/bc_sac_bij
+    #   bench_agent_arena_seq ... --sac-legacy-hash --load-a=weights/bc_sac_hash
+    add_executable(bench_agent_arena_seq
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/bench_agent_arena_main.cpp
+        ${SRC_DIR}/chess.cpp
+        ${SRC_DIR}/gamedb.cpp
+        ${SRC_DIR}/pos.cpp
+        ${SRC_DIR}/stone.cpp
+        ${SRC_DIR}/mcts.cpp
+        ${SRC_DIR}/abagent.cpp
+        ${SRC_DIR}/sacazagent.cpp
+        ${SRC_DIR}/sacazmoetbagent.cpp
+        ${SRC_DIR}/sacazmoemlpagent.cpp
+        ${SRC_DIR}/sacazlegacyagent.cpp
+        ${SRC_DIR}/ppomcts_agent.cpp)
+    target_compile_definitions(bench_agent_arena_seq PRIVATE
+        SACAZ_ALIGNED_REPR=1 SACAZ_MOE_EXPERT_SEQ=1)
+    target_include_directories(bench_agent_arena_seq PRIVATE ${SRC_DIR})
+    target_link_libraries(bench_agent_arena_seq PRIVATE
+        RL_CORE
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::Sql)
+    target_compile_options(bench_agent_arena_seq PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    set_target_properties(bench_agent_arena_seq PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+
     # ------------------------------------------- 同源副本 (数值对照用)
     # 与 bench_agent_arena 是**同一份源码**, 只换产物名。
     # 为什么需要它: 长时训练/对局进程会一直占住 bench_agent_arena.exe (Windows 不允许
@@ -1948,6 +1986,21 @@ if(CHESS_BUILD_TESTS)
     cmake_path(NORMAL_PATH _qt_bin_dir_bc)
     set_tests_properties(test_bc PROPERTIES TIMEOUT 900
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_qt_bin_dir_bc}")
+
+    # ------------------- 连败自动克隆的纯判据 (进 ctest; 毫秒级) -------------------
+    # [2026-10-16 用户口径] "在对弈训练中如果连续负5局就启用行为克隆模仿 ab agent-4
+    # 直到胜一局"。判据在 src/rl/bc_auto.hpp (纯函数), 所以这个目标**不链任何库、
+    # 不建 agent、不碰棋盘/Qt** —— 它只回答"什么时候该开、什么时候该关"。
+    # 为什么必须单独一个目标: 判据以前住在 ChessBoard::autoBcOnGameEnd 里, 要起一场
+    # 对局才跑得到 ⇒ 边界 (阈值前 / 和棋 / 无学生 / 还原 / 可重复触发) 一条都测不到。
+    add_executable(test_bc_auto
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bc_auto_main.cpp)
+    target_include_directories(test_bc_auto PRIVATE ${SRC_DIR})
+    set_target_properties(test_bc_auto PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF)
+    add_test(NAME test_bc_auto COMMAND test_bc_auto)
 
     # ------------------- PPO 骨干结构 + 裁剪口径的断言测试 (进 ctest; 秒级)
     # [2026-10] 为什么单独一个目标: 它**不建 agent、不跑 MCTS、不碰棋盘**, 所以只依赖

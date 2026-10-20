@@ -64,6 +64,10 @@ namespace {
 int g_seeds = 8;
 int g_steps = 600;
 int g_states = 600;
+/* [2026-10-16] MLP 门控隐层宽度的覆盖值 (0 = 用各臂自己的值)。见 makeMoe 与 --gate-hidden。 */
+int g_gateHidden = 0;
+/* [2026-10-16] 专家数 (模板参数, 只有 1 与 4 两个实例化)。见 makeMoe 与 --experts。 */
+int g_experts = 4;
 
 /* ============================================================
  *  小工具
@@ -243,15 +247,43 @@ struct Model {
     int D = 0;
 };
 
-std::shared_ptr<RL::SparseMoE<RL::MlpExpert, 4, 1> > makeMoe(int D, int hidden, const GateCfg &c)
+/*
+   E=4 的**具体类型**版本 —— 只给需要直接读门控权重 (`wg/wg1/wg2`) 的那一节用
+   ([3b] 均衡可达性要量"门控迁移"), 因为那些成员不在接口 `ISparseMoE` 上。
+   行为与 makeMoe 的 E=4 分支**逐字相同** (同一份配置代码), 不许在这里漂移。
+*/
+std::shared_ptr<RL::SparseMoE<RL::MlpExpert, 4, 1> >
+makeMoe4Concrete(int D, int hidden, const GateCfg &c)
 {
     auto m = std::make_shared<RL::SparseMoE<RL::MlpExpert, 4, 1> >(D, true, hidden);
     if (c.gs == GateStructure::Mlp) {
-        m->enableMlpGate(c.mlpHidden);
+        m->enableMlpGate(g_gateHidden > 0 ? g_gateHidden : c.mlpHidden);
     }
     m->setGateActivation(c.ga);
     m->setLossFreeBias(c.useBias, c.biasRate);
     return m;
+}
+
+/*
+   [2026-10-16] 专家数 `E` 是**模板参数** (`SparseMoE<Expert, E, K>`), 所以"MoE 值不值"
+   这条消融 (E=4 top-1 vs E=1 = 单个 MLP 专家) 必须有两个实例化。返回值用**接口指针**
+   (`ISparseMoE : iLayer`) ⇒ 两条路都能进 `Net::Layers`, 调用点一个都不用改。
+   为什么这条消融重要: 文档 §5 判断"conv 之后 MoE 的前提反转"**从未被证实也从未被证伪**
+   (`conv_resnet_moe_analysis.md` §0 自己写着 E=1 vs E=4 的消融没做) —— 而本工程对
+   MoE 的全部投入 (路由/均衡/稀疏回放) 都建立在这个前提上。
+*/
+std::shared_ptr<RL::ISparseMoE> makeMoe(int D, int hidden, const GateCfg &c)
+{
+    if (g_experts == 1) {
+        /*
+           E=1: 只有一个专家可路由 ⇒ 门控恒为 1、均衡恒成立 (MaxVio 0 / 有效专家 1)。
+           所以这个臂的**唯一**读数是 test MSE 与"省下的算力/参数" —— 那正是要问的:
+           4 个专家在**同样算力**下到底有没有换来更低的误差。
+           配置项 (激活/门控结构) 对它没有意义, 一律不装, 于是两臂只差"专家数"这一个变量。
+        */
+        return std::make_shared<RL::SparseMoE<RL::MlpExpert, 1, 1> >(D, true, hidden);
+    }
+    return makeMoe4Concrete(D, hidden, c);
 }
 
 void buildModel(Model &mdl, int D, const GateCfg &c)
@@ -753,13 +785,18 @@ void part3()
         {"mlp+softmax lossfree",     GateStructure::Mlp,    GateActivation::Softmax,  true,  0.01f,  0.0f},
     };
 
+    if (g_experts == 1) {
+        std::printf("      (E=1: 门控恒等、没有可迁移的门控权重 -> '均衡可达性' 这一节不适用, 跳过)\n");
+        return;
+    }
+
     for (int a = 0; a < (int)(sizeof(arms) / sizeof(arms[0])); a++) {
         const BalArm &A = arms[a];
         const int SEEDS = 3;
         std::vector<double> vios, mins, effs, dws;
         for (int sd = 0; sd < SEEDS; sd++) {
         GateCfg c = {"", A.gs, A.ga, 32, A.useBias, A.biasRate, A.aux};
-        auto moe = makeMoe(D, 8, c);
+        auto moe = makeMoe4Concrete(D, 8, c);   /* 具体类型: 本节的读数要用 wg/wg1/wg2 */
         RL::Net::Layers L;
         L.push_back(moe);
         L.push_back(RL::Layer<RL::Linear>::_(D, 1, true, true));
@@ -839,9 +876,19 @@ int main(int argc, char *argv[])
         else if (!(v = val("--steps")).empty())  { g_steps = std::atoi(v.c_str()); }
         else if (!(v = val("--states")).empty()) { g_states = std::atoi(v.c_str()); }
         else if (!(v = val("--only")).empty())   { only = std::atoi(v.c_str()); }
+        else if (!(v = val("--gate-hidden")).empty()) { g_gateHidden = std::atoi(v.c_str()); }
+        else if (!(v = val("--experts")).empty()) { g_experts = std::atoi(v.c_str()); }
         else if (k == "--quick") { g_seeds = 2; g_steps = 250; g_states = 200; }
         else if (k == "--help" || k == "-h") {
-            std::printf("用法: bench_gate_moe [--seeds=N] [--steps=N] [--states=N] [--only=1|2|3] [--quick]\n");
+            std::printf("用法: bench_gate_moe [--seeds=N] [--steps=N] [--states=N] "
+                        "[--only=1|2|3] [--gate-hidden=N] [--experts=1|4] [--quick]\n");
+            std::printf("  --gate-hidden=N: MLP 门控的隐层宽度 (覆盖 kArms 里的 32)。\n"
+                        "    为什么要有它 (2026-10-16): '门控宽度是否最优' 在本工程里**从未扫过**, \n"
+                        "    而宽度是唯一还没被 A/B 过的门控旋钮 (结构 linear/MLP、激活、\n"
+                        "    均衡方式都已经有对照臂)。不传 = 用各臂自己的值 (默认 32), 读数与改动前一位不变。\n");
+            std::printf("  --experts=1|4: 专家数 (模板参数, 只有这两个实例化)。默认 4 = 现役口径。\n"
+                        "    --experts=1 就是 E=1 vs E=4 消融的对照臂: 门控/均衡退化为恒等,\n"
+                        "    剩下的差别只有 task MSE 与'省下的算力/参数' —— 那正是'MoE 值不值'要问的。\n");
             return 0;
         }
     }
@@ -856,6 +903,11 @@ int main(int argc, char *argv[])
     std::printf("=== MoE 门控变体受控实验 ===\n");
     std::printf("seeds=%d steps=%d states=%d  Random::setSeed(20240901) 固定\n",
                 g_seeds, g_steps, g_states);
+    /* 这两行让日志自描述: 同一份读数在 E 或宽度不同时**不能**互相比较 */
+    std::printf("专家数 E=%d (模板参数; 1 = E=1 vs E=4 消融的对照臂)\n", g_experts);
+    if (g_experts == 4 && g_gateHidden > 0) {
+        std::printf("MLP 门控隐层覆盖 = %d (仅对 MLP 臂生效; 线性臂没有隐层)\n", g_gateHidden);
+    }
 
     if (only == 0 || only == 1) { part1(); }
     if (only == 0 || only == 2) { part2(); }
